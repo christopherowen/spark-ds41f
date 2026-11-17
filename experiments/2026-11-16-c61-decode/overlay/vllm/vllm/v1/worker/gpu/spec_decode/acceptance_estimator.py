@@ -40,6 +40,45 @@ _WARM_CONFIDENCE_HEAD_INTERCEPTS: tuple[float, ...] = (
 )
 
 
+# The same start for the feature with the draft's top-2 margin in it,
+# ``logit(p) + 2 * log(1 + margin)`` (SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE=2): the
+# slope and the intercept shifts are those between the two fits on the AgentX turns
+# of experiments/2026-11-17-draft-calibration-sizing (slope 1.086 -> 0.728,
+# intercepts lower by 0.89, 1.15, 1.29, 1.40, 1.49), applied to the values above.
+# Another gain starts from these too; the online refit moves them.
+_WARM_MARGIN_CONFIDENCE_SLOPE = 0.67
+_WARM_MARGIN_CONFIDENCE_INTERCEPTS: tuple[float, ...] = (
+    -1.41,
+    -1.79,
+    -2.25,
+    -2.25,
+    -2.23,
+)
+# Bound on the margin (confidence.MARGIN_CAP).
+_MARGIN_CAP = 64.0
+
+
+def add_margin_to_confidence_probs(
+    confidence_probs: torch.Tensor, margins: torch.Tensor, gain: float
+) -> None:
+    """``p <- sigmoid(logit(p) + gain * log(1 + margin))`` in place, for the paths
+    that calibrate the head's probabilities outside its fused kernel. ``margins``
+    has ``confidence_probs``' elements in its order; a row the drafter left at 0
+    stays 0, and a NaN margin counts as 0."""
+    raw = confidence_probs.float()
+    eps = 1e-6
+    clamped = raw.clamp(eps, 1.0 - eps)
+    features = torch.log(clamped / (1.0 - clamped)).clamp(-_MAX_LOG_ODDS, _MAX_LOG_ODDS)
+    margin = torch.nan_to_num(margins.float().view_as(raw), nan=0.0).clamp(
+        0.0, _MARGIN_CAP
+    )
+    features = (features + gain * torch.log1p(margin)).clamp(
+        -_MAX_LOG_ODDS, _MAX_LOG_ODDS
+    )
+    probs = torch.where(raw > 0.0, torch.sigmoid(features), torch.zeros_like(raw))
+    confidence_probs.copy_(probs.to(confidence_probs.dtype))
+
+
 @triton.jit
 def _accumulate_kernel(
     info_ptr,
@@ -547,12 +586,22 @@ class OnlineAcceptanceEstimator:
         *,
         warm_start: bool = False,
         prior_intercepts: tuple[float, ...] | list[float] | None = None,
+        with_margin: bool = False,
     ) -> None:
-        """Reset coefficients for a scalar confidence head."""
-        self.slope.fill_(_INIT_CONFIDENCE_HEAD_SLOPE)
+        """Reset coefficients for a scalar confidence head; ``with_margin``, for
+        the feature that carries the draft's top-2 margin."""
+        self.slope.fill_(
+            _WARM_MARGIN_CONFIDENCE_SLOPE
+            if with_margin and warm_start
+            else _INIT_CONFIDENCE_HEAD_SLOPE
+        )
         if warm_start or prior_intercepts is not None:
             priors = (
-                _WARM_CONFIDENCE_HEAD_INTERCEPTS
+                (
+                    _WARM_MARGIN_CONFIDENCE_INTERCEPTS
+                    if with_margin
+                    else _WARM_CONFIDENCE_HEAD_INTERCEPTS
+                )
                 if prior_intercepts is None
                 else prior_intercepts
             )

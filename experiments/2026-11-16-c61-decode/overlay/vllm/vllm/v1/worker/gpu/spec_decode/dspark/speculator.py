@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -138,8 +139,11 @@ def _compute_confidence_probs(
     confidence_markov_embeds: list[torch.Tensor],
     num_reqs: int,
     active_steps: int,
+    margins: torch.Tensor | None = None,
 ) -> None:
-    """Evaluate and calibrate DSpark confidence probabilities over active draft steps."""
+    """Evaluate and calibrate DSpark confidence probabilities over active draft steps.
+    ``margins`` ([num_reqs, n_spec] FP32): this step's top-2 draft logit margins, when
+    the step measured them and the margin gain is set."""
     n_spec = speculator.num_speculative_steps
     num_sample = num_reqs * n_spec
     truncated = active_steps < n_spec
@@ -184,6 +188,14 @@ def _compute_confidence_probs(
             conf_out,
             estimator,
             conf_idx_mapping,
+            **(
+                {}
+                if margins is None
+                else {
+                    "margins": margins.reshape(-1),
+                    "margin_gain": speculator._margin_confidence_gain,
+                }
+            ),
         )
     else:
         speculator.model.compute_confidence(
@@ -257,6 +269,14 @@ class DSparkSpeculator(DFlashSpeculator):
                 1.0,
             )
         )
+        # The gain on log(1 + top-2 margin) in the calibrated confidence feature
+        # (tilelang/confidence.py); 0 is off. It needs the runner-up of every greedy
+        # step, which the top-2 pairs carry; with a zero branch margin they change
+        # no draft.
+        self._margin_confidence_gain: float = max(
+            float(os.environ.get("SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE", "0") or 0.0),
+            0.0,
+        )
         self._enable_top2_branch: bool = (
             bool(
                 getattr(
@@ -266,6 +286,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 )
             )
             or self._top2_branch_margin > 0.0
+            or self._margin_confidence_gain > 0.0
         )
         draft_vocab = max(
             self.draft_model_config.hf_config.vocab_size,
@@ -381,7 +402,9 @@ class DSparkSpeculator(DFlashSpeculator):
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)
         if self.use_confidence_head and self.acceptance_estimator is not None:
-            self.acceptance_estimator.reset_for_confidence_head(warm_start=True)
+            self.acceptance_estimator.reset_for_confidence_head(
+                warm_start=True, with_margin=self._margin_confidence_gain > 0.0
+            )
 
     @property
     def tp_invariant_confidence(self) -> bool:
@@ -759,6 +782,15 @@ class DSparkSpeculator(DFlashSpeculator):
                 confidence_markov_embeds,
                 num_reqs,
                 active_steps,
+                # Only the vocabulary-parallel greedy steps measure the margin.
+                margins=(
+                    self.draft_top2_margins[:num_reqs]
+                    if getattr(self, "_margin_confidence_gain", 0.0) > 0.0
+                    and vocab_parallel
+                    and not local_head
+                    and self._enable_top2_branch
+                    else None
+                ),
             )
 
     def _can_sample_sparse_topk(self) -> bool:
