@@ -988,8 +988,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         out: torch.Tensor,
         estimator: object,
         idx_mapping: torch.Tensor,
+        margins: torch.Tensor | None = None,
+        margin_gain: float = 0.0,
     ) -> torch.Tensor:
-        """Per-position acceptance probability calibrated online by ``estimator``."""
+        """Per-position acceptance probability calibrated online by ``estimator``;
+        with ``margins`` (each row's top-2 draft logit margin) and a positive
+        ``margin_gain``, calibrated on the head's log-odds plus ``margin_gain *
+        log(1 + margin)``."""
+        if margins is None or margin_gain <= 0.0:
+            margins, margin_gain = None, 0.0
         assert self.model.confidence_head is not None
         head = self.model.confidence_head
         if (
@@ -1000,6 +1007,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             and idx_mapping.is_contiguous()
             and idx_mapping.numel() == head_hidden.shape[0]
         ):
+            # The margin arguments only when there is one: without it the call is
+            # the one every confidence head takes.
             return head.probability_and_calibrate(
                 head_hidden,
                 markov_embed,
@@ -1009,8 +1018,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 idx_mapping,
                 estimator.features,
                 estimator.predictions,
+                *(() if margins is None else (margins, margin_gain)),
             )
         probs = self.compute_confidence(head_hidden, markov_embed, out=out)
+        if margins is not None:
+            from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+                add_margin_to_confidence_probs,
+            )
+
+            add_margin_to_confidence_probs(probs, margins, margin_gain)
         if estimator is not None:
             num_steps = estimator.num_speculative_steps
             estimator.calibrate_confidence_probs(
