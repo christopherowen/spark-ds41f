@@ -1,11 +1,10 @@
 {
-  "notes": "candidate-60 at tp4-ring plus candidate-61 decode r14 (r13 plus MoE fuse_swiglu and wo/gemm/linear retune, bit-exact 3-split mHC preload, l2_prefetch burst-reset and WO=12 MB, hybrid card0_WQ_ONLY screen carve-out and 1-warp ping-pong vocab refine, CUDA conditional IF Markov halting and 3-layer front fusion, and lazy dev-mode CUPTI capture)",
+  "notes": "candidate-60 at tp4-ring plus candidate-61 decode r14 (r13 plus MoE fuse_swiglu and wo/gemm/linear retune, bit-exact 3-split mHC preload, l2_prefetch 2-CTA burst-reset at qualified 15/12/12 MB, hybrid card0_WQ_ONLY screen carve-out and 1-warp ping-pong vocab refine, CUDA conditional IF Markov halting and 3-layer front fusion, and lazy dev-mode CUPTI capture)",
   "extends": {
     "config": "experiments/2026-11-16-c60-prefill/tp4-dev.json"
   },
   "set": {
     "environment": {
-      "VLLM_DS41_L2_PREFETCH_WO_MB": "12",
       "VLLM_SERVER_DEV_MODE": "1"
     },
     "container": {
@@ -98,11 +97,6 @@
         [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/compressor.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/compressor.py",
-          "ro"
-        ],
-        [
-          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py",
-          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py",
           "ro"
         ],
         [
