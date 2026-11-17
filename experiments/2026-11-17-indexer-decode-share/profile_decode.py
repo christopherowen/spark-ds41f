@@ -2,7 +2,7 @@
 """One stream's decode steps at increasing context depth, timed and then profiled.
 
 usage: profile_decode.py BASE_URL [--depths 4096,262144,1000000] [--tokens 192] [--replays 30] [--settle 30]
-                         [--no-profile] [--repeats 2]
+                         [--no-profile] [--repeats 2] [--real-rows]
 
 A profiler-enabled arm with VLLM_SERVER_DEV_MODE=1 must be serving. For each depth, in order:
 
@@ -23,6 +23,12 @@ order is the traces' order.
 
 With --no-profile (a server without --profiler-config) the profiled phases are left out
 and phase 2 runs --repeats times, so the result is timing alone.
+
+With --real-rows (a server whose engine grid has real_rows) two more phases follow:
+
+6. grid-real: the same fixed steps with real rows, which route to experts and read a
+   context the server fills first, not profiled;
+7. grid-real-profiled: the same under the profiler, on the context phase 6 filled.
 """
 import json
 import sys
@@ -47,6 +53,8 @@ TOKENS = int(option("--tokens", "192"))
 REPLAYS = int(option("--replays", "30"))
 SETTLE = float(option("--settle", "30"))
 PROFILE = "--no-profile" not in sys.argv
+REAL_ROWS = "--real-rows" in sys.argv
+WINDOWS = 3 if REAL_ROWS else 2  # profiler windows a depth
 REPEATS = int(option("--repeats", "2")) if not PROFILE else 1
 QUESTION = "Explain the document above in detail, file by file and function by function."
 
@@ -155,7 +163,7 @@ for index, depth in enumerate(DEPTHS):
             after = counters()
         finally:
             post("/stop_profile")
-        emit(phase="real-profiled", depth=depth, window=2 * index, usage=profiled["usage"], chunks=profiled["chunks"],
+        emit(phase="real-profiled", depth=depth, window=WINDOWS * index, usage=profiled["usage"], chunks=profiled["chunks"],
              request_sent=round(began, 3), profile_started=round(profiled["lead"], 3),
              stream_ended=round(profiled["end"], 3), lead_completion_tokens=profiled["lead_completion_tokens"],
              **span(profiled, marks["profiled"], after))
@@ -174,8 +182,25 @@ for index, depth in enumerate(DEPTHS):
         finally:
             ended = time.time()
             post("/stop_profile")
-        emit(phase="grid-profiled", depth=depth, context_len=context, window=2 * index + 1, replays=REPLAYS,
+        emit(phase="grid-profiled", depth=depth, context_len=context, window=WINDOWS * index + 1, replays=REPLAYS,
              warmup=2, start=round(began, 3), end=round(ended, 3), grid=result)
         settle()
 
-emit(phase="done", windows=2 * len(DEPTHS) if PROFILE else 0)
+    if REAL_ROWS:
+        real = [dict(shape, real_rows=True) for shape in shapes]
+        began = time.time()
+        result = engine.summarize(engine.run(BASE, real, replays=REPLAYS, warmup=2))
+        emit(phase="grid-real", depth=depth, context_len=context, seconds=round(time.time() - began, 1), grid=result)
+        if PROFILE:
+            post("/start_profile")
+            began = time.time()
+            try:
+                result = engine.summarize(engine.run(BASE, real, replays=REPLAYS, warmup=2, fill_real_context=False))
+            finally:
+                ended = time.time()
+                post("/stop_profile")
+            emit(phase="grid-real-profiled", depth=depth, context_len=context, window=WINDOWS * index + 2,
+                 replays=REPLAYS, warmup=2, start=round(began, 3), end=round(ended, 3), grid=result)
+            settle()
+
+emit(phase="done", windows=WINDOWS * len(DEPTHS) if PROFILE else 0)

@@ -1021,11 +1021,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         The steps are the cost profile's dummy runs: identical work on every build,
         with no text, acceptance or scheduling in them. Run only on an idle server,
         and reset the prefix cache afterwards, since dummy steps write KV slots.
+
+        A dummy row is a padding row with no cache slot: the MoE routers skip it
+        and it sees no compressed context, whatever ``context_len`` is. A shape
+        with ``real_rows`` runs its rows as real ones instead (``_real_dummy_rows``):
+        they route, and they read ``context_len`` of context that real-row prefill
+        chunks wrote before the first timed step (``_fill_real_context``, about
+        the time of a real prefill of the longest such context; a spec with
+        ``fill_real_context`` false skips it, for a call that follows one which
+        filled the same context on a server idle since). The answer repeats
+        ``real_rows`` for each shape that ran so.
         """
         shapes = spec["shapes"]
         replays = int(spec.get("replays", 30))
         warmup = int(spec.get("warmup", 2))
         settle = int(spec.get("settle", 1))
+        if spec.get("fill_real_context", True):
+            self._fill_real_context(
+                max(
+                    (
+                        int(shape.get("context_len", 0))
+                        for shape in shapes
+                        if shape.get("real_rows")
+                    ),
+                    default=0,
+                )
+            )
 
         def run(shape: dict) -> None:
             kwargs: dict[str, Any] = {
@@ -1036,6 +1057,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 kwargs["single_request_prefill"] = True
             elif shape.get("num_reqs") is not None:
                 kwargs["profile_num_reqs"] = int(shape["num_reqs"])
+            if shape.get("real_rows"):
+                kwargs["real_rows"] = True
             self._dummy_run(**kwargs)
 
         for shape in shapes:
@@ -1060,6 +1083,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         results = [
             {
                 "shape": shape,
+                "real_rows": bool(shape.get("real_rows")),
                 "step_ms": [],
                 "forward_ms": [],
                 "drafter_ms": [],
@@ -1087,6 +1111,132 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "shapes": results,
         }
 
+    # A real-row prefill chunk of the context fill: the engine grid's prefill size.
+    _REAL_CONTEXT_CHUNK = 8192
+    # Real-row contexts are whole multiples of this, so every cache group's
+    # blocks before the context's end are whole.
+    _REAL_CONTEXT_ALIGN = 4096
+
+    def _fill_real_context(self, context_len: int) -> None:
+        """Write ``context_len`` tokens of context for the engine grid's
+        ``real_rows`` shapes: real-row prefill chunks of one dummy request, from
+        position 0. A dummy request's blocks do not depend on its length
+        (``assign_dummy_blocks``), so every shorter context is a prefix of this
+        one, and ``_real_dummy_rows`` points the other requests of a step at it.
+        Without it a real row would read whatever bytes its blocks hold, in another
+        group's format after real traffic, and a non-finite value reaches the
+        router's assert."""
+        if context_len % self._REAL_CONTEXT_ALIGN:
+            raise ValueError(
+                f"real_rows needs a context of whole {self._REAL_CONTEXT_ALIGN}-token "
+                f"blocks, not {context_len}"
+            )
+        for offset in range(0, context_len, self._REAL_CONTEXT_CHUNK):
+            self._dummy_run(
+                num_tokens=min(self._REAL_CONTEXT_CHUNK, context_len - offset),
+                context_len=offset,
+                single_request_prefill=True,
+                real_rows=True,
+            )
+
+    def _real_dummy_rows(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        context_len: int,
+    ) -> torch.Tensor:
+        """Make a dummy batch's rows real, for the engine grid's ``real_rows``
+        shapes, and return their slot mappings.
+
+        ``InputBatch.make_dummy`` repeats token 0, marks every row as padding and
+        leaves the slot mappings at ``PAD_SLOT_ID``. Here the rows take a fixed
+        pseudo-random token sequence (the same on every rank, by position, so a
+        context's tokens do not repeat), lose the padding flag, and take the slots
+        the step's own kernel computes from the dummy block tables. Every request
+        reads the first request's context blocks, which ``_fill_real_context``
+        wrote, and its ring; its own rows go to its own blocks after the context.
+        """
+        if self.pcp_manager is not None:
+            raise ValueError("real_rows is not supported with context parallelism")
+        bt = self.block_tables
+        num_reqs = input_batch.num_reqs
+        num_tokens = input_batch.num_tokens
+        query_len = input_batch.max_query_len or int(
+            input_batch.num_scheduled_tokens.max()
+        )
+        context_len = max(min(context_len, self.max_model_len - query_len), 0)
+        if context_len % self._REAL_CONTEXT_ALIGN:
+            raise ValueError(
+                f"real_rows needs a context of whole {self._REAL_CONTEXT_ALIGN}-token "
+                f"blocks, not {context_len}"
+            )
+        if not context_len:
+            # set_dummy_context leaves a batch without context alone: give it its
+            # positions and its blocks.
+            local_pos = np.arange(num_tokens, dtype=np.int64) - np.repeat(
+                input_batch.query_start_loc_np[:num_reqs],
+                input_batch.num_scheduled_tokens,
+            )
+            input_batch.positions.copy_(torch.from_numpy(local_pos))
+            assign_dummy_blocks(
+                bt, block_tables, num_reqs, query_len, self.kv_cache_config.num_blocks
+            )
+        elif num_reqs > 1:
+            for table, block_size, ring in zip(
+                block_tables, bt.kernel_block_sizes, bt._slot_mapping_circular
+            ):
+                if ring:
+                    # A ring group's slots all come from its first block.
+                    shared = 1
+                elif context_len % block_size:
+                    raise ValueError(
+                        f"real_rows context {context_len} splits a {block_size}-token "
+                        "block"
+                    )
+                else:
+                    shared = min(context_len // block_size, table.shape[1])
+                table[1:num_reqs, :shared] = table[:1, :shared]
+
+        ids = getattr(self, "_real_dummy_token_ids", None)
+        if ids is None:
+            span = 1 << 20
+            generator = torch.Generator().manual_seed(0)
+            ids = torch.randint(
+                1000,
+                min(self.vocab_size, 100000),
+                (span + self.input_buffers.input_ids.shape[0],),
+                generator=generator,
+                dtype=torch.int32,
+            ).to(self.device)
+            self._real_dummy_token_ids = ids
+            self._real_dummy_block_counts = torch.tensor(
+                [[table.shape[1]] * bt.max_num_reqs for table in bt.input_block_tables],
+                dtype=torch.int32,
+                device=self.device,
+            )
+        start = context_len % (ids.shape[0] - self.input_buffers.input_ids.shape[0])
+        input_batch.input_ids.copy_(ids[start : start + num_tokens])
+        input_batch.is_padding.fill_(False)
+
+        tilelang_inputs.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            input_batch.positions,
+            bt._input_block_table_ptrs_i64,
+            bt.block_table_strides,
+            self._real_dummy_block_counts,
+            bt.block_sizes_tensor,
+            bt.kernel_block_sizes_tensor,
+            bt.slot_mapping_enabled,
+            bt.slot_mapping_circular,
+            bt.group_cp_sizes,
+            bt.slot_mappings,
+            bt.cp_rank,
+            bt.cp_size,
+            bt.cp_interleave,
+        )
+        return bt.slot_mappings[:, : input_batch.num_tokens_after_padding]
+
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
@@ -1102,12 +1252,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         single_request_prefill: bool = False,
         profile_all_kv_cache_groups: bool = False,
+        real_rows: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
             raise ValueError(
                 "skip_attn must only be True for initial memory profiling."
             )
+        if real_rows and (skip_attn or is_profile or uniform_decode):
+            raise ValueError("real_rows is for the engine grid's dummy steps only.")
 
         # Create a dummy scheduler output.
         num_reqs = (
@@ -1174,6 +1327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 profile_all_kv_cache_groups=profile_all_kv_cache_groups,
+                real_dummy_rows=real_rows,
             )
         self.kv_connector.set_disabled(False)
 
@@ -3317,6 +3471,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         profile_all_kv_cache_groups: bool = False,
+        real_dummy_rows: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
@@ -3551,6 +3706,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     or int(input_batch.num_scheduled_tokens.max()),
                     self.kv_cache_config.num_blocks,
                 )
+            if real_dummy_rows:
+                # The engine grid's real_rows shapes: the rows route and read
+                # their context.
+                assert block_tables is not None
+                slot_mappings = self._real_dummy_rows(
+                    input_batch, block_tables, context_len
+                )
 
         attn_metadata = None
         slot_mappings_by_layer = None
@@ -3643,6 +3805,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 inputs_embeds = self.model_state.dummy_inputs_embeds(
                     input_batch.num_tokens_after_padding
                 )
+                if real_dummy_rows and inputs_embeds is not None:
+                    # Real rows embed their tokens, as prepare_inputs_embeds does.
+                    inputs_embeds[: input_batch.num_tokens] = (
+                        self.model.embed_input_ids(
+                            input_ids[: input_batch.num_tokens]
+                        )
+                    )
             else:
                 scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
                 if self.supports_mm_inputs and self.lora_config is not None:

@@ -49,6 +49,7 @@ class FakeServer:
 
     def __init__(self, step_scale: float = 1.0, variant: bool = False, prefill_stall_s: float = 0.0):
         self.step_scale = step_scale  # engine grid: multiplies every step time
+        self.real_rows = True         # engine grid: the server's grid runs real_rows shapes
         self.variant = variant        # model behaviour: a build whose numbers differ slightly
         # A prompt longer than LONG_PROMPT characters prefills for this long, and every
         # stream's next chunk waits for it, as decode steps wait for a prefill chunk.
@@ -112,6 +113,8 @@ class FakeServer:
                                 shapes.append({"shape": shape, "step_ms": samples,
                                                "forward_ms": [v * 0.8 for v in samples],
                                                "drafter_ms": [v * 0.2 for v in samples], "modes": []})
+                                if fake.real_rows:
+                                    shapes[-1]["real_rows"] = bool(shape.get("real_rows"))
                             workers.append({"rank": rank, "replays": spec["replays"], "shapes": shapes})
                         body = json.dumps({"results": workers}).encode()
                     self.send_response(200)
@@ -813,6 +816,25 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(max(s["num_reqs"] for s in tp3), 8)
         self.assertIn("decode 1x3 rows @504K", [engine.label(s) for s in tp3])
         self.assertEqual(len(tp3), 15)  # 6 at depths 1-2, 4 at full depth, 2 at 64K, 2 at 256K, 1 longest
+
+    def test_real_rows_shapes_are_named_apart_and_need_a_server_that_runs_them(self):
+        shapes = engine.default_shapes(5, 1048576, real_rows=True)
+        labels = [engine.label(s) for s in shapes]
+        self.assertIn("decode 1x3 real rows @1016K", labels)
+        self.assertIn("prefill 8192 real @256K",
+                      [engine.label(s) for s in engine.default_shapes(5, 1048576, prefill=True, real_rows=True)])
+        self.assertFalse(set(labels) & {engine.label(s) for s in engine.default_shapes(5, 1048576)})
+        self.assertTrue(all(s["context_len"] % 4096 == 0 for s in shapes))
+        server = FakeServer(1.0)
+        try:
+            raw = engine.run(server.url, shapes[:2], replays=3)
+            self.assertTrue(all(timed["real_rows"] for timed in raw["grid"]))
+            server.real_rows = False  # an image whose grid ignores the option
+            with self.assertRaisesRegex(RuntimeError, "padding rows for decode 1x2 real rows @4K"):
+                engine.run(server.url, shapes[:2], replays=3)
+            engine.run(server.url, engine.default_shapes(5, 1048576)[:2], replays=3)
+        finally:
+            server.close()
 
     def test_grid_run_summary_and_compare(self):
         fast, slow = FakeServer(1.0), FakeServer(1.05)

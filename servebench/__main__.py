@@ -108,7 +108,7 @@ def command_engine(args: argparse.Namespace) -> int:
     if args.grid == "default":
         longest = args.max_context or engine.max_model_len(args.url)
         shapes = engine.default_shapes(drafts=args.drafts, max_context=longest, prefill=args.prefill,
-                                       max_requests=args.max_requests)
+                                       max_requests=args.max_requests, real_rows=args.real_rows)
     else:
         with open(args.grid, encoding="utf-8") as handle:
             shapes = json.load(handle)
@@ -121,7 +121,7 @@ def command_engine(args: argparse.Namespace) -> int:
                          "prefix_cache_reset": raw["prefix_cache_reset"]},
               "workload": {"grid": args.grid, "replays": args.replays, "warmup": args.warmup,
                            "settle": raw["settle"], "drafts": args.drafts, "prefill": args.prefill,
-                           "max_requests": args.max_requests},
+                           "max_requests": args.max_requests, "real_rows": args.real_rows},
               "engine": rows}
     if args.output:
         write_json(args.output, result)
@@ -351,6 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "rebuilds the dummy metadata, the harness's cost)")
     grid.add_argument("--prefill", action="store_true",
                       help="add 8K prefill chunks (dummy prefill does not track real prefill)")
+    grid.add_argument("--real-rows", action="store_true",
+                      help="run the default grid's rows as real ones: they route to experts and read "
+                           "a context the server fills first (needs a server whose grid has real_rows)")
     grid.add_argument("--drafts", type=int, default=5, help="drafts per request in verify rows")
     grid.add_argument("--max-context", type=int, help="longest context (default: the server's)")
     grid.add_argument("--max-requests", type=int, default=16,
