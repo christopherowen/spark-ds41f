@@ -220,7 +220,7 @@ The traced step again, each rank with its own node's fit
   8.1 against 14.2 and 14.6): 0.80 ms a step, +3.0% if it went to zero. Timed together, a
   layer's three launches cost 9 to 15 µs over their bytes.
 - **The rate itself is now the largest item.** At October's rate the same bytes would take 22.7
-  ms: 1.6 ms less, +6.2% (about 91.6 tok/s), more than the launch costs and the collectives'
+  ms: 1.7 ms less, +6.7% (about 92.0 tok/s), more than the launch costs and the collectives'
   idle time are worth separately.
 
 ### What changed on the nodes is not established
