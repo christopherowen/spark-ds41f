@@ -453,6 +453,45 @@ with the rank-major exchange, against the reference across four and three simula
 replace and add; the update at 40, 700 and 1,280 positions (several ballot tiles, rows repeating up to
 about 20 times).
 
+**Bench** ([bundles/finish-bench-offstep](bundles/finish-bench-offstep), sp8; the same shapes, rings and
+collective stand-ins as the on-step bench above). For each call: the step's stream (the staging) and the
+learner's stream, each as GPU time alone and as rank 0 logs it with the GPU idle at the call; the host's
+time in `finish`; and the overlap, a memory-bound stand-in for the next step's forward (64 MiB copies, about
+19.7 ms) queued on the step's stream right after `finish`, timed with the learner's work beside it and
+without, alternating. Medians of 15, run 2
+([receipts/finish-bench-offstep-2](receipts/finish-bench-offstep-2)). Run 1
+([finish-bench-offstep-1](receipts/finish-bench-offstep-1)) agrees within 0.01 ms on both streams and
+within 35 µs on the overlap at every size but its first: there the stand-in itself took 33.5 ms instead
+of 19.5, so the GPU was shared or clocked down for that case, and it is set aside (it is kept in the
+receipt).
+
+| Turns × kept steps | Step's stream, gpu / idle | Learner's stream, gpu / idle | Host | Stand-in forward slowed |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 64 | 0.016 / 0.040 ms | 0.047 / 0.075 ms | 0.14 ms | +2 µs (−154 to +144) |
+| 1 × 128 | 0.018 / 0.038 ms | 0.076 / 0.114 ms | 0.14 ms | −13 µs (−89 to +88) |
+| 1 × 256 | 0.018 / 0.040 ms | 0.146 / 0.181 ms | 0.15 ms | +55 µs (0 to +200) |
+| 1 × 384 | 0.018 / 0.041 ms | 0.217 / 0.273 ms | 0.21 ms | +78 µs (−421 to +536) |
+| 1 × 512 | 0.022 / 0.043 ms | 0.297 / 0.332 ms | 0.21 ms | +164 µs (−175 to +258) |
+| 2 × 512 | 0.024 / 0.046 ms | 0.595 / 0.630 ms | 0.33 ms | +429 µs (+396 to +537) |
+| 4 × 512 | 0.031 / 0.054 ms | 1.19 / 1.23 ms | 0.56 ms | +933 µs (+854 to +1,456) |
+| 8 × 512 | 0.043 / 0.081 ms | 2.44 / 2.46 ms | 1.03 ms | +1,337 µs (+1,281 to +1,488) |
+
+GPU time a launch, one turn of 512 steps (two chunks): staging 0.012 ms and reset 0.003 ms on the step's
+stream; on the learner's, local 0.125, decode 0.106, update 0.033 (was 0.249), combine 0.027, totals 0.016
+(was 0.031), stand-ins 0.008 ms.
+
+- The step now waits 0.02 to 0.08 ms a call, against 0.14 to 4.8 ms before; no stage waits at any size.
+- The learner's work is 0.30 ms a 512-step turn, against 0.55 ms: the ballot search took the update from
+  0.249 to 0.033 ms. Decode and the local kernel are now 78% of it.
+- The stream does not make that work free. Beside a forward that is nothing but memory traffic, about half
+  to three quarters of the learner's GPU time comes back as forward time (+0.16 ms for one 512-step turn,
+  +1.3 ms for eight): both are bandwidth-bound, and the learner moves about 13 MB a chunk. A decode step
+  also waits on the network and on short kernels, which should hide more of it; the serving run measures
+  how much. The lever left is the decode: decoding the candidates' W2 rows inside the local and combine
+  kernels instead of writing 10 MiB a chunk and reading it back twice.
+- The host's time in `finish` (0.21 ms for a 512-step turn) stays on the host's path; with asynchronous
+  scheduling it overlaps the GPU's previous step.
+
 Serving run: [offstep-tp4-switched.json](offstep-tp4-switched.json):
 
 1. the screen suite, four boots alternating the learner off
