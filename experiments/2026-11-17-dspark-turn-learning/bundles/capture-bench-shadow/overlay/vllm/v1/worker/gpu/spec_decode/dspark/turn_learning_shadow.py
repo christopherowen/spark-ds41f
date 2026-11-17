@@ -30,9 +30,13 @@ in sorted order, before the slot can be reused):
    rank's packed shard), each bias and the sum rounded to BF16 as the step rounds
    them (where the step's input was the committed one the loaded logit is the
    step's value, and a change too small to move a BF16 bias moves nothing);
-3. the shadow score: each table's leading run of positions whose best candidate
-   is the committed token, one rule for both, so the comparison is paired; the
-   drafts the maxima give are checked against the drafts the ring holds;
+3. a score limited to those maxima: each table's leading run of positions whose
+   best candidate is the committed token, one rule for both; the drafts the
+   maxima give are checked against the drafts the ring holds. The offline study
+   shows this score does not track the learned copy's gain (it cannot see a fix
+   whose committed token is not among the step's maxima), so it is a health
+   signal; the gain is measured offline on exact replays, or with drafts read
+   from the learned table;
 4. the update: at the positions up to each block's first miss ("seen", where the
    step's input was the committed token, so its maxima are teacher forcing's),
    the cross-entropy of the committed token over the block maxima where the token
@@ -71,7 +75,7 @@ logger = init_logger(__name__)
 
 GREEDY_BLOCK = 2048
 _THREADS = 256
-_CAPTURE_THREADS = 128
+_CAPTURE_THREADS = 512  # 16 warps: one a part of the fused first position
 _NO_INDEX = 1 << 24  # above every vocabulary index, exact in FP32
 _INT32_MAX = 2147483647
 _LOCAL = 10  # see shadow_local_kernel
@@ -126,6 +130,16 @@ def _take(best, best_index, value, index):
     best_index[0] = T.if_then_else(take, index, best_index[0])
 
 
+@T.macro
+def _warp_take(best, best_index, other, other_index):
+    """Every lane's ``(best, best_index)`` becomes the warp's first maximum (the
+    combine is a total order, so the pairing does not matter)."""
+    for d in T.unroll(5):
+        other[0] = T.shfl_xor(best[0], 16 >> d)
+        other_index[0] = T.shfl_xor(best_index[0], 16 >> d)
+        _take(best, best_index, other[0], other_index[0])
+
+
 @tilelang.jit(pass_configs=_PASS)
 def shadow_capture_kernel(n_spec: int, parts: int):
     """One block a draft row: the row's block maxima at each drafted position
@@ -135,15 +149,18 @@ def shadow_capture_kernel(n_spec: int, parts: int):
 
     Position ``i``'s maxima are this rank's greedy partials of that position: the
     2048-column parts ``greedy_markov_shard_pair`` reduced (``part_values[i]``,
-    [rows, parts]), or, for position 0 when ``fused0``, the tiles the fused
-    projection reduced ([rows, num_tiles], ``tiles_per_block`` a part), reduced
-    here to parts by the same first-maximum rule. A row whose sampling slot is -1
+    [rows, parts]), one thread a part; or, for position 0 when ``fused0``, the
+    tiles the fused projection reduced ([rows, num_tiles], ``tiles_per_block`` a
+    part), reduced here to parts by the same first-maximum rule, one warp a part
+    (a tile a lane, then a shuffle reduction). A row whose sampling slot is -1
     (padding of the captured size) writes nothing."""
     map_len, pv_len, tv_len = T.dynamic("map_len, pv_len, tv_len")
     draft_rows, draft_stride = T.dynamic("draft_rows, draft_stride")
     ids_len, anchor_len = T.dynamic("ids_len, anchor_len")
     slots, cap = T.dynamic("slots, cap")
     span = n_spec * parts
+    warps = _CAPTURE_THREADS // 32
+    assert span <= _CAPTURE_THREADS
 
     @T.prim_func
     def capture(
@@ -169,44 +186,59 @@ def shadow_capture_kernel(n_spec: int, parts: int):
     ):
         with T.Kernel(map_len // n_spec, threads=_CAPTURE_THREADS) as r:
             tx = T.get_thread_binding()
+            lane = tx % 32
+            warp = tx // 32
             best = T.alloc_local((1,), T.float32)
             best_index = T.alloc_local((1,), T.int32)
+            other = T.alloc_local((1,), T.float32)
+            other_index = T.alloc_local((1,), T.int32)
             slot = T.alloc_var(T.int64, init=T.cast(sample_map[r * n_spec], T.int64))
             safe = T.alloc_var(T.int64, init=T.max(slot, T.int64(0)))
             count = T.alloc_var(T.int64, init=ring_count[safe])
             entry = T.alloc_var(T.int64, init=count % T.cast(cap, T.int64))
-            if slot >= 0:
-                for it in T.serial(T.ceildiv(span, _CAPTURE_THREADS)):
-                    e = it * _CAPTURE_THREADS + tx
-                    if e < span:
-                        i = e // parts
-                        b = e % parts
+            if (slot >= 0) & (fused0 != 0) & (active > 0):
+                # The fused first position: a warp a part, a tile a lane.
+                for round_ in T.serial(T.ceildiv(parts, warps)):
+                    b = round_ * warps + warp
+                    if b < parts:
                         best[0] = -T.infinity(T.float32)
                         best_index[0] = -1
-                        if i < active:
-                            if (i == 0) & (fused0 != 0):
-                                for t in T.serial(tiles_per_block):
-                                    tile = b * tiles_per_block + t
-                                    if tile < num_tiles:
-                                        x = tile_indices[r * num_tiles + tile]
-                                        _take(
-                                            best,
-                                            best_index,
-                                            tile_values[r * num_tiles + tile],
-                                            T.if_then_else(x == _INT32_MAX, -1, x),
-                                        )
-                            else:
-                                x = part_indices[i, r * parts + b]
+                        for it in T.serial(T.ceildiv(tiles_per_block, 32)):
+                            t = it * 32 + lane
+                            tile = b * tiles_per_block + t
+                            if (t < tiles_per_block) & (tile < num_tiles):
+                                x = tile_indices[r * num_tiles + tile]
                                 _take(
                                     best,
                                     best_index,
-                                    part_values[i, r * parts + b],
+                                    tile_values[r * num_tiles + tile],
                                     T.if_then_else(x == _INT32_MAX, -1, x),
                                 )
-                        ring_values[safe, entry, i, b] = best[0]
-                        ring_index[safe, entry, i, b] = T.if_then_else(
-                            best_index[0] >= 0, best_index[0] + vocab_start, -1
+                        _warp_take(best, best_index, other, other_index)
+                        if lane == 0:
+                            ring_values[safe, entry, 0, b] = best[0]
+                            ring_index[safe, entry, 0, b] = T.if_then_else(
+                                best_index[0] >= 0, best_index[0] + vocab_start, -1
+                            )
+            if (slot >= 0) & (tx < span):
+                i = tx // parts
+                b = tx % parts
+                if (i != 0) | (fused0 == 0):
+                    best[0] = -T.infinity(T.float32)
+                    best_index[0] = -1
+                    if i < active:
+                        x = part_indices[i, r * parts + b]
+                        _take(
+                            best,
+                            best_index,
+                            part_values[i, r * parts + b],
+                            T.if_then_else(x == _INT32_MAX, -1, x),
                         )
+                    ring_values[safe, entry, i, b] = best[0]
+                    ring_index[safe, entry, i, b] = T.if_then_else(
+                        best_index[0] >= 0, best_index[0] + vocab_start, -1
+                    )
+            if slot >= 0:
                 if tx < n_spec:
                     ring_drafts[safe, entry, tx] = T.if_then_else(
                         tx < active - 1, T.cast(drafts[r, tx], T.int32), -1
@@ -1007,7 +1039,7 @@ class DSparkShadowLearner:
             self.z[:count],
             self.summary[:rows].view(count, n, _LOCAL),
         )
-        gathered = self.all_gather(self.summary[:rows])
+        gathered = self.all_gather(self.summary[:rows]).contiguous()
         _kernel(shadow_combine_kernel, n, parts, dim, self.tp_size)(
             entry_f,
             entry_k,
@@ -1037,11 +1069,13 @@ class DSparkShadowLearner:
     def _check_replicas(self) -> None:
         """Every rank's copy must stay the same (they apply one all-reduced update):
         a sum of each copy, compared on rank 0's log."""
-        total = torch.sum(self.master, dtype=torch.float64).reshape(1, 1)
-        sums = self.all_gather(total)
+        total = torch.sum(self.master, dtype=torch.float64).reshape(1)
+        # Exchanged as the sum's two 32-bit words, compared bit for bit.
+        sums = self.all_gather(total.view(torch.int32).reshape(1, 2)).reshape(-1, 2)
         if self.tp_rank == 0:
-            values = sums.flatten().tolist()
-            same = all(v == values[0] for v in values)
+            words = sums.cpu()
+            values = words.view(torch.float64).flatten().tolist()
+            same = bool((words == words[0]).all())
             (logger.info if same else logger.warning)(
                 "DSpark turn learning (shadow): the copies of W1 %s across ranks (%s)",
                 "agree" if same else "differ",
@@ -1062,9 +1096,14 @@ class DSparkShadowLearner:
                     stats["tf_loaded"], 1
                 )
 
+            # The maxima-limited score misses most of what the learned copy fixes
+            # (the committed token is often not among the step's maxima where the
+            # draft missed); offline it reads about +0.0% where the exact gain is
+            # about +0.9% (README). It is logged as a health signal, not the gain.
             logger.info(
-                "DSpark turn learning (shadow): %d turns %s loss %.4f, shadow %+.2f%%; "
-                "since boot %s, shadow %+.2f%% (end of turn %.3f ms)",
+                "DSpark turn learning (shadow): %d turns %s loss %.4f, maxima-limited "
+                "score %+.2f%%; since boot %s, maxima-limited score %+.2f%% "
+                "(end of turn %.3f ms)",
                 turns,
                 c,
                 float(call[_COUNTS]) / max(c["trained"], 1),

@@ -1,8 +1,10 @@
 """Per-step cost of the shadow learner's capture: CUDA graphs of a draft-step tail stand-in
-(the last position's exchange and selection: a fixed-length kernel) with the capture forked
-onto a side stream before it and joined after it, with the capture inline before it, and
-without it, replayed many times. Also the capture alone in a graph."""
+(the last position's exchange and selection) with the capture forked onto a side stream
+before it and joined after it, with the capture inline before it, and without it, replayed
+many times; also the capture alone in a graph. Two tails: a one-thread spin (a collective
+waiting on the network leaves the SMs free) and a copy that fills every SM."""
 import json
+import statistics
 
 import torch
 
@@ -49,10 +51,26 @@ def timed(fn, reps=2000):
     return a.elapsed_time(b) * 1000.0 / reps
 
 
-# The tail stand-in: a copy long enough to stand for the exchange (sized by the
-# measured graph time of the tail alone, printed).
+ROUNDS = 5
+
+
+def median(fn):
+    return statistics.median(timed(fn) for _ in range(ROUNDS))
+
+
+# Clocks up before the first measurement.
+_warm = torch.randn(1 << 22, device=dev)
+for _ in range(2000):
+    _warm.mul_(1.0)
+torch.cuda.synchronize()
+
+# The tail stand-ins.
 src = torch.randn(1 << 21, device=dev)
 dst = torch.empty_like(src)
+TAILS = {
+    "spin": lambda: torch.cuda._sleep(20000),
+    "copy": lambda: dst.copy_(src),
+}
 
 for num_reqs in (1, 4, 16):
     rows = num_reqs * N_SPEC
@@ -64,28 +82,28 @@ for num_reqs in (1, 4, 16):
              input_ids, anchor_idx, ring_values, ring_index, ring_meta, ring_drafts,
              ring_count, N_SPEC, 1, NUM_TILES, sh.GREEDY_BLOCK // COLS, 32320)
 
-    def tail():
-        dst.copy_(src)
+    out = {"num_reqs": num_reqs, "capture_graph_us": round(median(capture), 2)}
+    for name, tail in TAILS.items():
 
-    def inline():
-        capture()
-        tail()
-
-    def forked():
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
+        def inline():
             capture()
-        tail()
-        torch.cuda.current_stream().wait_stream(side)
+            tail()
 
-    only = timed(capture)
-    base = timed(tail)
-    inl = timed(inline)
-    frk = timed(forked)
-    print(json.dumps({
-        "num_reqs": num_reqs,
-        "capture_graph_us": round(only, 2),
-        "tail_us": round(base, 2),
-        "inline_adds_us": round(inl - base, 2),
-        "forked_adds_us": round(frk - base, 2),
-    }), flush=True)
+        def forked():
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                capture()
+            tail()
+            torch.cuda.current_stream().wait_stream(side)
+
+        # Rounds interleave the three graphs, so clock drift falls on all alike.
+        rounds = [(timed(tail), timed(inline), timed(forked)) for _ in range(ROUNDS)]
+        base = statistics.median(r[0] for r in rounds)
+        out[f"{name}_tail_us"] = round(base, 2)
+        out[f"{name}_inline_adds_us"] = round(statistics.median(r[1] - r[0] for r in rounds), 2)
+        out[f"{name}_forked_adds_us"] = round(statistics.median(r[2] - r[0] for r in rounds), 2)
+        out[f"{name}_forked_adds_range_us"] = [
+            round(min(r[2] - r[0] for r in rounds), 2),
+            round(max(r[2] - r[0] for r in rounds), 2),
+        ]
+    print(json.dumps(out), flush=True)
