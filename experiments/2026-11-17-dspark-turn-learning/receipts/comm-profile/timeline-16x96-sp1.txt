@@ -1,0 +1,83 @@
+# python3 gaps.py off/16x96 comm/16x96 (sp1)
+step stream: 52710 kernels; span 1697.0 -> 1746.3 ms; kernel time 1935.3 -> 1947.3 ms; gaps -238.3 -> -201.0 ms
+
+largest gap changes, by (kernel before, kernel after) on the step's stream:
+    +42.52 ms  (-315.04 -> -272.52, n=1932)  oneshot_allreduce_kernel -> mhc_project_streams_kernel
+    -29.44 ms  ( -28.63 ->  -58.07, n=1638)  oneshot_allreduce_kernel -> glp_steer_kernel
+     +3.20 ms  ( 129.18 ->  132.39, n=1806)  gemm_mxfp8_kernel -> moe_combine_kernel
+     +2.80 ms  ( -22.76 ->  -19.96, n=3612)  mhc_project_streams_kernel -> mhc_finalize_kernel
+     +2.49 ms  (  -5.18 ->   -2.69, n=1806)  gemm_splitk_reduce_cast_kernel -> gemm_mxfp8_kernel
+     +2.29 ms  (  -5.30 ->   -3.01, n=168)  oneshot_allgather_kernel -> gather_columns_into_kernel
+     +1.74 ms  (  -0.10 ->    1.64, n=1554)  glp_steer_kernel -> mhc_project_streams_kernel
+     +1.44 ms  (  -5.65 ->   -4.21, n=1722)  sparse_mla_kernel -> gemm_fp8w_bf16_partials_kernel
+     +1.33 ms  (  64.07 ->   65.40, n=42)  oneshot_allreduce_kernel -> ced_copy_rows_kernel
+     +1.22 ms  ( -55.40 ->  -54.18, n=1806)  gemm_mxfp8_kernel -> oneshot_allreduce_kernel
+     +1.11 ms  ( -20.53 ->  -19.43, n=1806)  gemm_mxfp8_kernel -> attention_front_kernel
+     +1.07 ms  (  -0.10 ->    0.98, n=1806)  activation_swiglu_clamp_cast_kernel -> gemm_mxfp8_kernel
+
+largest duration changes on the step's stream:
+    +35.24 ms  (  30.73 ->   65.98, n=1638)  glp_steer_kernel
+     -8.24 ms  ( 448.29 ->  440.05, n=3612)  mhc_project_streams_kernel
+     -7.47 ms  ( 690.26 ->  682.79, n=3654)  oneshot_allreduce_kernel
+     -4.90 ms  (  98.41 ->   93.51, n=1806)  gemm_fp8w_bf16_partials_kernel
+     -2.66 ms  (  43.49 ->   40.83, n=3612)  mhc_finalize_kernel
+     +2.40 ms  ( 421.18 ->  423.58, n=9492)  gemm_mxfp8_kernel
+     -2.27 ms  (   5.46 ->    3.18, n=168)  gather_columns_into_kernel
+     +1.94 ms  (   1.17 ->    3.11, n=630)  metadata_decode_kernel
+
+# python3 concurrency.py (sp1, 16x96)
+off-16x96-sp1.json.gz
+  stream 161: 13440 kernels, 264.3 ms, 51.4% beside the step's stream; [('moe_dispatch_kernel', 5040), ('moe_grouped_fp8_fp4_gemm_ker', 3360)]
+  stream 160: 5292 kernels, 356.5 ms, 99.9% beside the step's stream; [('l2_prefetch_kernel', 5250), ('mhc_post_collapse_norm_kerne', 42)]
+  stream 403: 1554 kernels, 91.4 ms, 29.9% beside the step's stream; [('l2_prefetch_kernel', 336), ('vocab_packed_projection_kern', 210)]
+  stream 404: 756 kernels, 9.3 ms, 80.6% beside the step's stream; [('moe_grouped_fp8_fp4_gemm_ker', 252), ('gemm_bf16_partials_kernel', 126)]
+comm-16x96-sp1.json.gz
+  stream 164: 13440 kernels, 257.1 ms, 49.5% beside the step's stream; [('moe_dispatch_kernel', 5040), ('moe_grouped_fp8_fp4_gemm_ker', 3360)]
+  stream 163: 5292 kernels, 343.4 ms, 98.6% beside the step's stream; [('l2_prefetch_kernel', 5250), ('mhc_post_collapse_norm_kerne', 42)]
+  stream 406: 1554 kernels, 92.3 ms, 29.1% beside the step's stream; [('l2_prefetch_kernel', 336), ('vocab_packed_projection_kern', 210)]
+  stream 407: 756 kernels, 9.6 ms, 79.2% beside the step's stream; [('moe_grouped_fp8_fp4_gemm_ker', 252), ('gemm_bf16_partials_kernel', 126)]
+
+# python3 after_allreduce.py (sp1, 16x96)
+off-16x96-sp1.json.gz
+  -> mhc_project_streams_kernel n= 1932  all-reduce  203.4  next starts   40.3 after its start (-163.1 after its end)  next  201.1  next ends   38.0 after the all-reduce ends
+  -> glp_steer_kernel           n= 1638  all-reduce  173.1  next starts  155.6 after its start ( -17.5 after its end)  next   18.8  next ends    1.3 after the all-reduce ends
+  -> engram_rows_step_kernel    n=   42  all-reduce  191.6  next starts  191.9 after its start (  +0.3 after its end)  next    8.8  next ends    9.1 after the all-reduce ends
+  -> ced_copy_rows_kernel       n=   42  all-reduce  134.7  next starts 1660.2 after its start (+1525.5 after its end)  next    2.4  next ends 1527.9 after the all-reduce ends
+comm-16x96-sp1.json.gz
+  -> mhc_project_streams_kernel n= 1932  all-reduce  184.7  next starts   43.6 after its start (-141.1 after its end)  next  178.4  next ends   37.4 after the all-reduce ends
+  -> glp_steer_kernel           n= 1638  all-reduce  190.7  next starts  155.3 after its start ( -35.4 after its end)  next   40.3  next ends    4.8 after the all-reduce ends
+  -> engram_rows_step_kernel    n=   42  all-reduce  190.0  next starts  190.1 after its start (  +0.2 after its end)  next    8.0  next ends    8.2 after the all-reduce ends
+  -> ced_copy_rows_kernel       n=   42  all-reduce  132.8  next starts 1689.9 after its start (+1557.0 after its end)  next    2.5  next ends 1559.6 after the all-reduce ends
+
+# python3 step_profile.py (sp1, 16x96)
+42 steps of 1255 kernels on the step's stream
+step (first kernel start to last kernel end): 40284.9 -> 41508.8 µs (+1223.9)
+87 all-reduces a step; segment growth (µs) between consecutive all-reduce ends:
+      0..  284    -6.4  (void (anonymous namespac .. oneshot_allreduce_kernel)
+    284..  291    +1.5  (oneshot_allreduce_kernel .. oneshot_allreduce_kernel)
+    291..  310   -11.0  (oneshot_allreduce_kernel .. oneshot_allreduce_kernel)
+    310..  317   +16.9  (oneshot_allreduce_kernel .. oneshot_allreduce_kernel)
+    317..  349   +14.9  (oneshot_allreduce_kernel .. oneshot_allreduce_kernel)
+    349..  356   -12.4  (oneshot_allreduce_kernel .. oneshot_allreduce_kernel)
+    356..  369   +51.9  (oneshot_allreduce_kernel .. oneshot_allreduce_kernel)
+    369..  376   -11.6  (oneshot_allreduce_kernel .. oneshot_allreduce_kernel)
+  ...
+by segment kind (first three kernels after the segment's start):
+    +847.0 µs  ('mhc_project_streams_', 'mhc_finalize_kernel', 'gemm_mxfp8_kernel')
+    +317.3 µs  ('glp_steer_kernel', 'mhc_project_streams_', 'mhc_finalize_kernel')
+     +30.7 µs  ('glp_steer_kernel', 'engram_rows_step_ker', 'oneshot_allgather_ke')
+     +25.6 µs  ('ced_copy_rows_kernel',)
+     +20.8 µs  ('glp_steer_kernel', 'void at::native::vec', 'void at::native::vec')
+     -11.0 µs  ('engram_rows_step_ker', 'oneshot_allgather_ke', 'per_token_cast_kerne')
+      -6.4 µs  ('void at::native::vec', 'void at::native::vec', 'void at_cuda_detail:')
+largest single-kernel growth in end time:
+    +888.2 µs a step  mhc_project_streams_kernel
+    +203.3 µs a step  gemm_mxfp8_kernel
+    +141.3 µs a step  glp_steer_kernel
+    -118.9 µs a step  oneshot_allreduce_kernel
+     +85.4 µs a step  moe_combine_kernel
+     -79.3 µs a step  gemm_fp8w_bf16_partials_kernel
+     +46.6 µs a step  metadata_decode_kernel
+     -46.6 µs a step  oneshot_allgather_kernel
+     +32.4 µs a step  rope_kernel
+     +28.1 µs a step  engram_rows_step_kernel
