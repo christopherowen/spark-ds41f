@@ -1,0 +1,57 @@
+From 2246dcfb08346150922c46c8aaa9e0e5662546a0 Mon Sep 17 00:00:00 2001
+From: Zee-B33 <202631651+Zee-B33@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:18:29 -0600
+Subject: [PATCH] fix(dsv41): size the structured-output bitmask for copy-draft
+ verify rows
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-60's series applied through 0816.
+
+Rationale: StructuredOutputManager sizes the grammar bitmask by
+num_speculative_tokens (5), but DSpark copy drafts verify up to
+num_verification_tokens (16) rows per request. Roughly 6-16 concurrent
+response_format requests whose answers copy long prompt spans overrun the
+bitmask; xgrammar's bounds check then raises inside grammar_bitmask() and the
+engine exits, failing every in-flight request (#1194). Size the bitmask by the
+larger of the two. Diagnosis and fix by Zee-B33 in #1194.
+
+Quality implications: None on outputs. The bitmask grows from 96 to 272 rows
+at 16 seats (about 1.6 MB to 4.4 MB at the 129,280-token vocabulary); the row
+layout and the slice sent to workers are unchanged. backend_outlines.py and
+backend_lm_format_enforcer.py also read num_speculative_tokens and are not
+changed.
+
+Tests: JSON-burst probe (two waves of 32 concurrent json_object/json_schema
+requests whose answers copy 40 records from the prompt): 64/64 HTTP 200,
+valid JSON, exact counts, engine alive, on three candidate-60 boots carrying
+this change as a file mount (4x GB10, switched, TP4, 32 seats), and 32/32 on
+a fourth. The crash itself was not
+reproduced here; reproductions are in #1194.
+
+Upstream status: local patch proposal; vllm-project/vllm has no
+num_verification_tokens.
+---
+ vllm/v1/structured_output/__init__.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index c1ac615..777da2e 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -347,6 +347,13 @@ class StructuredOutputManager:
+ 
+         # Covers both speculative decoding and diffusion LLMs (canvas_length).
+         max_num_spec_tokens = self.vllm_config.num_speculative_tokens
++        spec_config = self.vllm_config.speculative_config
++        if spec_config is not None and getattr(
++            spec_config, "num_verification_tokens", None
++        ):
++            max_num_spec_tokens = max(
++                max_num_spec_tokens, spec_config.num_verification_tokens
++            )
+ 
+         if self._grammar_bitmask is None:
+             assert self.backend is not None
+-- 
+2.54.0 (Apple Git-157)
+
