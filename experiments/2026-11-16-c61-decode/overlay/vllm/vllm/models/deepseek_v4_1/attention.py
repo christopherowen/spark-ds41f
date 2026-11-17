@@ -21,7 +21,8 @@ from vllm.distributed import (
     get_tp_group,
     model_parallel_is_initialized,
 )
-from vllm.forward_context import get_forward_context
+import vllm.envs as envs
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers import linear as linear_layers
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -798,25 +799,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.is_ced_decoder
             else (False,)
         )
+        pads = (False, True) if not self.is_draft and not self.is_ced_decoder else (False,)
         for replay in replays:
-            args = (
-                self.swa_cache_layer.block_size,
-                self.window_size,
-                self.swa_width,
-                self.is_draft,
-                replay,
-            )
-            if self.compress_ratio:
-                calls.append(
-                    prepare.call(
-                        tl_metadata.decode_metadata_kernel,
-                        *args,
-                        self._main_width,
-                        self._main_page,
-                    )
+            for pad in pads:
+                args = (
+                    self.swa_cache_layer.block_size,
+                    self.window_size,
+                    self.swa_width,
+                    self.is_draft,
+                    replay,
                 )
-            else:
-                calls.append(prepare.call(tl_metadata.chunk_kernel, *args))
+                if self.compress_ratio:
+                    calls.append(
+                        prepare.call(
+                            tl_metadata.decode_metadata_kernel,
+                            *args,
+                            self._main_width,
+                            self._main_page,
+                            pad,
+                        )
+                    )
+                else:
+                    calls.append(prepare.call(tl_metadata.chunk_kernel, *args, pad))
+        if self.indexer is not None and not self.is_draft and not self.is_ced_decoder:
+            calls.append(prepare.call(tl_metadata.mask_lengths_kernel))
         # forward_mqa: the page tables of the index chunks, full or short.
         if self.indexer is not None:
             widths = {self._index_width}
@@ -1941,10 +1947,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
         # Only the score matrix needs row chunking. All selected positions
         # survive in the source-owned buffer until their reuse interval ends.
+        pad_mask = self._decode_is_padding(swa, rows)
         if self.indexer is not None:
             index_mode = "decode" if mode == "decode" else "prefill"
             *query, split, reference = index_query
             im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
+            im_lengths = (
+                self._masked_cache_lengths(im.cache_lengths, pad_mask, rows)
+                if pad_mask is not None
+                else im.cache_lengths
+            )
             lsa_enabled = os.environ.get("VLLM_DS41_LSA") == "1"
             score_width = None
             if (
@@ -2047,7 +2059,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     if page_table is None:
                         tl_metadata.pages(
                             im.req_id_per_token,
-                            im.cache_lengths,
+                            im_lengths,
                             im.block_table,
                             buf,
                             row,
@@ -2094,6 +2106,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                                     rows,
                                     decode_specs,
                                     q.device,
+                                    is_padding=pad_mask,
                                 )
                             else:
                                 meta_bufs = ()
@@ -2106,7 +2119,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         q_scales=iq_scale[offset:end],
                         query_weights=iw[offset:end],
                         page_table=page_table,
-                        cache_lengths=im.cache_lengths[row:row_end],
+                        cache_lengths=im_lengths[row:row_end],
                         score_width=score_width,
                         output_indices=selected[offset:end],
                         **candidate_args,
@@ -2202,7 +2215,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if output is None:
                 output = torch.empty_like(q)
             self._attend_split(
-                q, output, positions, swa, main, owner, rows, decode_rows
+                q, output, positions, swa, main, owner, rows, decode_rows,
+                is_padding=pad_mask,
             )
             return output
         if finish_front is not None:
@@ -2236,7 +2250,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
             )
             metadata_buffers = self._shared_decode_metadata(
-                swa, main, rows, shared_specs, device
+                swa, main, rows, shared_specs, device, is_padding=pad_mask
             )
             arena = current_workspace_manager().get_simultaneous(*scratch_specs)
             scratch = list(arena)
@@ -2245,7 +2259,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 *metadata_specs, *scratch_specs
             )
             metadata_count = len(metadata_specs)
-            self._write_decode_metadata(arena, swa, main, rows)
+            self._write_decode_metadata(arena, swa, main, rows, is_padding=pad_mask)
             metadata_buffers = arena[:metadata_count]
             scratch = arena[metadata_count:]
         if wait_selected is not None:
@@ -2274,7 +2288,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         return output
 
-    def _shared_decode_metadata(self, swa, main, rows, specs, device):
+    def _decode_is_padding(self, swa, rows: int) -> torch.Tensor | None:
+        if (
+            self.is_draft
+            or self.is_ced_decoder
+            or getattr(swa, "routing_mask", None) is not None
+            or not envs.VLLM_MOE_SKIP_PADDING
+            or not is_forward_context_available()
+        ):
+            return None
+        context = get_forward_context()
+        is_padding = getattr(context, "is_padding", None)
+        if is_padding is None:
+            return None
+        if getattr(context, "num_tokens", None) not in (None, rows):
+            return None
+        if is_padding.shape[0] < rows:
+            return None
+        return is_padding
+
+    @staticmethod
+    def _masked_cache_lengths(
+        cache_lengths: torch.Tensor, is_padding: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        context = get_forward_context()
+        cache = context.__dict__.setdefault("_ds41_masked_lengths", {})
+        key = (id(cache_lengths), id(is_padding), rows)
+        entry = cache.get(key)
+        if entry is not None and entry[0] is cache_lengths and entry[1] is is_padding:
+            return entry[2]
+        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+
+        masked = tl_metadata.mask_lengths(cache_lengths, is_padding, rows)
+        cache[key] = (cache_lengths, is_padding, masked)
+        return masked
+
+    def _shared_decode_metadata(
+        self, swa, main, rows, specs, device, *, is_padding=None
+    ):
         replay = self._replay_start(swa)
         key = (
             id(swa),
@@ -2284,6 +2335,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.is_ced_decoder,
             rows,
             specs,
+            id(is_padding) if is_padding is not None else None,
         )
         context = get_forward_context()
         shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
@@ -2293,16 +2345,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             or entry[0] is not swa
             or entry[1] is not main
             or entry[2] is not replay
+            or entry[3] is not is_padding
         ):
             metadata_buffers = tuple(
                 torch.empty(shape, dtype=dtype, device=device)
                 for shape, dtype in specs
             )
-            self._write_decode_metadata(metadata_buffers, swa, main, rows)
-            entry = shared[key] = (swa, main, replay, metadata_buffers)
-        return entry[3]
+            self._write_decode_metadata(
+                metadata_buffers, swa, main, rows, is_padding=is_padding
+            )
+            entry = shared[key] = (swa, main, replay, is_padding, metadata_buffers)
+        return entry[4]
 
-    def _attend_split(self, q, output, positions, swa, main, owner, rows, decode_rows):
+    def _attend_split(
+        self, q, output, positions, swa, main, owner, rows, decode_rows, *, is_padding=None
+    ):
         """A mixed step's attention: its decode requests' rows on the decode plan,
         the rest on the extend plan. Mixed steps run eagerly, so the per-row
         metadata is an ordinary allocation shared across contiguous layers of the
@@ -2340,7 +2397,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     torch.empty(shape, dtype=dtype, device=q.device)
                     for shape, dtype in extend_specs
                 )
-            self._write_decode_metadata(metadata, swa, main, rows)
+            self._write_decode_metadata(metadata, swa, main, rows, is_padding=is_padding)
             entry = context.__dict__["_ds41_split_metadata"] = (
                 key,
                 swa,
@@ -2390,7 +2447,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             return self._draft_replay_start
         return None
 
-    def _write_decode_metadata(self, buffers, swa, main, rows):
+    def _write_decode_metadata(self, buffers, swa, main, rows, *, is_padding=None):
         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
 
         swa_indices, swa_lengths, top_lengths = buffers[:3]
@@ -2413,7 +2470,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa.request_positions,
         )
         if main is None:
-            tl_metadata.chunk(*common, 0, rows, **window)
+            tl_metadata.chunk(*common, 0, rows, is_padding=is_padding, **window)
         else:
             # The window metadata and the main page table in one launch.
             tl_metadata.decode_metadata(
@@ -2425,6 +2482,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 rows,
                 main.block_table.shape[1],
                 main_page=self._main_page,
+                is_padding=is_padding,
                 **window,
             )
 
