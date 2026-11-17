@@ -309,7 +309,47 @@ counters, gradient summed over ranks, AdaGrad step), the update's row deduplicat
 bin/spark candidate queue tp4-switched experiments/2026-11-17-dspark-turn-learning/shadow-tp4-switched.json --apply
 ```
 
-Pending.
+Queue entry `20261117T095559-shadow-tp4-switched`, commit `33bf74665`. Receipts:
+[shadow-screen](receipts/shadow-screen) (both boots' suite files and the verdicts), [shadow-gate](receipts/shadow-gate).
+
+**Screen against candidate-60's recorded screen** (both boots of each; the lab's verdicts):
+
+| Metric | Change | ±95% | Margin | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| grid: decode geometric mean (20 shapes) | +0.40% | 0.14% | 0.27% | worse |
+| c16: decode tok/s, paired | −0.08% | 0.53% | 0.58% | same |
+| c16: output tok/s | −0.07% | 0.74% | 0.96% | same |
+| prefill 32,768 tok/s | −0.18% | 1.20% | 1.56% | same |
+| prefill 262,144 tok/s | −0.32% | 0.57% | 0.74% | same |
+
+c16's drafts are candidate-60's: 1.370 accepted a draft against 1.371, the same tokens a step and survival at
+every position. The grid's step split, each shadow boot against the mean of candidate-60's two (median over
+the 20 shapes):
+
+| Boot | Step | Target forward | Draft step |
+| --- | ---: | ---: | ---: |
+| shadow | +65.3 µs (+0.22%) | +29.3 µs (+0.18%) | +13.2 µs (+0.52%) |
+| shadow-again | +61.4 µs (+0.29%) | +42.5 µs (+0.28%) | +9.0 µs (+0.35%) |
+| candidate-60's own repeat | | −14.5 µs | +0.1 µs |
+
+Most of the step's difference is in the target forward, which shadow does not touch (its kernels and
+buffers are candidate-60's; the learner adds 144 MiB a rank at load and nothing to the forward), and the
+draft step's +9 to +13 µs is about the microbenchmark's inline capture several times over, not its forked
+cost. The reference ran on 2026-11-16; this screen on 2026-11-17. A same-session control separates the two:
+[shadow-control-tp4-switched.json](shadow-control-tp4-switched.json), four boots alternating the learner off
+([tp4-switched-off.json](tp4-switched-off.json): the same files mounted, nothing allocated or launched,
+candidate-60's draft path) and shadow, queued once the entry below finishes.
+
+**Gates** (one boot): determinism and greedy identical, candidate-60's hashes (log probabilities `18d61961` /
+`d6568649`, text `0a2dacdd` / `12fd8257`): shadow changes no output.
+
+**End of turn** (first screen boot, 159 finishes): median 0.277 ms, p90 0.35 ms for a finish call, with
+its all-gather and all-reduce; the first call of a boot, during startup warmup, took 633 ms. 63,048 drafts
+checked against the captured maxima, 0 mismatches. The maxima-limited score read −0.50%, as the offline
+check predicts of a score that cannot see most fixes. Warmup requests at startup reach the learner too
+(16 turns, 23 trained positions a boot); drafting with a learned table would need them left out.
+
+**AgentX, three hours at 8 sessions:** running.
 
 ## Where it stands
 
