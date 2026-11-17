@@ -9,8 +9,16 @@ Needs a server that exposes ``engine_grid`` to the dev-mode collective RPC (vLLM
 
 Prefill chunks are optional (``prefill=True``). Dummy prefill does not track real prefill:
 on 2026-10-14 it ran 1.7x faster than a real 16K prefill's kernels and called a build 1%
-slower that real cold prefill found level or faster, presumably because identical dummy
-tokens route the MoE unlike text. Judge prefill on real prompts.
+slower that real cold prefill found level or faster. Judge prefill on real prompts.
+
+A dummy row is a padding row without a cache slot, so the MoE routers skip it and it sees
+no compressed context at any context length: the fixed step leaves out the routed-expert
+work (half of a real one-stream step) and the indexer's and the attention's work on the
+context (experiments/2026-11-17-indexer-decode-share). A shape with ``real_rows`` runs its
+rows as real ones on a server that supports it: pseudo-random tokens that route, reading a
+context the server fills with real-row prefill chunks first (about a real prefill of the
+longest such context, once a run). Its label says ``real rows``, so it is never compared
+with a padding-row shape. Sampling and verification are in neither.
 """
 
 import json
@@ -23,14 +31,15 @@ SCHEMA = "servebench-engine/1"
 
 
 def default_shapes(drafts: int = 5, max_context: int | None = None, prefill: bool = False,
-                   max_requests: int = 16) -> list[dict]:
+                   max_requests: int = 16, real_rows: bool = False) -> list[dict]:
     """Verification rows (requests x (1 + depth)) at 4K context:
     - 1, 4, 8 and 16 requests at depths 1 and 2, what adaptive verification runs under
       load (about two rows a request at 8-16 streams on 2026-10-14);
     - 1, 2, 4, 8, 12 and 16 requests at the full ``drafts``.
     Then depth 2 for 1, 8 and 16 requests at 64K, 1 and 8 at 256K, and 1 at the server's
     longest context. Shapes of more than ``max_requests`` requests (the server's
-    --max-num-seqs) are left out. With ``prefill``, 8K chunks at 0 and 256K context too."""
+    --max-num-seqs) are left out. With ``prefill``, 8K chunks at 0 and 256K context too.
+    With ``real_rows``, every shape runs real rows (see the module's text)."""
     def decode(requests: int, depth: int, context: int) -> dict:
         return {"kind": "decode", "num_reqs": requests, "num_tokens": requests * (1 + depth),
                 "context_len": context}
@@ -43,15 +52,18 @@ def default_shapes(drafts: int = 5, max_context: int | None = None, prefill: boo
     shapes = [shape for shape in shapes if shape["num_reqs"] <= max_requests]
     if prefill:
         shapes += [{"kind": "prefill", "prefill": True, "num_tokens": 8192, "context_len": c} for c in (0, 262144)]
+    if real_rows:
+        shapes = [dict(shape, real_rows=True) for shape in shapes]
     return shapes
 
 
 def label(shape: dict) -> str:
     context = shape.get("context_len", 0)
     depth = f"{context // 1024}K" if context < 1 << 20 else f"{context / (1 << 20):.2g}M"
+    real = " real" if shape.get("real_rows") else ""
     if shape.get("prefill"):
-        return f"prefill {shape['num_tokens']} @{depth}"
-    return f"decode {shape.get('num_reqs', '?')}x{shape['num_tokens']} rows @{depth}"
+        return f"prefill {shape['num_tokens']}{real} @{depth}"
+    return f"decode {shape.get('num_reqs', '?')}x{shape['num_tokens']}{real} rows @{depth}"
 
 
 def max_model_len(base_url: str) -> int | None:
@@ -68,13 +80,17 @@ def _post(url: str, body: dict | None, timeout: float) -> dict | None:
 
 
 def run(base_url: str, shapes: list[dict], *, replays: int = 100, warmup: int = 2, settle: int = 1,
-        timeout: float = 3600.0, require_idle: bool = True) -> dict:
-    """Time ``shapes`` on the server and reset its prefix cache afterwards."""
+        timeout: float = 3600.0, require_idle: bool = True, fill_real_context: bool = True) -> dict:
+    """Time ``shapes`` on the server and reset its prefix cache afterwards. Without
+    ``fill_real_context`` the server does not write the ``real_rows`` shapes' context
+    again: only right after a run that filled the same context, the server idle since."""
     base = base_url.rstrip("/")
     if require_idle:
         prom.require_idle(base, "the grid")
     spec = {"shapes": [{k: v for k, v in s.items() if k != "kind"} for s in shapes],
             "replays": replays, "warmup": warmup, "settle": settle}
+    if not fill_real_context:
+        spec["fill_real_context"] = False
     answer = _post(base + "/collective_rpc",
                    {"method": "engine_grid", "args": [json.dumps(spec)], "timeout": timeout},
                    timeout + 60)
@@ -88,6 +104,11 @@ def run(base_url: str, shapes: list[dict], *, replays: int = 100, warmup: int = 
     except Exception:  # noqa: BLE001 - recorded: later cache hits could read dummy KV
         reset = False
     rank0 = min(grids, key=lambda g: g.get("rank", 0))
+    ignored = [label(shape) for shape, timed in zip(shapes, rank0["shapes"])
+               if shape.get("real_rows") and not timed.get("real_rows")]
+    if ignored:
+        raise RuntimeError(f"the server ran padding rows for {', '.join(ignored)}: "
+                           "its engine grid has no real_rows")
     return {"workers": len(workers), "rank": rank0.get("rank"), "prefix_cache_reset": reset,
             "replays": replays, "warmup": warmup, "settle": rank0.get("settle"), "shapes": shapes,
             "grid": rank0["shapes"]}
