@@ -578,6 +578,28 @@ communicator as shadow does and runs a chunk's all-gather and all-reduce 16 time
 idle; nothing else of the learner is allocated) and off-step. If the communicator alone carries the +1%,
 the fix is in how the learner exchanges; if not, it is in what else the off-step version holds.
 
+Queue entry `20261117T163029-comm-attribution-tp4-switched`, commit `704e87952`; receipts
+[comm-attribution](receipts/comm-attribution) (the six boots' grids, startup memory and telemetry, the lab's
+verdicts, [grid-split.txt](receipts/comm-attribution/grid-split.txt) from
+[grid_split.py](receipts/comm-attribution/grid_split.py)). Both communicator boots logged the communicator
+made and exercised ([comm-1-lines.log](receipts/comm-attribution/comm-1-lines.log)).
+
+| Grid, geometric mean (20 shapes) | Whole step | Target forward | Median a shape: step / forward / draft step |
+| --- | ---: | ---: | ---: |
+| off → communicator alone | +0.91% | +1.02% | +122 / +95 / +9 µs |
+| off → off-step | +1.04% | +1.26% | +149 / +130 / +7 µs |
+| communicator alone → off-step | +0.13% | +0.24% | +32 / +41 / −2 µs |
+| each arm's repeat (off, communicator, off-step) | +0.14%, −0.01%, +0.15% | +0.22%, +0.12%, +0.21% | |
+
+**The learner's own NCCL communicator carries the grid's cost.** Made, connected and exercised at load,
+then idle, it alone slows the grid by 0.91%, shape by shape as the whole off-step learner does (16×96 rows:
++1.13 ms alone, +1.11 ms off-step; 16×48: +0.55 and +0.49 ms; 4×12 and 2×12: −0.05 to −0.07 ms both); the
+rest of the learner adds 0.13%, inside the repeats. The communicator holds about 0.2 GiB a node (the
+learner another 0.17 GiB); clocks, temperatures and busy threads match the off boots. How an idle
+communicator slows the grid's dummy forward, and why c16's served steps do not show it, is not known; the
+dummy runs take the same collective policy as served steps (sparknet for eligible all-reduce and all-gather,
+pynccl for the rest).
+
 ## Where it stands
 
 After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
@@ -594,5 +616,6 @@ fixes. The gain needs exact replays (observe and the offline study) or drafts re
 
 Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 ms at p90 under AgentX,
 against 0.48 and 2.86 ms on the step), its outputs are candidate-60's, and c16 shows no cost. The grid
-does: its target forward is 1.2% slower with the learner present and idle, in both boots. The attribution
-job asks whether the learner's own NCCL communicator alone carries it.
+does: its target forward is 1.2% slower with the learner present and idle, in both boots, and the
+attribution job puts that on the learner's own NCCL communicator (+0.91% alone). The exchange is what has
+to change: the step's existing communicator, a communicator off the RDMA path, or the CPU group.
