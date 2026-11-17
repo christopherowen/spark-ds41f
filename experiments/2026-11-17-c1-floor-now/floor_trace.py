@@ -4,6 +4,8 @@ experiments/2026-10-26-c1-100tps/floor.py on today's kernel names.
 
 usage: floor_trace.py TRACES [--expert-rate OUTPUT.txt]
 
+``--expert-rate`` may hold ``{node}``: each rank is then read with its own node's fit.
+
 ``TRACES`` holds ``decode-trace/<node>/*.json.gz`` (one trace a rank, as a lab profile job
 leaves them). The record's ``window`` does the work; three things differ from 1022's build:
 
@@ -14,8 +16,8 @@ leaves them). The record's ``window`` does the work; three things differ from 10
   (``vocab_screen_greedy_partials_kernel``): one byte a weight, and a stream;
 - ``gemm_mxfp8_rope_mxfp4_kernel`` streams its projection.
 
-The expert-rate fit (FC1 and FC2 against the experts read, the record's dgx4 bundle) is the
-record's: a routed-expert kernel that changed since would move the experts it infers.
+The expert-rate fit (FC1 and FC2 against the experts read) defaults to the record's dgx4
+bundle of 1022's kernels; ``bundles/expert-rate`` is the same measurement on candidate-61's.
 """
 import argparse
 import glob
@@ -72,15 +74,16 @@ def main():
     ap.add_argument("traces")
     ap.add_argument("--expert-rate", default=os.path.join(REC, "runs", "expert-rate-dgx4-2.txt"))
     args = ap.parse_args()
-    fits = fl.expert_fits(args.expert_rate)
-    out = {"source": args.traces, "ranks": {}}
+    out = {"source": args.traces, "expert_rate": args.expert_rate, "ranks": {}}
     workload = os.path.join(args.traces, "decode.json")
     if os.path.exists(workload):
         out["workload"] = [json.loads(line) for line in open(workload) if line.startswith("{")]
     for folder in sorted(glob.glob(os.path.join(args.traces, "decode-trace", "*"))):
         ks = load(sorted(glob.glob(os.path.join(folder, "*.json.gz")))[0])
         steps = fl.steps(ks)[1:]
+        fits = fl.expert_fits(args.expert_rate.format(node=os.path.basename(folder)))
         w = fl.window(ks, 1, None, fits)
+        w["fit_us (launch, an expert)"] = {k: [round(v, 3) for v in fits[6][k]] for k in ("fc1", "fc2")}
         w["kernel_ms_by_family"] = families(ks, steps)
         spans = sorted((b - a) / 1e3 for _, _, a, b in steps)
         w["step_ms_median"] = round(statistics.median(spans), 3)

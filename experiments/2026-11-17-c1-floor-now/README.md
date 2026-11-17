@@ -163,3 +163,84 @@ indexer 3.3, LM heads and screens 1.7, GLP steer 1.4.
 - Three prose prompts, 308 steps, greedy, on one boot.
 - Two of the window's steps are the prompts' prefill (20 and 24 rows); they raise the mean step
   by 0.25 ms.
+
+## The expert-rate bundle on today's kernels
+
+The trace's floor and its launch costs used the record's fit of 1022's kernels.
+[bundles/expert-rate](bundles/expert-rate) is the record's bundle on candidate-61's plan (the
+dispatch and kernels of a call from the plan at its tile height; a layer's three launches also
+timed together), on candidate-60's image with candidate-61's overlay.
+
+- sp8, twice, from a copy staged under `~/spark-lab`: pass in 27 s each
+  ([runs/expert-rate-sp8-1.txt](runs/expert-rate-sp8-1.txt), `-2`);
+- the ring's four nodes, the cluster stopped ([expert-rate-tp4.json](expert-rate-tp4.json), queue
+  entry `20261117T225516` at `89297cb31`): pass on each in 24 to 25 s, verdicts agree
+  ([runs/expert-rate-dgx1.txt](runs/expert-rate-dgx1.txt) to `-dgx4`);
+- the record's own bundle on its own image (`spark-ds41f:19f2c20ed4d6-next-6`), unchanged, on
+  dgx1 and dgx4 ([expert-rate-1025-tp4.json](expert-rate-1025-tp4.json), queue entry
+  `20261117T225921`; [runs/expert-rate-1025-image-dgx4.txt](runs/expert-rate-1025-image-dgx4.txt)).
+
+Six rows, time a launch = launch cost + time an expert × experts (µs), and a plain `torch.sum`
+read of 110 and 220 MiB:
+
+| Run | FC1 | FC1 marginal | FC2 | FC2 marginal | Plain read |
+| --- | --- | ---: | --- | ---: | ---: |
+| October: 1022's kernels, dgx4 | 14.2 + 11.41 n | 266.6 GB/s | 14.6 + 5.75 n | 265.2 | 253.7, 253.4 GB/s |
+| October's bundle and image, dgx4 today | 13.5 + 12.50 n | 243.4 | 16.8 + 5.79 n | 263.4 | 229.4, 235.8 |
+| October's bundle and image, dgx1 today | 12.3 + 12.49 n | 243.6 | 15.0 + 5.85 n | 260.9 | 236.7, 235.8 |
+| Today's kernels, dgx1 | 10.8 + 12.28 n | 247.7 | 7.9 + 6.03 n | 253.2 | 237.3, 235.6 |
+| Today's kernels, dgx2 | 10.9 + 12.16 n | 250.3 | 8.2 + 5.92 n | 257.7 | 235.2, 236.7 |
+| Today's kernels, dgx3 | 10.7 + 12.19 n | 249.6 | 8.4 + 5.93 n | 257.4 | 237.7, 236.3 |
+| Today's kernels, dgx4 | 9.2 + 12.29 n | 247.6 | 7.9 + 5.95 n | 256.6 | 237.4, 235.1 |
+| Today's kernels, sp8 (two runs) | 10.3 + 11.71 n, 2.6 + 12.35 n | 259.7, 246.4 | 8.5 + 5.78 n, 6.4 + 5.96 n | 263.9, 255.9 | 246.4, 245.8 |
+
+The traced step again, each rank with its own node's fit
+([receipts/floor-trace-today-fit.json](receipts/floor-trace-today-fit.json)); rank 0, ms:
+
+| | With the record's fit | With today's fit |
+| --- | ---: | ---: |
+| Attainable rate | 266.6 GB/s | 247.7 GB/s |
+| Experts a layer | 17.2 | 16.2 (the reference routes: 16.1) |
+| Byte floor | 23.35 | 24.42 (89% of the step) |
+| Streaming below the rate | 2.37 | 1.29 |
+| of it: routed experts' launch costs | 1.24 | 0.80 |
+| DRAM idle | 1.81 | 1.81 |
+| Not bytes, total | 4.18 | 3.11 |
+
+### What it says
+
+- **The ring streams 7 to 9% slower than dgx4 did in October, with nothing of ours changed.**
+  The record's bundle on the record's image gives 243 GB/s for FC1 where it gave 266.6, and a
+  plain read 230 to 236 where it gave 248 to 254. dgx1 reads the same as dgx4. FC2's marginal
+  rate did not move (263 against 265).
+- **So today's floor is 24.4 ms, not 23.4**, and the step is at 89% of it. What is not bytes is
+  3.1 ms: 1.8 ms with DRAM idle (1.03 under collectives), 0.8 ms of launch costs, 0.5 ms of other
+  streaming below the rate.
+- **The launch costs came down.** 19 µs a layer for the two GEMMs against 29 at 1022 (10.4 and
+  8.1 against 14.2 and 14.6): 0.80 ms a step, +3.0% if it went to zero. Timed together, a
+  layer's three launches cost 9 to 15 µs over their bytes.
+- **The rate itself is now the largest item.** At October's rate the same bytes would take 22.7
+  ms: 1.6 ms less, +6.2% (about 91.6 tok/s), more than the launch costs and the collectives'
+  idle time are worth separately.
+
+### What changed on the nodes is not established
+
+Read from dgx4, nothing changed: the same kernel booted on 2026-10-25 and today
+(`7.0.0-1019-nvidia-64k`, 64 KiB pages), the same driver (580.178.04, installed 2026-10-16), the
+`performance` governor, THP `never`. Two differences are known:
+
+- October's run started 17 minutes after a boot (18:45, run at 19:02); today the nodes have been
+  up ten days, through every boot of the serving container since 2026-11-07. Free memory is
+  spread over small orders (`/proc/buddyinfo`: nothing free at the two largest orders).
+- the host setup of the 64 KiB profile (docs/setup.md) and the DGX OS release may have changed
+  between the two dates; this record did not check their history.
+
+sp8 (the 4 KiB kernel `7.0.0-1024-nvidia`) reads 246 GB/s and its FC1 rate differed by 5%
+between two runs a minute apart, so the rate is not a constant of the hardware.
+
+### Limits
+
+- One run a ring node; the nodes agree within 1% on every rate.
+- The October numbers are that record's receipts, not remeasured under October's conditions.
+- A cause is not shown. A reboot of one node with the bundle before and after would say whether
+  the time since boot is it.
