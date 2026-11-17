@@ -1,0 +1,286 @@
+verdicts: offstep-1 -> off-1, against the run's own repeat (off-1 -> offstep-2)
+metric                                 change    ±95%   repeat   floor  margin  verdict
+grid: decode geometric mean (20)       -0.36%   0.14%   +0.97%   0.84%   0.85%  same (both candidate boots; recorded A/A floor)
+c16: decode tok/s, paired              -0.20%   0.31%   -0.10%   0.29%   0.42%  same (both candidate boots; window tok/s -0.28% ±0.82%)
+c16: output tok/s                      -0.28%   0.82%   -0.22%       -   1.03%  same
+prefill: prefill 32,768 tok/s          +0.29%   0.59%   -0.35%       -   0.94%  same
+prefill: prefill 262,144 tok/s         -0.04%   0.51%   -0.33%       -   0.84%  same
+floors (tp4-switched, screen): grid 0.33% (7 pairs); c16 0.34% (7 pairs); same-build pairs of 2026-11-09 to 2026-11-10, servebench_suite_table.FLOORS
+paired rows: margin = ±95% (over requests) and floor in quadrature, where floor is the boot term of the boots averaged, each boot bounded by the recorded A/A bound or its repeat when larger (the grid's geometric mean likewise when it has a recorded floor); other rows: ±95% + |repeat|
+
+rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)
+step     arm                       tokens requests   rows  yield  wasted  by position (survival/coverage)
+c16      off-1                     34.179    14.42  44.54  0.767   10.36  0:0.715/1.000 1:0.357/0.582 2:0.168/0.285 3:0.082/0.141 4:0.048/0.081 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.715/0.715 1:0.500/0.614 2:0.469/0.589 3:0.492/0.584 4:0.582/0.589]
+c16      offstep-1                 34.200    14.39  44.59  0.767   10.39  0:0.715/1.000 1:0.359/0.584 2:0.170/0.288 3:0.084/0.145 4:0.048/0.081 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.715/0.715 1:0.502/0.615 2:0.472/0.588 3:0.498/0.584 4:0.564/0.586]
+c16      off-2                     34.232    14.43  44.62  0.767   10.39  0:0.716/1.000 1:0.357/0.581 2:0.167/0.285 3:0.085/0.146 4:0.047/0.079 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.716/0.716 1:0.499/0.615 2:0.467/0.585 3:0.507/0.580 4:0.555/0.592]
+c16      offstep-2                 34.123    14.40  44.43  0.768   10.31  0:0.716/1.000 1:0.358/0.582 2:0.167/0.283 3:0.081/0.140 4:0.048/0.081 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.716/0.716 1:0.500/0.615 2:0.466/0.590 3:0.488/0.581 4:0.584/0.589]
+
+######## offstep-1 -> off-1
+suite screen (4ff5d0a4ad09): offstep-1 -> off-1
+
+== model
+model behaviour: offstep-1 -> off-1
+  greedy responses identical: 128/128
+  acceptance_length           2.302 ->    2.301  -0.04%
+  verified_per_draft          2.035 ->    2.030  -0.24%
+  accepted_per_verified       0.640 ->    0.641  +0.17%
+  acceptance by draft position: 0: 0.710->0.711, 1: 0.586->0.588, 2: 0.556->0.555, 3: 0.554->0.552, 4: 0.556->0.559, 5: 0.000->0.000, 6: 0.000->0.000, 7: 0.000->0.000, 8: 0.000->0.000, 9: 0.000->0.000, 10: 0.000->0.000, 11: 0.000->0.000
+  teacher-forced over 32768 positions in 128 sequences
+    identical distributions 100.00%, top-1 agreement 100.000%
+    KL mean 0.000e+00 (±0.0e+00 over sequences), p99 0.000e+00, max 0.000e+00 nats
+    given-token log-probability change mean +0.00e+00, mean |change| 0.00e+00, max 0.00e+00
+    perplexity 1.31888 -> 1.31888 (+0.000%)
+
+== grid
+metric                        offstep-1        off-1   change    ±95%  verdict
+decode 1x2 rows @4K              13.413       13.310   -0.76%   0.44%  better
+decode 4x8 rows @4K              15.348       15.332   -0.10%   0.32%  same
+decode 8x16 rows @4K             17.359       17.294   -0.37%   0.66%  same
+decode 16x32 rows @4K            23.044       22.473   -2.48%   0.90%  better
+decode 1x3 rows @4K              13.818       13.757   -0.44%   0.76%  same
+decode 4x12 rows @4K             16.223       16.413   +1.17%   1.22%  same
+decode 8x24 rows @4K             19.542       19.712   +0.87%   0.95%  same
+decode 16x48 rows @4K            26.894       26.705   -0.70%   0.95%  same
+decode 1x6 rows @4K              15.042       14.937   -0.70%   1.55%  same
+decode 2x12 rows @4K             16.302       16.334   +0.20%   1.61%  same
+decode 4x24 rows @4K             18.998       18.865   -0.70%   0.44%  better
+decode 8x48 rows @4K             25.900       25.598   -1.16%   0.99%  better
+decode 12x72 rows @4K            34.964       34.257   -2.02%   0.67%  better
+decode 16x96 rows @4K            39.877       38.798   -2.71%   0.75%  better
+decode 1x3 rows @64K             13.990       14.080   +0.64%   1.55%  same
+decode 8x24 rows @64K            19.747       19.368   -1.92%   0.81%  better
+decode 16x48 rows @64K           27.023       26.401   -2.30%   1.04%  better
+decode 1x3 rows @256K            13.897       13.692   -1.48%   0.76%  better
+decode 8x24 rows @256K           19.423       19.272   -0.78%   0.19%  better
+decode 1x3 rows @1016K           13.901       13.756   -1.04%   0.82%  better
+decode geometric mean (20)                             -0.85%   0.14%  better
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 366
+
+== c16
+metric                    offstep-1        off-1   change    ±95%  verdict
+output tok/s                269.947      269.180   -0.28%   0.82%  same
+decode tok/s, paired         16.957       16.854   -0.13%   0.34%  same
+engine steps/s                7.897        7.880   -0.21%   2.26%  same
+output tokens/step           34.200       34.179   -0.06%   2.33%  same
+accepted/draft                1.376        1.371   -0.40%   4.96%  same
+TTFT p50 s                    0.413        0.411   -0.68%          same (no interval)
+TTFT p99 s                    0.478        0.475   -0.57%          same (no interval)
+TTFT, paired                  0.414        0.411   -0.28%   1.04%  same
+TPOT p50 ms                  58.775       58.752   -0.04%          same (no interval)
+TPOT p99 ms                  78.715       77.671   -1.33%          same (no interval)
+per-user tok/s p50           17.014       16.990   -0.14%          same (no interval)
+paired: 316 requests in both windows, each the same prompt on both builds; 58 streamed in as many chunks on both
+speculative log-tps: total -0.27% (1+tau -0.23%, steps/s -0.21%, reqs/step +0.17%; rows/step -0.11%, row yield +0.05%)
+
+== prefill
+metric                    offstep-1        off-1   change    ±95%  verdict
+prefill 32,768 tok/s       9429.382     9457.094   +0.29%   0.59%  same
+prefill 262,144 tok/s      9846.140     9842.557   -0.04%   0.51%  same
+
+######## offstep-1 -> off-2
+suite screen (4ff5d0a4ad09): offstep-1 -> off-2
+
+== model
+model behaviour: offstep-1 -> off-2
+  greedy responses identical: 128/128
+  acceptance_length           2.302 ->    2.304  +0.09%
+  verified_per_draft          2.035 ->    2.034  -0.04%
+  accepted_per_verified       0.640 ->    0.641  +0.21%
+  acceptance by draft position: 0: 0.710->0.709, 1: 0.586->0.589, 2: 0.556->0.563, 3: 0.554->0.549, 4: 0.556->0.556
+  teacher-forced over 32768 positions in 128 sequences
+    identical distributions 100.00%, top-1 agreement 100.000%
+    KL mean 0.000e+00 (±0.0e+00 over sequences), p99 0.000e+00, max 0.000e+00 nats
+    given-token log-probability change mean +0.00e+00, mean |change| 0.00e+00, max 0.00e+00
+    perplexity 1.31888 -> 1.31888 (+0.000%)
+
+== grid
+metric                        offstep-1        off-2   change    ±95%  verdict
+decode 1x2 rows @4K              13.413       13.314   -0.74%   0.42%  better
+decode 4x8 rows @4K              15.348       15.312   -0.23%   0.34%  same
+decode 8x16 rows @4K             17.359       17.577   +1.26%   1.01%  worse
+decode 16x32 rows @4K            23.044       22.636   -1.77%   0.95%  better
+decode 1x3 rows @4K              13.818       13.626   -1.39%   0.57%  better
+decode 4x12 rows @4K             16.223       16.226   +0.01%   1.01%  same
+decode 8x24 rows @4K             19.542       19.499   -0.22%   0.60%  same
+decode 16x48 rows @4K            26.894       26.766   -0.47%   0.91%  same
+decode 1x6 rows @4K              15.042       14.917   -0.83%   1.56%  same
+decode 2x12 rows @4K             16.302       16.342   +0.25%   1.49%  same
+decode 4x24 rows @4K             18.998       18.890   -0.57%   0.44%  better
+decode 8x48 rows @4K             25.900       25.643   -0.99%   0.93%  better
+decode 12x72 rows @4K            34.964       34.289   -1.93%   0.73%  better
+decode 16x96 rows @4K            39.877       38.839   -2.60%   0.75%  better
+decode 1x3 rows @64K             13.990       13.856   -0.96%   1.11%  same
+decode 8x24 rows @64K            19.747       19.441   -1.55%   0.84%  better
+decode 16x48 rows @64K           27.023       26.472   -2.04%   1.08%  better
+decode 1x3 rows @256K            13.897       13.630   -1.92%   0.70%  better
+decode 8x24 rows @256K           19.423       19.300   -0.63%   0.20%  better
+decode 1x3 rows @1016K           13.901       13.707   -1.40%   0.77%  better
+decode geometric mean (20)                             -0.94%   0.13%  better
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 381
+
+== c16
+metric                    offstep-1        off-2   change    ±95%  verdict
+output tok/s                269.947      268.973   -0.36%   0.86%  same
+decode tok/s, paired         16.955       16.893   -0.17%   0.51%  same
+engine steps/s                7.897        7.863   -0.42%   2.44%  same
+output tokens/step           34.200       34.232   +0.09%   2.58%  same
+accepted/draft                1.376        1.371   -0.36%   5.05%  same
+TTFT p50 s                    0.413        0.410   -0.81%          same (no interval)
+TTFT p99 s                    0.478        0.472   -1.14%          same (no interval)
+TTFT, paired                  0.414        0.410   -0.16%   0.92%  same
+TPOT p50 ms                  58.775       58.732   -0.07%          same (no interval)
+TPOT p99 ms                  78.715       79.060   +0.44%          same (no interval)
+per-user tok/s p50           17.014       16.892   -0.72%          same (no interval)
+paired: 315 requests in both windows, each the same prompt on both builds; 50 streamed in as many chunks on both
+speculative log-tps: total -0.33% (1+tau -0.21%, steps/s -0.42%, reqs/step +0.30%; rows/step +0.07%, row yield +0.03%)
+
+== prefill
+metric                    offstep-1        off-2   change    ±95%  verdict
+prefill 32,768 tok/s       9429.382     9470.506   +0.44%   1.30%  same
+prefill 262,144 tok/s      9846.140     9802.223   -0.45%   0.52%  same
+
+######## offstep-1 -> offstep-2
+suite screen (4ff5d0a4ad09): offstep-1 -> offstep-2
+
+== model
+model behaviour: offstep-1 -> offstep-2
+  greedy responses identical: 128/128
+  acceptance_length           2.302 ->    2.301  -0.04%
+  verified_per_draft          2.035 ->    2.030  -0.24%
+  accepted_per_verified       0.640 ->    0.641  +0.17%
+  acceptance by draft position: 0: 0.710->0.711, 1: 0.586->0.588, 2: 0.556->0.555, 3: 0.554->0.552, 4: 0.556->0.559, 5: 0.000->0.000, 6: 0.000->0.000, 7: 0.000->0.000, 8: 0.000->0.000, 9: 0.000->0.000, 10: 0.000->0.000, 11: 0.000->0.000
+  teacher-forced over 32768 positions in 128 sequences
+    identical distributions 100.00%, top-1 agreement 100.000%
+    KL mean 0.000e+00 (±0.0e+00 over sequences), p99 0.000e+00, max 0.000e+00 nats
+    given-token log-probability change mean +0.00e+00, mean |change| 0.00e+00, max 0.00e+00
+    perplexity 1.31888 -> 1.31888 (+0.000%)
+
+== grid
+metric                        offstep-1    offstep-2   change    ±95%  verdict
+decode 1x2 rows @4K              13.413       13.408   -0.04%   0.34%  same
+decode 4x8 rows @4K              15.348       15.409   +0.40%   0.45%  same
+decode 8x16 rows @4K             17.359       17.318   -0.23%   0.63%  same
+decode 16x32 rows @4K            23.044       23.046   +0.01%   0.82%  same
+decode 1x3 rows @4K              13.818       13.815   -0.02%   0.58%  same
+decode 4x12 rows @4K             16.223       16.228   +0.03%   1.04%  same
+decode 8x24 rows @4K             19.542       19.598   +0.29%   0.54%  same
+decode 16x48 rows @4K            26.894       27.042   +0.55%   0.86%  same
+decode 1x6 rows @4K              15.042       15.110   +0.45%   1.65%  same
+decode 2x12 rows @4K             16.302       16.320   +0.11%   1.63%  same
+decode 4x24 rows @4K             18.998       19.072   +0.39%   0.53%  same
+decode 8x48 rows @4K             25.900       25.766   -0.52%   0.76%  same
+decode 12x72 rows @4K            34.964       35.180   +0.62%   0.69%  same
+decode 16x96 rows @4K            39.877       39.956   +0.20%   0.81%  same
+decode 1x3 rows @64K             13.990       14.118   +0.91%   1.25%  same
+decode 8x24 rows @64K            19.747       19.445   -1.53%   0.76%  better
+decode 16x48 rows @64K           27.023       27.086   +0.23%   1.16%  same
+decode 1x3 rows @256K            13.897       13.949   +0.37%   0.90%  same
+decode 8x24 rows @256K           19.423       19.448   +0.13%   0.26%  same
+decode 1x3 rows @1016K           13.901       13.898   -0.02%   0.80%  same
+decode geometric mean (20)                             +0.12%   0.13%  same
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 389
+
+== c16
+metric                    offstep-1    offstep-2   change    ±95%  verdict
+output tok/s                269.947      268.590   -0.50%   0.88%  same
+decode tok/s, paired         16.957       16.857   -0.27%   0.32%  same
+engine steps/s                7.897        7.877   -0.25%   2.43%  same
+output tokens/step           34.200       34.123   -0.23%   2.44%  same
+accepted/draft                1.376        1.370   -0.46%   5.07%  same
+TTFT p50 s                    0.413        0.410   -0.83%          same (no interval)
+TTFT p99 s                    0.478        0.498   +4.19%          worse (no interval)
+TTFT, paired                  0.414        0.410   +0.57%   0.69%  same
+TPOT p50 ms                  58.775       58.947   +0.29%          same (no interval)
+TPOT p99 ms                  78.715       78.102   -0.78%          same (no interval)
+per-user tok/s p50           17.014       16.964   -0.29%          same (no interval)
+paired: 316 requests in both windows, each the same prompt on both builds; 56 streamed in as many chunks on both
+speculative log-tps: total -0.48% (1+tau -0.26%, steps/s -0.25%, reqs/step +0.04%; rows/step -0.37%, row yield +0.14%)
+
+== prefill
+metric                    offstep-1    offstep-2   change    ±95%  verdict
+prefill 32,768 tok/s       9429.382     9423.658   -0.06%   0.68%  same
+prefill 262,144 tok/s      9846.140     9809.792   -0.37%   0.54%  same
+
+######## off-1 -> offstep-2
+suite screen (4ff5d0a4ad09): off-1 -> offstep-2
+
+== model
+model behaviour: off-1 -> offstep-2
+  greedy responses identical: 128/128
+  acceptance_length           2.301 ->    2.301  +0.00%
+  verified_per_draft          2.030 ->    2.030  +0.00%
+  accepted_per_verified       0.641 ->    0.641  +0.00%
+  acceptance by draft position: 0: 0.711->0.711, 1: 0.588->0.588, 2: 0.555->0.555, 3: 0.552->0.552, 4: 0.559->0.559, 5: 0.000->0.000, 6: 0.000->0.000, 7: 0.000->0.000, 8: 0.000->0.000, 9: 0.000->0.000, 10: 0.000->0.000, 11: 0.000->0.000
+  teacher-forced over 32768 positions in 128 sequences
+    identical distributions 100.00%, top-1 agreement 100.000%
+    KL mean 0.000e+00 (±0.0e+00 over sequences), p99 0.000e+00, max 0.000e+00 nats
+    given-token log-probability change mean +0.00e+00, mean |change| 0.00e+00, max 0.00e+00
+    perplexity 1.31888 -> 1.31888 (+0.000%)
+
+== grid
+metric                            off-1    offstep-2   change    ±95%  verdict
+decode 1x2 rows @4K              13.310       13.408   +0.73%   0.40%  worse
+decode 4x8 rows @4K              15.332       15.409   +0.50%   0.46%  worse
+decode 8x16 rows @4K             17.294       17.318   +0.14%   0.63%  same
+decode 16x32 rows @4K            22.473       23.046   +2.55%   0.93%  worse
+decode 1x3 rows @4K              13.757       13.815   +0.42%   0.76%  same
+decode 4x12 rows @4K             16.413       16.228   -1.13%   1.23%  same
+decode 8x24 rows @4K             19.712       19.598   -0.58%   0.94%  same
+decode 16x48 rows @4K            26.705       27.042   +1.26%   0.88%  worse
+decode 1x6 rows @4K              14.937       15.110   +1.16%   1.55%  same
+decode 2x12 rows @4K             16.334       16.320   -0.08%   1.61%  same
+decode 4x24 rows @4K             18.865       19.072   +1.10%   0.51%  worse
+decode 8x48 rows @4K             25.598       25.766   +0.65%   0.83%  same
+decode 12x72 rows @4K            34.257       35.180   +2.69%   0.67%  worse
+decode 16x96 rows @4K            38.798       39.956   +2.99%   0.78%  worse
+decode 1x3 rows @64K             14.080       14.118   +0.27%   1.70%  same
+decode 8x24 rows @64K            19.368       19.445   +0.39%   0.37%  worse
+decode 16x48 rows @64K           26.401       27.086   +2.59%   1.00%  worse
+decode 1x3 rows @256K            13.692       13.949   +1.87%   0.83%  worse
+decode 8x24 rows @256K           19.272       19.448   +0.92%   0.20%  worse
+decode 1x3 rows @1016K           13.756       13.898   +1.03%   0.83%  worse
+decode geometric mean (20)                             +0.97%   0.13%  worse
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 371
+
+== c16
+metric                        off-1    offstep-2   change    ±95%  verdict
+output tok/s                269.180      268.590   -0.22%   0.82%  same
+decode tok/s, paired         16.854       16.857   -0.10%   0.42%  same
+engine steps/s                7.880        7.877   -0.04%   2.48%  same
+output tokens/step           34.179       34.123   -0.16%   2.58%  same
+accepted/draft                1.371        1.370   -0.05%   5.12%  same
+TTFT p50 s                    0.411        0.410   -0.15%          same (no interval)
+TTFT p99 s                    0.475        0.498   +4.79%          worse (no interval)
+TTFT, paired                  0.411        0.410   +0.03%   0.90%  same
+TPOT p50 ms                  58.752       58.947   +0.33%          same (no interval)
+TPOT p99 ms                  77.671       78.102   +0.56%          same (no interval)
+per-user tok/s p50           16.990       16.964   -0.15%          same (no interval)
+paired: 316 requests in both windows, each the same prompt on both builds; 52 streamed in as many chunks on both
+speculative log-tps: total -0.21% (1+tau -0.03%, steps/s -0.04%, reqs/step -0.13%; rows/step -0.25%, row yield +0.09%)
+
+== prefill
+metric                        off-1    offstep-2   change    ±95%  verdict
+prefill 32,768 tok/s       9457.094     9423.658   -0.35%   0.70%  same
+prefill 262,144 tok/s      9842.557     9809.792   -0.33%   0.34%  same
+
+2026-11-17T15:01:04Z start experiments/2026-11-17-dspark-turn-learning/tp4-switched-offstep.json
+WARN: sp1: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096
+WARN: sp1: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k
+WARN: sp1: candidate UVM does not select the expected memory-saver DKMS module
+WARN: sp1: memory-saver module has no readable Secure Boot signer
+WARN: sp2: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096
+WARN: sp2: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k
+WARN: sp2: candidate UVM does not select the expected memory-saver DKMS module
+WARN: sp2: memory-saver module has no readable Secure Boot signer
+WARN: sp3: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096
+WARN: sp3: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k
+WARN: sp3: candidate UVM does not select the expected memory-saver DKMS module
+WARN: sp3: memory-saver module has no readable Secure Boot signer
+WARN: sp4: serving profile recommends 7.0.0-1019-nvidia-64k / 65536-byte pages; running '7.0.0-1024-nvidia' / 4096
+WARN: sp4: memory-saver DKMS 0.4.1 is missing or not installed for 7.0.0-1019-nvidia-64k
+WARN: sp4: candidate UVM does not select the expected memory-saver DKMS module
+WARN: sp4: memory-saver module has no readable Secure Boot signer
+profile: experiments/2026-11-17-dspark-turn-learning/tp4-switched-offstep.json on sp1, sp2, sp3, sp4
+live:    running: 4 nodes, TP4, context 1,048,576, KV 10.5 GiB, image spark-ds41f:candidate-60-afcaac35, started from experiments/2026-11-17-dspark-turn-learning/tp4-switched-offstep.json
+plan:    4 nodes, TP4, context 1,048,576, KV 10.5 GiB, image spark-ds41f:candidate-60-afcaac35
+shape:   unchanged
