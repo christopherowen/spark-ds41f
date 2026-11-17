@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import gc
 import itertools
 import os
@@ -58,7 +59,93 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner
 
 logger = init_logger(__name__)
+
+_CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY = 0x08
+_CUDART = None
+
+
+def _get_cudart():
+    global _CUDART
+    if _CUDART is None:
+        lib = ctypes.CDLL("libcudart.so")
+        lib.cudaGraphInstantiateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        lib.cudaGraphInstantiateWithFlags.restype = ctypes.c_int
+        lib.cudaGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.cudaGraphLaunch.restype = ctypes.c_int
+        lib.cudaGraphExecDestroy.argtypes = [ctypes.c_void_p]
+        lib.cudaGraphExecDestroy.restype = ctypes.c_int
+        _CUDART = lib
+    return _CUDART
+
+
+class _PriorityCUDAGraphExec:
+    """CUDA graph executable instantiated with ``UseNodePriority`` flags."""
+
+    def __init__(self, exec_handle: ctypes.c_void_p, lib, device: torch.device):
+        self._exec = exec_handle
+        self._lib = lib
+        self._device = device
+
+    def replay(self) -> None:
+        assert self._exec is not None, "CUDA graph executable has been reset"
+        stream = current_stream()
+        rc = self._lib.cudaGraphLaunch(
+            self._exec, ctypes.c_void_p(stream.cuda_stream)
+        )
+        if rc != 0:
+            raise RuntimeError(f"cudaGraphLaunch failed with error code {rc}")
+
+    def reset(self) -> None:
+        if self._exec is not None:
+            self._lib.cudaGraphExecDestroy(self._exec)
+            self._exec = None
+
+    def __del__(self) -> None:
+        exec_handle = getattr(self, "_exec", None)
+        lib = getattr(self, "_lib", None)
+        if exec_handle is not None and lib is not None:
+            try:
+                lib.cudaGraphExecDestroy(exec_handle)
+            except Exception:
+                pass
+            self._exec = None
+
+
+def _new_cudagraph():
+    try:
+        return torch.cuda.CUDAGraph(keep_graph=True)
+    except TypeError:
+        return torch.cuda.CUDAGraph()
+
+
+def _maybe_instantiate_priority_cudagraph(graph, device: torch.device):
+    raw_fn = getattr(graph, "raw_cuda_graph", None)
+    if raw_fn is None:
+        return graph
+    try:
+        raw = raw_fn()
+        if not raw:
+            return graph
+        lib = _get_cudart()
+        exec_ptr = ctypes.c_void_p()
+        rc = lib.cudaGraphInstantiateWithFlags(
+            ctypes.byref(exec_ptr),
+            ctypes.c_void_p(raw),
+            ctypes.c_uint64(_CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY),
+        )
+        if rc != 0 or not exec_ptr.value:
+            return graph
+        graph.reset()
+        return _PriorityCUDAGraphExec(exec_ptr, lib, device)
+    except Exception:
+        return graph
+
 _DENSE_VARLEN_DECODE_MAX_REQS = 2
+_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16
 
 
 def dense_varlen_decode_shapes(
@@ -72,11 +159,24 @@ def dense_varlen_decode_shapes(
     Covers every valid token total for low-concurrency batches (``1`` to
     ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
     adaptively trimmed totals) and the full-depth speculative batch for each
-    higher request count up to ``max_num_reqs``. When copy drafts widen the
-    verification limit, retain ordinary full-depth row totals with room for
-    any valid request count, using ``uniform_query_len``.
+    higher request count up to ``_FULL_DEPTH_VARLEN_DECODE_MAX_REQS`` (above
+    which the 8-row/16-row padded ladder already covers ``104+`` rows). When
+    copy drafts widen the verification limit, retain ordinary full-depth row
+    totals with room for any valid request count, using ``uniform_query_len``.
     """
     dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
+    full_depth_reqs = min(_FULL_DEPTH_VARLEN_DECODE_MAX_REQS, max_num_reqs)
+    has_copy_width = (
+        uniform_query_len is not None and 1 < uniform_query_len < decode_query_len
+    )
+    full_depth_tokens = min(
+        max_capture_tokens,
+        (
+            full_depth_reqs * uniform_query_len + (decode_query_len - uniform_query_len)
+            if has_copy_width
+            else full_depth_reqs * decode_query_len
+        ),
+    )
     dense = (
         (num_reqs, num_tokens)
         for num_reqs in range(1, dense_reqs + 1)
@@ -86,20 +186,20 @@ def dense_varlen_decode_shapes(
     widths = {decode_query_len}
     uniform = (
         (num_reqs, num_reqs * width)
-        for num_reqs in range(dense_reqs + 1, max_num_reqs + 1)
+        for num_reqs in range(dense_reqs + 1, full_depth_reqs + 1)
         for width in sorted(widths)
-        if width > 1 and num_reqs * width <= max_capture_tokens
+        if width > 1 and num_reqs * width <= full_depth_tokens
     )
     native_rows = ()
-    if uniform_query_len is not None and 1 < uniform_query_len < decode_query_len:
+    if has_copy_width:
         native_rows = (
             (min(rows, max_num_reqs), rows)
             for rows in range(
                 uniform_query_len,
-                max_num_reqs * uniform_query_len + 1,
+                full_depth_reqs * uniform_query_len + 1,
                 uniform_query_len,
             )
-            if rows <= max_capture_tokens
+            if rows <= full_depth_tokens
         )
     return tuple(dict.fromkeys((*dense, *uniform, *native_rows)))
 
@@ -796,7 +896,7 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+                        graph = _new_cudagraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -821,6 +921,9 @@ class CudaGraphManager:
                             mem_samples.append(
                                 _measure_full_graph_memory(desc, memory_before)
                             )
+                        graph = _maybe_instantiate_priority_cudagraph(
+                            graph, self.device
+                        )
                         self.graphs[desc] = graph
                         self.graph_capture_resources[desc] = resources
                         compilation_counter.num_cudagraph_captured += 1

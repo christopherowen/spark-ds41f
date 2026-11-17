@@ -60,7 +60,7 @@ SINGLE_REQ_TILE_SPILL_SCALE = 2.0
 # distinct experts per live draft row (~+2.5-4.1 ms/row) without cross-request
 # coalescing; scale the calibrated c1 row cost accordingly while leaving
 # multi-request concurrency (c2..c16) and long copy-draft proposals untouched.
-SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5
+SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 1.0
 
 
 def resolve_adaptive_cudagraph_mode(

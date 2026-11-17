@@ -192,17 +192,27 @@ collectives, and DSpark drafting.
    takes 23–30 µs per layer (~3% of a decode step) and runs serially between the
    two grouped GEMMs. Keeping routed tiles resident across `FC1 -> SwiGLU -> FC2`
    (or fusing the SwiGLU + MXFP8 requantization epilogue over live tiles) avoids
-   the global intermediate round-trip and extra kernel launch per layer.
+   the global intermediate round-trip and extra kernel launch per layer. On
+   `sp8` (`H=5120, I=576`, `E=384, topk=6`), `fuse_swiglu=True` at
+   `decode_block_M=16` is 100% bit-identical (`diff_q=0, diff_sf=0` across
+   distinct and shared-expert multi-row tiles) and cuts Cold-L2 `routed` MoE at
+   `live=1` (`182.5 -> 171.6 us`), with smaller overlapped `Shared + Routed` gain
+   (`-1.1` to `-0.7 us` at `live=1..3`, `+4.4 us` at `live=4` vs `pm3+08`) because
+   `fuse_swiglu` mandates `trigger_after_loop=True`. Full FC1->SwiGLU->FC2
+   persistence remains open.
 2. **Direct producer writes (`WO-B` / `moe_combine`) into registered `sparknet`
    RoCE send buffers** (~1.3–1.6% decode ceiling). `1107` overlaps collective
    launches via PDL (`0753`, `0755`, `0756`), but `roce_all_reduce` still stages
    an explicit `cudaMemcpyAsync` from the producer output tensor into
    `comm_buf` (116 launches per step). Writing final BF16 outputs directly into
    the registered RoCE send buffer removes the staging copy.
-3. **Q-B and indexer Q-B tile-contiguous weight layout.** Both projections win
-   in isolation but trail by 3–5% per call in serving when reading row-major
-   weights. Screen a tile-contiguous weight layout for the decode projections,
-   kept bit-identical with prefill.
+3. **Q-B, indexer Q-B, and WO-B tile-contiguous weight layout.** Q-B and indexer
+   Q-B already pack `[N // 128, K // 128, 128, 128]` tiles (`TILE_CONTIGUOUS_FP8`).
+   On `sp8` (`M=3`, `block_M=16`, Cold-L2 across 10 copies), `wo_b` `(5120, 2048)`
+   is bit-identical with `tile_contiguous=True` and speeds up from `51.93` to
+   `48.90 us/call` (`-3.03 us/call`, `x40 = -0.12 ms/step`); wiring it for `wo_b`
+   needs care in `TileLangWOProjection` so SP prefill's peer `sp_shards` gather and
+   GEMMs handle packed weights consistently across TP3/TP4/TP8.
 4. **Vocabulary head (`128`-row token tile and per-tile epilogue summary).**
    - **A 128-row token tile:** a head call with 65–128 rows on TP4 `c16` runs a
      second 64-row tile that re-reads and unpacks the 248 MB shard from DRAM.
@@ -224,15 +234,15 @@ collectives, and DSpark drafting.
    on the main stream immediately after `wq_b` while the side stream finishes
    the compressor and scores only the `n_new` ($\le M$) newly written blocks,
    merging the `n_new` scores into the sorted `k` prefix keys in a lightweight
-   merge kernel before MLA. Pass `cudaGraphInstantiateFlagUseNodePriority`
-   (`0x08`) when instantiating multi-stream decode CUDA graphs so the hardware
-   CTA scheduler honors capturing-stream priorities (prioritizing the
-   latency-critical indexer / router-gate / compressor side stream over
-   shared-expert / main-stream MoE nodes; by default CUDA Graph instantiation
-   ignores stream priority without that flag), and gate two-stream branching and
-   small-batch decode fusions on active token count $M$ (e.g. `c1..c4` vs
-   `c8..c16`) so branches that win at low concurrency do not contend for GB10's
-   48 SMs once batch concurrency already saturates the device. First bound how
+   merge kernel before MLA. Passing `cudaGraphInstantiateFlagUseNodePriority`
+   (`0x08`) via `_PriorityCUDAGraphExec` (`cudagraph_utils.py`) with highest-priority
+   `aux_stream` (`priority=-3` on SM121 `(0, -3)`, `torch_utils.py`) is staged in
+   `c61-r7`: on `sp8` Cold-L2 40-layer `Shared + Routed MoE` (`H=5120, I=576`),
+   `pm3 + 0x08` beats `p0` by `-2.5` to `-5.7 us/call` across `live=1..4` (`live=1`:
+   `225.7 -> 223.2`, `live=2`: `342.0 -> 337.8`, `live=3`: `455.7 -> 451.6`,
+   `live=4`: `570.8 -> 565.1 us`; `-0.10` to `-0.23 ms/step`). Still open: overlapping
+   DSpark context-KV preparation and compressor/indexer-key writes on `aux_stream`,
+   plus incremental `old + new` indexer scoring. First bound how
    much of the latency-bound bucket is serial dependency rather than SM
    occupancy; if GB10's 48 SMs or 99 KiB per-CTA shared memory serialize
    concurrent streams during tail waves, screen co-tuning pipeline stages /
@@ -320,7 +330,7 @@ graph retention (`0728`), fused single-rank Markov drafting (`0717`), and
 device-side `prepare_inputs` folding (`0754`) are all active.
 
 Open levers:
-- **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms` (`s3/2` beats `s2/2` across warmed `live=3, 4, 16, 38, 64` at `159.1 vs 160.8`, `192.7 vs 194.6`, `622.8 vs 623.9`, `1423.5 vs 1427.4`, `2369.4 vs 2377.9 us`). Live `dgx1` `c61-r5` `prose-c1` telemetry (`4,701` steady decode steps) shows `36.3%` commit 1 token (`med 25.30 ms`), `30.0%` commit 2 (`25.60 ms`), `21.1%` commit 3 (`26.70 ms`), `8.1%` commit 4 (`28.70 ms`), `3.2%` commit 5 (`30.90 ms`), `1.2%` commit 6 (`33.50 ms`). Implemented in `c61-r6` (`SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` -> `tau_c1 = 0.1386` for `num_reqs == 1` calibrated DSpark rows while keeping `c2..c16` at `0.06335`, paired with `_WARM_CONFIDENCE_HEAD_INTERCEPTS` + halted-zero preservation in `acceptance_estimator.py`; `PR #1002` `VLLM_DSPARK_ONLINE_ADAPT=1` measured only `+0.03%` on held-out `c1` (`87.11 -> 87.14`) and `+0.10%` on coding (`160.91 -> 161.07`) in `c57-adapt` and remains opt-in). Screen `c61-r6` on `dgx1..dgx4` and sweep higher single-request scales if `pos 2` marginal yield stays unprofitable.
+- **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms` (`s3/2` beats `s2/2` across warmed `live=3, 4, 16, 38, 64` at `159.1 vs 160.8`, `192.7 vs 194.6`, `622.8 vs 623.9`, `1423.5 vs 1427.4`, `2369.4 vs 2377.9 us`). Live `dgx1` `c61-r5` `prose-c1` telemetry (`4,701` steady decode steps) shows `36.3%` commit 1 token (`med 25.30 ms`), `30.0%` commit 2 (`25.60 ms`), `21.1%` commit 3 (`26.70 ms`), `8.1%` commit 4 (`28.70 ms`), `3.2%` commit 5 (`30.90 ms`), `1.2%` commit 6 (`33.50 ms`). `c61-r6` (`e0436c584`) tested IRLS warm-start priors (`_WARM_CONFIDENCE_HEAD_INTERCEPTS` + zero-preservation) + `SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` (`tau_c1 = 0.1386`) on `dgx1..dgx4`: warmup req `#00` improved `71.66 -> 73.13 dec tok/s` (`ttft` `0.283s -> 0.163s`), `code-c1` improved `114.25 -> 115.04 dec tok/s` (`med_dt 31.50 -> 29.90 ms`), and `c16` (`271.38`) + determinism (`0` diffs) held, but `prose-c1` shifted `-1.83 ms/step` (`26.58 -> 24.75 ms` mean) against `-0.163 commits/step` (`2.144 -> 1.981`, `81.38 -> 80.72 dec tok/s`), showing the pruned `pos 2..4` tail tokens earned `89.1 tok/s` marginal rate (conditional acceptance > independent confidence product). Keep warm-start priors and drop `scale = 2.5` back to `1.0` in `c61-r7`. (`PR #1002` `VLLM_DSPARK_ONLINE_ADAPT=1` measured `+0.03%` on held-out `c1` (`87.11 -> 87.14`) and `+0.10%` on coding (`160.91 -> 161.07`) in `c57-adapt` and remains opt-in.)
 - **Bounded or indexed CopyDrafter history match, forward-locality cursor, and
   payoff-gated wide copy passes at 100K–1M contexts.** Even with warp
   early-exit (`0744`), a decode step that does not hit a 256-token match scans
