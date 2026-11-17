@@ -79,6 +79,14 @@ Result: 6 passed.
    `0a2dacdd` / `12fd8257`): observe changes no output;
 2. a fresh boot: AgentX's agent-trace replay at 8 sessions for an hour, the turns the offline study reads.
 
+The image is `spark-ds41f:candidate-60-afcaac35`: dgx4's `candidate-60` (tree `afcaac35`, the final
+candidate-60 build the profiles name) under a new tag, copied to sp1 for `cluster sync` to distribute.
+Spaceport's own `candidate-60` tag holds the earlier build (tree `b7c6c958`, before `fdf5751ee`'s SP-prefill
+stream-lifetime fix) and is left as it is. The files the overlay replaces, and the draft-step modules the
+learner calls, are identical in both trees (SHA-256 of `model_runner.py`, `dspark/speculator.py`,
+`dspark/greedy.py`, `sample/tilelang_sampling.py`, `nvidia/dspark.py`, `tilelang_inputs.py`, `states.py`).
+The kernel tests ran on sp8's `candidate-60` (tree `b7c6c958`).
+
 This is a correctness and data-collection run, not a performance comparison: with dumps on, the end of a
 turn also copies its rows to the host.
 
