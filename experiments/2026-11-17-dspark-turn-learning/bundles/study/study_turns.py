@@ -13,6 +13,13 @@ drafter's final norm and its Markov W1 and W2. For each turn:
 3. each learner's update on the turn: full-vocabulary cross-entropy of the committed
    token, gradient into the W1 rows of the chain's inputs, on an FP32 master copy.
 
+``blockseen`` is the rule a shadow learner in serving can run: the block-maxima rule
+on the positions up to each block's first miss only (``live_candidates``). Each
+learner also gets the shadow score serving can compute from those maxima alone
+beside the exact teacher-forced one, so the proxy is calibrated: ``proxy_accepted`` over the
+seen positions only, and ``tf_proxy_accepted``, teacher-forced over every drafted position
+from the same maxima, for the loaded and the learned table alike.
+
 Prints one JSON line a turn and a summary line. Nothing is written elsewhere.
 """
 
@@ -59,20 +66,25 @@ def base_logits(hidden: torch.Tensor, t: dict, eps: float, chunk: int = 320) -> 
     return torch.cat(out).view(*hidden.shape[:-1], -1)
 
 
-def markov_logits(base: torch.Tensor, prev: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor):
-    """base [R, V] BF16 plus the Markov bias of prev ([R]) through W1 (BF16) and W2."""
+def markov_logits(base: torch.Tensor, prev: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
+                  rounded: bool = False):
+    """base [R, V] BF16 plus the Markov bias of prev ([R]) through W1 (BF16) and W2; with
+    ``rounded``, each sum rounded to BF16 as the serving step rounds it (its argmax then
+    takes the first of tied tokens, as the step does)."""
     bias = w1[prev].to(torch.bfloat16) @ w2.t()
-    return base.float() + bias.float()
+    z = base.float() + bias.float()
+    return z.to(torch.bfloat16).float() if rounded else z
 
 
-def chain(base: torch.Tensor, ids: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, *, teacher: bool):
+def chain(base: torch.Tensor, ids: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, *, teacher: bool,
+          rounded: bool = False):
     """Argmax at each of the five positions: the chain's input at position i is the
     label before it (teacher) or the previous argmax (replay)."""
     rows, n = base.shape[0], base.shape[1]
     preds = torch.empty((rows, n), dtype=torch.int64, device=base.device)
     prev = ids[:, 0].long()
     for i in range(n):
-        z = markov_logits(base[:, i], prev, w1, w2)
+        z = markov_logits(base[:, i], prev, w1, w2, rounded=rounded)
         preds[:, i] = z.argmax(-1)
         prev = ids[:, i + 1].long() if teacher else preds[:, i]
     return preds
@@ -186,6 +198,84 @@ def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=25
     return loss_sum / idx.numel()
 
 
+def live_candidates(base, ids, labels, active, w1_loaded, w2):
+    """What a shadow learner in serving sees of a turn: at each position, the live
+    step's block maxima under the loaded table (the sums rounded to BF16, as the
+    greedy partials keep them) and their values; the positions up to each block's
+    first miss under those maxima, within its drafted positions (there the step's
+    input was the committed token, so its maxima are teacher forcing's)."""
+    rows, n = labels.shape
+    out = []
+    hits = torch.zeros((rows, n), dtype=torch.bool, device=base.device)
+    for i in range(n):
+        prev = ids[:, i].long()
+        z_live = markov_logits(base[:, i], prev, w1_loaded, w2).to(torch.bfloat16).float()
+        maxima = block_candidates(z_live)
+        values = z_live.gather(1, maxima)
+        pred = maxima.gather(1, values.argmax(dim=1, keepdim=True)).squeeze(1)
+        hits[:, i] = (pred == labels[:, i].long()) & (labels[:, i] >= 0)
+        out.append((prev, maxima, values))
+    drafted = torch.arange(n, device=base.device)[None, :] < active[:, None]
+    seen = torch.cat([torch.ones_like(hits[:, :1]), hits.int().cumprod(dim=1)[:, :-1].bool()], dim=1)
+    return out, seen & drafted & (labels >= 0)
+
+
+def proxy_accepted(cands, labels, mask, master, w1_loaded, w2):
+    """The shadow score: the leading run of seen positions where the argmax over the
+    live maxima of their values under the learner's table (the loaded values plus the
+    change of the input's W1 row projected on the maxima's W2 rows) is the committed
+    token. With the loaded table it is the drafts' accepted run."""
+    rows, n = labels.shape
+    hits = torch.zeros((rows, n), dtype=torch.bool, device=labels.device)
+    for i, (prev, maxima, values) in enumerate(cands):
+        v = values
+        if master is not None:
+            # As serving would round it with the learned table: the step's sum less
+            # the loaded bias, plus the learned (BF16) row's bias, each bias rounded
+            # to BF16 as the projection writes it, the sum rounded again.
+            rows_w2 = w2[maxima].float()
+            b0 = torch.einsum("rd,rcd->rc", w1_loaded[prev].float(), rows_w2).to(torch.bfloat16).float()
+            bl = torch.einsum("rd,rcd->rc", master[prev].to(torch.bfloat16).float(), rows_w2)
+            bl = bl.to(torch.bfloat16).float()
+            v = (values - b0 + bl).to(torch.bfloat16).float()
+        pred = maxima.gather(1, v.argmax(dim=1, keepdim=True)).squeeze(1)
+        hits[:, i] = pred == labels[:, i].long()
+    return (hits & mask).int().cumprod(dim=1).sum(dim=1)
+
+
+def draft_candidates(base, ids, drafts, labels, active, w1_loaded, w2):
+    """The live step's block maxima at every drafted position, as serving keeps them:
+    under the step's own input (the anchor, then the previous draft), the sums rounded
+    to BF16; and the positions a teacher-forced score reads (drafted and labeled)."""
+    rows, n = labels.shape
+    out = []
+    for i in range(n):
+        prev_d = ids[:, 0].long() if i == 0 else drafts[:, i - 1].long()
+        z_live = markov_logits(base[:, i], prev_d, w1_loaded, w2, rounded=True)
+        maxima = block_candidates(z_live)
+        out.append((prev_d, ids[:, i].long(), maxima, z_live.gather(1, maxima)))
+    drafted = torch.arange(n, device=base.device)[None, :] < active[:, None]
+    return out, drafted & (labels >= 0)
+
+
+def tf_proxy_accepted(dc, labels, valid, w1_loaded, w2, master=None):
+    """The teacher-forced shadow score: at each drafted position, each live maximum's
+    logit with the step's input bias replaced by the committed input's under a table
+    (the loaded one, or the learner's as BF16), biases and sum rounded to BF16 as
+    serving rounds them; the leading run of positions whose best maximum is the
+    committed token. Both tables are scored by this one rule over the same maxima."""
+    hits = []
+    for prev_d, prev_l, maxima, values in dc:
+        rows_w2 = w2[maxima].float()
+        b0 = torch.einsum("rd,rcd->rc", w1_loaded[prev_d].float(), rows_w2).to(torch.bfloat16).float()
+        src = w1_loaded[prev_l].float() if master is None else master[prev_l].to(torch.bfloat16).float()
+        bt = torch.einsum("rd,rcd->rc", src, rows_w2).to(torch.bfloat16).float()
+        z = (values - b0 + bt).to(torch.bfloat16).float()
+        pred = maxima.gather(1, z.argmax(dim=1, keepdim=True)).squeeze(1)
+        hits.append(pred == labels[:, len(hits)].long())
+    return (torch.stack(hits, dim=1) & valid).int().cumprod(dim=1).sum(dim=1)
+
+
 def cap_drift(master, loaded, cap):
     """Each row's displacement from the loaded row, at most ``cap`` of its norm."""
     if cap <= 0:
@@ -249,6 +339,8 @@ def main() -> None:
             prefix_mask = torch.cat([torch.ones_like(hit[:, :1]), hit.cumprod(dim=1)[:, :-1]], dim=1).bool()
             pos = torch.arange(replay.shape[1], device=device)[None, :] < active[:, None]
             loaded_acc = accepted(chain(base, ids, w1_loaded, w2, teacher=True), labels)
+            loaded_r = int(accepted(chain(base, ids, w1_loaded, w2, teacher=True, rounded=True), labels).sum())
+            totals["rounded_loaded"] = totals.get("rounded_loaded", 0) + loaded_r
             # How much of the turn the compact candidates cover: the committed token among
             # the live step's block maxima, at each labeled position.
             n = labels.shape[1]
@@ -269,17 +361,39 @@ def main() -> None:
             totals["covered"] = totals.get("covered", 0) + covered
             totals["replay_checked"] += int(pos.sum())
             totals["replay_equal"] += int(((replay == drafts) & pos).sum())
+            cands, seen = live_candidates(base, ids, labels, active, w1_loaded, w2)
+            dc, tf_valid = draft_candidates(base, ids, drafts, labels, active, w1_loaded, w2)
+            tf_loaded = int(tf_proxy_accepted(dc, labels, tf_valid, w1_loaded, w2).sum())
+            row["tf_proxy_loaded"] = tf_loaded
+            totals["tf_proxy_loaded"] = totals.get("tf_proxy_loaded", 0) + tf_loaded
+            proxy_loaded = int(proxy_accepted(cands, labels, seen, None, w1_loaded, w2).sum())
+            row["proxy_loaded"] = proxy_loaded
+            totals["proxy_loaded"] = totals.get("proxy_loaded", 0) + proxy_loaded
+            totals["seen"] = totals.get("seen", 0) + int(seen.sum())
             for key in lrs:
                 name = f"{key[0]}:{key[1]}"
                 w1 = masters[key].to(torch.bfloat16)
                 acc = accepted(chain(base, ids, w1, w2, teacher=True), labels)
                 row[name] = int(acc.sum())
                 totals["learned"][name] += int(acc.sum())
+                acc_r = int(accepted(chain(base, ids, w1, w2, teacher=True, rounded=True), labels).sum())
+                row["rounded " + name] = acc_r
+                totals.setdefault("rounded", {}).setdefault(name, 0)
+                totals["rounded"][name] += acc_r
+                proxy = int(proxy_accepted(cands, labels, seen, masters[key], w1_loaded, w2).sum())
+                row["proxy " + name] = proxy
+                totals.setdefault("proxy", {}).setdefault(name, 0)
+                totals["proxy"][name] += proxy
+                tfp = int(tf_proxy_accepted(dc, labels, tf_valid, w1_loaded, w2, masters[key]).sum())
+                row["tf_proxy " + name] = tfp
+                totals.setdefault("tf_proxy", {}).setdefault(name, 0)
+                totals["tf_proxy"][name] += tfp
             for key in lrs:
                 name = f"{key[0]}:{key[1]}"
-                row["loss " + name] = round(ce_step(base, ids, labels, masters[key], w2, key[1], method=key[0], live_w1=w1_loaded,
-                                                      train_mask=prefix_mask if key[0] == "live4" else None,
-                                                      accum=accums[key]), 4)
+                mask = {"live4": prefix_mask, "blockseen": seen}.get(key[0])
+                method = "block" if key[0] == "blockseen" else key[0]
+                row["loss " + name] = round(ce_step(base, ids, labels, masters[key], w2, key[1], method=method, live_w1=w1_loaded,
+                                                      train_mask=mask, accum=accums[key]), 4)
                 cap_drift(masters[key], w1_loaded.float(), args.max_drift)
                 drift = (masters[key] - w1_loaded.float()).norm(dim=1) / w1_loaded.float().norm(dim=1).clamp_min(1e-6)
                 row["drift " + name] = round(float(drift.max()), 4)
@@ -296,6 +410,15 @@ def main() -> None:
     summary["label_in_block_maxima"] = totals.get("covered", 0) / max(totals["labeled"], 1)
     summary["gain_pct"] = {k: 100.0 * (v - totals["loaded"]) / max(totals["loaded"], 1)
                            for k, v in totals["learned"].items()}
+    base_r = max(totals.get("rounded_loaded", 0), 1)
+    summary["rounded_gain_pct"] = {k: 100.0 * (v - base_r) / base_r
+                                   for k, v in totals.get("rounded", {}).items()}
+    base_tf = max(totals.get("tf_proxy_loaded", 0), 1)
+    summary["tf_proxy_gain_pct"] = {k: 100.0 * (v - base_tf) / base_tf
+                                    for k, v in totals.get("tf_proxy", {}).items()}
+    base_proxy = max(totals.get("proxy_loaded", 0), 1)
+    summary["proxy_gain_pct"] = {k: 100.0 * (v - base_proxy) / base_proxy
+                                 for k, v in totals.get("proxy", {}).items()}
     print(json.dumps({"summary": summary}), flush=True)
 
 

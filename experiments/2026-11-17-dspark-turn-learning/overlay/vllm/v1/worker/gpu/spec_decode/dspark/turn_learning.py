@@ -20,9 +20,10 @@ kernels (head projection, Markov projection, shard pairs, first-argmax):
   exact number of positions each block would have had accepted, all ``N`` of
   them, with whatever Markov W1 the chain reads.
 
-This revision observes only (``observe``): it changes no draft and no weight. With
-``VLLM_DSPARK_TURN_LEARNING_DUMP`` set, rank 0 also writes each turn's rows and
-labels to that directory, for an offline study of the update.
+``observe`` changes no draft and no weight. With ``VLLM_DSPARK_TURN_LEARNING_DUMP``
+set, rank 0 also writes each turn's rows and labels to that directory, for an
+offline study of the update. ``shadow`` (``turn_learning_shadow.py``) keeps only the
+step's block maxima and trains a copy of W1 the draft step does not read.
 
 Off (the default), nothing is allocated or launched.
 """
@@ -46,7 +47,7 @@ from vllm.v1.worker.gpu import tilelang_inputs
 
 logger = init_logger(__name__)
 
-_MODES = ("off", "observe")
+_MODES = ("off", "observe", "shadow")  # shadow: turn_learning_shadow.py
 
 _PASS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
