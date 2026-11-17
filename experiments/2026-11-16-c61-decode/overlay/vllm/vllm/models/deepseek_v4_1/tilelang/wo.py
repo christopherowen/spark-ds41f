@@ -67,15 +67,13 @@ from .linear import (
 # added in shard order, so a row's bits do not depend on the path. A bucket either
 # splits the shards over CTAs (FP32 partials, then splitk_reduce: the SMs a narrow grid
 # leaves idle at decode) or adds them inside the kernel (no partials to write and read
-# back). Path and tile per bucket keep bit-identity across all rows:
-# - 1..16 rows stay split with block_K=256 (fewer K-loop barriers while overlapping
-#   1-CTA 200 ns L2 prefetch);
-# - 17..128 rows retain the baseline 64-col, two-stage split tiles (avoiding
-#   in-kernel shard accumulation overhead at M=36..96 on live tp4-ring);
-# - >128 keeps 96x64x64 in-kernel prefill.
+# back). Path and tile per bucket from the split sweeps (bits depend on neither): 64
+# columns and two stages throughout; four shards beat two at decode, and tiles as tall
+# as the bucket from 65 rows (2026-10-13 sweep 2: 72-96 rows 27.9-29.5 against 34.5 us,
+# 512 rows 119.1 against 131.8 us, 8192 rows 1675 against 1758 us).
 _WO_A_SHARDS = 4
 _WO_A_TILES = {
-    16: dict(split=True, block_M=16, block_K=256),
+    16: dict(split=True, block_M=16),
     32: dict(split=True, block_M=32),
     64: dict(split=True, block_M=64),
     96: dict(split=True, block_M=96),
@@ -150,17 +148,16 @@ class _GroupedBF16:
         reduce."""
         n, k = self.weight.shape
         groups = self.groups
-        kernels = {}
-        for bucket, tile in _WO_A_TILES.items():
-            cfg = {**_WO_A_COMMON, **{m: v for m, v in tile.items() if m != "split"}}
-            kernels[bucket] = (
-                prepare.call(
+        return {
+            "kernels": {
+                bucket: prepare.call(
                     fp8w_bf16_gemm_partials,
                     n // groups,
                     k,
                     groups,
                     _WO_A_SHARDS,
-                    **cfg,
+                    block_M=tile["block_M"],
+                    **_WO_A_COMMON,
                 )
                 if tile["split"]
                 else prepare.call(
@@ -169,11 +166,11 @@ class _GroupedBF16:
                     k,
                     groups,
                     shards=_WO_A_SHARDS,
-                    **cfg,
+                    block_M=tile["block_M"],
+                    **_WO_A_COMMON,
                 )
-            )
-        return {
-            "kernels": kernels,
+                for bucket, tile in _WO_A_TILES.items()
+            },
             "reduce": prepare.call(splitk_reduce_cast, n, _WO_A_SHARDS),
         }
 
