@@ -23,7 +23,6 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
-import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -143,7 +142,7 @@ def _compute_confidence_probs(
 ) -> None:
     """Evaluate and calibrate DSpark confidence probabilities over active draft steps.
     ``margins`` ([num_reqs, n_spec] FP32): this step's top-2 draft logit margins, when
-    the step measured them and the margin gain is set."""
+    the step measured them and the head calibrates on them."""
     n_spec = speculator.num_speculative_steps
     num_sample = num_reqs * n_spec
     truncated = active_steps < n_spec
@@ -188,14 +187,7 @@ def _compute_confidence_probs(
             conf_out,
             estimator,
             conf_idx_mapping,
-            **(
-                {}
-                if margins is None
-                else {
-                    "margins": margins.reshape(-1),
-                    "margin_gain": speculator._margin_confidence_gain,
-                }
-            ),
+            **({} if margins is None else {"margins": margins.reshape(-1)}),
         )
     else:
         speculator.model.compute_confidence(
@@ -269,25 +261,13 @@ class DSparkSpeculator(DFlashSpeculator):
                 1.0,
             )
         )
-        # The gain on log(1 + top-2 margin) in the calibrated confidence feature
-        # (tilelang/confidence.py); 0 is off. It needs the runner-up of every greedy
-        # step, which the top-2 pairs carry; with a zero branch margin they change
-        # no draft.
-        self._margin_confidence_gain: float = max(
-            float(os.environ.get("SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE", "0") or 0.0),
-            0.0,
-        )
-        self._enable_top2_branch: bool = (
-            bool(
-                getattr(
-                    self.draft_model_config.hf_config,
-                    "dspark_top2_branch",
-                    False,
-                )
-            )
-            or self._top2_branch_margin > 0.0
-            or self._margin_confidence_gain > 0.0
-        )
+        # The greedy steps always report each draft's runner-up: the confidence head
+        # calibrates on the top-2 margin (tilelang/confidence.py). With a zero branch
+        # margin the runner-up changes no draft.
+        self._enable_top2_branch: bool = True
+        # Set by ``load_model``: whether the draft steps measure the margin and the
+        # head takes it.
+        self._confidence_margin: bool = False
         draft_vocab = max(
             self.draft_model_config.hf_config.vocab_size,
             getattr(self.draft_model_config.hf_config, "draft_vocab_size", None) or 0,
@@ -402,8 +382,18 @@ class DSparkSpeculator(DFlashSpeculator):
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)
         if self.use_confidence_head and self.acceptance_estimator is not None:
+            # The vocabulary-parallel greedy steps measure each draft's top-2 margin;
+            # a head that takes it calibrates on it, from that feature's start.
+            local_head = getattr(
+                self.model, "supports_local_draft_argmax", lambda: False
+            )()
+            self._confidence_margin = bool(
+                self._enable_top2_branch
+                and self._vocab_parallel_greedy(local_head)
+                and getattr(self.model, "confidence_takes_margin", False)
+            )
             self.acceptance_estimator.reset_for_confidence_head(
-                warm_start=True, with_margin=self._margin_confidence_gain > 0.0
+                warm_start=True, with_margin=self._confidence_margin
             )
 
     @property
@@ -785,10 +775,9 @@ class DSparkSpeculator(DFlashSpeculator):
                 # Only the vocabulary-parallel greedy steps measure the margin.
                 margins=(
                     self.draft_top2_margins[:num_reqs]
-                    if getattr(self, "_margin_confidence_gain", 0.0) > 0.0
+                    if getattr(self, "_confidence_margin", False)
                     and vocab_parallel
                     and not local_head
-                    and self._enable_top2_branch
                     else None
                 ),
             )

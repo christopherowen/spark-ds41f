@@ -27,17 +27,17 @@ FMA contraction), and the probability adds the sigmoid's own few roundings. The
 order is fixed per row: a row's result does not depend on the batch, and a dot
 product that is exact in FP32 gives the torch head's bits.
 
-``SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE`` (a gain ``g``; 0, the default, is off) adds the
-draft's own evidence to the head's before the online calibration: the calibrated
-feature is ``logit(p) + g * log(1 + margin)``, ``margin`` the gap between the drafted
-token's logit and the runner-up's. The margin predicts acceptance better than the
-head does (experiments/2026-11-17-draft-calibration-sizing), and the estimator fits
-its slope and intercepts on the sum as it did on the head's logit alone.
+The calibrated launch adds the draft's own evidence to the head's before the online
+calibration: its feature is ``logit(p) + MARGIN_GAIN * log(1 + margin)``, ``margin`` the
+gap between the drafted token's logit and the runner-up's, which the greedy draft
+steps measure. The margin predicts acceptance better than the head does, and one
+term with one constant carries it (experiments/2026-11-17-draft-calibration-sizing:
++1.2% single stream and +1.3% at 16 streams on tp4-ring); the estimator fits its slope
+and intercepts on the sum.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
 # annotations eagerly, and the symbolic shape must resolve.
-import os
 from functools import cache
 
 import tilelang
@@ -50,15 +50,12 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
 # BF16 values in one sixteen-byte piece; one accumulator per value of a piece.
 _VEC = 8
 
-MARGIN_GAIN_ENV = "SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE"
+# The gain on ``log(1 + margin)`` in the calibrated feature (acceptance_estimator's
+# ``_CONFIDENCE_MARGIN_GAIN``, which its start and its torch form are for).
+MARGIN_GAIN = 2.0
 # A margin past this adds nothing (log(1 + 64) = 4.2); it also bounds a runner-up
 # a shard did not report (-inf, so an infinite margin).
 MARGIN_CAP = 64.0
-
-
-def margin_gain() -> float:
-    """The gain on ``log(1 + margin)`` in the calibrated feature; 0 is off."""
-    return max(float(os.environ.get(MARGIN_GAIN_ENV, "0") or 0.0), 0.0)
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -145,9 +142,12 @@ def dspark_confidence_kernel(hidden: int, rank: int, threads: int = 128):
 def dspark_confidence_calibrate_kernel(
     hidden: int, rank: int, steps: int = 5, threads: int = 128
 ):
-    """``out[m] = sigmoid(slope * clamp(logit(clamp(sigmoid(w . [h[m] | e[m]]), eps, 1 - eps)), -40, 40) + intercepts[m % steps])``,
-    also recording ``features[slot, m % steps]`` and ``predictions[slot, m % steps]``
-    when ``slot = idx_mapping[m] >= 0``."""
+    """``out[m] = sigmoid(slope * feature + intercepts[m % steps])`` with ``feature =
+    clamp(clamp(logit(clamp(sigmoid(w . [h[m] | e[m]]), eps, 1 - eps)), -40, 40) +
+    MARGIN_GAIN * log(1 + clamp(margins[m], 0, MARGIN_CAP)), -40, 40)``, also recording
+    ``features[slot, m % steps]`` and ``predictions[slot, m % steps]`` when ``slot =
+    idx_mapping[m] >= 0``. A NaN margin counts as 0; a zero margin leaves the head's
+    own log-odds."""
     assert (
         hidden % _VEC == 0 and rank % _VEC == 0 and steps > 0 and threads % 32 == 0
     )
@@ -171,118 +171,7 @@ def dspark_confidence_calibrate_kernel(
         idx_mapping: T.Tensor((rows,), T.int32),
         features: T.Tensor((slots, steps), T.float32),
         predictions: T.Tensor((slots, steps), T.float32),
-    ):
-        with T.Kernel(rows, threads=threads) as m:
-            tx = T.get_thread_binding()
-            xs = T.alloc_local((chunks * _VEC,), T.bfloat16)
-            ws = T.alloc_local((chunks * _VEC,), T.float32)
-            acc = T.alloc_local((_VEC,), T.float32)
-            total = T.alloc_local((1,), T.float32)
-            partial = T.alloc_shared((warps,), T.float32)
-            for c in T.unroll(hidden_chunks):
-                piece = c * threads + tx
-                if piece < hidden_pieces:
-                    for i in T.vectorized(_VEC):
-                        xs[c * _VEC + i] = h[m, piece * _VEC + i]
-                    for i in T.vectorized(4):
-                        ws[c * _VEC + i] = weight[piece * _VEC + i]
-                    for i in T.vectorized(4):
-                        ws[c * _VEC + 4 + i] = weight[piece * _VEC + 4 + i]
-                else:
-                    for i in T.vectorized(_VEC):
-                        xs[c * _VEC + i] = T.bfloat16(0)
-                    for i in T.vectorized(_VEC):
-                        ws[c * _VEC + i] = T.float32(0)
-            for c in T.unroll(rank_chunks):
-                piece = c * threads + tx
-                k = hidden_chunks + c
-                if piece < rank_pieces:
-                    for i in T.vectorized(_VEC):
-                        xs[k * _VEC + i] = e[m, piece * _VEC + i]
-                    for i in T.vectorized(4):
-                        ws[k * _VEC + i] = weight[hidden + piece * _VEC + i]
-                    for i in T.vectorized(4):
-                        ws[k * _VEC + 4 + i] = weight[hidden + piece * _VEC + 4 + i]
-                else:
-                    for i in T.vectorized(_VEC):
-                        xs[k * _VEC + i] = T.bfloat16(0)
-                    for i in T.vectorized(_VEC):
-                        ws[k * _VEC + i] = T.float32(0)
-            for i in T.unroll(_VEC):
-                acc[i] = T.float32(0)
-            for c in T.unroll(chunks):
-                for i in T.unroll(_VEC):
-                    acc[i] += T.cast(xs[c * _VEC + i], T.float32) * ws[c * _VEC + i]
-            for i in T.unroll(4):
-                acc[i] = acc[i] + acc[i + 4]
-            for i in T.unroll(2):
-                acc[i] = acc[i] + acc[i + 2]
-            acc[0] = acc[0] + acc[1]
-            acc[0] = T.warp_reduce_sum(acc[0])
-            if tx % 32 == 0:
-                partial[tx // 32] = acc[0]
-            T.sync_threads()
-            if tx == 0:
-                total[0] = T.float32(0)
-                for warp in T.serial(warps):
-                    total[0] += partial[warp]
-                raw_prob = T.float32(1) / (T.float32(1) + T.exp(-total[0]))
-                clamped = T.min(
-                    T.max(raw_prob, T.float32(1e-6)),
-                    T.float32(1.0 - 1e-6),
-                )
-                feat = T.min(
-                    T.max(
-                        T.log(clamped / (T.float32(1.0) - clamped)),
-                        T.float32(-40.0),
-                    ),
-                    T.float32(40.0),
-                )
-                step = m % steps
-                cal = slope[0] * feat + intercepts[step]
-                prob = T.float32(1) / (T.float32(1) + T.exp(-cal))
-                out[m] = prob
-                slot = idx_mapping[m]
-                if slot >= 0:
-                    features[slot, step] = feat
-                    predictions[slot, step] = prob
-
-    return dspark_confidence_calibrate
-
-
-@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
-def dspark_confidence_margin_calibrate_kernel(
-    hidden: int, rank: int, steps: int = 5, threads: int = 128
-):
-    """``dspark_confidence_calibrate_kernel`` with the draft's top-2 margin in the
-    feature: ``feature = clamp(logit(...) + gain * log(1 + clamp(margins[m], 0,
-    MARGIN_CAP)), -40, 40)``, and ``out[m] = sigmoid(slope * feature + intercepts[m %
-    steps])``. A NaN margin counts as 0; ``gain = 0`` gives the other kernel's bits."""
-    assert (
-        hidden % _VEC == 0 and rank % _VEC == 0 and steps > 0 and threads % 32 == 0
-    )
-    warps = threads // 32
-    hidden_pieces = hidden // _VEC
-    rank_pieces = rank // _VEC
-    hidden_chunks = -(-hidden_pieces // threads)
-    rank_chunks = -(-rank_pieces // threads)
-    chunks = hidden_chunks + rank_chunks
-    rows = T.dynamic("rows")
-    slots = T.dynamic("slots")
-
-    @T.prim_func
-    def dspark_confidence_margin_calibrate(
-        h: T.Tensor((rows, hidden), T.bfloat16),
-        e: T.Tensor((rows, rank), T.bfloat16),
-        weight: T.Tensor((hidden + rank,), T.float32),
-        out: T.Tensor((rows,), T.float32),
-        slope: T.Tensor((1,), T.float32),
-        intercepts: T.Tensor((steps,), T.float32),
-        idx_mapping: T.Tensor((rows,), T.int32),
-        features: T.Tensor((slots, steps), T.float32),
-        predictions: T.Tensor((slots, steps), T.float32),
         margins: T.Tensor((rows,), T.float32),
-        gain: T.float32,
     ):
         with T.Kernel(rows, threads=threads) as m:
             tx = T.get_thread_binding()
@@ -354,7 +243,8 @@ def dspark_confidence_margin_calibrate_kernel(
                 margin = T.min(T.max(margins[m], T.float32(0.0)), T.float32(MARGIN_CAP))
                 feat = T.min(
                     T.max(
-                        head_feat + gain * T.log(T.float32(1.0) + margin),
+                        head_feat
+                        + T.float32(MARGIN_GAIN) * T.log(T.float32(1.0) + margin),
                         T.float32(-40.0),
                     ),
                     T.float32(40.0),
@@ -368,7 +258,7 @@ def dspark_confidence_margin_calibrate_kernel(
                     features[slot, step] = feat
                     predictions[slot, step] = prob
 
-    return dspark_confidence_margin_calibrate
+    return dspark_confidence_calibrate
 
 
 @cache
@@ -381,34 +271,15 @@ def _calibrate_kernel(hidden: int, rank: int, steps: int):
     return dspark_confidence_calibrate_kernel(hidden, rank, steps)
 
 
-@cache
-def _margin_calibrate_kernel(hidden: int, rank: int, steps: int):
-    return dspark_confidence_margin_calibrate_kernel(hidden, rank, steps)
-
-
 def declare(hidden: int, rank: int, steps: int = 5) -> None:
     """Declare the head over ``hidden``-wide hidden states and ``rank``-wide Markov
-    embeddings, and keep it; with a margin gain set, its margin kernel too."""
-    with_margin = margin_gain() > 0.0
+    embeddings, and keep it."""
     prepare.declare(
         lambda: [
             prepare.call(dspark_confidence_kernel, hidden, rank),
             prepare.call(dspark_confidence_calibrate_kernel, hidden, rank, steps),
-        ]
-        + (
-            [
-                prepare.call(
-                    dspark_confidence_margin_calibrate_kernel, hidden, rank, steps
-                )
-            ]
-            if with_margin
-            else []
-        ),
-        bind=lambda: (
-            _kernel(hidden, rank),
-            _calibrate_kernel(hidden, rank, steps),
-        )
-        + ((_margin_calibrate_kernel(hidden, rank, steps),) if with_margin else ()),
+        ],
+        bind=lambda: (_kernel(hidden, rank), _calibrate_kernel(hidden, rank, steps)),
     )
 
 
@@ -458,11 +329,11 @@ def dspark_confidence_calibrate(
     features: torch.Tensor,
     predictions: torch.Tensor,
     margins: torch.Tensor | None = None,
-    gain: float = 0.0,
 ) -> None:
-    """Fused confidence head projection and online logistic calibration; with
-    ``margins`` (FP32 [M], each row's top-2 logit margin) and a positive ``gain``,
-    the calibrated feature is the head's log-odds plus ``gain * log(1 + margin)``."""
+    """Fused confidence head projection and online logistic calibration on the head's
+    log-odds plus ``MARGIN_GAIN * log(1 + margin)``. ``margins`` (FP32 [M]): each
+    row's top-2 draft logit margin; a step that measured none passes ``None``, which
+    is a zero margin."""
     rows, width = hidden.shape
     rank = markov_embed.shape[-1]
     steps = intercepts.shape[0]
@@ -496,29 +367,18 @@ def dspark_confidence_calibrate(
         )
     if rows == 0:
         return
-    if margins is None or gain <= 0.0:
-        _calibrate_kernel(width, rank, steps)(
-            hidden,
-            markov_embed,
-            weight,
-            out,
-            slope,
-            intercepts,
-            idx_mapping,
-            features,
-            predictions,
-        )
-        return
-    if (
+    if margins is None:
+        margins = torch.zeros(rows, dtype=torch.float32, device=hidden.device)
+    elif (
         margins.dtype != torch.float32
         or margins.shape != (rows,)
         or not margins.is_contiguous()
     ):
         raise ValueError(
-            "The margin-calibrated DSpark confidence head needs a contiguous FP32 [M] "
+            "The TileLang DSpark confidence calibration needs a contiguous FP32 [M] "
             f"margin: {tuple(margins.shape)} {margins.dtype}"
         )
-    _margin_calibrate_kernel(width, rank, steps)(
+    _calibrate_kernel(width, rank, steps)(
         hidden,
         markov_embed,
         weight,
@@ -529,7 +389,6 @@ def dspark_confidence_calibrate(
         features,
         predictions,
         margins,
-        float(gain),
     )
 
 
@@ -538,6 +397,8 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
     probability is the one-launch kernel."""
 
     tp_invariant: bool = True
+    # Its calibrated launch reads each row's top-2 draft logit margin.
+    takes_margin: bool = True
 
     def __init__(self, hidden_size: int, markov_rank: int, prefix: str = ""):
         super().__init__(hidden_size + markov_rank, prefix=prefix)
@@ -578,7 +439,6 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
         features: torch.Tensor,
         predictions: torch.Tensor,
         margins: torch.Tensor | None = None,
-        margin_gain: float = 0.0,
     ) -> torch.Tensor:
         """Each row's calibrated acceptance probability in one TileLang launch."""
         if out is None:
@@ -596,20 +456,17 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
             features,
             predictions,
             margins,
-            margin_gain,
         )
         return out
 
 
 __all__ = [
     "MARGIN_CAP",
-    "MARGIN_GAIN_ENV",
+    "MARGIN_GAIN",
     "TileLangConfidenceHead",
     "declare",
     "dspark_confidence",
     "dspark_confidence_calibrate",
     "dspark_confidence_calibrate_kernel",
     "dspark_confidence_kernel",
-    "dspark_confidence_margin_calibrate_kernel",
-    "margin_gain",
 ]

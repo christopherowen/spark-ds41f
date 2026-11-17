@@ -218,12 +218,13 @@ def test_declared_as_the_head_calls_it():
     ]
 
 
-# --- the top-2 margin in the calibrated feature -------------------------------------
+# --- the calibrated launch: the head's log-odds and the draft's top-2 margin ----------
 
 STEPS = 5
+GAIN = confidence.MARGIN_GAIN
 
 
-def _calibrate(hidden, markov, weight, *, margins=None, gain=0.0, slots=None, seed=7):
+def _calibrate(hidden, markov, weight, *, margins=None, slots=None, seed=7):
     """The fused calibration over ``hidden``'s rows: probabilities, and the features
     and predictions it recorded (rows of -7 where it wrote nothing)."""
     rows = hidden.shape[0]
@@ -238,92 +239,86 @@ def _calibrate(hidden, markov, weight, *, margins=None, gain=0.0, slots=None, se
     out = torch.empty(rows, dtype=torch.float32, device="cuda")
     confidence.dspark_confidence_calibrate(
         hidden, markov, weight, out, slope, intercepts, slots, features, predictions,
-        margins, gain,
+        margins,
     )  # fmt: skip
     return out, features, predictions, slope, intercepts
 
 
-def _margin_reference(hidden, markov, weight, margins, gain, slope, intercepts):
+def _calibrate_reference(hidden, markov, weight, margins, slope, intercepts):
     """The feature and probability in FP64 from the kernel's own FP32 head
     probability."""
     p = _tilelang(hidden, markov, weight).double().clamp(1e-6, 1 - 1e-6)
     margin = torch.nan_to_num(margins.double(), nan=0.0).clamp(0.0, confidence.MARGIN_CAP)
-    feature = (torch.log(p / (1 - p)) + gain * torch.log1p(margin)).clamp(-40.0, 40.0)
+    feature = (torch.log(p / (1 - p)).clamp(-40.0, 40.0) + GAIN * torch.log1p(margin)).clamp(-40.0, 40.0)
     step = torch.arange(hidden.shape[0], device="cuda") % STEPS
     return feature, torch.sigmoid(slope.double() * feature + intercepts.double()[step])
 
 
+def _check(got, want_features, want_probs, rows):
+    out, features, predictions = got[:3]
+    assert torch.allclose(features[: rows // STEPS].reshape(-1).double(), want_features, atol=2e-5, rtol=2e-6)
+    assert torch.allclose(out.double(), want_probs, atol=2e-6)
+    assert torch.equal(predictions[: rows // STEPS].reshape(-1), out)
+
+
 @pytest.mark.parametrize("rows", [5, 10, 80])
-def test_zero_margins_give_the_calibration_kernels_bits(rows):
+def test_no_margin_is_a_zero_margin_and_the_heads_own_log_odds(rows):
     hidden, markov, weight = _inputs(rows, seed=11)
-    plain = _calibrate(hidden, markov, weight)
     zeros = torch.zeros(rows, device="cuda")
-    with_margin = _calibrate(hidden, markov, weight, margins=zeros, gain=2.0)
-    for a, b in zip(plain[:3], with_margin[:3]):
+    none = _calibrate(hidden, markov, weight)
+    zero = _calibrate(hidden, markov, weight, margins=zeros)
+    for a, b in zip(none[:3], zero[:3]):
         assert torch.equal(a, b)
-    # No margin tensor, or no gain, is the calibration kernel itself.
-    no_gain = _calibrate(hidden, markov, weight, margins=zeros + 3.0, gain=0.0)
-    for a, b in zip(plain[:3], no_gain[:3]):
-        assert torch.equal(a, b)
+    feature, prob = _calibrate_reference(hidden, markov, weight, zeros, none[3], none[4])
+    _check(none, feature, prob, rows)
 
 
 @pytest.mark.parametrize("rows", [5, 10, 80])
-@pytest.mark.parametrize("gain", [0.5, 2.0])
-def test_margin_feature_and_probability(rows, gain):
+def test_margin_feature_and_probability(rows):
     hidden, markov, weight = _inputs(rows, seed=12)
     generator = torch.Generator(device="cuda").manual_seed(13)
     margins = torch.rand(rows, generator=generator, device="cuda") * 12.0
-    out, features, predictions, slope, intercepts = _calibrate(
-        hidden, markov, weight, margins=margins, gain=gain
-    )
-    feature, prob = _margin_reference(
-        hidden, markov, weight, margins, gain, slope, intercepts
-    )
-    assert torch.allclose(features[: rows // STEPS].reshape(-1).double(), feature, atol=2e-5, rtol=2e-6)
-    assert torch.allclose(out.double(), prob, atol=2e-6)
-    assert torch.equal(predictions[: rows // STEPS].reshape(-1), out)
+    got = _calibrate(hidden, markov, weight, margins=margins)
+    feature, prob = _calibrate_reference(hidden, markov, weight, margins, got[3], got[4])
+    _check(got, feature, prob, rows)
     # A larger margin never lowers the probability (the slope is positive).
-    more, *_ = _calibrate(hidden, markov, weight, margins=margins + 1.0, gain=gain)
-    assert bool((more >= out).all())
+    more, *_ = _calibrate(hidden, markov, weight, margins=margins + 1.0)
+    assert bool((more >= got[0]).all())
 
 
 def test_margin_is_bounded_and_a_negative_or_nan_margin_is_zero():
     hidden, markov, weight = _inputs(STEPS, seed=14)
     margins = torch.tensor([INF, -3.0, NAN, 1e30, confidence.MARGIN_CAP], device="cuda")
-    out, features, _, slope, intercepts = _calibrate(
-        hidden, markov, weight, margins=margins, gain=2.0
-    )
-    feature, prob = _margin_reference(hidden, markov, weight, margins, 2.0, slope, intercepts)
+    got = _calibrate(hidden, markov, weight, margins=margins)
+    out, features = got[0], got[1]
+    feature, prob = _calibrate_reference(hidden, markov, weight, margins, got[3], got[4])
     assert bool(torch.isfinite(out).all()) and bool(torch.isfinite(features[0]).all())
-    assert torch.allclose(features[0].double(), feature, atol=2e-5, rtol=2e-6)
-    assert torch.allclose(out.double(), prob, atol=2e-6)
+    _check(got, feature, prob, STEPS)
     # The negative and the NaN margin add nothing: the head's own log-odds.
     plain = _calibrate(hidden, markov, weight)
     assert features[0, 1] == plain[1][0, 1] and features[0, 2] == plain[1][0, 2]
 
 
-def test_margin_rows_independent_of_batch_and_repeatable():
+def test_calibration_rows_independent_of_batch_and_repeatable():
     hidden, markov, weight = _inputs(80, seed=15)
     generator = torch.Generator(device="cuda").manual_seed(16)
     margins = torch.rand(80, generator=generator, device="cuda") * 9.0
-    whole = _calibrate(hidden, markov, weight, margins=margins, gain=2.0)
-    again = _calibrate(hidden, markov, weight, margins=margins, gain=2.0)
+    whole = _calibrate(hidden, markov, weight, margins=margins)
+    again = _calibrate(hidden, markov, weight, margins=margins)
     for a, b in zip(whole[:3], again[:3]):
         assert torch.equal(a, b)
     part = _calibrate(
         hidden[:10].contiguous(), markov[:10].contiguous(), weight,
-        margins=margins[:10].contiguous(), gain=2.0,
+        margins=margins[:10].contiguous(),
     )  # fmt: skip
     assert torch.equal(part[0], whole[0][:10])
 
 
-def test_margin_records_only_live_slots():
+def test_calibration_records_only_live_slots():
     hidden, markov, weight = _inputs(10, seed=17)
     margins = torch.full((10,), 2.5, device="cuda")
     slots = torch.tensor([1, 1, 1, -1, -1, 0, 0, 0, 0, 0], dtype=torch.int32, device="cuda")
-    out, features, predictions, *_ = _calibrate(
-        hidden, markov, weight, margins=margins, gain=2.0, slots=slots
-    )
+    out, features, predictions, *_ = _calibrate(hidden, markov, weight, margins=margins, slots=slots)
     assert bool((features[1, 3:] == -7.0).all()) and bool((predictions[1, 3:] == -7.0).all())
     assert torch.equal(predictions[1, :3], out[:3])
     assert torch.equal(predictions[0], out[5:])
@@ -331,14 +326,14 @@ def test_margin_records_only_live_slots():
     assert bool(torch.isfinite(out).all())
 
 
-def test_margin_refuses_other_layouts():
+def test_calibration_refuses_other_margin_layouts():
     hidden, markov, weight = _inputs(STEPS, seed=18)
     with pytest.raises(ValueError):
-        _calibrate(hidden, markov, weight, margins=torch.zeros(STEPS + 1, device="cuda"), gain=2.0)
+        _calibrate(hidden, markov, weight, margins=torch.zeros(STEPS + 1, device="cuda"))
     with pytest.raises(ValueError):
-        _calibrate(hidden, markov, weight, margins=torch.zeros(STEPS, device="cuda").double(), gain=2.0)
+        _calibrate(hidden, markov, weight, margins=torch.zeros(STEPS, device="cuda").double())
     with pytest.raises(ValueError):
-        _calibrate(hidden, markov, weight, margins=torch.zeros(STEPS, 2, device="cuda")[:, 0], gain=2.0)
+        _calibrate(hidden, markov, weight, margins=torch.zeros(STEPS, 2, device="cuda")[:, 0])
 
 
 def test_the_head_passes_its_margins():
@@ -347,33 +342,16 @@ def test_the_head_passes_its_margins():
     hidden, markov, weight = _inputs(STEPS, seed=19)
     head.proj = SimpleNamespace(weight=weight.view(1, -1))
     head.hidden_size, head.markov_rank = HIDDEN, RANK
+    assert head.takes_margin is True
     margins = torch.tensor([0.0, 1.0, 2.0, 4.0, 8.0], device="cuda")
-    want, features, predictions, slope, intercepts = _calibrate(
-        hidden, markov, weight, margins=margins, gain=2.0
-    )
-    got_features = torch.full_like(features, -7.0)
-    got_predictions = torch.full_like(predictions, -7.0)
     slots = torch.zeros(STEPS, dtype=torch.int32, device="cuda")
-    got = head.probability_and_calibrate(
-        hidden, markov, None, slope, intercepts, slots, got_features, got_predictions,
-        margins, 2.0,
-    )  # fmt: skip
-    assert torch.equal(got, want)
-    assert torch.equal(got_features, features) and torch.equal(got_predictions, predictions)
-
-
-def test_margin_kernel_declared_only_with_a_gain(monkeypatch):
-    monkeypatch.setenv(confidence.MARGIN_GAIN_ENV, "2")
-    assert confidence.margin_gain() == 2.0
-    registry = JitWarmupRegistry(vllm_config=None)
-    with registry.activate():
-        confidence.declare(HIDDEN, RANK)
-    assert list(prepare.declared_calls(registry)) == [
-        (confidence.dspark_confidence_kernel, (HIDDEN, RANK), {}),
-        (confidence.dspark_confidence_calibrate_kernel, (HIDDEN, RANK, 5), {}),
-        (confidence.dspark_confidence_margin_calibrate_kernel, (HIDDEN, RANK, 5), {}),
-    ]
-    monkeypatch.setenv(confidence.MARGIN_GAIN_ENV, "-1")
-    assert confidence.margin_gain() == 0.0
-    monkeypatch.delenv(confidence.MARGIN_GAIN_ENV)
-    assert confidence.margin_gain() == 0.0
+    for given in (margins, None):
+        want, features, predictions, slope, intercepts = _calibrate(hidden, markov, weight, margins=given)
+        got_features = torch.full_like(features, -7.0)
+        got_predictions = torch.full_like(predictions, -7.0)
+        got = head.probability_and_calibrate(
+            hidden, markov, None, slope, intercepts, slots, got_features, got_predictions,
+            *(() if given is None else (given,)),
+        )  # fmt: skip
+        assert torch.equal(got, want)
+        assert torch.equal(got_features, features) and torch.equal(got_predictions, predictions)

@@ -981,6 +981,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         assert self.model.confidence_head is not None
         return self.model.confidence_head.probability(head_hidden, markov_embed, out)
 
+    @property
+    def confidence_takes_margin(self) -> bool:
+        """Whether the confidence head calibrates on each draft's top-2 logit margin
+        beside its own probability (``TileLangConfidenceHead``)."""
+        return bool(getattr(self.model.confidence_head, "takes_margin", False))
+
     def compute_and_calibrate_confidence(
         self,
         head_hidden: torch.Tensor,
@@ -989,14 +995,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         estimator: object,
         idx_mapping: torch.Tensor,
         margins: torch.Tensor | None = None,
-        margin_gain: float = 0.0,
     ) -> torch.Tensor:
         """Per-position acceptance probability calibrated online by ``estimator``;
-        with ``margins`` (each row's top-2 draft logit margin) and a positive
-        ``margin_gain``, calibrated on the head's log-odds plus ``margin_gain *
-        log(1 + margin)``."""
-        if margins is None or margin_gain <= 0.0:
-            margins, margin_gain = None, 0.0
+        with ``margins`` (each row's top-2 draft logit margin, which a head that
+        ``confidence_takes_margin`` is handed), calibrated on the head's log-odds plus
+        the margin term."""
+        if not self.confidence_takes_margin:
+            margins = None
         assert self.model.confidence_head is not None
         head = self.model.confidence_head
         if (
@@ -1007,8 +1012,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             and idx_mapping.is_contiguous()
             and idx_mapping.numel() == head_hidden.shape[0]
         ):
-            # The margin arguments only when there is one: without it the call is
-            # the one every confidence head takes.
+            # The margin only to a head that takes one: without it the call is the
+            # one every confidence head takes.
             return head.probability_and_calibrate(
                 head_hidden,
                 markov_embed,
@@ -1018,7 +1023,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 idx_mapping,
                 estimator.features,
                 estimator.predictions,
-                *(() if margins is None else (margins, margin_gain)),
+                *(() if margins is None else (margins,)),
             )
         probs = self.compute_confidence(head_hidden, markov_embed, out=out)
         if margins is not None:
@@ -1026,7 +1031,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 add_margin_to_confidence_probs,
             )
 
-            add_margin_to_confidence_probs(probs, margins, margin_gain)
+            add_margin_to_confidence_probs(probs, margins)
         if estimator is not None:
             num_steps = estimator.num_speculative_steps
             estimator.calibrate_confidence_probs(

@@ -293,10 +293,11 @@ receipts.
 
 ### One variable
 
-`SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE=2`: the feature the online estimator calibrates becomes
-`logit(p) + 2 * log(1 + margin)`, with `p` the confidence head's probability and `margin` the gap
-between the drafted token's logit and the runner-up's. Unset (the default), nothing changes: the
-same kernels, the same calls.
+The feature the online estimator calibrates: `logit(p) + 2 * log(1 + margin)` in place of
+`logit(p)`, with `p` the confidence head's probability and `margin` the gap between the drafted
+token's logit and the runner-up's. For the screen it sat behind a switch
+(`SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE=2`, at `29cbe60cb`), so that two arms at one commit
+differed in it alone. The switch is gone: see [Integration](#integration).
 
 ### Which term
 
@@ -320,18 +321,20 @@ turns' fit applied to those turns unchanged gives AUC 0.886 against 0.859.
 
 ### The change
 
-In candidate-61's overlay, all of it inert without the switch:
+In candidate-61's overlay (as integrated; the screened commit had the same arithmetic behind the
+switch, in a second kernel beside the unchanged one):
 
 - [confidence.py](../2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/confidence.py)
-  (candidate-60's file, new in the overlay): `dspark_confidence_margin_calibrate_kernel`, the fused
-  calibration kernel with the margin and the gain as two more inputs. The margin is clamped to
-  [0, 64]; a zero margin gives the calibration kernel's bits.
-- `dspark/speculator.py`: the switch turns on the top-2 pairs the greedy steps can already
-  report (declared kernels, used by the top-2 branch that is off by default; with a zero branch
-  margin no draft changes) and hands the step's margins to the confidence head. Only the
-  vocabulary-parallel greedy steps measure a margin; other steps calibrate as before.
-- `nvidia/dspark.py`: `compute_and_calibrate_confidence` passes the margins on.
-- `acceptance_estimator.py`: the estimator's start for the new feature (slope 0.67, intercepts
+  (candidate-60's file, new in the overlay): the fused calibration kernel takes each row's margin
+  and calibrates on the sum. The margin is clamped to [0, 64]; a zero margin leaves the head's
+  own log-odds.
+- `dspark/speculator.py`: the greedy steps always report each draft's runner-up (the top-2
+  pairs, declared kernels that the top-2 branch already used; with a zero branch margin no draft
+  changes), and the step's margins go to the confidence head. The vocabulary-parallel greedy
+  steps measure a margin, which is every draft step of this deployment.
+- `nvidia/dspark.py`: `compute_and_calibrate_confidence` passes the margins to a head that takes
+  them.
+- `acceptance_estimator.py`: the estimator's start for the feature (slope 0.67, intercepts
   −1.41, −1.79, −2.25, −2.25, −2.23): the shipped start moved by the difference between the two
   fits on the agent turns (`warm` in the receipts). The online refit takes over from there.
 
@@ -339,22 +342,21 @@ Every draft is still verified by the target, so no output can change.
 
 ### Tests (sp8, candidate-60's image with candidate-61's overlay)
 
-[bundles/margin-tests](bundles/margin-tests) and [bundles/margin-tests-on](bundles/margin-tests-on)
-(the switch set to 2), run with `scripts/lab.py kernel-local` from copies staged under
-`~/spark-lab` before the commit was published:
+[bundles/margin-tests](bundles/margin-tests), run with `scripts/lab.py kernel-local` from a copy
+staged under `~/spark-lab` before each commit was published:
 
-- the kernel (`tests/kernels/test_deepseek_v41_tilelang_confidence.py`): a zero margin or a zero
-  gain gives the calibration kernel's bits; the feature and the probability against an FP64
+- the kernel (`tests/kernels/test_deepseek_v41_tilelang_confidence.py`): no margin is a zero
+  margin, which leaves the head's own log-odds; the feature and the probability against an FP64
   reference; an infinite, negative or NaN margin; rows independent of the batch; only live slots
-  recorded; refused layouts; declared only with a gain;
+  recorded; refused layouts;
 - `tests/v1/spec_decode/test_margin_confidence.py`: the torch form, the estimator's start, the
-  model's dispatch (no margin arguments without a margin), and the speculator's confidence step
-  with a step's margins on the fused and the unfused path;
-- the estimator, adaptive-verification and DSpark draft tests of the image, with the switch
-  off and on.
+  model's dispatch (the margin only to a head that takes it), and the speculator's confidence
+  step with a step's margins on the fused and the unfused path;
+- the estimator, adaptive-verification and DSpark draft tests of the image.
 
-Result: 192 passed with the switch off, 158 with it on, 1 skipped (needs two CUDA devices)
-([receipts/margin-tests](receipts/margin-tests)). One test is deselected:
+Result: 190 passed, 1 skipped (needs two CUDA devices)
+([receipts/margin-tests](receipts/margin-tests)). At the screened commit, with the switch: 192
+passed with it off and 158 with it on. One test is deselected:
 `test_dspark_revisited_position_uses_step_seed[True]` fails the same way on main's overlay
 without this change (the TileLang sampler refuses FP64 Gumbel draws).
 
@@ -363,19 +365,14 @@ attribute; the call site now reads it with a default.
 
 ### Screen (tp4-ring)
 
-[screen-margin-tp4.json](screen-margin-tp4.json): four boots at one commit, the control
-([tp4-margin-off.json](tp4-margin-off.json): candidate-61's dev arm with the new files mounted
-and the switch unset) and the margin arm ([tp4-margin.json](tp4-margin.json)) alternating, each
-with candidate-61's screen workloads (single stream 150 s, 16 streams 90 s, the greedy
-determinism record). Both arms name this folder's copy of candidate-60's source lock
-([upstreams.lock.json](upstreams.lock.json), unchanged): the first queue attempt (at
-`9cf1545f1`) was refused before any boot, because the switch is not in candidate-60's qualified
-profile ("qualified config drift"), and a lock of the experiment's own is how an arm with a
-variable of its own is declared.
-
-```sh
-bin/spark candidate queue tp4-ring experiments/2026-11-17-draft-calibration-sizing/screen-margin-tp4.json --apply
-```
+`screen-margin-tp4.json` at `29cbe60cb`: four boots at one commit, the control
+(`tp4-margin-off.json`: candidate-61's dev arm with the new files mounted and the switch unset)
+and the margin arm (`tp4-margin.json`) alternating, each with candidate-61's screen workloads
+(single stream 150 s, 16 streams 90 s, the greedy determinism record). The first queue attempt
+(at `9cf1545f1`) was refused before any boot: the switch was not in candidate-60's qualified
+profile ("qualified config drift"), and the arms then named a copy of candidate-60's source
+lock of their own, which is how an arm with a variable of its own is declared. The spec, the two
+arms and the lock copy were removed with the switch; they are in the history at `40d8ec130`.
 
 ### Runs
 
@@ -449,3 +446,12 @@ files mounted): the files and the unset switch change nothing, and two boots of 
 - The gain is fixed at 2 and the estimator's start comes from agent traffic; neither was tuned
   on the screen.
 - An overlay on candidate-60's image, not a build.
+
+### Integration
+
+The owner's decision (2026-11-17): the margin is the better way, so it is the only way. The
+switch, the second kernel and the two arms are removed; the calibration kernel always carries the
+margin, the greedy steps always report the runner-up, and candidate-61's dev arm
+([tp4-dev.json](../2026-11-16-c61-decode/tp4-dev.json)) mounts `confidence.py` and its tests.
+A head without the margin (the image's own `confidence.py`, when an arm does not mount the
+overlay's) is called as before and starts from the shipped intercepts.

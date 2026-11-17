@@ -40,12 +40,13 @@ _WARM_CONFIDENCE_HEAD_INTERCEPTS: tuple[float, ...] = (
 )
 
 
-# The same start for the feature with the draft's top-2 margin in it,
-# ``logit(p) + 2 * log(1 + margin)`` (SPARK_DS41F_DSPARK_MARGIN_CONFIDENCE=2): the
-# slope and the intercept shifts are those between the two fits on the AgentX turns
-# of experiments/2026-11-17-draft-calibration-sizing (slope 1.086 -> 0.728,
-# intercepts lower by 0.89, 1.15, 1.29, 1.40, 1.49), applied to the values above.
-# Another gain starts from these too; the online refit moves them.
+# A confidence head that takes the draft's top-2 logit margin calibrates on
+# ``logit(p) + _CONFIDENCE_MARGIN_GAIN * log(1 + margin)`` (the TileLang head's fused
+# kernel, whose MARGIN_GAIN this is). Its start: the slope and the intercept shifts
+# between the two fits on the AgentX turns of
+# experiments/2026-11-17-draft-calibration-sizing (slope 1.086 -> 0.728, intercepts
+# lower by 0.89, 1.15, 1.29, 1.40, 1.49), applied to the values above.
+_CONFIDENCE_MARGIN_GAIN = 2.0
 _WARM_MARGIN_CONFIDENCE_SLOPE = 0.67
 _WARM_MARGIN_CONFIDENCE_INTERCEPTS: tuple[float, ...] = (
     -1.41,
@@ -59,7 +60,9 @@ _MARGIN_CAP = 64.0
 
 
 def add_margin_to_confidence_probs(
-    confidence_probs: torch.Tensor, margins: torch.Tensor, gain: float
+    confidence_probs: torch.Tensor,
+    margins: torch.Tensor,
+    gain: float = _CONFIDENCE_MARGIN_GAIN,
 ) -> None:
     """``p <- sigmoid(logit(p) + gain * log(1 + margin))`` in place, for the paths
     that calibrate the head's probabilities outside its fused kernel. ``margins``
