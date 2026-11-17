@@ -823,3 +823,21 @@ never runs over pynccl ([tp4-switched-stepops-learner.json](tp4-switched-stepops
 all-reduces of 4 MiB, the kind the step runs over pynccl for its larger all-reduces
 ([tp4-switched-stepops-bf16.json](tp4-switched-stepops-bf16.json)). If the learner's operations cost and the BF16
 ones do not, running a kind of NCCL operation the step does not is what costs, whatever communicator runs it.
+
+Queue entry `20261117T223644-stepops-tp4-switched`, commit `2d7f711e3`; receipts [stepops](receipts/stepops)
+(grids, startup memory, telemetry, verdicts, [grid-split.txt](receipts/stepops/grid-split.txt), the arms' log
+lines: each operations boot logged its operations).
+
+| Grid against the learner off (geometric mean, 20 shapes) | Whole step | Target forward | Boot to boot |
+| --- | ---: | ---: | ---: |
+| the learner's FP32 all-gathers and all-reduces at load, on the step's communicator | −0.26% | −0.34% | −0.02% |
+| BF16 all-reduces at load, on the step's communicator | −0.08% | −0.08% | −0.29% |
+| learner off, repeat | +0.18% | +0.13% | |
+
+**The operations cost nothing.** Run on the step's existing communicator, the learner's exchanges leave the
+grid where it is with the learner off. What has cost about 1% in every job is a second NCCL communicator
+made: alive and idle (+0.91%, +1.23%), destroyed after use (+1.44%, one boot), on Socket with the learner
+(+1.28%), on RoCE with the learner (+0.98%, +1.04%). The learner over the step's communicator, with no second
+one made, read +0.58% (boots +0.79%, +0.40%); the attribution job put the learner without a communicator at
++0.13%. A second communicator's cost outlasts its destroy, so it is something its making leaves behind, not
+anything it does while it exists.
