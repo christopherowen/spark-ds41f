@@ -296,12 +296,17 @@ collectives, and DSpark drafting.
    1-launch atomic `project_and_finalize_streams` (which regressed in `#946`),
    `c61-r16` lands the intermediate split: `mhc_finalize` (`80×/step`) splits
    into a 5-CTA critical-path `mhc_finalize_norm` (`1.9 us`) plus off-critical-path
-   `mhc_finalize_sinkhorn` (`threads=32`) on dedicated `_SINKHORN_STREAMS` via
-   `async_sinkhorn()` / `wait_sinkhorn(...)` (`model.py`), while keeping
-   `pdl.chain()` strictly first across all `mhc` kernels so `mhc_project_streams`
-   does not contend with `oneshot_allreduce`'s early `roce_doorbell` `T.pdl_trigger()`
-   (verified `-2.23..-2.69 us/call` = `-0.20..-0.23 ms/step` on `sp8` Cold-L2,
-   `72/72` `torch.equal`, `0` PDL violations). Still open: keep `project_streams`
+   `mhc_finalize_sinkhorn` (`threads=32`) on `aux_stream()` (reused from
+   `vllm.utils.torch_utils.aux_stream()` in `c61-r20`; `_finalize_sinkhorn`
+   stays launched before `_finalize_norm` so the `_finalize_norm -> GEMM` PDL
+   edge stays unbroken) via `async_sinkhorn()` / `wait_sinkhorn(...)` (`model.py`),
+   while keeping `pdl.chain()` strictly first across all `mhc` kernels so
+   `mhc_project_streams` does not contend with `oneshot_allreduce`'s early
+   `roce_doorbell` `T.pdl_trigger()` (verified `-2.23..-2.69 us/call` =
+   `-0.20..-0.23 ms/step` on `sp8` Cold-L2, `72/72` `torch.equal`, `0` PDL
+   violations; fusing MXFP8 cast into `dspark_context.context_inputs` was also
+   rejected after `sp8` Cold-L2 measured `+1.23..+3.95 us` slower with `main_proj`).
+   Still open: keep `project_streams`
    writing the unnormalized collapsed stream `C` and the partial sums-of-squares
    `Q`, and have the consumer decode projections (`fused_wqa_wkv` and MoE
    gate/shared-expert input) reduce the partial sums `Q`, multiply by `rsqrt * gamma`,

@@ -1323,11 +1323,17 @@ def _sinkhorn_stream(device: torch.device) -> torch.cuda.Stream:
     device = _normalize_device(device)
     stream = _SINKHORN_STREAMS.get(device)
     if stream is None:
-        try:
-            _, high_priority = torch.cuda.Stream.priority_range()
-            stream = torch.cuda.Stream(device=device, priority=high_priority)
-        except Exception:
-            stream = torch.cuda.Stream(device=device)
+        from vllm.utils.torch_utils import aux_stream
+
+        shared = aux_stream()
+        if shared is not None and _normalize_device(shared.device) == device:
+            stream = shared
+        else:
+            try:
+                _, high_priority = torch.cuda.Stream.priority_range()
+                stream = torch.cuda.Stream(device=device, priority=high_priority)
+            except Exception:
+                stream = torch.cuda.Stream(device=device)
         _SINKHORN_STREAMS[device] = stream
     return stream
 
