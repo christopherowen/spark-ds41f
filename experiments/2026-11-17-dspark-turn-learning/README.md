@@ -182,3 +182,33 @@ Reading: on distinct agent sessions the shared W1 table (one row a previous toke
 learns only with small steps, slowly, and still improving after an hour; what the smoke boot showed was
 repeated prompts. The rules that need the least serving work behave differently: block maxima (which the
 draft step already computes) is positive, live4 is negative.
+
+Follow-up runs on the same turns ([receipts/study-agentx-cap](receipts/study-agentx-cap),
+[study-agentx-small](receipts/study-agentx-small), [study-agentx-adagrad](receipts/study-agentx-adagrad)):
+
+- **Drift cap** (each row within its loaded norm): step 0.1 still loses (full −13.7%, block −9.1%); the
+  small steps are unchanged (their rows stay inside the cap). The loss of large steps is the direction:
+  a row serves every context after its token.
+- **Smaller SGD steps and a per-row AdaGrad step** (frequent rows step less):
+
+| Rule | Step | Gain [95% CI] | By quarter of the hour |
+| --- | --- | ---: | --- |
+| full vocabulary | AdaGrad 0.3 | +1.52% [+1.26, +1.81] | +1.14 / +1.27 / +1.74 / +1.80% |
+| full vocabulary | SGD 0.005 | +1.39% [+1.11, +1.65] | +0.88 / +0.97 / +1.41 / +2.02% |
+| full vocabulary | SGD 0.002 | +0.91% [+0.72, +1.10] | +0.42 / +0.78 / +0.95 / +1.30% |
+| block maxima | AdaGrad 0.3 | +0.96% [+0.73, +1.22] | +0.69 / +0.53 / +1.03 / +1.46% |
+| block maxima | AdaGrad 0.1 | +0.84% [+0.66, +1.02] | +0.36 / +0.73 / +0.80 / +1.31% |
+| block maxima | SGD 0.01 | +0.77% [+0.56, +1.00] | +0.46 / +0.58 / +0.63 / +1.22% |
+| block maxima | AdaGrad 1.0 | −0.40% [−0.77, −0.03] | −1.26 / −0.84 / −0.30 / +0.49% |
+
+## Where it stands
+
+After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
+1.5% with the full-vocabulary rule and about 1% with the block-maxima rule, the one whose serving work
+fits a microsecond budget (it reads only the maxima the draft step already computes). Both are still
+rising at the end of the hour (last quarter +1.8% and +1.5%). Teacher-forced acceptance is an upper bound
+of what verification realizes; no serving speed has been measured. Learning resets at every restart
+unless the learned rows are saved.
+
+Not built: the serving-side update (shadow, then on). What an hour cannot show is where the gain levels
+off; a longer collection in observe mode, studied the same way, would.
