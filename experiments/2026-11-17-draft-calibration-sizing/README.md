@@ -376,3 +376,76 @@ variable of its own is declared.
 ```sh
 bin/spark candidate queue tp4-ring experiments/2026-11-17-draft-calibration-sizing/screen-margin-tp4.json --apply
 ```
+
+### Runs
+
+Queue entry `20261117T182659-screen-margin-tp4` on dgx1..dgx4 at `29cbe60cb`, 18:27 to 19:05 UTC,
+four boots back to back. Receipts: [receipts/margin-screen](receipts/margin-screen)
+([summary.txt](receipts/margin-screen/summary.txt) from [margin_screen.py](margin_screen.py),
+the lab's [table.txt](receipts/margin-screen/table.txt), each arm's servebench results and the
+gate's lines).
+
+The margin arm acts: its first boot has the switch in the container's environment and
+`confidence.py` mounted, and compiled 35 kernels on each node, `dspark_confidence_margin_calibrate`
+and the top-2 selection kernels among them (so that boot's time to ready, 119.1 s, is not a
+comparison; the second margin boot compiled none and was ready in 112.4 s, the controls in 118
+to 119 s). No failed request in any run. Free memory after each stop was 116.9 to 117.9 GiB on
+every node, the same for both arms.
+
+Single stream (150 s after a 30 s warm-up, the same seed and prompts):
+
+| Arm | tok/s | Steps/s | ms a step | Tokens a step | Drafts verified a step | Greedy gate |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| control | 85.09 | 35.840 | 27.90 | 2.3826 | 2.586 | identical, `0a2dacdd` / `12fd8257` |
+| margin | 85.95 | 36.233 | 27.60 | 2.3817 | 2.537 | identical, `0a2dacdd` / `12fd8257` |
+| control, second boot | 85.01 | 35.807 | 27.93 | 2.3823 | 2.586 | identical, `0a2dacdd` / `12fd8257` |
+| margin, second boot | 86.11 | 36.253 | 27.58 | 2.3840 | 2.539 | identical, `0a2dacdd` / `12fd8257` |
+
+16 streams (90 s after a 30 s warm-up):
+
+| Arm | tok/s | Steps/s | Tokens a step | Rows scheduled a step |
+| --- | ---: | ---: | ---: | ---: |
+| control | 270.16 | 7.789 | 34.736 | 37.55 |
+| margin | 273.39 | 7.900 | 34.629 | 37.40 |
+| control, second boot | 270.06 | 7.778 | 34.743 | 37.54 |
+| margin, second boot | 273.63 | 7.933 | 34.519 | 37.28 |
+
+Margin against control:
+
+| | Means of two boots | Each boot pair | Paired batches (20) [95%] |
+| --- | ---: | --- | ---: |
+| Single stream tok/s | 85.05 → 86.03, +1.16% | +1.02%, +1.29% | +1.20% [0.17, 2.22] |
+| Single stream steps/s | +1.17% | +1.10%, +1.25% | +1.17% [0.82, 1.52] |
+| Single stream tokens a step | +0.01% | −0.04%, +0.07% | +0.04% [−1.11, 1.19] |
+| 16 streams tok/s | 270.11 → 273.51, +1.26% | +1.20%, +1.32% | +1.28% [0.62, 1.94] |
+| 16 streams steps/s | +1.71% | +1.43%, +2.00% | +1.71% [1.04, 2.39] |
+| 16 streams tokens a step | −0.48% | −0.31%, −0.65% | −0.47% [−1.16, 0.23] |
+
+The control is the recorded `c61-r18` again (85.03 and 269.84 on the same code without the new
+files mounted): the files and the unset switch change nothing, and two boots of one arm differ by
+0.1%.
+
+### Conclusion
+
+- **The margin is a gain on both screen workloads: +1.2% single stream, +1.3% at 16 streams**,
+  in both boot pairs, with identical greedy output. The size is what the offline replay gave
+  (+1.3 to +1.8% single stream, +0.6 to +1.5% at many-stream costs).
+- **It comes from the step, not from more tokens.** Single stream commits the same tokens a
+  step in 0.33 ms less; it verifies 1.9% fewer drafted rows. At 16 streams a step is 1.7% faster
+  for 0.5% fewer tokens.
+- **Not all of the step time is attributed.** 0.05 fewer rows a step at the 2 to 3 ms a row
+  measured in `c61` is 0.10 to 0.15 ms of the 0.33 ms. The first draft's acceptance also reads
+  higher (0.680 against 0.666) though the drafts are the same, so the mix of step kinds moved
+  (the copy drafter's choice reads DSpark's survival too); the screen's counters do not separate
+  that.
+- Against `candidate-60`'s recorded base (83.23 and 272.92): 86.03 single stream (+3.4%) and
+  273.51 at 16 streams (+0.2%, the first `c61` state above the base at 16 streams).
+
+### Limits
+
+- The screen's two workloads on tp4-ring only: no AgentX run (the traffic the lever was sized
+  on), no other shape, no sampled requests (their draft steps do not measure a margin and
+  calibrate as before), no soak.
+- The gain is fixed at 2 and the estimator's start comes from agent traffic; neither was tuned
+  on the screen.
+- An overlay on candidate-60's image, not a build.
