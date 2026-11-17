@@ -1,0 +1,54 @@
+{
+  "notes": "candidate-60 (image alias candidate-60-afcaac35, the final candidate-60 build copied from dgx4) at tp4-switched with development RPC for the engine grid and the DSpark turn learner in shadow mode mounted from overlay/: each draft step's block maxima kept in a 512-step ring a request (a side-stream kernel), each finished turn scored with an FP32 copy of Markov W1 and then trained into it (per-row AdaGrad 0.3); drafts keep reading the loaded W1, so no draft or output changes; its own copy of candidate-60's source lock (upstreams.lock.json, unchanged), since the learner's variables are not in candidate-60's qualified profile",
+  "extends": {
+    "config": "experiments/2026-11-16-c60-prefill/tp4-switched-dev.json"
+  },
+  "set": {
+    "container": {
+      "mounts": [
+        [
+          "{home}/.cache/huggingface/hub",
+          "/hub",
+          "ro"
+        ],
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf",
+          "/glp/vector.gguf",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning_shadow.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning_shadow.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ]
+      ],
+      "image": "spark-ds41f:candidate-60-afcaac35"
+    },
+    "environment": {
+      "VLLM_DSPARK_TURN_LEARNING": "shadow",
+      "VLLM_DSPARK_TURN_LEARNING_CAPACITY": "512",
+      "VLLM_DSPARK_TURN_LEARNING_LR": "0.3"
+    },
+    "upstreams_config": "experiments/2026-11-17-dspark-turn-learning/upstreams.lock.json"
+  }
+}
