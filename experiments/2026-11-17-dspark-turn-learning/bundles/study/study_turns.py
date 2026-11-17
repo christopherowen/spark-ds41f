@@ -98,7 +98,8 @@ def block_candidates(z: torch.Tensor, shards: int = 4, block: int = 2048) -> tor
     return torch.stack(out, dim=1)
 
 
-def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=256, live_w1=None):
+def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=256, live_w1=None,
+            train_mask=None):
     """One SGD step of the turn's cross-entropy into W1's rows: over the full
     vocabulary (``full``), or over each vocabulary shard's maximum and the committed
     token (``shard4``, the candidates serving's shard pairs already hold)."""
@@ -107,6 +108,8 @@ def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=25
     y_all = labels.reshape(-1).long()
     z_rows = base.reshape(rows * n, -1)
     keep = y_all >= 0
+    if train_mask is not None:
+        keep = keep & train_mask.reshape(-1)
     idx = keep.nonzero().squeeze(1)
     if idx.numel() == 0:
         return 0.0
@@ -126,6 +129,21 @@ def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=25
             continue
         vocab = z.shape[1]
         width = -(-vocab // shards)
+        if method == "live4":
+            z_live = markov_logits(z_rows[sel], prev_all[sel], live_w1, w2)
+            cands = torch.stack(
+                [z_live[:, k * width : min((k + 1) * width, vocab)].argmax(-1) + k * width
+                 for k in range(shards)], dim=1)
+            cands = torch.cat([cands, y[:, None]], dim=1)
+            zc = z.gather(1, cands)
+            dup = (cands[:, :shards] == y[:, None])
+            zc[:, :shards] = zc[:, :shards].masked_fill(dup, float("-inf"))
+            logp = torch.log_softmax(zc, dim=-1)
+            loss_sum += float(-logp[:, -1].sum())
+            coef = logp.exp()
+            coef[:, -1] -= 1.0
+            grad_rows[s : s + chunk] = torch.einsum("rc,rcd->rd", coef, w2.float()[cands])
+            continue
         if method == "block":
             # The live step's block maxima (loaded W1), and the label only when it is
             # among them: serving keeps no head logit for any other token.
@@ -158,12 +176,25 @@ def ce_step(base, ids, labels, master, w2, lr, method="full", shards=4, chunk=25
     return loss_sum / idx.numel()
 
 
+def cap_drift(master, loaded, cap):
+    """Each row's displacement from the loaded row, at most ``cap`` of its norm."""
+    if cap <= 0:
+        return
+    delta = master - loaded
+    limit = cap * loaded.norm(dim=1, keepdim=True)
+    norm = delta.norm(dim=1, keepdim=True)
+    scale = torch.where(norm > limit, limit / norm.clamp_min(1e-12), torch.ones_like(norm))
+    master.copy_(loaded + delta * scale)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--turns", required=True)
     ap.add_argument("--snapshot", required=True)
     ap.add_argument("--lrs", default="0.003,0.01,0.03,0.1,0.3")
-    ap.add_argument("--methods", default="full,shard4,block")
+    ap.add_argument("--methods", default="full,shard4,block,live4")
+    ap.add_argument("--max-drift", type=float, default=0.0,
+                    help="cap each row's displacement at this fraction of its loaded norm (0: none)")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
     device = "cuda"
@@ -197,6 +228,11 @@ def main() -> None:
         with torch.no_grad():
             base = base_logits(hidden, t, eps)
             replay = chain(base, ids, w1_loaded, w2, teacher=False)
+            # Positions up to each block's first miss under the loaded table: there the
+            # chain's input is the committed token, so the draft step saw these maxima.
+            tf_loaded = chain(base, ids, w1_loaded, w2, teacher=True)
+            hit = ((tf_loaded == labels.long()) & (labels >= 0)).int()
+            prefix_mask = torch.cat([torch.ones_like(hit[:, :1]), hit.cumprod(dim=1)[:, :-1]], dim=1).bool()
             pos = torch.arange(replay.shape[1], device=device)[None, :] < active[:, None]
             loaded_acc = accepted(chain(base, ids, w1_loaded, w2, teacher=True), labels)
             # How much of the turn the compact candidates cover: the committed token among
@@ -227,7 +263,9 @@ def main() -> None:
                 totals["learned"][name] += int(acc.sum())
             for key in lrs:
                 name = f"{key[0]}:{key[1]}"
-                row["loss " + name] = round(ce_step(base, ids, labels, masters[key], w2, key[1], method=key[0], live_w1=w1_loaded), 4)
+                row["loss " + name] = round(ce_step(base, ids, labels, masters[key], w2, key[1], method=key[0], live_w1=w1_loaded,
+                                                      train_mask=prefix_mask if key[0] == "live4" else None), 4)
+                cap_drift(masters[key], w1_loaded.float(), args.max_drift)
                 drift = (masters[key] - w1_loaded.float()).norm(dim=1) / w1_loaded.float().norm(dim=1).clamp_min(1e-6)
                 row["drift " + name] = round(float(drift.max()), 4)
         totals["blocks"] += row["blocks"]
