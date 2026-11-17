@@ -811,7 +811,7 @@ def _declare_block32(
     )
 
 
-def _block32_scale_words(layer) -> None:
+def _block32_scale_words(layer, *, split_override: dict | None = None) -> None:
     """Pack the 32x32 block-scale grid. The GEMM indexes it with ``row // 32``.
 
     ``pack_scale_words(..., rows=N)`` repeats this grid once per output row.
@@ -849,10 +849,17 @@ def _block32_scale_words(layer) -> None:
         r1 = r0 + part_n
         layer.shard_weight = layer.weight[r0:r1]
         layer.shard_weight_sf = full_sf[r0 // 32 : r1 // 32]
+    groups = getattr(layer, "tilelang_groups", 1)
+    split = (
+        split_override
+        if split_override is not None
+        else (SPLIT_FP8.get((logical_n, cols)) if groups == 1 else None)
+    )
     if (
-        (logical_n, cols) in TILE_CONTIGUOUS_FP8
+        not split
+        and (logical_n, cols) in TILE_CONTIGUOUS_FP8
         and logical_n == rows
-        and getattr(layer, "tilelang_groups", 1) == 1
+        and groups == 1
         and not getattr(layer, "tilelang_weight_packed", False)
     ):
         packed = pack_weight_tiles(layer.weight)
@@ -976,7 +983,7 @@ class TileLangGroupedBlock32Rows:
         self.tilelang_mxfp8_input = all(
             getattr(p, "tilelang_mxfp8_input", False) for p in projections
         )
-        _block32_scale_words(self)
+        _block32_scale_words(self, split_override=SPLIT_FP8.get((part_n, k)))
 
     def declare_kernels(self) -> None:
         """Declare kernels for the stacked N projection using the slice's split-K."""
