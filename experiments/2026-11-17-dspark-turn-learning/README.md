@@ -502,6 +502,82 @@ Serving run: [offstep-tp4-switched.json](offstep-tp4-switched.json):
 2. one boot: the determinism and greedy gates, which must equal candidate-60's hashes;
 3. a fresh boot: AgentX at 8 sessions for an hour (the step's and the learner's times, the replica check).
 
+Queue entry `20261117T140325-offstep-tp4-switched`, commit `4ec6cdaef`. Receipts:
+[offstep-screen](receipts/offstep-screen) (the four boots' suite files, startup memory and telemetry, the lab's
+verdicts, [grid-split.txt](receipts/offstep-screen/grid-split.txt) from
+[grid_split.py](receipts/offstep-screen/grid_split.py), the learner's log lines),
+[offstep-gate](receipts/offstep-gate), [offstep-agentx](receipts/offstep-agentx).
+
+**Gates** (one boot): determinism and greedy identical, candidate-60's hashes (log probabilities `18d61961` /
+`d6568649`, text `0a2dacdd` / `12fd8257`). The screen's model step: greedy responses identical (128 of 128)
+and identical distributions between every pair of the four boots.
+
+**Screen, the learner off against off-step in one session** (two boots each, alternating; each value the
+boot's own):
+
+| Metric | Off | Off-step | Change |
+| --- | ---: | ---: | ---: |
+| grid: whole step, geometric mean (20 shapes) | 19.152 / 19.148 ms | 19.338 / 19.338 ms | +0.98% |
+| grid: target forward, geometric mean | 14.848 / 14.840 ms | 15.025 / 15.026 ms | +1.22% |
+| grid: draft step, geometric mean | 2.816 / 2.822 ms | 2.815 / 2.819 ms | −0.07% |
+| c16: output tok/s | 269.18 / 268.97 | 269.95 / 268.59 | +0.07% |
+| c16: engine steps/s | 7.880 / 7.863 | 7.897 / 7.877 | +0.20% |
+| c16: accepted a draft | 1.371 / 1.371 | 1.376 / 1.370 | |
+| prefill 32,768 and 262,144 tok/s | | | same (the lab's verdicts, ±0.6%) |
+
+- **The grid is slower with the learner on, by 0.98%, and it is not noise.** Each arm's own repeat is
+  −0.02% (off) and −0.00% (off-step). The lab's verdict line calls the grid "same" only because its repeat
+  term, off-1 against offstep-2, is itself an off-against-on pair (+0.97%); its first pair's table
+  (offstep-1 to off-1) calls off faster at 11 of 20 shapes and slower at none.
+- **It is the target forward, not the draft step.** Median over the shapes: whole step +152 µs, target
+  forward +139 µs, draft step −7.5 µs. It grows with the work: +46 µs at 1×2 rows @4K, +0.33 ms at 8×48,
+  +0.75 ms at 12×72, +1.10 ms at 16×96, +0.58 ms at 16×48 @64K, +0.27 ms at 1×3 @256K.
+- **The learner is idle during the grid.** The grid times the server's own dummy steps, in which no
+  request finishes: in both off-step boots no learner call fell inside the grid's 82 s (the last a second
+  or three before it, the next as it ended). So the cost comes
+  from something the off-step version holds while idle that the on-step version did not. On-step shadow's
+  forward read +29 and +42 µs against candidate-60's recorded screen; today's off boots read +35 µs
+  against it (the day's drift, +0.21% on the step), today's off-step boots +161 µs (+1.19%). What is new
+  and present while idle: the learner's NCCL communicator over the tensor-parallel group (made and
+  connected at load, over the same RoCE NIC as sparknet's step collectives), its CUDA stream and the
+  11.4 MiB stage. GPU clocks, temperatures and the busy threads (sparknet's proxy, the engine core, the
+  worker) read the same in all four boots.
+- **c16, where the learner runs (about a finished request a second), shows no cost.** Output tok/s
+  +0.07%; the lab's paired decode tok/s: off against off-step −0.20%, margin 0.42%, where the grid's
+  change at c16's rows (about 44 a step, between 16×32 and 16×48) would be +0.8% or more. So whatever
+  slows the grid's dummy forward does not slow c16's served steps the same way.
+- The learner in the screen boots: 517 and 527 calls; the step's stream median 0.018 ms a call (p90
+  0.022 ms); the learner's 0.36 ms (p90 0.46 ms); no stage waits; copies agreed at all four checks; 0 draft
+  mismatches in 497,332. The first call of the first boot took 126 ms on the step and 505 ms off it during
+  startup warmup (the kernels' first load); the second boot's first call, 0.054 ms.
+
+**AgentX, an hour at 8 sessions** (a fresh boot, profiling 15:10–16:15 UTC): valid, 814 requests, 0 errors,
+TTFT p50/p90 0.66/1.86 s, 25.1/42.1 tok/s a user, 169.5 output tok/s, prefix hits 96.8% of 97.1% ideal, 1.80
+accepted a draft. Not a speed comparison: no learner-off AgentX hour ran in this session.
+
+The learner over the hour ([turn-learning-lines.log](receipts/offstep-agentx/turn-learning-lines.log)): 871
+calls, 934 turns, 359,043 trained positions; the copies agreed at all three checks; 0 draft mismatches in
+675,656 checked; no stage waits.
+
+| End of turn, a call | Median | p90 | p99 | Max | In all |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| step's stream (off-step, this hour) | 0.019 ms | 0.20 ms | 0.34 ms | 0.36 ms | 42 ms |
+| learner's stream (off-step, this hour) | 0.53 ms | 3.3 ms | 5.9 ms | 7.5 ms | 1.23 s |
+| on the step (on-step shadow, its three hours) | 0.48 ms | 2.86 ms | | 5.87 ms | 1.94 s |
+
+The learner's stream time includes waiting at its collectives for the other ranks. The step's p90 of
+0.20 ms is ten times the screen boots' and the bench's: a likely cause is that the learner's stream starts on
+the staging's event, before the reset kernel, so the reset (and so the step's next work) can wait for SMs
+the learner's first kernels hold. Recording the event after the reset would remove that wait; not yet done.
+
+**Attribution** ([comm-attribution-tp4-switched.json](comm-attribution-tp4-switched.json), the suite
+[model-grid-suite.json](model-grid-suite.json): the screen's model and grid steps alone): six boots
+alternating the learner off, the learner off with its communicator alone
+([tp4-switched-offstep-comm.json](tp4-switched-offstep-comm.json): [overlay-comm/](overlay-comm) makes the
+communicator as shadow does and runs a chunk's all-gather and all-reduce 16 times at load, then leaves it
+idle; nothing else of the learner is allocated) and off-step. If the communicator alone carries the +1%,
+the fix is in how the learner exchanges; if not, it is in what else the off-step version holds.
+
 ## Where it stands
 
 After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
@@ -515,3 +591,8 @@ forked over a tail that leaves the SMs free, and an end-of-turn score and update
 cannot do is measure the gain: the block maxima show what a learned table breaks and miss most of what it
 fixes. The gain needs exact replays (observe and the offline study) or drafts read from the learned table
 (on). Learning resets at every restart unless the learned rows are saved.
+
+Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 ms at p90 under AgentX,
+against 0.48 and 2.86 ms on the step), its outputs are candidate-60's, and c16 shows no cost. The grid
+does: its target forward is 1.2% slower with the learner present and idle, in both boots. The attribution
+job asks whether the learner's own NCCL communicator alone carries it.
