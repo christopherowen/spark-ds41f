@@ -338,7 +338,8 @@ draft step's +9 to +13 µs is about the microbenchmark's inline capture several 
 cost. The reference ran on 2026-11-16; this screen on 2026-11-17. A same-session control separates the two:
 [shadow-control-tp4-switched.json](shadow-control-tp4-switched.json), four boots alternating the learner off
 ([tp4-switched-off.json](tp4-switched-off.json): the same files mounted, nothing allocated or launched,
-candidate-60's draft path) and shadow, queued once the entry below finishes.
+candidate-60's draft path) and shadow, in one measure job without a recorded reference (the lab refuses a
+single boot an arm against one), queued after the entry below.
 
 **Gates** (one boot): determinism and greedy identical, candidate-60's hashes (log probabilities `18d61961` /
 `d6568649`, text `0a2dacdd` / `12fd8257`): shadow changes no output.
@@ -349,24 +350,32 @@ checked against the captured maxima, 0 mismatches. The maxima-limited score read
 check predicts of a score that cannot see most fixes. Warmup requests at startup reach the learner too
 (16 turns, 23 trained positions a boot); drafting with a learned table would need them left out.
 
-**AgentX, three hours at 8 sessions:** running.
+**AgentX, three hours at 8 sessions** (a fresh boot, profiling 10:38–13:39 UTC;
+[receipts/shadow-agentx](receipts/shadow-agentx)): valid, 1,822 requests, 0 errors, TTFT p50/p90
+0.70/1.81 s, 26.6/43.7 tok/s a user, 174.7 output tok/s, prefix hits 96.7% of 97.5% ideal, 1.965 accepted
+a draft. It is not a speed comparison: no learner-off AgentX run of this shape is recorded (observe's hour
+read 0.69/1.93 s, 25.2/44.6 tok/s a user, 171.2 tok/s).
+
+The learner over the three hours ([turn-learning-lines.log](receipts/shadow-agentx/turn-learning-lines.log)):
+1,875 finish calls, 958,471 trained positions; the copies of W1 agreed across the four ranks at all seven
+checks; 0 draft mismatches in 1,726,496 checked. The maxima-limited score by hour: −0.19%, +0.22%, +0.52%,
++0.57% (a health signal that cannot see most fixes; it climbs as the copy learns). End of turn: 1.94 s in
+all over 10,822 s, median 0.48 ms, p90 2.86 ms, max 5.87 ms; below.
 
 ### End of turn under agent traffic, and where its time goes
 
-The AgentX boot's first two hours (1,293 finish calls, 1,263 of them one turn): the end of turn takes far
-longer than in the screen, whose turns are short. Rank 0's events around the call:
+The AgentX boot (1,875 finish calls, 1,839 of them one turn): the end of turn takes far longer than in the
+screen, whose turns are short. Rank 0's events around the call:
 
 | Calls | n | Median | p90 | Max |
 | --- | ---: | ---: | ---: | ---: |
-| all | 1,293 | 0.47 ms | 2.70 ms | 5.87 ms |
-| one turn, 32–128 held steps | 468 | 0.21 ms | 1.78 ms | 4.62 ms |
-| one turn, 128–256 | 245 | 0.41 ms | 2.38 ms | 4.36 ms |
-| one turn, 256–384 | 136 | 0.69 ms | 2.67 ms | 3.21 ms |
-| one turn, 384–512 | 235 | 1.02 ms | 3.23 ms | 4.55 ms |
-| one turn, 512 or more | 103 | 1.03 ms | 3.36 ms | 3.99 ms |
+| all | 1,875 | 0.48 ms | 2.86 ms | 5.87 ms |
+| one turn, 32–128 held steps | 679 | 0.22 ms | 1.97 ms | 4.62 ms |
+| one turn, 128–256 | 386 | 0.41 ms | 2.47 ms | 4.36 ms |
+| one turn, 256–384 | 179 | 0.71 ms | 2.85 ms | 3.47 ms |
+| one turn, 384–512 | 337 | 1.04 ms | 3.34 ms | 4.55 ms |
+| one turn, 512 or more | 159 | 1.13 ms | 3.35 ms | 3.99 ms |
 | observe's AgentX hour, for scale | 935 | 16.5 ms | 32.1 ms | 43.9 ms |
-
-Copies of W1 agreed across the four ranks at all five checks; 0 draft mismatches in 1,174,368 checked.
 
 [bundles/finish-bench-shadow](bundles/finish-bench-shadow) runs the learner's own `finish` on sp8 at serving
 shapes (rank 0 of four, a packed W2 shard built as at load, 16 slots, rings filled like finished turns), with
@@ -403,7 +412,7 @@ GPU time a launch, one turn of 512 steps (two chunks; events around each launch)
 What this says:
 
 - The work is GPU-bound and linear in kept steps, about 0.28 ms a 256-step chunk; the host stays ahead.
-- The serving median at 384–512 steps (1.02 ms) is the bench's 0.62 ms plus about 0.4 ms, the two chunks'
+- The serving median at 384–512 steps (1.04 ms) is the bench's 0.62 ms plus about 0.4 ms, the two chunks'
   network all-gather and all-reduce. The tail to 3–4 ms at every turn size is not work (the bench's range is
   within 0.15 ms): it is waiting, the call's first collective absorbing whatever skew the ranks arrive with.
 - `shadow_update_kernel` is 45% of the GPU time and needlessly so: each owner block's threads each loop
