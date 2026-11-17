@@ -34,7 +34,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu import tilelang_inputs
@@ -430,6 +429,19 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         assert table is not None
         if mode == "shadow":
+            # The end of turn runs on the learner's stream while the step's
+            # collectives run on the step's: its own NCCL communicator over the
+            # tensor-parallel group, never the step's.
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+            from vllm.distributed.parallel_state import get_tp_group
+
+            comm = PyNcclCommunicator(get_tp_group().cpu_group, device=self.device)
+            if comm.disabled:
+                raise RuntimeError(
+                    "shadow turn learning needs its own NCCL communicator over the "
+                    "tensor-parallel group; NCCL is unavailable"
+                )
+            self._turn_learning_comm = comm
             self.turn_learner = DSparkShadowLearner(
                 model=self.model,
                 table=table,
@@ -439,8 +451,12 @@ class DSparkSpeculator(DFlashSpeculator):
                 anchor_idx=self._anchor_idx,
                 sample_idx_mapping=self.sample_idx_mapping,
                 sample_pos=self.sample_pos,
-                all_gather=lambda t: tensor_model_parallel_all_gather(t, dim=-1),
-                all_reduce=tensor_model_parallel_all_reduce,
+                gather_into=lambda out, x: comm.all_gather(
+                    out, x, stream=torch.cuda.current_stream()
+                ),
+                reduce_in_place=lambda x: comm.all_reduce(
+                    x, out_tensor=x, stream=torch.cuda.current_stream()
+                ),
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 tp_size=tp_size,

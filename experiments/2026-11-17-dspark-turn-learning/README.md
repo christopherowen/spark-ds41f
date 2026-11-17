@@ -335,11 +335,10 @@ the 20 shapes):
 Most of the step's difference is in the target forward, which shadow does not touch (its kernels and
 buffers are candidate-60's; the learner adds 144 MiB a rank at load and nothing to the forward), and the
 draft step's +9 to +13 µs is about the microbenchmark's inline capture several times over, not its forked
-cost. The reference ran on 2026-11-16; this screen on 2026-11-17. A same-session control separates the two:
-[shadow-control-tp4-switched.json](shadow-control-tp4-switched.json), four boots alternating the learner off
-([tp4-switched-off.json](tp4-switched-off.json): the same files mounted, nothing allocated or launched,
-candidate-60's draft path) and shadow, in one measure job without a recorded reference (the lab refuses a
-single boot an arm against one), queued after the entry below.
+cost. The reference ran on 2026-11-16; this screen on 2026-11-17. A same-session control (four boots
+alternating the learner off and on) was planned for this version; it never ran, replaced before the queue
+took it by the same control of the off-step version below, whose learner-off boots also measure the day's
+drift against this reference. This version's files are `overlay/` at commit `33bf74665` (the queue entry's).
 
 **Gates** (one boot): determinism and greedy identical, candidate-60's hashes (log probabilities `18d61961` /
 `d6568649`, text `0a2dacdd` / `12fd8257`): shadow changes no output.
@@ -421,6 +420,48 @@ What this says:
   it, near memory bandwidth (about 13 MB a chunk).
 - Even at that cost, a finished long turn holds the whole batch for a few hundred microseconds plus two
   collectives, and the collectives bring the ranks' skew with them.
+
+### Off the step
+
+[overlay-offstep/](overlay-offstep/vllm/v1/worker/gpu/spec_decode/dspark) (`turn_learning_shadow.py`,
+`speculator.py`; the profile [tp4-switched-offstep.json](tp4-switched-offstep.json)). One causal change: where
+the end of turn runs. Two kernel fixes ride with it, as the owner decided.
+
+- **On the step's stream, only the staging.** `shadow_stage_kernel` (a block an entry) writes each kept entry's
+  labels and inputs (`labels_kernel`'s rule) and a copy of its ring entry into the learner's stage, entry-major
+  in call order; then the finished and preempted rings are cleared. One host-to-device copy a call carries the
+  slots and each entry's turn and step. The stage has room for two calls at full rings (16,384 entries,
+  11.4 MiB); a call's rows come round again only after its end of turn is done, and if they are still being
+  read the step waits for it and counts a stage wait.
+- **On the learner's stream, the rest.** The decode, the local kernel, the all-gather, the combine, the
+  all-reduce, the update and the totals read only the stage, on a CUDA stream of the learner's own that waits
+  for the staging. The collectives go through an NCCL communicator of the learner's own over the
+  tensor-parallel group (vLLM's `PyNcclCommunicator`, built at load), never the step's, whose collectives run
+  meanwhile; every rank issues the learner's in the same order. The all-gather's layout is rank-major, so
+  the combine reads it as it lands. The replica check is asynchronous too: the copies' sums are exchanged on
+  the learner's stream and compared on rank 0 when they arrive.
+- **`shadow_update_kernel`:** a warp ballot a 32 positions finds the row's training positions (one word a
+  warp), each thread adds its column of those rows only, in position order as before; the squared norm is
+  a shuffle tree a warp. **`shadow_totals_kernel`:** a warp a counter instead of a thread, and it replaces
+  the call's totals on a call's first chunk (no separate zeroing).
+- Rank 0 logs both times a call: the step's (`on the step`) and the learner stream's (`off it`).
+
+Kernel tests ([receipts/kernels-7](receipts/kernels-7), sp8, candidate-60 image): 14 pass. New or changed:
+the stage against `labels_kernel` and the ring (held, not held, past the turn, a wrapped ring, more kept
+steps than the ring holds, rows outside the call untouched); the end of turn on stage rows at an offset
+with the rank-major exchange, against the reference across four and three simulated ranks; the totals'
+replace and add; the update at 40, 700 and 1,280 positions (several ballot tiles, rows repeating up to
+about 20 times).
+
+Serving run: [offstep-tp4-switched.json](offstep-tp4-switched.json):
+
+1. the screen suite, four boots alternating the learner off
+   ([tp4-switched-offstep-off.json](tp4-switched-offstep-off.json): the same files mounted, nothing
+   allocated, launched or connected, candidate-60's draft path) and off-step shadow, in one measure job (the
+   lab refuses a single boot an arm against a recorded reference; the off boots are the session's own
+   reference, and against candidate-60's recorded screen they measure the day's drift);
+2. one boot: the determinism and greedy gates, which must equal candidate-60's hashes;
+3. a fresh boot: AgentX at 8 sessions for an hour (the step's and the learner's times, the replica check).
 
 ## Where it stands
 
