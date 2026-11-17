@@ -841,3 +841,11 @@ made: alive and idle (+0.91%, +1.23%), destroyed after use (+1.44%, one boot), o
 one made, read +0.58% (boots +0.79%, +0.40%); the attribution job put the learner without a communicator at
 +0.13%. A second communicator's cost outlasts its destroy, so it is something its making leaves behind, not
 anything it does while it exists.
+
+**Two builds without the cost** ([builds-tp4-switched.json](builds-tp4-switched.json); the model and grid steps,
+six boots alternating), each the whole off-step learner: the learner off; the learner's exchanges over the
+step's own communicator, none made ([tp4-switched-exchange-step.json](tp4-switched-exchange-step.json), the
+`step` arm measured once above, measured again); and the learner's own communicator made at its first
+exchange, after startup has made the KV cache and captured the graphs
+([tp4-switched-lazycomm.json](tp4-switched-lazycomm.json), [overlay-lazycomm/](overlay-lazycomm)). The first
+end of turn comes after both (a boot's log: model loaded, KV cache made, graphs captured, then requests).
