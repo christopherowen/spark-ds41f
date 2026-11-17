@@ -744,3 +744,13 @@ boot logged its communicator.
   extra streams at load follow their costs: memory alone 0 (nothing), `step` 2 (the learner's capture and
   learn streams, +0.58%), the communicator alone 3 (+0.91%), off-step and `socket` 4 (+1.04%, +1.28%).
   This is the working explanation, not yet tested.
+
+**Streams alone** ([streams-tp4-switched.json](streams-tp4-switched.json); the model and grid steps, six boots
+alternating): the learner off; the learner off with three bare CUDA streams made at load where the
+communicator made its three ([tp4-switched-streams-3.json](tp4-switched-streams-3.json)); and the
+communicator alone followed by 29 bare streams, 32 in all, the hardware queues' count
+([tp4-switched-comm-pad-32.json](tp4-switched-comm-pad-32.json)); [overlay-streams/](overlay-streams) is
+overlay-comm's speculator with `VLLM_DSPARK_TURN_LEARNING_EXTRA_STREAMS`. If three bare streams cost what the
+communicator did and the communicator padded to 32 costs nothing, the cost is the step's streams' order on
+the hardware queues, and the learner can keep its own communicator if what it makes at load is padded or
+made after the step's streams.

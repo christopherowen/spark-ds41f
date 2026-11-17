@@ -1,0 +1,51 @@
+{
+  "notes": "attribution arm: the learner off (nothing of it allocated, launched or connected) and three bare CUDA streams made at load where the communicator alone made its three (its two NCCL streams and its exercise's side stream), nothing run on them (overlay-streams/speculator.py, VLLM_DSPARK_TURN_LEARNING_EXTRA_STREAMS=3); does the shift in the step's streams' creation order alone slow the grid?",
+  "extends": {
+    "config": "experiments/2026-11-17-dspark-turn-learning/tp4-switched-offstep-off.json"
+  },
+  "set": {
+    "environment": {
+      "VLLM_DSPARK_TURN_LEARNING": "off",
+      "VLLM_DSPARK_TURN_LEARNING_EXTRA_STREAMS": "3"
+    },
+    "container": {
+      "mounts": [
+        [
+          "{home}/.cache/huggingface/hub",
+          "/hub",
+          "ro"
+        ],
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf",
+          "/glp/vector.gguf",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay-offstep/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning_shadow.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning_shadow.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay-streams/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ]
+      ]
+    }
+  }
+}
