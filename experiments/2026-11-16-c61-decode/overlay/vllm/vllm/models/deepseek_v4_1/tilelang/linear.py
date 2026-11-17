@@ -653,9 +653,7 @@ def _block32_kernels(
             k,
             head_dim=head_dim,
             rope_dim=rope_dim,
-            block_N=64 if part % 64 == 0 else 128,
             block_K=pick_block_K(k),
-            num_stages=3,
             padded_rows=True,
             **tile_kw,
         )

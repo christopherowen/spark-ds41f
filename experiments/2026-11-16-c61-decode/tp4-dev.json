@@ -1,5 +1,5 @@
 {
-  "notes": "candidate-60 at tp4-ring plus candidate-61 decode r15 (r13 plus MoE fuse_swiglu and gemm/linear retune, hybrid card0_WQ_ONLY screen carve-out and 1-warp ping-pong vocab refine, 3-layer DSpark front fusion, and lazy dev-mode CUPTI capture; reverted l2_prefetch, mhc, wo, and conditional IF regressions)",
+  "notes": "candidate-60 at tp4-ring plus candidate-61 decode r16 (reverts M<=16 gemm/linear/moe fuse_swiglu regressions, adds mhc finalize norm/sinkhorn split, co-tuned wo.py _WO_A_TILES, and /dev/nvidiactl RM scanout carve-out without /dev/dri/card0)",
   "extends": {
     "config": "experiments/2026-11-16-c60-prefill/tp4-dev.json"
   },
@@ -8,6 +8,22 @@
       "VLLM_SERVER_DEV_MODE": "1"
     },
     "container": {
+      "docker_run_args": [
+        "--network=host",
+        "--ipc=host",
+        "--gpus=all",
+        "--device=/dev/infiniband:/dev/infiniband:rwm",
+        "--cap-add=IPC_LOCK",
+        "--ulimit=memlock=-1:-1",
+        "--ulimit=stack=67108864:67108864",
+        "--ulimit=core=0",
+        "--security-opt=seccomp=unconfined",
+        "--security-opt=label=disable",
+        "--shm-size=16g",
+        "--memory=112g",
+        "--memory-swap=112g",
+        "--cpuset-cpus=5-9,15-19"
+      ],
       "mounts": [
         [
           "{checkout}/cache",
@@ -22,11 +38,6 @@
         [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/kernels/deepseek_v41_pdl_sources.py",
           "/opt/spark-ds41f/candidate/vllm/tests/kernels/deepseek_v41_pdl_sources.py",
-          "ro"
-        ],
-        [
-          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py",
-          "/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py",
           "ro"
         ],
         [
@@ -50,8 +61,18 @@
           "ro"
         ],
         [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/model_executor/model_loader/test_direct_loader_cuda.py",
+          "/opt/spark-ds41f/candidate/vllm/tests/model_executor/model_loader/test_direct_loader_cuda.py",
+          "ro"
+        ],
+        [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/v1/spec_decode/test_adaptive_verification.py",
           "/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/v1/worker/test_display_carveout.py",
+          "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_display_carveout.py",
           "ro"
         ],
         [
@@ -87,6 +108,11 @@
         [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/compressor.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/compressor.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/model.py",
           "ro"
         ],
         [
@@ -127,6 +153,11 @@
         [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/metadata.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/metadata.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/mhc.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/mhc.py",
           "ro"
         ],
         [

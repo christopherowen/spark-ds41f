@@ -72,6 +72,8 @@ CHAIN = {
     "mhc_collapse",
     "mhc_collapse_column",
     "mhc_finalize",
+    "mhc_finalize_norm",
+    "mhc_finalize_sinkhorn",
     "mhc_post",
     "mhc_post_collapse",
     "mhc_post_collapse_norm",

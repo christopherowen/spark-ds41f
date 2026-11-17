@@ -2692,13 +2692,13 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
         64: dict(block_N=128, block_K=128, num_stages=2),
     },
     (8192, 1280): {
-        16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+        16: dict(block_N=128, block_K=128, num_stages=3),
         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
         48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
         64: dict(block_N=128, block_K=128, num_stages=2),
     },
     (4096, 1280): {
-        16: dict(block_N=32, block_K=256, num_stages=4, threads=128),
+        16: dict(block_N=64, block_K=128, num_stages=3),
         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
         48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
         64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
@@ -2789,7 +2789,7 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
         64: dict(block_N=64, block_K=64, num_stages=2),
     },
     (5120, 576): {
-        16: dict(block_N=32, block_K=192, num_stages=4, threads=128),
+        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
         32: dict(block_N=32, block_K=192, num_stages=4, threads=128),
         48: dict(block_N=32, block_K=192, num_stages=4, threads=128),
         64: dict(block_N=32, block_K=192, num_stages=4, threads=128),
@@ -2841,7 +2841,7 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
         128: dict(block_N=128, block_K=128, num_stages=2, threads=256),
     },
     (5120, 2048): {
-        16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+        16: dict(block_N=128, block_K=128, num_stages=3),
         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
         # 2026-10-13 sweep (experiments/2026-10-13-tilelang-fp8-cast): 0.87 of the
         # default tile at 48-64 rows; a 96-row tile 0.91 of the prefill tile at 72-96.

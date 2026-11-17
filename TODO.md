@@ -8,9 +8,9 @@ owner.
 
 ## Recent candidate decisions
 
-- **Candidate `61` (in progress)** ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)) stacks on `candidate-60` with decode and infrastructure improvements verified through `c61-r14` (`00306d1ef`) on `tp4-ring` (`dgx1..dgx4`), with `c61-r15` surgical isolation staged next:
-  - Integrated certified 2-pass `W_q` Markov vocab screening + per-row $\ell_2$ scale search + extreme-outlier sign-clamping (`Rank 2`), BF16 compressor replication up to `TP<=4` (`Rank 5`), `PR #1225` (`0817..0819`) + `pipe` + `<2>` dense `indexer_score_v41` + gated `_decode_index_split` (`Rank 6`; also supersedes `PR #1086`), grouped 3-layer DSpark `context_kv` + strided `front.py` (`Rank 10`), `PR #995` CopyDrafter guards/gentle ramp (`Rank 13`), fixed `PR #1072` `shm_broadcast.py` 2 ms post-wakeup spin anchor (`Rank 14`: eliminated 5s stalls, `ttft_p99 = 0.133s`), `PR #1081` shard-local sampled verification + `PR #988` sparse top-k Markov (`Rank 15`), `PR #1078` 48-row decode projection tile (`Rank 16A`), `PR #984` UMA allocator hygiene (`Rank 17`), `PR #987` 128-row `WO-B` / `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16` / `all_reduce_rank_order`, `Decode #3` (`wo_b`, `shared_up`, and `dspark.main_proj` `tile_contiguous=True` + `linear.py` `split_override` unpacking guard), `Decode #5` (`aux_stream` priority `-3` + `_PriorityCUDAGraphExec` `UseNodePriority=0x08`), `Decode #6` (`moe_down` PDL prologue weight preload + `LayerChain` fix), `c61-r10` host-vs-GPU $p_k^2$ coverage-squaring elimination (`adaptive_verification.py`), `c61-r12` `SparseMlaV41Plan` `"split"` `skip_inactive=True` (`sparse_mla.py`), `c61-r13` device-side `is_padding` dead-row masking (`metadata.py` + `attention.py`), `tilelang_rejection.py` `initcheck` uninitialized-read guard (`705 passed, 0 errors`), `qwen3_dspark.py` `apply_bias_topk` deduplication, and `PR #1222`/`#1223` lab fixes (`124 passed` in `test_lab.py` + `test_source_locks.py`). (`PR #967` `sparse_mla.py` TIRx compiler fixes verified byte-identical in `candidate-60` across all 6 routes.)
-  - Screened `c61-r13` (`179fd3b75`: ready `+115.2 s`, `jit_new_files = 0`, **`c1 = 84.78 ± 6.11% tok/s`** — `35.720 steps/s` = `28.00 ms/step`, `2.3825 tok/step`, `2.5894 draft/draft`, `1.4033 acc/draft`, `ttft_p50 = 0.1127 s`, `tpot_p50 = 11.80 ms`; `prose = 80.26 e2e / 82.81 dec tok/s`, `code = 112.59 e2e / 118.25 dec tok/s`, warmup `#00 = 75.80 dec tok/s`; **`c16 = 271.66 ± 1.05% tok/s`** at `7.878 steps/s`; `0` diffs matching `0a2dacdd...` / `12fd8257...`). Screened `c61-r14` (`00306d1ef`: `c1 = 83.62 tok/s` / `28.39 ms/step`, `c16 = 269.91 tok/s`, `0` greedy diffs): 36-shape live `engine_grid` + 4-node CUPTI (`dgx1..dgx4`) showed `card0_WQ_ONLY` + `vocab` (`-180..-220 us/step`), `context_kv_front_3layer` (`-6.1 us/step`), and MoE `fuse_swiglu=True` (`16x48` `-0.116 ms`) won, while un-paced 2-CTA `l2_prefetch` + 256-CTA `wo_a` (`+1.43 ms/40L` collision in Target), pre-`pdl.chain()` `mhc` (`+1.5 ms/step` while `oneshot_allreduce` runs), and conditional `IF` Markov halting (`+0.34 ms` `gap_ms`) regressed `forward_ms`/`gap_ms`. Staged `c61-r15`: keeps hybrid `card0_WQ_ONLY` + `vocab`, `context_kv_front_3layer`, `moe` `fuse_swiglu=True` + `gemm`/`linear` retunes, and lazy dev CUPTI while reverting those 4 regressors.
+- **Candidate `61` (in progress)** ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)) stacks on `candidate-60` with decode and infrastructure improvements verified through `c61-r15` (`d0a111fa2`) on `tp4-ring` (`dgx1..dgx4`), with `c61-r16` small-batch `forward_ms` cleanup + verified `sp8` reworks integrated next (`mhc` split `finalize_norm`/`finalize_sinkhorn`, co-tuned `wo.py` `_WO_A_TILES`, and `/dev/nvidiactl` RM scanout carve-out replacing `/dev/dri/card0`):
+  - Integrated certified 2-pass `W_q` Markov vocab screening + per-row $\ell_2$ scale search + extreme-outlier sign-clamping (`Rank 2`), BF16 compressor replication up to `TP<=4` (`Rank 5`), `PR #1225` (`0817..0819`) + `pipe` + `<2>` dense `indexer_score_v41` + gated `_decode_index_split` (`Rank 6`; also supersedes `PR #1086`), grouped 3-layer DSpark `context_kv` + strided `front.py` (`Rank 10`), `PR #995` CopyDrafter guards/gentle ramp (`Rank 13`), fixed `PR #1072` `shm_broadcast.py` 2 ms post-wakeup spin anchor (`Rank 14`: eliminated 5s stalls, `ttft_p99 = 0.133s`), `PR #1081` shard-local sampled verification + `PR #988` sparse top-k Markov (`Rank 15`), `PR #1078` 48-row decode projection tile (`Rank 16A`), `PR #984` UMA allocator hygiene (`Rank 17`), `PR #987` 128-row `WO-B` / `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16` / `all_reduce_rank_order`, `Decode #3` (`wo_b`, `shared_up`, and `dspark.main_proj` `tile_contiguous=True` + `linear.py` `split_override` unpacking guard), `Decode #5` (`aux_stream` priority `-3` + `_PriorityCUDAGraphExec` `UseNodePriority=0x08`), `Decode #6` (`moe_down` PDL prologue weight preload + `LayerChain` fix), `c61-r10` host-vs-GPU $p_k^2$ coverage-squaring elimination (`adaptive_verification.py`), `c61-r12` `SparseMlaV41Plan` `"split"` `skip_inactive=True` (`sparse_mla.py`), `c61-r13` device-side `is_padding` dead-row masking (`metadata.py` + `attention.py`), `c61-r15` hybrid `WQ_ONLY` + 1-warp/ping-pong `vocab.py` refine + `context_kv_front_3layer` + `gemm.py` `M=32/48` retune, `c61-r16` `mhc` strict `pdl.chain()`-first + split `finalize_norm`/`finalize_sinkhorn` (`_SINKHORN_STREAMS`, `-0.20..-0.23 ms/step`), `wo.py` `_WO_A_TILES` (`-0.04..-0.21 ms/40L` at `M=1..16`, `-0.19..-0.37 ms/40L` at `M=64..128`), and `/dev/nvidiactl` RM scanout carve-out replacing `/dev/dri/card0`, `tilelang_rejection.py` `initcheck` uninitialized-read guard (`705 passed, 0 errors`), `qwen3_dspark.py` `apply_bias_topk` deduplication, and `PR #1222`/`#1223` lab fixes (`124 passed` in `test_lab.py` + `test_source_locks.py`). (`PR #967` `sparse_mla.py` TIRx compiler fixes verified byte-identical in `candidate-60` across all 6 routes.)
+  - Screened `c61-r13` (`179fd3b75`: ready `+115.2 s`, `jit_new_files = 0`, **`c1 = 84.78 ± 6.11% tok/s`** — `35.720 steps/s` = `28.00 ms/step`, `2.3825 tok/step`, `2.5894 draft/draft`, `1.4033 acc/draft`, `ttft_p50 = 0.1127 s`, `tpot_p50 = 11.80 ms`; **`c16 = 271.66 ± 1.05% tok/s`**; `0` diffs), `c61-r14` (`00306d1ef`: `c1 = 83.62 tok/s`, `c16 = 269.91 tok/s`, `0` diffs), and `c61-r15` (`d0a111fa2`: `501 passed, 7 skipped`, `920` kernels / `0` PDL viol; `c1 = 84.11 ± 6.04% tok/s` / `28.23 ms/step`, `ttft_p50 = 0.1106 s`, `c16 = 271.23 ± 1.08% tok/s`, `0` diffs matching `0a2dacdd...` / `12fd8257...`). Live `c61_r15_engine_grid.json` verified `gap_ms` restored (`1.317 ms`), `drafter_ms` `-28..-63 us` faster at `1x`, and `forward_ms` `-0.17..-0.68 ms` faster at `8x36..16x48`, while `M <= 16` `forward_ms` regressed `+0.20..+0.58 ms` due to `gemm.py` `M=16`, `linear.py`, and `moe.py` `decode_block_M=16` `fuse_swiglu=True`; those three `M <= 16` changes are reverted for `c61-r16`.
 - **Candidate `60`** ([`experiments/2026-11-16-c60-prefill`](experiments/2026-11-16-c60-prefill/README.md)) builds on `candidate-59` (via `#1218` / `#1219`) in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
   - Integrated PR `#992` `bf16x2` producer casts, `indexer.py` `bfloat162` SMEM + warp-shuffle `block_scan` top-$k$, `attention.py` SP prefill compressor/front async overlap + deferred `finish_front` + `cacheable = index_rows <= chunk_rows`, PR `#983` Clock-Pro 2-bit Engram prefill shield + `SPARK_DS41F_ENGRAM_PIN_SCALES`, PR `#1010` hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1006` uncached GPU post-load vectorizations / pressure-gated `release_device_memory_under_pressure` / lazy imports / first-prefill `_warm_model_runtime` warmup (dropping `postload_cache` after measuring slower reload than uncached GPU vectorization on GB10), piece-level parallel prompt tokenizer caching (`vllm/tokenizers/deepseek_v41.py`), PR `#1212` (rebased `#1047`) literal image-token escape, `defer_loading: true` + `tool_reference` inline tool-schema resolution (`serving.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`), and stream/lifecycle/parser hardening (`sp_prefill.py`, `engram_rows/rows.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`; evaluated and removed opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK` from PR `#1150` during optionality cleanup).
   - Qualified with zero regressions on `tp4-switched` (`model`: `128/128` greedy / `100.00%` identical, `KL mean 0.000e+00`, `8/8` gate determinism/greedy `0` diffs; `grid` `-0.07% ±0.13%` `same`; `c16` `+0.17%` / `+0.15%` `same`; `c1-decisions` `82.91 tok/s`; `prefill 262K` `default-text` **`+2.10% ±0.64%` (`better`, `9,833.2 tok/s`)**, `+4.50%` over `c58-final`; `source` prefill `32K/131K/262K` `9,521 / 9,924 / 9,830 tok/s`, with Step 1 hitting `10,000.1 tok/s` mean at `131K`; `bench` `quality` `5/5` pass) and `tp3-switched` (`model`: `100.00%` identical, `8/8` gate `0` diffs, `grid` `-0.03% ±0.12%` `same`, `c8` `-0.25%` / `-0.23%` `same`, `sp5` startup `min_available_gib` `5.90–5.97 GiB`; `tp4-ring` remained held and untested).
@@ -201,11 +201,14 @@ collectives, and DSpark drafting.
    `fuse_swiglu` mandates `trigger_after_loop=True`. Full FC1->SwiGLU->FC2
    persistence remains open.
 2. **Direct producer writes (`WO-B` / `moe_combine`) into registered `sparknet`
-   RoCE send buffers** (~1.3–1.6% decode ceiling). `1107` overlaps collective
-   launches via PDL (`0753`, `0755`, `0756`), but `roce_all_reduce` still stages
-   an explicit `cudaMemcpyAsync` from the producer output tensor into
-   `comm_buf` (116 launches per step). Writing final BF16 outputs directly into
-   the registered RoCE send buffer removes the staging copy.
+   RoCE send buffers** — **superseded / measured negative on GB10** (live
+   4-node CUPTI confirms `sparknet 0.5.0` already has `0` pre-AR
+   `cudaMemcpyAsync` calls [`0.0006 ms/step` total `gpu_memcpy` at `c1`],
+   instead staging L2-hot `inp` in-kernel via 16-byte coalesced
+   `roce_copy_pack`; `sp8` Cold-L2 prototype writing `wo_b` / `moe_combine`
+   directly into `pin_memory=True` `send_slot` with `fence.sc.sys` /
+   `st.release.sys.v4` regressed `wo_b` by `+2.42..+51.06 us/L` at `M=6..48`
+   and `moe_chain` at `M=3..48`).
 3. **Q-B, indexer Q-B, WO-B, and SHARED-UP tile-contiguous weight layout.** Q-B and indexer
    Q-B already pack `[N // 128, K // 128, 128, 128]` tiles (`TILE_CONTIGUOUS_FP8`).
    On `sp8` (`M=3`, `block_M=16`, Cold-L2 across 10 copies), `wo_b` `(5120, 2048)`
@@ -291,14 +294,21 @@ collectives, and DSpark drafting.
 7. **Forward-fusing `mHC` stream finalize and MXFP8 quantization into consumer
    projections (plus fused `embed` + Layer-0 `project_streams`).** Unlike
    1-launch atomic `project_and_finalize_streams` (which regressed in `#946`),
-   keep `project_streams` writing the unnormalized collapsed stream `C` and the
-   partial sums-of-squares `Q`, and have the consumer decode projections
-   (`fused_wqa_wkv` and MoE gate/shared-expert input) reduce the partial sums
-   `Q`, multiply by `rsqrt * gamma`, and quantize to MXFP8 inside their
-   prologue—removing the global BF16 normalized activation round-trip and
-   standalone MXFP8 cast launches. At model entry, also screen fusing token
-   embedding lookup, 4-stream broadcast, Engram `token_map` lookup, and Layer-0
-   `project_streams` into one launch.
+   `c61-r16` lands the intermediate split: `mhc_finalize` (`80×/step`) splits
+   into a 5-CTA critical-path `mhc_finalize_norm` (`1.9 us`) plus off-critical-path
+   `mhc_finalize_sinkhorn` (`threads=32`) on dedicated `_SINKHORN_STREAMS` via
+   `async_sinkhorn()` / `wait_sinkhorn(...)` (`model.py`), while keeping
+   `pdl.chain()` strictly first across all `mhc` kernels so `mhc_project_streams`
+   does not contend with `oneshot_allreduce`'s early `roce_doorbell` `T.pdl_trigger()`
+   (verified `-2.23..-2.69 us/call` = `-0.20..-0.23 ms/step` on `sp8` Cold-L2,
+   `72/72` `torch.equal`, `0` PDL violations). Still open: keep `project_streams`
+   writing the unnormalized collapsed stream `C` and the partial sums-of-squares
+   `Q`, and have the consumer decode projections (`fused_wqa_wkv` and MoE
+   gate/shared-expert input) reduce the partial sums `Q`, multiply by `rsqrt * gamma`,
+   and quantize to MXFP8 inside their prologue—removing the global BF16
+   normalized activation round-trip and standalone MXFP8 cast launches. At model
+   entry, also screen fusing token embedding lookup, 4-stream broadcast, Engram
+   `token_map` lookup, and Layer-0 `project_streams` into one launch.
 8. **Piggybacking KV-RoPE onto `wq_b` via extra tail CTAs.** `0748` and `0749`
    fuse `wq_b + indexer.wq_b` with query RoPE and MXFP4 quantization; screen
    appending tail CTAs to `wq_b`'s grid that branch to apply RoPE and cache
@@ -536,26 +546,26 @@ Open levers:
   framebuffer). About 1.2 GiB remains free on TP3 (and ~2.0 GiB on TP4) for
   read-once-per-step data (`experiments/2026-09-29-display-carveout-kv`).
   - **GPU-L2-cached RM scanout carve-out (`NV01_MEMORY_SYSTEM` with
-    `ISO_YES | GPU_CACHEABLE_YES`) and CUDA VMM contiguous stitching:**
-    `vllm/v1/worker/display_carveout.py` (`0021`/`0030`/`0804`) currently
-    allocates via `/dev/dri/card0` (`DRM_IOCTL_MODE_CREATE_DUMB` +
-    `cuImportExternalMemory`), which inherits `nvidia-drm`'s
-    `GPU_CACHEABLE_DEFAULT -> GPU_CACHEABLE_NO` (`mem.c`) and therefore suffers
-    7 GB/s random 576-byte reads (vs. 221 GB/s in `cudaMalloc`) and 2.3×
-    slower large-$M$ GEMMs (`experiments/2026-09-29-display-carveout-kv`). Screen
-    allocating directly through `/dev/nvidiactl` (`NV_ESC_RM_ALLOC`
-    `NV01_MEMORY_SYSTEM` with `NVOS32_ATTR2_ISO_YES |
-    NVOS32_ATTR2_GPU_CACHEABLE_YES` and 2 MiB huge pages, exported via
-    `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` and imported via
-    `cuMemImportFromShareableHandle` + `cuMemAddressReserve` + `cuMemMap`):
-    first run `reserve_bw.cu` and `gemm_place.py` on `sp8` to verify whether
-    `GPU_CACHEABLE_YES` restores full L2 cache reuse (~221 GB/s random reads,
-    1.0× large-$M$ GEMM); if confirmed, use the remaining ~1.2 GiB/rank on TP3
-    (and ~2.0 GiB/rank on TP4) to hold `lm_head` `W_q` screening /
-    `vision_model` / resident `Engram` tables or VMM-stitch (`cuMemMap`) the
-    carve-out onto the KV cache to reclaim 1.2–2.0 GiB of host `MemAvailable`
-    per node while avoiding `/dev/dri/card0` DRM master contention and
-    `cuImportExternalMemory` `cuda-compat` pointer quirks (`0804`).
+    `ISO_YES | GPU_CACHEABLE_YES` / `NO`) and CUDA VMM contiguous stitching:**
+    In `c61-r16`, `vllm/v1/worker/display_carveout.py` replaces `/dev/dri/card0`
+    (`DRM_IOCTL_MODE_CREATE_DUMB` + `cuImportExternalMemory`) with direct
+    `/dev/nvidiactl` calls (`NV_ESC_RM_ALLOC` `NV01_MEMORY_SYSTEM` with
+    `NVOS32_ATTR2_ISO_YES`, `2 MiB` huge pages, and selectable
+    `GPU_CACHEABLE_YES` / `GPU_CACHEABLE_NO`, exported via
+    `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD` and imported via CUDA VMM
+    `cuMemImportFromShareableHandle` + `cuMemAddressReserve` + `cuMemMap`,
+    immediately closing all RM/FD handles and enforcing `_MAX_TOTAL_BYTES = 1968 << 20`).
+    Verified on `sp8` (`candidate-60`, `-v /dev/null:/dev/dri/card0`, `22 passed`):
+    both RM modes stream at `251–257 GB/s` sequential and **`230.6–234.4 GB/s`
+    random-576B** (vs `10.2 GB/s` on `card0`), `GPU_CACHEABLE_YES` matches `cudaMalloc`
+    (`1.00x`) on large-M ViT GEMMs, `GPU_CACHEABLE_NO` avoids L2 allocation on
+    single-pass `W_q` (`rm_HYBRID`: `lm_head(M=6) = 718.02 us` vs `card0_WQ_ONLY = 716.46 us`
+    and `cudaMalloc = 767.20 us`), and `rm_hybrid` (`776 MiB` carve-out) reclaims
+    **`+868.92 MiB`** host `MemAvailable` over `cudaMalloc` (`rm_wq_only`: `+128.67 MiB`).
+    Still open once promoted to `config/cluster.json`: remove the `/dev/dri/card0`
+    bind-mount and `c 226:* rw` rule from `config/cluster.json` (lines 54–55) and
+    `scripts/lab` carveout helper, and test VMM-stitching (`cuMemMap`) any
+    remaining scanout capacity onto the KV cache or other read-once/cached tables.
   - **DMA-BUF VMM range export (`CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD`) and Arm64 Write-Combining / mixed-mapping barrier discipline:**
     (1) when exporting `cuMemCreate` VMM ranges for CPU `mmap` access or
     ConnectX-7 RDMA registration (`ibv_reg_dmabuf_mr`), use
@@ -728,7 +738,14 @@ Don't repeat these without a new reason:
   from `6.5–6.6 us` to `49.3–74.0 us` (`3.09–3.81 ms/step` vs `1.54–1.65 ms`);
   and (c) CUDA Graph conditional `IF` Markov halting — adds `10–14 us` per
   conditional stream boundary (`+0.34 ms` `gap_ms` across all 36 `engine_grid`
-  shapes and `+0.05..+0.15 ms` `dft_ms` at `8x..16x`).
+  shapes and `+0.05..+0.15 ms` `dft_ms` at `8x..16x`). Direct producer writes
+  into `sparknet` `pin_memory=True` `send_slot` (`TODO` Decode #2) were also
+  retired after live 4-node CUPTI confirmed `0` pre-AR `cudaMemcpyAsync`
+  staging copies (`0.0006 ms/step` total `gpu_memcpy` at `c1`; `roce_copy_pack`
+  stages 16B-coalesced L2-hot `inp` in-kernel) and `sp8` Cold-L2 `COPIES=12`
+  measurements showed `wo_b` `pin+fence` `+2.30..+51.06 us/L` slower (`M=1..48`)
+  and `moe_chain` `+0.14..+1.00 us/L` slower (`M=3, 6, 48`, vs `-0.30..-2.51 us/L`
+  for `skip_stage` alone).
 - **Prefill:** M32 MoE tile (+1%); fused M32 MoE (no gain, less headroom);
   `NCCL_PROTO=Simple` (no gain); `--max-parallel-prefills 8` (four-64K mean TTFT
   41 → 67 s); sequence parallelism below 205 tokens (+12 ms TTFT on short

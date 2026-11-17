@@ -78,8 +78,14 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
         # head (1.5 * n * k bytes) and its 8-bit screening table (1.0 * n * k
         # bytes) share one carve-out mapping without allocating host memory.
         alloc_shape = (n, k + k // 4) if self.tilelang else shape
+        # TileLang decode shares this buffer with the single-pass 8-bit W_q
+        # screening table, where GPU_CACHEABLE_NO avoids L2 line allocation
+        # overhead; packed-only carve-outs keep GPU_CACHEABLE_YES.
         raw = display_carveout.allocate(
-            alloc_shape, params_dtype, torch.get_default_device()
+            alloc_shape,
+            params_dtype,
+            torch.get_default_device(),
+            cacheable=not self.tilelang,
         )
         if raw is not None and self.tilelang:
             data = raw.view(-1)[: n * k].view(shape)
@@ -100,6 +106,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
                     torch.uint8,
                     torch.get_default_device(),
                     optional=True,
+                    cacheable=False,
                 )
                 if wq is not None:
                     layer._carveout_screen_wq = wq

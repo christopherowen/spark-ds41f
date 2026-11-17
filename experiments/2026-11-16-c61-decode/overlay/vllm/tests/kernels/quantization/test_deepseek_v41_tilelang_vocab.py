@@ -702,8 +702,8 @@ def test_packed_bf16_lm_head_carveout_shares_single_buffer_with_screen_wq(monkey
     from vllm.v1.worker import display_carveout
     from vllm.v1.worker.gpu.spec_decode.greedy_verification import vocab_parallel_pairs
 
-    if not os.access("/dev/dri/card0", os.R_OK | os.W_OK):
-        pytest.skip("no DRM node")
+    if not os.access("/dev/nvidiactl", os.R_OK | os.W_OK):
+        pytest.skip("no NVIDIA RM node")
 
     class _HeadLayer(torch.nn.Module):
         pass

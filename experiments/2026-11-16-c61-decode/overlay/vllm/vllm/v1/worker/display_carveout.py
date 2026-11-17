@@ -1,58 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Embedding and output-head weights in the GB10 display carve-out.
+"""Embedding, output-head, and decode-only weights in the GB10 display carve-out.
 
 DGX Spark firmware reserves about 2 GiB at the top of physical memory for
 display scanout surfaces (the DISPLAY_FRM carve-out). Linux and ordinary CUDA
 allocations never use it, so on a headless node it sits idle; a text console
-takes only its framebuffer (8 MiB at 1920x1080). nvidia-drm serves DRM dumb
-buffers from that carve-out, and a dumb buffer exported as a dma-buf and
-imported with ``cuImportExternalMemory`` is readable by kernels.
+takes only its framebuffer (8 MiB at 1920x1080). Calling NVIDIA's Resource
+Manager directly on /dev/nvidiactl (NV_ESC_RM_ALLOC with
+NV01_MEMORY_SYSTEM, NVOS32_ATTR2_ISO_YES, and 2 MiB huge pages),
+exporting the RM handle via NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD,
+and importing it through CUDA Virtual Memory Management
+(cuMemImportFromShareableHandle + cuMemAddressReserve + cuMemMap +
+cuMemSetAccess) maps scanout memory into CUDA without touching
+/dev/dri/card0, avoiding DRM master contention and 16 MiB dumb-buffer
+rounding while staying readable by kernels and direct_io.
 
-Measured on GB10, the imported mapping streams at full speed (235 GB/s
-sequential reads; a 6-row GEMV over a 43K-row head runs 10% faster than from
-ordinary memory) but gives no reuse: random 576-byte reads run at 7 GB/s
-against 221 GB/s, and large-M GEMMs that re-read their weights run 2.3x
-slower. So only data read once per step belongs there. The embedding table
-(row lookups) and the output head (only ever multiplied by decode rows and
-prefill's sampled positions) qualify, while the KV cache, which attention
-gathers and re-reads, does not: holding it there cost 8% at eight streams.
+Measured on GB10 (spark-ds41f:candidate-60), both RM scanout modes stream
+at full speed (~251-257 GB/s sequential read) and deliver ~231-234 GB/s on
+random 576-byte reads (versus ~10 GB/s on DRM dumb buffers and ~225 GB/s in
+cudaMalloc). NVOS32_ATTR2_GPU_CACHEABLE_YES matches cudaMalloc
+(1.00x) on large-M GEMMs that re-read weights (appropriate for embed_tokens,
+packed lm_head.weight, markov_w1, and multi-token tables), while
+NVOS32_ATTR2_GPU_CACHEABLE_NO bypasses L2 cache line allocation for
+single-pass decode-only weights such as the 8-bit vocab screening matrix W_q
+and DSpark routed-expert slabs (saving ~39 us on lm_head_greedy(M=6) vs.
+caching W_q).
 
-With ``SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`` those weights are created in the
-carve-out when the model is built (``allocate``), so the checkpoint streams
-straight into it and they never occupy ordinary memory: on GB10, memory freed
-after loading stays charged to the process, so copying them in after loading
-and freeing the originals would cost host memory for good. Once loading is
-done, before any kernel plan or graph captures the weights, the worker confirms
-that every vocabulary-sized weight of the served model is in the carve-out and
-that no carve-out buffer was left behind by a layer the model dropped. It
-refuses to start otherwise, or when the carve-out cannot hold them.
+With SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 mandatory vocabulary tables are
+created in the carve-out when the model is built (allocate), so the
+checkpoint streams straight into it and they never occupy ordinary memory: on
+GB10, memory freed after loading stays charged to the process, so copying them
+in after loading and freeing the originals would cost host memory for good.
+Once loading is done, before any kernel plan or graph captures the weights,
+the worker confirms that every mandatory vocabulary-sized weight of the served
+model is in the carve-out and that no carve-out buffer was left behind by a
+layer the model dropped. It refuses to start otherwise, or when the carve-out
+cannot hold them.
 
 Nothing writes the weights after loading, and nothing else can reach them:
-the DRM file and its buffer handle close right after the export, the dma-buf
-stays private to the worker, the display engine only scans out its own
-surfaces, and the scanout heap never hands out a range in use. A driver fault
-or GPU reset could still leave the mapping on memory that something else
-reuses, and the result would be wrong embeddings or logits with no error.
-
-For debugging such a fault, ``SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
-turns on an integrity check; production leaves it unset, which adds no work
-at all. The worker then checksums every carve-out weight once loading is
-done and, from the end of graph capture, re-checks it from a background
-thread on a side stream at that interval (about 20 ms per check for the
-842.5 MiB of a DS4.1 rank). A mismatch is logged and kills the worker, which
-stops the engine; nothing runs in the serving loop.
+the RM client, device, memory handles, and export file descriptor all close
+immediately after CUDA VMM imports the handle, leaving no open RM control fd
+and keeping the imported allocation private to the worker process (reclaimed by
+the kernel on close() or process exit). The scanout heap never hands out a
+range already in use, and _MAX_TOTAL_BYTES keeps at least 64 MiB free for a
+node's 8 MiB /dev/fb0 text console. A driver fault or GPU reset could still
+leave a stale mapping, so SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS above
+0 turns on periodic side-stream checksum verification; production leaves it
+unset for zero runtime overhead.
 """
 
 from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import fcntl
 import math
 import os
 import signal
-import struct
 import threading
 import time
 
@@ -69,123 +74,486 @@ _CHECK_SECONDS = float(
 )
 # 16 MiB of 32-bit words per partial checksum (a 32 MiB int64 transient).
 _CHECK_CHUNK_WORDS = 1 << 22
-_DRM_NODE = "/dev/dri/card0"
+_RM_NODE = "/dev/nvidiactl"
 
-_DRM_IOCTL_MODE_CREATE_DUMB = 0xC02064B2
-_DRM_IOCTL_PRIME_HANDLE_TO_FD = 0xC00C642D
-_DUMB_WIDTH = 4096
-_DUMB_BPP = 32
-_ROW_BYTES = _DUMB_WIDTH * _DUMB_BPP // 8
-_GRANULE = 16 << 20
-# Vocabulary-sized tables (including DSpark's 63.125 MiB markov_w1) and
+# 2 MiB huge pages inside the scanout reserve match CUDA VMM mapping granularity.
+_GRANULE = 2 << 20
+# Vocabulary-sized tables (including DSpark's 60-64 MiB markov_w1) and
 # decode-only DSpark routed-expert slabs; small embeddings stay where they are.
 _MIN_WEIGHT_BYTES = 60 << 20
 # Leave 64 MiB of the 2,032 MiB scanout reserve free for the console framebuffer.
 _MAX_TOTAL_BYTES = 1968 << 20
-_CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD = 9
+
+# NVIDIA Resource Manager escape codes (nv_escape.h), class IDs (cl0000.h /
+# cl0080.h / cl003e.h), and control commands (ctrl0000gpu.h / ctrl0000unix.h).
+_NV_ESC_RM_FREE = 0x29
+_NV_ESC_RM_CONTROL = 0x2A
+_NV_ESC_RM_ALLOC = 0x2B
+
+_NV01_ROOT = 0x0
+_NV01_DEVICE_0 = 0x80
+_NV01_MEMORY_SYSTEM = 0x3E
+
+_NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS = 0x201
+_NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2 = 0x205
+_NV0000_CTRL_CMD_GPU_ATTACH_IDS = 0x215
+_NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID = 0x275
+_NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD = 0x3D05
+
+_NV0000_CTRL_GPU_ATTACH_ALL_PROBED_IDS = 0x0000FFFF
+_NV0000_CTRL_GPU_INVALID_ID = 0xFFFFFFFF
+_NV0000_CTRL_CMD_GPU_GET_UUID_FLAGS_BINARY_SHA1 = 0x2
+_NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM = 1
+_NV0000_GPU_MAX_GID_LENGTH = 256
+_NV_MAX_DEVICES = 32
+
+# Non-zero RM owner tag ('spk1') and memory attributes (nvos.h) for contiguous
+# 2 MiB ISO scanout pages with selectable GPU L2 cacheability.
+_RM_OWNER = 0x73706B31
+_NVOS32_TYPE_IMAGE = 0
+_NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE = 0x00000100
+_NVOS32_ATTR = (
+    (3 << 23)  # NVOS32_ATTR_PAGE_SIZE_HUGE
+    | (1 << 25)  # NVOS32_ATTR_LOCATION_PCI
+    | (2 << 27)  # NVOS32_ATTR_PHYSICALITY_CONTIGUOUS
+    | (1 << 29)  # NVOS32_ATTR_COHERENCY_CACHED
+)
+_NVOS32_ATTR2_BASE = (
+    (1 << 18)  # NVOS32_ATTR2_ISO_YES
+    | (1 << 20)  # NVOS32_ATTR2_PAGE_SIZE_HUGE_2MB
+)
+_NVOS32_ATTR2_GPU_CACHEABLE_YES = 1 << 2
+_NVOS32_ATTR2_GPU_CACHEABLE_NO = 2 << 2
+
+_CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1
+_CU_MEM_LOCATION_TYPE_DEVICE = 1
+_CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+
+_HANDLE_DEVICE = 0x10001
+_HANDLE_MEMORY = 0x20001
 
 
-class _Win32Handle(ctypes.Structure):
-    _fields_ = [("handle", ctypes.c_void_p), ("name", ctypes.c_void_p)]
+def _iowr(nr: int, size: int) -> int:
+    return (3 << 30) | (size << 16) | (ord("F") << 8) | nr
 
 
-class _HandleUnion(ctypes.Union):
+class _NvOs21Params(ctypes.Structure):
     _fields_ = [
-        ("fd", ctypes.c_int),
-        ("win32", _Win32Handle),
-        ("nvSciBufObject", ctypes.c_void_p),
+        ("hRoot", ctypes.c_uint32),
+        ("hObjectParent", ctypes.c_uint32),
+        ("hObjectNew", ctypes.c_uint32),
+        ("hClass", ctypes.c_uint32),
+        ("pAllocParms", ctypes.c_uint64),
+        ("paramsSize", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
     ]
 
 
-class _ExternalMemoryHandleDesc(ctypes.Structure):
+class _NvOs00Params(ctypes.Structure):
     _fields_ = [
-        ("type", ctypes.c_int),
-        ("handle", _HandleUnion),
-        ("size", ctypes.c_ulonglong),
-        ("flags", ctypes.c_uint),
-        ("reserved", ctypes.c_uint * 16),
+        ("hRoot", ctypes.c_uint32),
+        ("hObjectParent", ctypes.c_uint32),
+        ("hObjectOld", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
     ]
 
 
-class _ExternalMemoryBufferDesc(ctypes.Structure):
+class _NvOs54Params(ctypes.Structure):
     _fields_ = [
-        ("offset", ctypes.c_ulonglong),
-        ("size", ctypes.c_ulonglong),
-        ("flags", ctypes.c_uint),
-        ("reserved", ctypes.c_uint * 16),
+        ("hClient", ctypes.c_uint32),
+        ("hObject", ctypes.c_uint32),
+        ("cmd", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("params", ctypes.c_uint64),
+        ("paramsSize", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
     ]
+
+
+class _Nv0000AllocParams(ctypes.Structure):
+    _fields_ = [
+        ("hClient", ctypes.c_uint32),
+        ("processID", ctypes.c_uint32),
+        ("processName", ctypes.c_char * 100),
+        ("pOsPidInfo", ctypes.c_uint64),
+    ]
+
+
+class _Nv0080AllocParams(ctypes.Structure):
+    _fields_ = [
+        ("deviceId", ctypes.c_uint32),
+        ("hClientShare", ctypes.c_uint32),
+        ("hTargetClient", ctypes.c_uint32),
+        ("hTargetDevice", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("vaSpaceSize", ctypes.c_uint64),
+        ("vaStartInternal", ctypes.c_uint64),
+        ("vaLimitInternal", ctypes.c_uint64),
+        ("vaMode", ctypes.c_uint32),
+    ]
+
+
+class _NvMemoryAllocationParams(ctypes.Structure):
+    _fields_ = [
+        ("owner", ctypes.c_uint32),
+        ("type", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("pitch", ctypes.c_int32),
+        ("attr", ctypes.c_uint32),
+        ("attr2", ctypes.c_uint32),
+        ("format", ctypes.c_uint32),
+        ("comprCovg", ctypes.c_uint32),
+        ("zcullCovg", ctypes.c_uint32),
+        ("rangeLo", ctypes.c_uint64),
+        ("rangeHi", ctypes.c_uint64),
+        ("size", ctypes.c_uint64),
+        ("alignment", ctypes.c_uint64),
+        ("offset", ctypes.c_uint64),
+        ("limit", ctypes.c_uint64),
+        ("address", ctypes.c_uint64),
+        ("ctagOffset", ctypes.c_uint32),
+        ("hVASpace", ctypes.c_uint32),
+        ("internalflags", ctypes.c_uint32),
+        ("tag", ctypes.c_uint32),
+        ("numaNode", ctypes.c_int32),
+    ]
+
+
+class _Nv0000AttachIdsParams(ctypes.Structure):
+    _fields_ = [
+        ("gpuIds", ctypes.c_uint32 * _NV_MAX_DEVICES),
+        ("failedId", ctypes.c_uint32),
+    ]
+
+
+class _Nv0000AttachedIdsParams(ctypes.Structure):
+    _fields_ = [("gpuIds", ctypes.c_uint32 * _NV_MAX_DEVICES)]
+
+
+class _Nv0000GpuIdInfoV2Params(ctypes.Structure):
+    _fields_ = [
+        ("gpuId", ctypes.c_uint32),
+        ("gpuFlags", ctypes.c_uint32),
+        ("deviceInstance", ctypes.c_uint32),
+        ("subDeviceInstance", ctypes.c_uint32),
+        ("sliStatus", ctypes.c_uint32),
+        ("boardId", ctypes.c_uint32),
+        ("gpuInstance", ctypes.c_uint32),
+        ("numaId", ctypes.c_int32),
+    ]
+
+
+class _Nv0000UuidFromGpuIdParams(ctypes.Structure):
+    _fields_ = [
+        ("gpuId", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("gpuUuid", ctypes.c_uint8 * _NV0000_GPU_MAX_GID_LENGTH),
+        ("uuidStrLen", ctypes.c_uint32),
+    ]
+
+
+class _Nv0000CtrlOsUnixExportObjectToFdParams(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_uint32),
+        ("hDevice", ctypes.c_uint32),
+        ("hParent", ctypes.c_uint32),
+        ("hObject", ctypes.c_uint32),
+        ("fd", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class _CUmemLocation(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class _CUmemAccessDesc(ctypes.Structure):
+    _fields_ = [("location", _CUmemLocation), ("flags", ctypes.c_int)]
+
+
+_libcuda = None
+
+
+def _cuda():
+    global _libcuda
+    if _libcuda is None:
+        _libcuda = ctypes.CDLL("libcuda.so.1")
+    return _libcuda
+
+
+def _check(cuda, status: int, what: str) -> None:
+    if status:
+        text = ctypes.c_char_p()
+        cuda.cuGetErrorString(status, ctypes.byref(text))
+        detail = text.value.decode() if text.value else status
+        raise OSError(errno.ENOMEM, f"{what} failed: {detail}")
+
+
+def _rm_alloc(
+    ctl_fd: int, root: int, parent: int, new_obj: int, cls: int, params
+) -> int:
+    req = _NvOs21Params(
+        hRoot=root,
+        hObjectParent=parent,
+        hObjectNew=new_obj,
+        hClass=cls,
+        pAllocParms=ctypes.addressof(params),
+        paramsSize=ctypes.sizeof(params),
+    )
+    fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_ALLOC, ctypes.sizeof(req)), req)
+    if req.status != 0:
+        err = errno.ENOMEM if req.status == 0x51 else errno.EIO
+        raise OSError(
+            err, f"NV_ESC_RM_ALLOC(class={cls:#x}) failed: status={req.status:#x}"
+        )
+    return req.hObjectNew
+
+
+def _rm_control(ctl_fd: int, client: int, obj: int, cmd: int, params) -> None:
+    req = _NvOs54Params(
+        hClient=client,
+        hObject=obj,
+        cmd=cmd,
+        flags=0,
+        params=ctypes.addressof(params),
+        paramsSize=ctypes.sizeof(params),
+    )
+    fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_CONTROL, ctypes.sizeof(req)), req)
+    if req.status != 0:
+        raise OSError(
+            errno.EIO,
+            f"NV_ESC_RM_CONTROL(cmd={cmd:#x}) failed: status={req.status:#x}",
+        )
+
+
+def _rm_free(ctl_fd: int, root: int, parent: int, obj: int) -> None:
+    req = _NvOs00Params(hRoot=root, hObjectParent=parent, hObjectOld=obj)
+    with contextlib.suppress(OSError):
+        fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_FREE, ctypes.sizeof(req)), req)
+
+
+def _device_uuid(cuda, device_index: int) -> bytes:
+    cu_dev = ctypes.c_int()
+    _check(cuda, cuda.cuDeviceGet(ctypes.byref(cu_dev), device_index), "cuDeviceGet")
+    cu_uuid = (ctypes.c_uint8 * 16)()
+    get_uuid = getattr(cuda, "cuDeviceGetUuid_v2", cuda.cuDeviceGetUuid)
+    _check(cuda, get_uuid(cu_uuid, cu_dev), "cuDeviceGetUuid")
+    return bytes(cu_uuid)
+
+
+def _resolve_device_instance(
+    ctl_fd: int, hclient: int, cuda, device_index: int
+) -> int:
+    target_uuid = _device_uuid(cuda, device_index)
+    attached = _Nv0000AttachedIdsParams()
+    _rm_control(ctl_fd, hclient, hclient, _NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS, attached)
+    for gpu_id in attached.gpuIds:
+        if gpu_id == 0 or gpu_id == _NV0000_CTRL_GPU_INVALID_ID:
+            continue
+        uuid_req = _Nv0000UuidFromGpuIdParams(
+            gpuId=gpu_id, flags=_NV0000_CTRL_CMD_GPU_GET_UUID_FLAGS_BINARY_SHA1
+        )
+        try:
+            _rm_control(
+                ctl_fd,
+                hclient,
+                hclient,
+                _NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID,
+                uuid_req,
+            )
+        except OSError:
+            continue
+        if bytes(uuid_req.gpuUuid[:16]) == target_uuid:
+            info = _Nv0000GpuIdInfoV2Params(gpuId=gpu_id)
+            _rm_control(
+                ctl_fd, hclient, hclient, _NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, info
+            )
+            return int(info.deviceInstance)
+    raise OSError(
+        errno.ENODEV,
+        f"No RM GPU matches CUDA device {device_index} UUID {target_uuid.hex()}",
+    )
 
 
 class _Carveout:
-    """One dumb buffer imported into CUDA; alive for the whole process.
+    """One RM scanout allocation mapped via CUDA VMM; alive for the process.
 
-    The DRM file is held only while creating and exporting the buffer: the
-    first opener of a card with no display server becomes DRM master, and the
-    kernel's framebuffer console stops drawing while a userspace master exists.
-    The exported dma-buf keeps the buffer alive after the file closes.
+    /dev/nvidiactl and all RM handles (client, device, memory, and export
+    fd) close right after cuMemImportFromShareableHandle retains its own
+    kernel reference to the exported object.
     """
 
-    def __init__(self, nbytes: int):
+    def __init__(
+        self, nbytes: int, *, device_index: int = 0, cacheable: bool = True
+    ):
         self.nbytes = nbytes
-        drm_fd = os.open(_DRM_NODE, os.O_RDWR | os.O_CLOEXEC)
-        try:
-            request = bytearray(
-                struct.pack(
-                    "IIIIIIQ", nbytes // _ROW_BYTES, _DUMB_WIDTH, _DUMB_BPP, 0, 0, 0, 0
-                )
-            )
-            fcntl.ioctl(drm_fd, _DRM_IOCTL_MODE_CREATE_DUMB, request)
-            _, _, _, _, handle, _, size = struct.unpack("IIIIIIQ", request)
-            if size != nbytes:
-                raise RuntimeError(
-                    f"display carve-out returned {size} bytes, asked for {nbytes}"
-                )
-            prime = bytearray(struct.pack("IIi", handle, os.O_CLOEXEC | os.O_RDWR, -1))
-            fcntl.ioctl(drm_fd, _DRM_IOCTL_PRIME_HANDLE_TO_FD, prime)
-            self.dmabuf_fd = struct.unpack("IIi", prime)[2]
-        finally:
-            os.close(drm_fd)
-
-        cuda = ctypes.CDLL("libcuda.so.1")
-        desc = _ExternalMemoryHandleDesc()
-        desc.type = _CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD
-        desc.handle.fd = self.dmabuf_fd
-        desc.size = nbytes
-        self.external = ctypes.c_void_p()
-        _check(
-            cuda,
-            cuda.cuImportExternalMemory(
-                ctypes.byref(self.external), ctypes.byref(desc)
-            ),
-            "cuImportExternalMemory",
-        )
-        buffer = _ExternalMemoryBufferDesc()
-        buffer.size = nbytes
+        self.device_index = device_index
+        self.cacheable = cacheable
+        self._closed = True
+        self.handle = ctypes.c_uint64()
         self.pointer = ctypes.c_ulonglong()
-        _check(
-            cuda,
-            cuda.cuExternalMemoryGetMappedBuffer(
-                ctypes.byref(self.pointer), self.external, ctypes.byref(buffer)
-            ),
-            "cuExternalMemoryGetMappedBuffer",
-        )
+        self._mapped = False
+
+        cuda = _cuda()
+        torch.cuda.init()
+
+        ctl_fd = os.open(_RM_NODE, os.O_RDWR | os.O_CLOEXEC)
+        hclient = 0
+        hdev = 0
+        hmem = 0
+        export_fd = -1
+        try:
+            root_params = _Nv0000AllocParams()
+            # Kernel upgrades NV01_ROOT allocation hObjectNew cleanly when 0.
+            req = _NvOs21Params(
+                hRoot=0,
+                hObjectParent=0,
+                hObjectNew=0,
+                hClass=_NV01_ROOT,
+                pAllocParms=ctypes.addressof(root_params),
+                paramsSize=ctypes.sizeof(root_params),
+            )
+            fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_ALLOC, ctypes.sizeof(req)), req)
+            if req.status != 0:
+                raise OSError(
+                    errno.EIO,
+                    f"NV_ESC_RM_ALLOC(NV01_ROOT) failed: status={req.status:#x}",
+                )
+            hclient = req.hObjectNew
+
+            attach = _Nv0000AttachIdsParams()
+            attach.gpuIds[0] = _NV0000_CTRL_GPU_ATTACH_ALL_PROBED_IDS
+            attach.gpuIds[1] = _NV0000_CTRL_GPU_INVALID_ID
+            _rm_control(
+                ctl_fd, hclient, hclient, _NV0000_CTRL_CMD_GPU_ATTACH_IDS, attach
+            )
+
+            device_instance = _resolve_device_instance(
+                ctl_fd, hclient, cuda, device_index
+            )
+            dev_params = _Nv0080AllocParams(
+                deviceId=device_instance, hClientShare=hclient
+            )
+            hdev = _rm_alloc(
+                ctl_fd, hclient, hclient, _HANDLE_DEVICE, _NV01_DEVICE_0, dev_params
+            )
+
+            cache_attr = (
+                _NVOS32_ATTR2_GPU_CACHEABLE_YES
+                if cacheable
+                else _NVOS32_ATTR2_GPU_CACHEABLE_NO
+            )
+            mem_params = _NvMemoryAllocationParams(
+                owner=_RM_OWNER,
+                type=_NVOS32_TYPE_IMAGE,
+                flags=_NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE,
+                attr=_NVOS32_ATTR,
+                attr2=_NVOS32_ATTR2_BASE | cache_attr,
+                size=nbytes,
+                alignment=_GRANULE,
+            )
+            hmem = _rm_alloc(
+                ctl_fd, hclient, hdev, _HANDLE_MEMORY, _NV01_MEMORY_SYSTEM, mem_params
+            )
+
+            export_fd = os.open(_RM_NODE, os.O_RDWR | os.O_CLOEXEC)
+            export_params = _Nv0000CtrlOsUnixExportObjectToFdParams(
+                type=_NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM,
+                hDevice=hdev,
+                hParent=hdev,
+                hObject=hmem,
+                fd=export_fd,
+                flags=0,
+            )
+            _rm_control(
+                ctl_fd,
+                hclient,
+                hclient,
+                _NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD,
+                export_params,
+            )
+            _check(
+                cuda,
+                cuda.cuMemImportFromShareableHandle(
+                    ctypes.byref(self.handle),
+                    ctypes.c_void_p(export_fd),
+                    _CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                ),
+                "cuMemImportFromShareableHandle",
+            )
+        finally:
+            if export_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(export_fd)
+            if hmem:
+                _rm_free(ctl_fd, hclient, hdev, hmem)
+            if hdev:
+                _rm_free(ctl_fd, hclient, hclient, hdev)
+            if hclient:
+                _rm_free(ctl_fd, hclient, 0, hclient)
+            os.close(ctl_fd)
+
         self._closed = False
+        try:
+            _check(
+                cuda,
+                cuda.cuMemAddressReserve(
+                    ctypes.byref(self.pointer),
+                    ctypes.c_size_t(nbytes),
+                    ctypes.c_size_t(_GRANULE),
+                    ctypes.c_ulonglong(0),
+                    ctypes.c_ulonglong(0),
+                ),
+                "cuMemAddressReserve",
+            )
+            _check(
+                cuda,
+                cuda.cuMemMap(
+                    self.pointer,
+                    ctypes.c_size_t(nbytes),
+                    ctypes.c_size_t(0),
+                    self.handle,
+                    ctypes.c_ulonglong(0),
+                ),
+                "cuMemMap",
+            )
+            self._mapped = True
+            access = _CUmemAccessDesc(
+                location=_CUmemLocation(
+                    type=_CU_MEM_LOCATION_TYPE_DEVICE, id=device_index
+                ),
+                flags=_CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+            )
+            _check(
+                cuda,
+                cuda.cuMemSetAccess(
+                    self.pointer,
+                    ctypes.c_size_t(nbytes),
+                    ctypes.byref(access),
+                    ctypes.c_size_t(1),
+                ),
+                "cuMemSetAccess",
+            )
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         if getattr(self, "_closed", True):
             return
         self._closed = True
-        cuda = ctypes.CDLL("libcuda.so.1")
+        cuda = _cuda()
+        if getattr(self, "_mapped", False) and getattr(self, "pointer", None) and self.pointer.value:
+            cuda.cuMemUnmap(self.pointer, ctypes.c_size_t(self.nbytes))
+            self._mapped = False
         if getattr(self, "pointer", None) and self.pointer.value:
-            cuda.cuMemFree_v2(self.pointer)
+            cuda.cuMemAddressFree(self.pointer, ctypes.c_size_t(self.nbytes))
             self.pointer = ctypes.c_ulonglong()
-        if getattr(self, "external", None) and self.external.value:
-            cuda.cuDestroyExternalMemory(self.external)
-            self.external = ctypes.c_void_p()
-        if getattr(self, "dmabuf_fd", -1) >= 0:
-            with contextlib.suppress(OSError):
-                os.close(self.dmabuf_fd)
-            self.dmabuf_fd = -1
+        if getattr(self, "handle", None) and self.handle.value:
+            cuda.cuMemRelease(self.handle)
+            self.handle = ctypes.c_uint64()
 
     @property
     def __cuda_array_interface__(self):
@@ -196,14 +564,6 @@ class _Carveout:
             "version": 3,
             "strides": None,
         }
-
-
-def _check(cuda, status: int, what: str) -> None:
-    if status:
-        text = ctypes.c_char_p()
-        cuda.cuGetErrorString(status, ctypes.byref(text))
-        detail = text.value.decode() if text.value else status
-        raise RuntimeError(f"{what} failed: {detail}")
 
 
 # One buffer per weight, alive for the whole process.
@@ -220,11 +580,12 @@ def allocate(
     device: torch.device | str,
     *,
     optional: bool = False,
+    cacheable: bool = True,
 ) -> torch.Tensor | None:
     """A vocabulary-sized weight created in its own carve-out buffer, or None.
 
-    Returns None unless the carve-out is required (or ``optional=True`` and the
-    DRM scanout reserve can hold it), the device is CUDA and the weight reaches
+    Returns None unless the carve-out is required (or optional=True and the
+    RM scanout reserve can hold it), the device is CUDA and the weight reaches
     the vocabulary-sized threshold; the caller then allocates ordinary memory as
     usual. Loading writes the checkpoint straight into the returned tensor.
     """
@@ -235,16 +596,24 @@ def allocate(
     if not _REQUIRED and not optional:
         return None
     rounded = -(-nbytes // _GRANULE) * _GRANULE
-    if optional and total_bytes() + rounded > _MAX_TOTAL_BYTES:
-        return None
+    if total_bytes() + rounded > _MAX_TOTAL_BYTES:
+        if optional:
+            return None
+        raise RuntimeError(
+            f"SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out limit "
+            f"({_MAX_TOTAL_BYTES >> 20} MiB) cannot hold a {nbytes >> 20} MiB weight"
+        )
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     try:
-        carveout = _Carveout(rounded)
+        carveout = _Carveout(rounded, device_index=device_index, cacheable=cacheable)
     except OSError as error:
         if optional:
             return None
         raise RuntimeError(
             f"SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
-            f"hold a {nbytes >> 20} MiB weight ({_DRM_NODE}: {error})"
+            f"hold a {nbytes >> 20} MiB weight ({_RM_NODE}: {error})"
         ) from error
     _carveouts.append(carveout)
     backing = torch.as_tensor(carveout, device=device)
@@ -258,14 +627,14 @@ def total_bytes() -> int:
 
 
 def compact(tensor: torch.Tensor) -> torch.Tensor:
-    """Shrink a carve-out buffer to fit ``tensor`` after in-place packing.
+    """Shrink a carve-out buffer to fit tensor after in-place packing.
 
     12-bit vocabulary packing shrinks an unpacked BF16 table to 75% of its
-    bytes in place. Reallocating a tight dumb buffer and closing the unpacked
-    one reclaims 112 MiB of carve-out a table at TP3 (80 MiB at TP4) without
-    touching ordinary memory.
+    bytes in place. Reallocating a tight scanout buffer and closing the unpacked
+    one reclaims carve-out space (at 2 MiB granularity) without touching
+    ordinary memory.
 
-    The old buffer is closed, so ``tensor`` must be the only live view of it:
+    The old buffer is closed, so tensor must be the only live view of it:
     a caller that keeps other data in the same buffer (the TileLang packed
     head's screening table) must not compact it.
     """
@@ -284,7 +653,11 @@ def compact(tensor: torch.Tensor) -> torch.Tensor:
         if rounded >= carveout.nbytes:
             return tensor
         try:
-            staging = _Carveout(rounded)
+            staging = _Carveout(
+                rounded,
+                device_index=carveout.device_index,
+                cacheable=carveout.cacheable,
+            )
         except OSError:
             return tensor
         staging_view = (
@@ -294,12 +667,16 @@ def compact(tensor: torch.Tensor) -> torch.Tensor:
         )
         staging_view.copy_(tensor)
         torch.cuda.synchronize(tensor.device)
+        device_index = carveout.device_index
+        cacheable = carveout.cacheable
         del tensor
         carveout.close()
-        # Reallocate at the bottom of the scanout heap now that ``carveout`` is
+        # Reallocate at the bottom of the scanout heap now that carveout is
         # closed so compacted vocabulary tables leave no hole between them.
         try:
-            shrunk = _Carveout(rounded)
+            shrunk = _Carveout(
+                rounded, device_index=device_index, cacheable=cacheable
+            )
         except OSError:
             _carveouts[index] = staging
             return staging_view
@@ -315,13 +692,14 @@ def compact(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def move(tensor: torch.Tensor) -> torch.Tensor:
+def move(tensor: torch.Tensor, *, cacheable: bool = False) -> torch.Tensor:
     """Move a prepared decode-only weight tensor into the carve-out if space permits.
 
-    Used after ``process_weights_after_loading`` prepares a tile-major
-    decode-only weight (such as DSpark's routed-expert ``w13_weight`` and
-    ``w2_weight``) when the remaining carve-out capacity within
-    ``_MAX_TOTAL_BYTES`` can hold it.
+    Used after process_weights_after_loading prepares a tile-major
+    decode-only weight (such as DSpark's routed-expert w13_weight and
+    w2_weight) when the remaining carve-out capacity within
+    _MAX_TOTAL_BYTES can hold it. Defaults to uncached L2 streaming
+    (GPU_CACHEABLE_NO) for single-pass decode weights.
     """
     nbytes = _nbytes(tensor)
     if (
@@ -336,8 +714,13 @@ def move(tensor: torch.Tensor) -> torch.Tensor:
     rounded = -(-nbytes // _GRANULE) * _GRANULE
     if total_bytes() + rounded > _MAX_TOTAL_BYTES:
         return tensor
+    device_index = (
+        tensor.device.index
+        if tensor.device.index is not None
+        else torch.cuda.current_device()
+    )
     try:
-        carveout = _Carveout(rounded)
+        carveout = _Carveout(rounded, device_index=device_index, cacheable=cacheable)
     except OSError:
         return tensor
     _carveouts.append(carveout)
@@ -472,11 +855,11 @@ def _is_mandatory_vocab_module(module: torch.nn.Module) -> bool:
 def streamed_weights(
     model: torch.nn.Module, *extra_models: torch.nn.Module | None
 ) -> list[tuple[str, torch.nn.Parameter]]:
-    """Streamed carve-out weights across ``model`` and any ``extra_models``, deduplicated.
+    """Streamed carve-out weights across model and any extra_models, deduplicated.
 
-    Includes every mandatory vocabulary-sized table (``VocabParallelEmbedding``
-    and DSpark's ``markov_w1``) plus any decode-only parameters moved into
-    ``_carveouts`` after preparation. A drafter that aliases the target's
+    Includes every mandatory vocabulary-sized table (VocabParallelEmbedding
+    and DSpark's markov_w1) plus any decode-only parameters moved into
+    _carveouts after preparation. A drafter that aliases the target's
     modules shares their parameters, so each tensor appears once.
     """
     roots = [model, *(m for m in extra_models if m is not None)]
@@ -512,11 +895,18 @@ def confirm_streamed_weights(
     """Confirm the streamed weights loaded into the display carve-out.
 
     Every vocabulary-sized weight of the served model (and any drafter) must
-    sit in a buffer from ``allocate``, and every carve-out buffer must hold a
+    sit in a buffer from allocate, and every carve-out buffer must hold a
     live parameter of the served models.
     """
-    assert ctypes.sizeof(_ExternalMemoryHandleDesc) == 104
-    assert ctypes.sizeof(_ExternalMemoryBufferDesc) == 88
+    assert ctypes.sizeof(_NvOs21Params) == 32
+    assert ctypes.sizeof(_NvOs00Params) == 16
+    assert ctypes.sizeof(_NvOs54Params) == 32
+    assert ctypes.sizeof(_Nv0000AllocParams) == 120
+    assert ctypes.sizeof(_Nv0080AllocParams) == 56
+    assert ctypes.sizeof(_NvMemoryAllocationParams) == 128
+    assert ctypes.sizeof(_Nv0000CtrlOsUnixExportObjectToFdParams) == 24
+    assert ctypes.sizeof(_CUmemLocation) == 8
+    assert ctypes.sizeof(_CUmemAccessDesc) == 12
     weights = streamed_weights(model, *extra_models)
     if not weights:
         raise RuntimeError(
