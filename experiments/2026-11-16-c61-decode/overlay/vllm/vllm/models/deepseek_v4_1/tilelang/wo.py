@@ -70,18 +70,17 @@ from .linear import (
 # back). Path and tile per bucket keep bit-identity across all rows:
 # - 1..16 rows stay split with block_K=256 (fewer K-loop barriers while overlapping
 #   1-CTA 200 ns L2 prefetch);
-# - 17..32 rows stay on 64x64 split;
-# - 33..128 rows switch to in-kernel shard accumulation (skipping the 1.6-4.2 MB
-#   FP32 partials roundtrip), 32x128 (threads=128) at 33..64 and 64x128
-#   (threads=256) at 65..128; >128 keeps 96x64x64 in-kernel prefill.
+# - 17..128 rows retain the baseline 64-col, two-stage split tiles (avoiding
+#   in-kernel shard accumulation overhead at M=36..96 on live tp4-ring);
+# - >128 keeps 96x64x64 in-kernel prefill.
 _WO_A_SHARDS = 4
 _WO_A_TILES = {
     16: dict(split=True, block_M=16, block_K=256),
-    32: dict(split=True, block_M=32, block_K=64),
-    64: dict(split=False, block_M=64, block_N=32, block_K=128),
-    96: dict(split=False, block_M=96, block_K=128, threads=256),
-    128: dict(split=False, block_M=128, block_K=128, threads=256),
-    None: dict(split=False, block_M=96, block_K=64),
+    32: dict(split=True, block_M=32),
+    64: dict(split=True, block_M=64),
+    96: dict(split=True, block_M=96),
+    128: dict(split=True, block_M=128),
+    None: dict(split=False, block_M=96),
 }
 _WO_A_COMMON = dict(block_N=64, num_stages=2)
 
