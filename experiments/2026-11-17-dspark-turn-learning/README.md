@@ -309,7 +309,159 @@ counters, gradient summed over ranks, AdaGrad step), the update's row deduplicat
 bin/spark candidate queue tp4-switched experiments/2026-11-17-dspark-turn-learning/shadow-tp4-switched.json --apply
 ```
 
-Pending.
+Queue entry `20261117T095559-shadow-tp4-switched`, commit `33bf74665`. Receipts:
+[shadow-screen](receipts/shadow-screen) (both boots' suite files and the verdicts), [shadow-gate](receipts/shadow-gate).
+
+**Screen against candidate-60's recorded screen** (both boots of each; the lab's verdicts):
+
+| Metric | Change | ±95% | Margin | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| grid: decode geometric mean (20 shapes) | +0.40% | 0.14% | 0.27% | worse |
+| c16: decode tok/s, paired | −0.08% | 0.53% | 0.58% | same |
+| c16: output tok/s | −0.07% | 0.74% | 0.96% | same |
+| prefill 32,768 tok/s | −0.18% | 1.20% | 1.56% | same |
+| prefill 262,144 tok/s | −0.32% | 0.57% | 0.74% | same |
+
+c16's drafts are candidate-60's: 1.370 accepted a draft against 1.371, the same tokens a step and survival at
+every position. The grid's step split, each shadow boot against the mean of candidate-60's two (median over
+the 20 shapes):
+
+| Boot | Step | Target forward | Draft step |
+| --- | ---: | ---: | ---: |
+| shadow | +65.3 µs (+0.22%) | +29.3 µs (+0.18%) | +13.2 µs (+0.52%) |
+| shadow-again | +61.4 µs (+0.29%) | +42.5 µs (+0.28%) | +9.0 µs (+0.35%) |
+| candidate-60's own repeat | | −14.5 µs | +0.1 µs |
+
+Most of the step's difference is in the target forward, which shadow does not touch (its kernels and
+buffers are candidate-60's; the learner adds 144 MiB a rank at load and nothing to the forward), and the
+draft step's +9 to +13 µs is about the microbenchmark's inline capture several times over, not its forked
+cost. The reference ran on 2026-11-16; this screen on 2026-11-17. A same-session control (four boots
+alternating the learner off and on) was planned for this version; it never ran, replaced before the queue
+took it by the same control of the off-step version below, whose learner-off boots also measure the day's
+drift against this reference. This version's files are `overlay/` at commit `33bf74665` (the queue entry's).
+
+**Gates** (one boot): determinism and greedy identical, candidate-60's hashes (log probabilities `18d61961` /
+`d6568649`, text `0a2dacdd` / `12fd8257`): shadow changes no output.
+
+**End of turn** (first screen boot, 159 finishes): median 0.277 ms, p90 0.35 ms for a finish call, with
+its all-gather and all-reduce; the first call of a boot, during startup warmup, took 633 ms. 63,048 drafts
+checked against the captured maxima, 0 mismatches. The maxima-limited score read −0.50%, as the offline
+check predicts of a score that cannot see most fixes. Warmup requests at startup reach the learner too
+(16 turns, 23 trained positions a boot); drafting with a learned table would need them left out.
+
+**AgentX, three hours at 8 sessions** (a fresh boot, profiling 10:38–13:39 UTC;
+[receipts/shadow-agentx](receipts/shadow-agentx)): valid, 1,822 requests, 0 errors, TTFT p50/p90
+0.70/1.81 s, 26.6/43.7 tok/s a user, 174.7 output tok/s, prefix hits 96.7% of 97.5% ideal, 1.965 accepted
+a draft. It is not a speed comparison: no learner-off AgentX run of this shape is recorded (observe's hour
+read 0.69/1.93 s, 25.2/44.6 tok/s a user, 171.2 tok/s).
+
+The learner over the three hours ([turn-learning-lines.log](receipts/shadow-agentx/turn-learning-lines.log)):
+1,875 finish calls, 958,471 trained positions; the copies of W1 agreed across the four ranks at all seven
+checks; 0 draft mismatches in 1,726,496 checked. The maxima-limited score by hour: −0.19%, +0.22%, +0.52%,
++0.57% (a health signal that cannot see most fixes; it climbs as the copy learns). End of turn: 1.94 s in
+all over 10,822 s, median 0.48 ms, p90 2.86 ms, max 5.87 ms; below.
+
+### End of turn under agent traffic, and where its time goes
+
+The AgentX boot (1,875 finish calls, 1,839 of them one turn): the end of turn takes far longer than in the
+screen, whose turns are short. Rank 0's events around the call:
+
+| Calls | n | Median | p90 | Max |
+| --- | ---: | ---: | ---: | ---: |
+| all | 1,875 | 0.48 ms | 2.86 ms | 5.87 ms |
+| one turn, 32–128 held steps | 679 | 0.22 ms | 1.97 ms | 4.62 ms |
+| one turn, 128–256 | 386 | 0.41 ms | 2.47 ms | 4.36 ms |
+| one turn, 256–384 | 179 | 0.71 ms | 2.85 ms | 3.47 ms |
+| one turn, 384–512 | 337 | 1.04 ms | 3.34 ms | 4.55 ms |
+| one turn, 512 or more | 159 | 1.13 ms | 3.35 ms | 3.99 ms |
+| observe's AgentX hour, for scale | 935 | 16.5 ms | 32.1 ms | 43.9 ms |
+
+[bundles/finish-bench-shadow](bundles/finish-bench-shadow) runs the learner's own `finish` on sp8 at serving
+shapes (rank 0 of four, a packed W2 shard built as at load, 16 slots, rings filled like finished turns), with
+one-GPU stand-ins for the collectives: their network time is not in it. `gpu` is the GPU's time alone (a
+spin queued ahead keeps the launches ahead of the GPU), `idle` what rank 0 logs with the GPU idle at the
+call, `host` the host's time in `finish`; medians of 15
+([receipts/finish-bench-shadow-2](receipts/finish-bench-shadow-2); run 1,
+[finish-bench-shadow-1](receipts/finish-bench-shadow-1), within 0.03 ms of it on `idle`):
+
+| Turns × kept steps | Chunks | gpu | idle | host |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 64 | 1 | 0.08 ms | 0.14 ms | 0.16 ms |
+| 1 × 128 | 1 | 0.14 ms | 0.19 ms | 0.17 ms |
+| 1 × 256 | 1 | 0.29 ms | 0.34 ms | 0.21 ms |
+| 1 × 384 | 2 | 0.42 ms | 0.48 ms | 0.30 ms |
+| 1 × 512 | 2 | 0.55 ms | 0.62 ms | 0.34 ms |
+| 2 × 512 | 4 | 1.15 ms | 1.23 ms | 0.59 ms |
+| 4 × 512 | 8 | 2.32 ms | 2.42 ms | 1.07 ms |
+| 8 × 512 | 16 | 4.58 ms | 4.83 ms | 2.15 ms |
+
+GPU time a launch, one turn of 512 steps (two chunks; events around each launch):
+
+| Launch | Launches | GPU | Host |
+| --- | ---: | ---: | ---: |
+| `shadow_update_kernel` | 2 | 0.249 ms | 0.027 ms |
+| `shadow_local_kernel` | 2 | 0.127 ms | 0.033 ms |
+| `vocab_embedding_packed` (decode) | 2 | 0.111 ms | 0.033 ms |
+| `shadow_totals_kernel` | 2 | 0.031 ms | 0.026 ms |
+| `shadow_combine_kernel` | 2 | 0.025 ms | 0.033 ms |
+| host-to-device copies | 6 | 0.023 ms | 0.137 ms |
+| `labels_kernel`, `reset_kernel` | 2 | 0.016 ms | 0.031 ms |
+| collective stand-ins | 4 | 0.008 ms | 0.062 ms |
+
+What this says:
+
+- The work is GPU-bound and linear in kept steps, about 0.28 ms a 256-step chunk; the host stays ahead.
+- The serving median at 384–512 steps (1.04 ms) is the bench's 0.62 ms plus about 0.4 ms, the two chunks'
+  network all-gather and all-reduce. The tail to 3–4 ms at every turn size is not work (the bench's range is
+  within 0.15 ms): it is waiting, the call's first collective absorbing whatever skew the ranks arrive with.
+- `shadow_update_kernel` is 45% of the GPU time and needlessly so: each owner block's threads each loop
+  serially over every later position for its row (positions² work). A block-wide search for the few
+  matching positions would take it to about 0.01 ms a chunk. Decode and the local kernel are then most of
+  it, near memory bandwidth (about 13 MB a chunk).
+- Even at that cost, a finished long turn holds the whole batch for a few hundred microseconds plus two
+  collectives, and the collectives bring the ranks' skew with them.
+
+### Off the step
+
+[overlay-offstep/](overlay-offstep/vllm/v1/worker/gpu/spec_decode/dspark) (`turn_learning_shadow.py`,
+`speculator.py`; the profile [tp4-switched-offstep.json](tp4-switched-offstep.json)). One causal change: where
+the end of turn runs. Two kernel fixes ride with it, as the owner decided.
+
+- **On the step's stream, only the staging.** `shadow_stage_kernel` (a block an entry) writes each kept entry's
+  labels and inputs (`labels_kernel`'s rule) and a copy of its ring entry into the learner's stage, entry-major
+  in call order; then the finished and preempted rings are cleared. One host-to-device copy a call carries the
+  slots and each entry's turn and step. The stage has room for two calls at full rings (16,384 entries,
+  11.4 MiB); a call's rows come round again only after its end of turn is done, and if they are still being
+  read the step waits for it and counts a stage wait.
+- **On the learner's stream, the rest.** The decode, the local kernel, the all-gather, the combine, the
+  all-reduce, the update and the totals read only the stage, on a CUDA stream of the learner's own that waits
+  for the staging. The collectives go through an NCCL communicator of the learner's own over the
+  tensor-parallel group (vLLM's `PyNcclCommunicator`, built at load), never the step's, whose collectives run
+  meanwhile; every rank issues the learner's in the same order. The all-gather's layout is rank-major, so
+  the combine reads it as it lands. The replica check is asynchronous too: the copies' sums are exchanged on
+  the learner's stream and compared on rank 0 when they arrive.
+- **`shadow_update_kernel`:** a warp ballot a 32 positions finds the row's training positions (one word a
+  warp), each thread adds its column of those rows only, in position order as before; the squared norm is
+  a shuffle tree a warp. **`shadow_totals_kernel`:** a warp a counter instead of a thread, and it replaces
+  the call's totals on a call's first chunk (no separate zeroing).
+- Rank 0 logs both times a call: the step's (`on the step`) and the learner stream's (`off it`).
+
+Kernel tests ([receipts/kernels-7](receipts/kernels-7), sp8, candidate-60 image): 14 pass. New or changed:
+the stage against `labels_kernel` and the ring (held, not held, past the turn, a wrapped ring, more kept
+steps than the ring holds, rows outside the call untouched); the end of turn on stage rows at an offset
+with the rank-major exchange, against the reference across four and three simulated ranks; the totals'
+replace and add; the update at 40, 700 and 1,280 positions (several ballot tiles, rows repeating up to
+about 20 times).
+
+Serving run: [offstep-tp4-switched.json](offstep-tp4-switched.json):
+
+1. the screen suite, four boots alternating the learner off
+   ([tp4-switched-offstep-off.json](tp4-switched-offstep-off.json): the same files mounted, nothing
+   allocated, launched or connected, candidate-60's draft path) and off-step shadow, in one measure job (the
+   lab refuses a single boot an arm against a recorded reference; the off boots are the session's own
+   reference, and against candidate-60's recorded screen they measure the day's drift);
+2. one boot: the determinism and greedy gates, which must equal candidate-60's hashes;
+3. a fresh boot: AgentX at 8 sessions for an hour (the step's and the learner's times, the replica check).
 
 ## Where it stands
 
