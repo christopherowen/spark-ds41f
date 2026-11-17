@@ -814,3 +814,12 @@ connections, so confining its threads (which the container cannot do here anyway
 FP32 all-reduce and an all-gather over pynccl) on the step's communicator. What stays after a destroy is
 process-wide: the NCCL kernels loaded for those operations (with CUDA's lazy module loading) and whatever
 NCCL set up at its first use.
+
+**NCCL operations on the step's own communicator** ([stepops-tp4-switched.json](stepops-tp4-switched.json); the
+model and grid steps, six boots alternating): the learner off, and no communicator made, with NCCL operations
+run once at load on the tensor-parallel group's existing pynccl communicator ([overlay-ncclops/](overlay-ncclops)):
+the learner's exchanges, 16 FP32 all-gathers and 16 FP32 all-reduces at a chunk's sizes, operations the step
+never runs over pynccl ([tp4-switched-stepops-learner.json](tp4-switched-stepops-learner.json)); or 32 BF16
+all-reduces of 4 MiB, the kind the step runs over pynccl for its larger all-reduces
+([tp4-switched-stepops-bf16.json](tp4-switched-stepops-bf16.json)). If the learner's operations cost and the BF16
+ones do not, running a kind of NCCL operation the step does not is what costs, whatever communicator runs it.
