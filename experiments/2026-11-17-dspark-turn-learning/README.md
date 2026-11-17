@@ -793,3 +793,24 @@ never logged it, held in the exercise's last collective: `ncclCommAbort` is loca
 done first aborted while their peers' last transfers were still in flight. The destroy now waits at a barrier
 over the group's CPU communicator first. The job runs again whole, as
 [commthreads-2-tp4-switched.json](commthreads-2-tp4-switched.json).
+
+The second run (queue entry `20261117T221018-commthreads-2-tp4-switched`, commit `4fb187f1b`; receipts
+[commthreads-2](receipts/commthreads-2)) ran a learner-off boot and a destroyed boot, then stopped: the first
+confined boot refused to start, as its arm is written to, because no core of 0–4 and 10–14 is the
+process's. The serving container's cpuset is the performance cores alone (5–9, 15–19), and every thread in
+it is pinned within them; the worker of rank 0 is pinned to core 18, and the three threads the communicator
+started inherited core 18 (the destroyed boot's log, [destroyed-1-lines.log](receipts/commthreads-2/destroyed-1-lines.log);
+the second pair of lines there is the same container restarted by the lab's rollback).
+
+| Grid, one boot each (geometric mean, 20 shapes) | Whole step | Target forward | 16×96 | 16×48 | 1×3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| learner off → the communicator made, exercised and destroyed | +1.44% | +1.81% | +1.10 ms | +0.64 ms | +0.26 ms |
+
+**Destroying the communicator does not remove the cost** (one boot of each; the repeat did not run). With its
+threads gone (none left after the destroy) and its connections closed, the grid is as slow as with it alive:
+the cost is something that outlasts the communicator once NCCL has been set up and run, not its threads or
+connections, so confining its threads (which the container cannot do here anyway) would not have helped. The
+`step` arm fits that too: no communicator made, but the learner ran NCCL operations the step does not (an
+FP32 all-reduce and an all-gather over pynccl) on the step's communicator. What stays after a destroy is
+process-wide: the NCCL kernels loaded for those operations (with CUDA's lazy module loading) and whatever
+NCCL set up at its first use.
