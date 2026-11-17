@@ -484,3 +484,19 @@ def test_decode_metadata_and_mask_lengths_skip_padding_rows():
         assert torch.equal(swa1[r, : l1[r]], swa0[r, : l0[r]])
     for r in (2, 4, 5):
         assert l1[r].item() == 0 and top1[r].item() == 0
+
+    # `pages` accepts a full-capacity `reqs` alongside a step-sized `masked` length
+    # tensor (e.g. CAP=1024 vs rows=6), matching live rows and leaving padded rows untouched.
+    reqs_long = torch.zeros((CAP,), dtype=torch.int32, device=device)
+    page_out0 = torch.full((rows, 16), -9, dtype=torch.int32, device=device)
+    page_out1 = page_out0.clone()
+    metadata.pages(reqs_long, lens, table, page_out0, 0, rows, 8, page=page)
+    metadata.pages(reqs_long, masked, table, page_out1, 0, rows, 8, page=page)
+    page_sub = torch.full((rows - 2, 16), -9, dtype=torch.int32, device=device)
+    metadata.pages(reqs_long, masked, table, page_sub, 2, rows - 2, 8, page=page)
+    torch.accelerator.synchronize()
+    live = _live_columns(reqs_long, masked, 0, rows, page, 8, 16)
+    _live_equal(page_out1, page_out0.cpu().long(), live, rows, sentinel=-9)
+    for r in (2, 4, 5):
+        assert bool((page_out1[r] == -9).all())
+    assert torch.equal(page_sub, page_out1[2:])

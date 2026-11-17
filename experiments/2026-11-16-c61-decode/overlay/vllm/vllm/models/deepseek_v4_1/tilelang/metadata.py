@@ -571,8 +571,9 @@ def pages(
     """Page tables for ``rows`` rows from source row ``offset``, over the pages of
     each row's ``lengths`` entries (``page`` a page; ``out`` is ``[*, width]``, its
     other columns keep their contents)."""
+    end = offset + rows
     pages_kernel(out.shape[1], page)(
-        reqs, lengths, table, out[:rows], offset, read_width
+        reqs[:end], lengths[:end], table, out[:rows], offset, read_width
     )
 
 
