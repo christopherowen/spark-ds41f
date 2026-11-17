@@ -786,7 +786,7 @@ def grouped_fp8_fp4_gemm(
     assert tail in (0, 64) and k_full >= 1, "K must be a multiple of 64, at least 128"
     assert N % block_N == 0, "N must be a multiple of block_N"
     if fuse_swiglu:
-        assert gather and trigger_after_loop and block_N == 128
+        assert gather and block_N == 128
         assert coded_scales and narrow_codes
         assert threads % 64 == 0 and block_M % (threads // 64) == 0
     inter = N // 2
@@ -1985,7 +1985,7 @@ class MoeExpertsV41Plan:
             gemm_config = (
                 {**config, "swizzle_panel": swizzle} if swizzle else config
             )
-            fused = fuse_prefill and prefix == "prefill_"
+            fused = fuse_prefill and prefix in ("", "late_", "prefill_")
             gate_up_config = (
                 {**gemm_config, "fuse_swiglu": True, "swiglu_limit": self.swiglu_limit}
                 if fused
@@ -2050,14 +2050,16 @@ class MoeExpertsV41Plan:
         """The (gate/up, SwiGLU, down) kernels of a call at its tile height, its
         grouped GEMMs triggering late from ``LATE_TRIGGER_ROWS`` rows."""
         height = self.tile_height(rows)
+        fused = self._has_prefill_swiglu_fusion()
         if height != self.decode_block_M:
             if height == self.block_M:
                 return self.mid_gate_up, self.mid_swiglu, self.mid_down
-            swiglu = None if self._has_prefill_swiglu_fusion() else self.prefill_swiglu
+            swiglu = None if fused else self.prefill_swiglu
             return self.prefill_gate_up, swiglu, self.prefill_down
+        swiglu = None if fused else self.swiglu
         if rows >= LATE_TRIGGER_ROWS:
-            return self.late_gate_up, self.swiglu, self.late_down
-        return self.gate_up, self.swiglu, self.down
+            return self.late_gate_up, swiglu, self.late_down
+        return self.gate_up, swiglu, self.down
 
     def declare_kernels(self) -> None:
         """Declare the grouped GEMMs, the fused SwiGLU and each reachable dispatch
@@ -2127,7 +2129,7 @@ class MoeExpertsV41Plan:
         hidden, inter = self.hidden, self.intermediate
         fused = (
             self._has_prefill_swiglu_fusion()
-            and self.tile_height(rows) == self.prefill_block_M
+            and self.tile_height(rows) in (self.decode_block_M, self.prefill_block_M)
         )
         specs = [*dispatch.workspace_specs(rows)]
         if not fused:

@@ -24,6 +24,8 @@ backbone forward AND the sequential Markov sampling.
 """
 
 from collections.abc import Sequence
+from contextlib import nullcontext
+import math
 from typing import Any
 
 import torch
@@ -32,7 +34,13 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
+)
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    alloc_conditional_handles,
+    capture_conditional_if,
+    conditional_graph_supported,
 )
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu import tilelang_inputs
@@ -310,7 +318,33 @@ class DSparkSpeculator(DFlashSpeculator):
         self._markov_conf_weight = torch.zeros(
             rank, dtype=torch.float32, device=device
         )
+        self._conf_log_probs = torch.zeros(
+            (self.max_num_reqs, self.num_speculative_steps),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._conf_row_alive = torch.ones(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self._conf_log_tau = torch.full(
+            (1,), float("-inf"), dtype=torch.float32, device=device
+        )
+        # Stepwise conditional gating wins cleanly for single-stream (c1) without
+        # penalizing high-concurrency (c16) batches where at least one request
+        # almost always remains live across later draft steps.
+        self._early_halt_max_reqs: int = 1
+        self._last_early_halt_tau: float = 0.0
         logger.info_once("DSpark pre-drafting Markov head truncation enabled")
+
+    def update_early_halt_tau(self, tau: float) -> None:
+        """Keep device ``_conf_log_tau`` synced with ``effective_dead_rows_tau``."""
+        tau_val = float(tau) if tau > 0.0 else 0.0
+        if tau_val == self._last_early_halt_tau:
+            return
+        self._last_early_halt_tau = tau_val
+        self._conf_log_tau.fill_(
+            math.log(tau_val) if tau_val > 0.0 else float("-inf")
+        )
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -557,6 +591,18 @@ class DSparkSpeculator(DFlashSpeculator):
                     top2_branch=use_top2,
                 )
             )
+        if getattr(self, "use_confidence_head", False):
+            conf_head = getattr(
+                getattr(self.model, "model", None), "confidence_head", None
+            )
+            if conf_head is not None and hasattr(conf_head, "probability_step_and_gate"):
+                from vllm.models.deepseek_v4_1.tilelang import confidence as conf_tl
+
+                conf_tl.declare_step_and_gate(
+                    self.hidden_states.shape[1],
+                    self._markov_step_embed.shape[1],
+                    steps=n_spec,
+                )
 
     def _markov_table(self) -> torch.Tensor | None:
         """The Markov W1 the vocabulary-parallel greedy steps look up in their own
@@ -603,28 +649,76 @@ class DSparkSpeculator(DFlashSpeculator):
             and active_steps <= 16
             and getattr(self.model, "fuses_screened_markov_greedy", False)
         )
-        if local_head:
-            base_logits = self.model.compute_local_draft_logits(sample_hidden)
-        elif use_screened_markov:
-            screened_norm, screened_u_base, screened_x_norm = (
-                self.model.screen_draft_logits_local(sample_hidden)
-            )
-            base_logits = None
-        elif vocab_parallel:
-            if can_unfuse_markov:
-                vocab_start, shard_vocab = self.model.draft_vocab_shard
-            base_logits = self.model.compute_draft_logits_local(sample_hidden)
-        else:
-            base_logits = self.model.compute_draft_logits(sample_hidden)
-        if base_logits is not None:
-            vocab_size = base_logits.shape[-1]
-            base_logits = base_logits.view(num_reqs, active_steps, vocab_size)
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
         if active_steps < n_spec:
             idx_map = idx_map[:, :active_steps]
             sample_pos = sample_pos[:, :active_steps]
+
+        capturing = torch.cuda.is_current_stream_capturing()
+        eager_early_halt = bool(getattr(self, "_eager_early_halt", False))
+        estimator = getattr(self, "acceptance_estimator", None)
+        conf_head = getattr(
+            getattr(self.model, "model", None), "confidence_head", None
+        )
+        tp_safe = True
+        if vocab_parallel and getattr(self, "use_confidence_head", False):
+            try:
+                tp_group = get_tp_group()
+                if tp_group.world_size > 1:
+                    tp_safe = bool(
+                        getattr(self, "tp_invariant_confidence", False)
+                        and getattr(
+                            getattr(tp_group, "device_communicator", None),
+                            "rank_order_reduce_scatter",
+                            False,
+                        )
+                    )
+            except AssertionError:
+                tp_safe = True
+        use_early_halt = (
+            (capturing and conditional_graph_supported() or eager_early_halt)
+            and num_reqs <= getattr(self, "_early_halt_max_reqs", 1)
+            and not local_head
+            and active_steps == n_spec
+            and getattr(self, "use_confidence_head", False)
+            and estimator is not None
+            and tp_safe
+            and conf_head is not None
+            and hasattr(conf_head, "probability_step_and_gate")
+            and hasattr(self.model, "compute_and_calibrate_confidence_step")
+            and getattr(self, "_conf_log_tau", None) is not None
+            and getattr(self, "_conf_log_probs", None) is not None
+            and getattr(self, "_conf_row_alive", None) is not None
+        )
+
+        def _compute_base_logits() -> None:
+            nonlocal base_logits, vocab_size, screened_norm, screened_u_base, screened_x_norm, shard_vocab, vocab_start
+            if local_head:
+                base_logits = self.model.compute_local_draft_logits(sample_hidden)
+            elif use_screened_markov:
+                screened_norm, screened_u_base, screened_x_norm = (
+                    self.model.screen_draft_logits_local(sample_hidden)
+                )
+                base_logits = None
+            elif vocab_parallel:
+                if can_unfuse_markov:
+                    vocab_start, shard_vocab = self.model.draft_vocab_shard
+                base_logits = self.model.compute_draft_logits_local(sample_hidden)
+            else:
+                base_logits = self.model.compute_draft_logits(sample_hidden)
+            if base_logits is not None:
+                vocab_size = base_logits.shape[-1]
+                base_logits = base_logits.view(num_reqs, active_steps, vocab_size)
+
+        base_logits = None
+        vocab_size = 0
+        screened_norm = screened_u_base = screened_x_norm = None
+        vocab_start = shard_vocab = 0
+        if not use_early_halt:
+            _compute_base_logits()
+
         confidence_markov_embeds: list[torch.Tensor] = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
@@ -642,114 +736,173 @@ class DSparkSpeculator(DFlashSpeculator):
                 step_embed,
                 confidence_embeds[:, 0],
             )
+            pending_markov_embed = step_embed
         else:
             confidence_embeds = None
             prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+            pending_markov_embed = (
+                self.model.markov_embed(prev) if use_early_halt else None
+            )
+
+        if use_early_halt:
+            handles = (
+                alloc_conditional_handles(active_steps, default_value=0)
+                if capturing
+                else [0] * active_steps
+            )
+            if not sample_hidden.is_contiguous():
+                sample_hidden = sample_hidden.contiguous()
+            sample_hidden_steps = sample_hidden.view(num_reqs, active_steps, -1)
+            conf_out_probs = self.draft_token_confidence_probs[:num_reqs]
+            conf_log_probs = self._conf_log_probs[:num_reqs]
+            conf_row_alive = self._conf_row_alive[:num_reqs]
+            conf_log_tau = self._conf_log_tau
+
+            def _eval_confidence_step(
+                step_idx: int, handle_i64: int, step_m_embed: torch.Tensor
+            ) -> None:
+                self.model.compute_and_calibrate_confidence_step(
+                    sample_hidden_steps[:, step_idx],
+                    step_m_embed,
+                    conf_out_probs,
+                    estimator,
+                    idx_map[:, step_idx],
+                    conf_log_probs,
+                    conf_row_alive,
+                    conf_log_tau,
+                    step_idx,
+                    handle_i64=handle_i64,
+                )
+
+            assert pending_markov_embed is not None
+            _eval_confidence_step(0, handles[0], pending_markov_embed)
+        else:
+            handles = []
 
         for i in range(active_steps):
-            # Sequential stage: Markov bias from the previously sampled token.
-            if table is not None:
-                markov_embed = step_embed
-            else:
-                markov_embed = self.model.markov_embed(prev)
-                if self.use_confidence_head:
-                    confidence_markov_embeds.append(markov_embed)
-            if local_head:
-                bias = self.model.compute_local_markov_bias(markov_embed)
-                if self.draft_logits is None and not _needs_logits_for_acceptance(self):
-                    draft_sampled_i = self.model.sample_local_draft_logits(
-                        base_logits[:, i], bias
-                    )
+            if use_early_halt and not capturing and eager_early_halt:
+                if not bool(conf_row_alive.any()):
+                    break
+            step_ctx = (
+                capture_conditional_if(handles[i])
+                if (use_early_halt and capturing)
+                else nullcontext()
+            )
+            with step_ctx:
+                if use_early_halt and i == 0:
+                    _compute_base_logits()
+                # Sequential stage: Markov bias from the previously sampled token.
+                if table is not None:
+                    markov_embed = step_embed
+                elif use_early_halt:
+                    assert pending_markov_embed is not None
+                    markov_embed = pending_markov_embed
                 else:
-                    logits_i = self.model.gather_local_draft_logits(
-                        base_logits[:, i], bias
-                    )
-                    draft_sampled_i = self._sample_logits(
-                        logits_i, idx_map[:, i], sample_pos[:, i], i
-                    )
-                self.draft_tokens[:num_reqs, i] = draft_sampled_i
-                prev = draft_sampled_i
-                continue
-            if vocab_parallel:
-                use_top2 = self._enable_top2_branch
-                pairs = self._greedy_shard_pairs[:num_reqs]
-                if use_screened_markov:
-                    self.model.screened_markov_greedy_pairs_local(
-                        markov_embed,
-                        screened_norm[i : i + 1],
-                        screened_u_base[i : i + 1],
-                        screened_x_norm[i : i + 1],
-                        pairs,
-                        top2=use_top2,
-                    )
-                elif not can_unfuse_markov or _use_fused_markov_greedy_step(
-                    tp_size, i, num_reqs
-                ):
-                    # The Markov projection adds the base logits and reduces
-                    # this rank's shard: no bias tensor.
-                    self.model.markov_greedy_pairs_local(
-                        markov_embed, base_logits[:, i], pairs, top2=use_top2
-                    )
-                else:
-                    bias = self.model.markov_bias_local(markov_embed)
-                    greedy_markov_shard_pair(
-                        base_logits[:, i, :shard_vocab],
-                        bias[:, :shard_vocab],
-                        vocab_start,
-                        pairs,
-                        self._greedy_partial_values,
-                        self._greedy_partial_indices,
-                        top2=use_top2,
-                    )
-                draft_sampled_i = self.draft_tokens[:num_reqs, i]
-                has_embed = table is not None and i + 1 < active_steps
-                select_first_argmax(
-                    tensor_model_parallel_all_gather(pairs, dim=-1),
-                    draft_sampled_i,
-                    pair_width=4,
-                    embed=(
-                        (table, step_embed, confidence_embeds[:, i + 1])
-                        if has_embed
-                        else None
-                    ),
-                    top2_branch=(
-                        (
-                            self._markov_conf_weight if has_embed else None,
-                            self.draft_runner_up_tokens[:num_reqs, i],
-                            self.draft_top2_margins[:num_reqs, i],
-                            self._top2_branch_margin,
-                            self._top2_branch_weight,
+                    markov_embed = self.model.markov_embed(prev)
+                    if self.use_confidence_head:
+                        confidence_markov_embeds.append(markov_embed)
+                if local_head:
+                    bias = self.model.compute_local_markov_bias(markov_embed)
+                    if self.draft_logits is None and not _needs_logits_for_acceptance(
+                        self
+                    ):
+                        draft_sampled_i = self.model.sample_local_draft_logits(
+                            base_logits[:, i], bias
                         )
-                        if use_top2
-                        else None
-                    ),
-                )
-                prev = draft_sampled_i
-                continue
-            bias = self.model.markov_bias(markov_embed)
-            if (
-                self.draft_logits is None
-                and self.model.draft_id_to_target_id is None
-                and base_logits.dtype == bias.dtype
-                and not _needs_logits_for_acceptance(self)
-            ):
-                draft_sampled_i = self.draft_tokens[:num_reqs, i]
-                sample_greedy_markov(
-                    base_logits[:, i],
-                    bias,
-                    draft_sampled_i,
-                    self._greedy_partial_values,
-                    self._greedy_partial_indices,
-                )
-            else:
-                logits_i = base_logits[:, i] + bias
-                draft_sampled_i = self._sample_logits(
-                    logits_i, idx_map[:, i], sample_pos[:, i], i
-                )
-                self.draft_tokens[:num_reqs, i] = draft_sampled_i
-            prev = draft_sampled_i
+                    else:
+                        logits_i = self.model.gather_local_draft_logits(
+                            base_logits[:, i], bias
+                        )
+                        draft_sampled_i = self._sample_logits(
+                            logits_i, idx_map[:, i], sample_pos[:, i], i
+                        )
+                    self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                    prev = draft_sampled_i
+                elif vocab_parallel:
+                    use_top2 = self._enable_top2_branch
+                    pairs = self._greedy_shard_pairs[:num_reqs]
+                    if use_screened_markov:
+                        self.model.screened_markov_greedy_pairs_local(
+                            markov_embed,
+                            screened_norm[i : i + 1],
+                            screened_u_base[i : i + 1],
+                            screened_x_norm[i : i + 1],
+                            pairs,
+                            top2=use_top2,
+                        )
+                    elif not can_unfuse_markov or _use_fused_markov_greedy_step(
+                        tp_size, i, num_reqs
+                    ):
+                        # The Markov projection adds the base logits and reduces
+                        # this rank's shard: no bias tensor.
+                        self.model.markov_greedy_pairs_local(
+                            markov_embed, base_logits[:, i], pairs, top2=use_top2
+                        )
+                    else:
+                        bias = self.model.markov_bias_local(markov_embed)
+                        greedy_markov_shard_pair(
+                            base_logits[:, i, :shard_vocab],
+                            bias[:, :shard_vocab],
+                            vocab_start,
+                            pairs,
+                            self._greedy_partial_values,
+                            self._greedy_partial_indices,
+                            top2=use_top2,
+                        )
+                    draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                    has_embed = table is not None and i + 1 < active_steps
+                    select_first_argmax(
+                        tensor_model_parallel_all_gather(pairs, dim=-1),
+                        draft_sampled_i,
+                        pair_width=4,
+                        embed=(
+                            (table, step_embed, confidence_embeds[:, i + 1])
+                            if has_embed
+                            else None
+                        ),
+                        top2_branch=(
+                            (
+                                self._markov_conf_weight if has_embed else None,
+                                self.draft_runner_up_tokens[:num_reqs, i],
+                                self.draft_top2_margins[:num_reqs, i],
+                                self._top2_branch_margin,
+                                self._top2_branch_weight,
+                            )
+                            if use_top2
+                            else None
+                        ),
+                    )
+                    prev = draft_sampled_i
+                else:
+                    bias = self.model.markov_bias(markov_embed)
+                    if (
+                        self.draft_logits is None
+                        and self.model.draft_id_to_target_id is None
+                        and base_logits.dtype == bias.dtype
+                        and not _needs_logits_for_acceptance(self)
+                    ):
+                        draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                        sample_greedy_markov(
+                            base_logits[:, i],
+                            bias,
+                            draft_sampled_i,
+                            self._greedy_partial_values,
+                            self._greedy_partial_indices,
+                        )
+                    else:
+                        logits_i = base_logits[:, i] + bias
+                        draft_sampled_i = self._sample_logits(
+                            logits_i, idx_map[:, i], sample_pos[:, i], i
+                        )
+                        self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                    prev = draft_sampled_i
 
-        if self.use_confidence_head:
+                if use_early_halt and i + 1 < active_steps:
+                    if table is None:
+                        pending_markov_embed = self.model.markov_embed(prev)
+                    _eval_confidence_step(i + 1, handles[i + 1], pending_markov_embed)
+
+        if not use_early_halt and self.use_confidence_head:
             _compute_confidence_probs(
                 self,
                 head_hidden,

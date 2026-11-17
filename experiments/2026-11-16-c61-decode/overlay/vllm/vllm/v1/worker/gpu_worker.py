@@ -1708,15 +1708,39 @@ class Worker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
-        # Check if profiling is enabled
+    def profile(
+        self, is_start: bool | str = True, profile_prefix: str | None = None
+    ):
+        if isinstance(is_start, str):
+            is_start = is_start.strip().lower() in ("1", "true", "yes", "on")
+
+        # Check if profiling is enabled (allow lazy dev-mode CUPTI setup via RPC)
         if self.profiler_config is None or self.profiler_config.profiler is None:
-            raise RuntimeError(
-                "Profiling is not enabled. Please set --profiler-config to enable "
-                "profiling. Example: "
-                "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
-                "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
+            if not envs.VLLM_SERVER_DEV_MODE:
+                raise RuntimeError(
+                    "Profiling is not enabled. Please set --profiler-config to enable "
+                    "profiling. Example: "
+                    "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
+                    "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
+                )
+            if not is_start:
+                logger.warning("Profiler was not started, nothing to stop.")
+                return
+            from vllm.config.profiler import ProfilerConfig
+
+            profiler_dir = "/cache/torch-profiler"
+            os.makedirs(profiler_dir, exist_ok=True)
+            self.profiler_config = ProfilerConfig(
+                profiler="torch",
+                torch_profiler_dir=profiler_dir,
+                torch_profiler_with_stack=False,
+                torch_profiler_record_shapes=False,
+                ignore_frontend=True,
+                torch_profiler_use_gzip=True,
+                torch_profiler_dump_cuda_time_total=False,
             )
+            self.vllm_config.profiler_config = self.profiler_config
+            self._lazy_dev_profiler = True
 
         if is_start:
             profiler_type = self.profiler_config.profiler
@@ -1770,11 +1794,13 @@ class Worker(WorkerBase):
             try:
                 self.profiler.stop()
             finally:
-                if self.profiler_config.profiler == "proton" and not (
-                    self.profiler.has_cuda_graph_session
-                ):
-                    # Proton output names are fixed when the wrapper is constructed.
-                    # Recreate it so the next profile_prefix is honored.
+                if (
+                    self.profiler_config.profiler == "proton"
+                    and not self.profiler.has_cuda_graph_session
+                ) or getattr(self, "_lazy_dev_profiler", False):
+                    # Proton output names are fixed at construction; lazy dev-mode
+                    # torch profiling also drops the wrapper after stop so normal
+                    # serving returns to zero overhead and new prefixes take effect.
                     self.profiler = None
 
     def engine_grid(self, spec: str) -> dict:

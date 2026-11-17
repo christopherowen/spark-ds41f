@@ -1,9 +1,13 @@
 {
-  "notes": "candidate-60 at tp4-ring plus candidate-61 decode r13 (r12 plus metadata.py and attention.py is_padding dead-row masking for sparse_mla and indexer)",
+  "notes": "candidate-60 at tp4-ring plus candidate-61 decode r14 (r13 plus MoE fuse_swiglu and wo/gemm/linear retune, bit-exact 3-split mHC preload, l2_prefetch burst-reset and WO=12 MB, hybrid card0_WQ_ONLY screen carve-out and 1-warp ping-pong vocab refine, CUDA conditional IF Markov halting and 3-layer front fusion, and lazy dev-mode CUPTI capture)",
   "extends": {
     "config": "experiments/2026-11-16-c60-prefill/tp4-dev.json"
   },
   "set": {
+    "environment": {
+      "VLLM_DS41_L2_PREFETCH_WO_MB": "12",
+      "VLLM_SERVER_DEV_MODE": "1"
+    },
     "container": {
       "mounts": [
         [
@@ -22,8 +26,18 @@
           "ro"
         ],
         [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py",
+          "/opt/spark-ds41f/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py",
+          "ro"
+        ],
+        [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py",
           "/opt/spark-ds41f/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/kernels/test_deepseek_v41_tilelang_confidence.py",
+          "/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_confidence.py",
           "ro"
         ],
         [
@@ -32,8 +46,23 @@
           "ro"
         ],
         [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py",
+          "/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_front.py",
+          "ro"
+        ],
+        [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/kernels/test_deepseek_v41_tilelang_metadata.py",
           "/opt/spark-ds41f/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_metadata.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/v1/spec_decode/test_adaptive_verification.py",
+          "/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/tests/v1/worker/test_dspark_greedy_markov.py",
+          "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_dspark_greedy_markov.py",
           "ro"
         ],
         [
@@ -44,6 +73,11 @@
         [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/distributed/device_communicators/shm_broadcast.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/distributed/device_communicators/shm_broadcast.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/model_executor/layers/quantization/online/packed_bf16.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/quantization/online/packed_bf16.py",
           "ro"
         ],
         [
@@ -67,6 +101,11 @@
           "ro"
         ],
         [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/l2_prefetch.py",
+          "ro"
+        ],
+        [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/nvidia/dspark.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/dspark.py",
           "ro"
@@ -79,6 +118,11 @@
         [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/collectives.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/collectives.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/confidence.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/confidence.py",
           "ro"
         ],
         [
@@ -107,6 +151,11 @@
           "ro"
         ],
         [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/mhc.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/mhc.py",
+          "ro"
+        ],
+        [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py",
           "ro"
@@ -132,6 +181,16 @@
           "ro"
         ],
         [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/glm5next/nvidia/l2_prefetch.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/l2_prefetch.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py",
+          "ro"
+        ],
+        [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/utils/gc_utils.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/utils/gc_utils.py",
           "ro"
@@ -149,6 +208,11 @@
         [
           "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/v1/executor/multiproc_executor.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/v1/executor/multiproc_executor.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-16-c61-decode/overlay/vllm/vllm/v1/worker/display_carveout.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/display_carveout.py",
           "ro"
         ],
         [

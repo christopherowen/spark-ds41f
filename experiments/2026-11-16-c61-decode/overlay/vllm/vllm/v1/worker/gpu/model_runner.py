@@ -4126,6 +4126,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         input_batch.idx_mapping,
                         boundary_capture,
                     )
+                if self.adaptive_verification is not None and hasattr(
+                    self.speculator, "update_early_halt_tau"
+                ):
+                    self.speculator.update_early_halt_tau(
+                        self.adaptive_verification.effective_dead_rows_tau(
+                            num_reqs=input_batch.num_reqs
+                        )
+                    )
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,

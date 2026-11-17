@@ -781,6 +781,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             writer_call,
         )
         from vllm.models.deepseek_v4_1.tilelang.front import (
+            context_kv_front_3layer_call,
             context_kv_front_call,
             front_call,
             sp_front_call,
@@ -864,6 +865,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         if self.is_draft:
             calls.append(
                 context_kv_front_call(
+                    self.kv_norm.variance_epsilon,
+                    self.swa_cache_layer.block_size,
+                    SLOT_DTYPE,
+                )
+            )
+            calls.append(
+                context_kv_front_3layer_call(
                     self.kv_norm.variance_epsilon,
                     self.swa_cache_layer.block_size,
                     SLOT_DTYPE,

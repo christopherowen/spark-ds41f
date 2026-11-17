@@ -109,6 +109,7 @@ EARLY_PARAMETERS: dict[str, set[str]] = {
     "indexer_mxfp4_quantize": {"CosSin", "Positions", "Slots", "Weight"},
     "mhc_finalize": {"base", "scale", "weight"},
     "mhc_post": {"comb", "post", "residual"},
+    "mhc_project_streams": {"Fn"},
     "moe_combine": {"RoutePos", "Shared", "Weights"},
     "moe_grouped_fp8_fp4_gemm": {
         "B",

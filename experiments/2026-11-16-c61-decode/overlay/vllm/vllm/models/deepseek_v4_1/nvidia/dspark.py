@@ -496,13 +496,60 @@ class DSparkDeepseekV4Model(nn.Module):
                 if grouped is not None
                 else [proj(main_x) for proj in self._context_kv_projections]
             )
-        for i, (layer, kv_raw) in enumerate(zip(self.layers, kv_raws)):
-            slot_mapping = (
-                context_slot_mappings
-                if context_slot_mappings is None
-                or isinstance(context_slot_mappings, torch.Tensor)
-                else context_slot_mappings[i]
+        slot_list = [
+            context_slot_mappings
+            if context_slot_mappings is None
+            or isinstance(context_slot_mappings, torch.Tensor)
+            else context_slot_mappings[i]
+            for i in range(len(self.layers))
+        ]
+        if (
+            len(self.layers) == 3
+            and len(kv_raws) == 3
+            and all(s is not None and s.dtype == slot_list[0].dtype for s in slot_list)
+            and all(
+                hasattr(layer.attn, "insert_raw_context_kv")
+                and getattr(layer.attn, "_ready", False)
+                for layer in self.layers
             )
+        ):
+            a0, a1, a2 = (layer.attn for layer in self.layers)
+            c0, c1, c2 = (
+                a0.swa_cache_layer.kv_cache,
+                a1.swa_cache_layer.kv_cache,
+                a2.swa_cache_layer.kv_cache,
+            )
+            if (
+                kv_raws[0].stride() == kv_raws[1].stride() == kv_raws[2].stride()
+                and kv_raws[0].shape == kv_raws[1].shape == kv_raws[2].shape
+                and a0.kv_norm.variance_epsilon
+                == a1.kv_norm.variance_epsilon
+                == a2.kv_norm.variance_epsilon
+                and a0.swa_cache_layer.block_size
+                == a1.swa_cache_layer.block_size
+                == a2.swa_cache_layer.block_size
+                and a0.rotary_emb.cos_sin_cache
+                is a1.rotary_emb.cos_sin_cache
+                is a2.rotary_emb.cos_sin_cache
+                and c0.shape == c1.shape == c2.shape
+                and c0.stride() == c1.stride() == c2.stride()
+                and slot_list[0].shape == slot_list[1].shape == slot_list[2].shape
+                and all(s.is_contiguous() for s in slot_list)
+            ):
+                from ..tilelang.front import context_kv_front_3layer
+
+                context_kv_front_3layer(
+                    kv_raws,
+                    [a0.kv_norm.weight, a1.kv_norm.weight, a2.kv_norm.weight],
+                    a0.kv_norm.variance_epsilon,
+                    context_positions,
+                    a0.rotary_emb.cos_sin_cache,
+                    [c0, c1, c2],
+                    slot_list,
+                    a0.swa_cache_layer.block_size,
+                )
+                return
+        for layer, kv_raw, slot_mapping in zip(self.layers, kv_raws, slot_list):
             if slot_mapping is None:
                 continue
             attn = layer.attn
@@ -970,6 +1017,49 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 probs.view(-1, num_steps), idx_mapping
             )
         return probs
+
+    def compute_and_calibrate_confidence_step(
+        self,
+        head_hidden: torch.Tensor,
+        markov_embed: torch.Tensor,
+        out_probs: torch.Tensor,
+        estimator: object,
+        idx_mapping: torch.Tensor,
+        log_probs: torch.Tensor,
+        row_alive: torch.Tensor,
+        log_tau: torch.Tensor,
+        step: int,
+        handle_i64: int = 0,
+    ) -> None:
+        """Evaluate calibrated confidence for one draft position ``step`` and
+        update the cumulative-survival conditional handle."""
+        assert self.model.confidence_head is not None
+        head = self.model.confidence_head
+        if (
+            estimator is not None
+            and hasattr(head, "probability_step_and_gate")
+            and head_hidden.is_cuda
+            and idx_mapping.dtype == torch.int32
+        ):
+            head.probability_step_and_gate(
+                head_hidden,
+                markov_embed,
+                out_probs,
+                estimator.slope,
+                estimator.intercepts,
+                idx_mapping,
+                estimator.features,
+                estimator.predictions,
+                log_probs,
+                row_alive,
+                log_tau,
+                step,
+                handle_i64=handle_i64,
+            )
+            return
+        raise RuntimeError(
+            "Stepwise confidence gating requires TileLangConfidenceHead"
+        )
 
     # --- Weight loading ----------------------------------------------------
 

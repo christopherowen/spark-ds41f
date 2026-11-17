@@ -7,7 +7,7 @@ import os
 from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from itertools import groupby, product
@@ -61,11 +61,42 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY = 0x08
+_CUDA_GRAPH_NODE_TYPE_CONDITIONAL = 13
+_CUDA_GRAPH_COND_TYPE_IF = 0
+_CUDA_GRAPH_COND_ASSIGN_DEFAULT = 1
+_CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1
+_CUDA_STREAM_SET_CAPTURE_DEPENDENCIES = 1
 _CUDART = None
+_CUDART_HAS_CONDITIONAL = False
+_CONDITIONAL_BRANCH_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+class _CudaConditionalNodeParams(ctypes.Structure):
+    _fields_ = [
+        ("handle", ctypes.c_uint64),
+        ("type", ctypes.c_int),
+        ("size", ctypes.c_uint),
+        ("phGraph_out", ctypes.POINTER(ctypes.c_void_p)),
+        ("ctx", ctypes.c_void_p),
+    ]
+
+
+class _CudaGraphNodeParamsConditional(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("_pad0", ctypes.c_int),
+        ("reserved", ctypes.c_void_p),
+        ("conditional", _CudaConditionalNodeParams),
+        (
+            "_tail",
+            ctypes.c_ubyte
+            * (256 - 16 - ctypes.sizeof(_CudaConditionalNodeParams)),
+        ),
+    ]
 
 
 def _get_cudart():
-    global _CUDART
+    global _CUDART, _CUDART_HAS_CONDITIONAL
     if _CUDART is None:
         lib = ctypes.CDLL("libcudart.so")
         lib.cudaGraphInstantiateWithFlags.argtypes = [
@@ -78,8 +109,217 @@ def _get_cudart():
         lib.cudaGraphLaunch.restype = ctypes.c_int
         lib.cudaGraphExecDestroy.argtypes = [ctypes.c_void_p]
         lib.cudaGraphExecDestroy.restype = ctypes.c_int
+        lib.cudaGetLastError.argtypes = []
+        lib.cudaGetLastError.restype = ctypes.c_int
+        cond_syms = (
+            "cudaGraphConditionalHandleCreate",
+            "cudaStreamGetCaptureInfo",
+            "cudaGraphAddNode",
+            "cudaStreamBeginCaptureToGraph",
+            "cudaStreamEndCapture",
+            "cudaStreamUpdateCaptureDependencies",
+        )
+        if all(hasattr(lib, sym) for sym in cond_syms):
+            lib.cudaGraphConditionalHandleCreate.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_uint,
+            ]
+            lib.cudaGraphConditionalHandleCreate.restype = ctypes.c_int
+            lib.cudaStreamGetCaptureInfo.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+            ]
+            lib.cudaStreamGetCaptureInfo.restype = ctypes.c_int
+            lib.cudaGraphAddNode.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+            ]
+            lib.cudaGraphAddNode.restype = ctypes.c_int
+            lib.cudaStreamBeginCaptureToGraph.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            lib.cudaStreamBeginCaptureToGraph.restype = ctypes.c_int
+            lib.cudaStreamEndCapture.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            lib.cudaStreamEndCapture.restype = ctypes.c_int
+            lib.cudaStreamUpdateCaptureDependencies.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_uint,
+            ]
+            lib.cudaStreamUpdateCaptureDependencies.restype = ctypes.c_int
+            _CUDART_HAS_CONDITIONAL = True
         _CUDART = lib
     return _CUDART
+
+
+def conditional_graph_supported() -> bool:
+    """Return True if the CUDA runtime exposes conditional graph node APIs."""
+    try:
+        _get_cudart()
+        return _CUDART_HAS_CONDITIONAL
+    except Exception:
+        return False
+
+
+def _get_capture_info(lib, stream: torch.cuda.Stream):
+    status = ctypes.c_int()
+    capture_id = ctypes.c_uint64()
+    graph_ptr = ctypes.c_void_p()
+    deps_ptr = ctypes.c_void_p()
+    edge_ptr = ctypes.c_void_p()
+    num_deps = ctypes.c_size_t()
+    rc = lib.cudaStreamGetCaptureInfo(
+        ctypes.c_void_p(stream.cuda_stream),
+        ctypes.byref(status),
+        ctypes.byref(capture_id),
+        ctypes.byref(graph_ptr),
+        ctypes.byref(deps_ptr),
+        ctypes.byref(edge_ptr),
+        ctypes.byref(num_deps),
+    )
+    if rc != 0:
+        raise RuntimeError(f"cudaStreamGetCaptureInfo failed with error code {rc}")
+    return status.value, graph_ptr, deps_ptr, edge_ptr, num_deps.value
+
+
+def alloc_conditional_handles(count: int, default_value: int = 0) -> list[int]:
+    """Allocate ``count`` conditional handles on the currently capturing CUDA graph.
+
+    Handles are returned as signed 64-bit integers matching two-s-complement
+    ``cudaGraphConditionalHandle`` bits for scalar kernel arguments.
+    """
+    if count <= 0:
+        return []
+    lib = _get_cudart()
+    if not _CUDART_HAS_CONDITIONAL:
+        raise RuntimeError("CUDA runtime lacks conditional graph handle support")
+    status, graph_ptr, _, _, _ = _get_capture_info(lib, current_stream())
+    if status == 0 or not graph_ptr.value:
+        raise RuntimeError("alloc_conditional_handles requires active stream capture")
+    handles: list[int] = []
+    for _ in range(count):
+        handle = ctypes.c_uint64()
+        rc = lib.cudaGraphConditionalHandleCreate(
+            ctypes.byref(handle),
+            graph_ptr,
+            ctypes.c_uint(default_value),
+            ctypes.c_uint(_CUDA_GRAPH_COND_ASSIGN_DEFAULT),
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"cudaGraphConditionalHandleCreate failed with error code {rc}"
+            )
+        handles.append(ctypes.c_int64(handle.value).value)
+    return handles
+
+
+@contextmanager
+def capture_conditional_if(handle_i64: int):
+    """Capture subsequent ops inside a CUDA Graph ``IF`` conditional body node."""
+    lib = _get_cudart()
+    if not _CUDART_HAS_CONDITIONAL:
+        raise RuntimeError("CUDA runtime lacks conditional graph node support")
+    main_stream = current_stream()
+    status, graph_ptr, deps_ptr, edge_ptr, num_deps = _get_capture_info(
+        lib, main_stream
+    )
+    if status == 0 or not graph_ptr.value:
+        raise RuntimeError("capture_conditional_if requires active stream capture")
+
+    params = _CudaGraphNodeParamsConditional()
+    ctypes.memset(ctypes.byref(params), 0, ctypes.sizeof(params))
+    params.type = _CUDA_GRAPH_NODE_TYPE_CONDITIONAL
+    params.conditional.handle = ctypes.c_uint64(handle_i64).value
+    params.conditional.type = _CUDA_GRAPH_COND_TYPE_IF
+    params.conditional.size = 1
+
+    node_ptr = ctypes.c_void_p()
+    rc = lib.cudaGraphAddNode(
+        ctypes.byref(node_ptr),
+        graph_ptr,
+        deps_ptr,
+        edge_ptr,
+        num_deps,
+        ctypes.byref(params),
+    )
+    if rc != 0:
+        raise RuntimeError(f"cudaGraphAddNode(conditional) failed with error code {rc}")
+    ph_after = params.conditional.phGraph_out
+    if not ph_after or not ph_after[0]:
+        raise RuntimeError("cudaGraphAddNode did not populate conditional body graph")
+    body_graph_ptr = ctypes.c_void_p(ph_after[0])
+
+    dev_idx = main_stream.device_index
+    branch_stream = _CONDITIONAL_BRANCH_STREAMS.get(dev_idx)
+    if branch_stream is None:
+        branch_stream = torch.cuda.Stream(device=main_stream.device)
+        _CONDITIONAL_BRANCH_STREAMS[dev_idx] = branch_stream
+
+    rc = lib.cudaStreamBeginCaptureToGraph(
+        ctypes.c_void_p(branch_stream.cuda_stream),
+        body_graph_ptr,
+        None,
+        None,
+        0,
+        _CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"cudaStreamBeginCaptureToGraph failed with error code {rc}"
+        )
+
+    ended = False
+    try:
+        with torch.cuda.stream(branch_stream):
+            yield
+        ret_graph = ctypes.c_void_p()
+        rc = lib.cudaStreamEndCapture(
+            ctypes.c_void_p(branch_stream.cuda_stream), ctypes.byref(ret_graph)
+        )
+        ended = True
+        if rc != 0:
+            raise RuntimeError(
+                f"cudaStreamEndCapture(branch) failed with error code {rc}"
+            )
+        node_arr = (ctypes.c_void_p * 1)(node_ptr)
+        rc = lib.cudaStreamUpdateCaptureDependencies(
+            ctypes.c_void_p(main_stream.cuda_stream),
+            node_arr,
+            None,
+            1,
+            _CUDA_STREAM_SET_CAPTURE_DEPENDENCIES,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"cudaStreamUpdateCaptureDependencies failed with error code {rc}"
+            )
+    finally:
+        if not ended:
+            ret_graph = ctypes.c_void_p()
+            lib.cudaStreamEndCapture(
+                ctypes.c_void_p(branch_stream.cuda_stream), ctypes.byref(ret_graph)
+            )
 
 
 class _PriorityCUDAGraphExec:
@@ -148,6 +388,7 @@ def _maybe_instantiate_priority_cudagraph(graph, device: torch.device):
             ctypes.c_uint64(_CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY),
         )
         if rc != 0 or not exec_ptr.value:
+            lib.cudaGetLastError()
             return graph
         return _PriorityCUDAGraphExec(graph, exec_ptr, lib)
     except Exception:
