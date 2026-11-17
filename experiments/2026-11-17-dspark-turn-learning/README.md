@@ -677,3 +677,10 @@ after startup, against the learner off): `step` about 0.15 GiB (+0.58%), the com
 read about +0.2% beyond the day's drift. The nodes start without the memory-saver module the doctor expects
 (every boot warns of it), so memory taken at load could change where later allocations (the KV cache, the
 graphs' pool) land. Untested: the learner off with the same amounts merely allocated at load would tell.
+
+**Memory alone** ([reserve-tp4-switched.json](reserve-tp4-switched.json)): six boots of the model and grid steps
+alternating the learner off and the learner off with 150 or 350 MiB merely held from load
+([overlay-reserve/](overlay-reserve) allocates and zeroes it where the learner and its communicator allocate
+theirs; [tp4-switched-reserve-150.json](tp4-switched-reserve-150.json),
+[tp4-switched-reserve-350.json](tp4-switched-reserve-350.json)). If the grid slows with the amount, the cost
+is memory held from load, whatever holds it; if not, it is in what the learner and a communicator do.
