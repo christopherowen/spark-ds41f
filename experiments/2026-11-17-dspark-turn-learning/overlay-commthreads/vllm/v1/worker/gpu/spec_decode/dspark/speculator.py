@@ -580,6 +580,11 @@ class DSparkSpeculator(DFlashSpeculator):
             or "none",
         )
         if destroy:
+            # ncclCommAbort is local and immediate: a rank done with the exercise
+            # must not abort while a peer's last transfer is still in flight
+            # (without this barrier, ranks 1 and 3 hung in their last all-reduce on
+            # 2026-11-17 and the boot timed out).
+            torch.distributed.barrier(group=get_tp_group().cpu_group)
             comm.destroy()
             self._turn_learning_comm = None
             left = {tid: name for tid, name in _tasks().items() if tid in made}

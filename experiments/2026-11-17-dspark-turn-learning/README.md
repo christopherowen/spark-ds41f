@@ -784,3 +784,12 @@ left idle ([tp4-switched-comm-little.json](tp4-switched-comm-little.json)).
 threads the communicator started and their cores, and what remains after a destroy. If confining the threads
 removes the cost, it is CPU interference with the step's proxy or worker, and the learner keeps its
 communicator made that way; if only a destroy removes it, it is what a live communicator holds.
+
+The first run failed (queue entry `20261117T212544-commthreads-tp4-switched`, commit `81e1f9e7d`; receipts
+[commthreads-failed](receipts/commthreads-failed): the four ranks' preserved start logs and the lab's log).
+Its learner-off boot ran; the first destroyed boot hung at load and the lab rolled the cluster back after its
+30-minute barrier timeout. Ranks 0 and 2 logged the communicator made, exercised and destroyed; ranks 1 and 3
+never logged it, held in the exercise's last collective: `ncclCommAbort` is local and immediate, so the ranks
+done first aborted while their peers' last transfers were still in flight. The destroy now waits at a barrier
+over the group's CPU communicator first. The job runs again whole, as
+[commthreads-2-tp4-switched.json](commthreads-2-tp4-switched.json).
