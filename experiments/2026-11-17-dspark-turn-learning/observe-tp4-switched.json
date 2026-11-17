@@ -1,0 +1,48 @@
+{
+  "experiment": "experiments/2026-11-17-dspark-turn-learning",
+  "run": "turn-learning-observe-tp4-switched",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "measure",
+      "bench": false,
+      "bracket": false,
+      "arms": [
+        {
+          "config": "experiments/2026-11-17-dspark-turn-learning/tp4-switched-observe.json",
+          "label": "observe"
+        }
+      ],
+      "extras": [
+        [
+          "experiments/2026-11-08-online-dspark-adaptation/online_adaptation_workload.py",
+          ["--turn-tokens", "384", "--heldout-tokens", "256"],
+          "workload"
+        ],
+        [
+          "experiments/2026-11-10-tp4-ring-determinism/token_determinism_record.py",
+          ["--tokens", "192", "--long-lines", "700", "--wide",
+           "--record", "results/private/determinism/{run}/record-determinism-{label}.json"],
+          "determinism"
+        ],
+        [
+          "experiments/2026-11-10-tp4-ring-determinism/token_determinism_record.py",
+          ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs",
+           "--record", "results/private/determinism/{run}/record-greedy-{label}.json"],
+          "greedy"
+        ]
+      ]
+    },
+    {
+      "kind": "agentx",
+      "arm": {
+        "config": "experiments/2026-11-17-dspark-turn-learning/tp4-switched-observe.json",
+        "label": "observe-agentx"
+      },
+      "points": [8],
+      "duration": 3600
+    }
+  ]
+}
