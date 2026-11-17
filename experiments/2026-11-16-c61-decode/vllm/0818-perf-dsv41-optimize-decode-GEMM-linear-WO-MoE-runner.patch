@@ -1,0 +1,1499 @@
+From fab8277b386387ac6a4f66d9feb674910ae33390 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:01:31 +0100
+Subject: [PATCH 818/822] perf(dsv41): optimize decode GEMM, linear, WO, MoE
+ runner, mHC, and collectives
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-61 series applied through 0817.
+
+Rationale: Uses contiguous FP8 weight packing in decode WO and GEMM/linear
+kernels, schedules persistent L2 prefetch and PDL across decode stages, and
+tunes MoE runner, mHC, and SparkNet/CUDA collective orchestration.
+
+Quality implications: None; bit-identical WO split tiles, L2 schedule tests,
+and PDL source verification pass.
+
+Tests: pytest -q -p deepseek_models -p tests.kernels.deepseek_v41_pdl_sources tests/models/test_deepseek_v4_1_l2_schedule.py tests/kernels/test_deepseek_v41_tilelang_wo.py
+
+Upstream status: local candidate-61 patch
+---
+ tests/kernels/deepseek_v41_pdl_sources.py     |  14 +-
+ .../models/test_deepseek_v4_1_l2_schedule.py  |  21 +-
+ .../device_communicators/cuda_communicator.py |   6 +-
+ .../layers/fused_moe/runner/moe_runner.py     |  23 +-
+ .../deepseek_v4_1/tilelang/collectives.py     |  30 +-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  83 +++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  90 +++-
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     | 446 +++++++++++++++---
+ vllm/models/deepseek_v4_1/tilelang/wo.py      |  88 +++-
+ 9 files changed, 666 insertions(+), 135 deletions(-)
+
+diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
+index 35d259ea0..2fb24f861 100644
+--- a/tests/kernels/deepseek_v41_pdl_sources.py
++++ b/tests/kernels/deepseek_v41_pdl_sources.py
+@@ -72,6 +72,8 @@ CHAIN = {
+     "mhc_collapse",
+     "mhc_collapse_column",
+     "mhc_finalize",
++    "mhc_finalize_norm",
++    "mhc_finalize_sinkhorn",
+     "mhc_post",
+     "mhc_post_collapse",
+     "mhc_post_collapse_norm",
+@@ -110,7 +112,17 @@ EARLY_PARAMETERS: dict[str, set[str]] = {
+     "mhc_finalize": {"base", "scale", "weight"},
+     "mhc_post": {"comb", "post", "residual"},
+     "moe_combine": {"RoutePos", "Shared", "Weights"},
+-    "moe_grouped_fp8_fp4_gemm": {"Narrow", "Order", "SFBase", "TileExpert"},
++    "moe_grouped_fp8_fp4_gemm": {
++        "B",
++        "BT",
++        "Narrow",
++        "Order",
++        "SFB",
++        "SFB8",
++        "SFBase",
++        "SFC8",
++        "TileExpert",
++    },
+     "moe_swiglu_cast_kernel": {"Order", "TileExpert", "Weights"},
+     "rope": {"cos_sin", "positions"},
+     "sparse_mla": {"CosSin", "Positions", "Sinks"},
+diff --git a/tests/models/test_deepseek_v4_1_l2_schedule.py b/tests/models/test_deepseek_v4_1_l2_schedule.py
+index 5bf93f9ec..a11f9f182 100644
+--- a/tests/models/test_deepseek_v4_1_l2_schedule.py
++++ b/tests/models/test_deepseek_v4_1_l2_schedule.py
+@@ -181,6 +181,8 @@ def test_engram_layer_moves_next_after_its_projection(segments, issued):
+ 
+ 
+ def test_decode_shared_experts_launch_after_router_gate():
++    from contextlib import nullcontext
++
+     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+     from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+         SharedExpertsOrder,
+@@ -226,25 +228,42 @@ def test_decode_shared_experts_launch_after_router_gate():
+ 
+     runner = SimpleNamespace(
+         _shared_experts=_Shared(),
++        gate=None,
++        _sequence_parallel_context=nullcontext,
++        _maybe_dispatch=lambda h, r: (h, r),
++        _maybe_combine=lambda s, h: h,
+         _maybe_apply_shared_experts=lambda *a, **k: None,
+         _quant_method=SimpleNamespace(
+             modular_experts=experts,
+             topk_indices_dtype=torch.int64,
+         ),
+         routed_experts=SimpleNamespace(
++            _ensure_moe_quant_config_init=lambda: None,
+             quant_method=SimpleNamespace(is_monolithic=False),
+             forward_modular=lambda **kwargs: (events.append("routed"), "routed_out")[1],
+         ),
+         router=_Router(),
+     )
++    runner._apply_quant_method = MoERunner._apply_quant_method.__get__(
++        runner, MoERunner
++    )
+ 
+     x6 = torch.zeros(6, 16)
+     MoERunner._apply_quant_method(runner, x6, x6, x6)
+     assert events == ["gate", "shared_async", "topk", "routed", "shared_wait"]
+ 
++    events.clear()
++    MoERunner._forward_impl(runner, x6, x6, x6)
++    assert events == ["gate", "shared_async", "topk", "routed", "shared_wait"]
++
++    events.clear()
++    x24 = torch.zeros(24, 16)
++    MoERunner._forward_impl(runner, x24, x24, x24)
++    assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
++
+     events.clear()
+     x48 = torch.zeros(48, 16)
+-    MoERunner._apply_quant_method(runner, x48, x48, x48)
++    MoERunner._forward_impl(runner, x48, x48, x48)
+     assert events == ["shared_async", "gate", "topk", "routed", "shared_wait"]
+ 
+ 
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 2ccde309a..012a15700 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -526,7 +526,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             )
+ 
+             return all_reduce_rank_order(
+-                self.pynccl_comm, input_, self.rank_in_group, self.world_size
++                self.pynccl_comm,
++                input_,
++                self.rank_in_group,
++                self.world_size,
++                roce_comm=b12x_ar_comm,
+             )
+ 
+         fi_ar_comm = self.fi_ar_comm
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 465e02b80..54dc38807 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -773,11 +773,12 @@ class MoERunner(MoERunnerInterface):
+                 # The shared expert runs on the aux stream beside the routed
+                 # experts; their combine waits for it, then adds its output.
+                 # When the router runs a single-tile decode gate projection
+-                # itself (<= 32 rows, 24 CTAs), defer the aux-stream launch
+-                # until immediately after the gate GEMM so shared gate_up_proj
+-                # overlaps top-k routing and routed experts instead of
+-                # contending with the critical-path gate GEMM and FFN L2
+-                # prefetch.
++                # itself (<= 16 rows, 48 CTAs at TP4), defer the aux-stream
++                # launch until immediately after the gate GEMM so shared
++                # gate_up_proj overlaps top-k routing and routed experts instead
++                # of contending with the critical-path gate GEMM and FFN L2
++                # prefetch. Above 16 rows shared_down switches to smaller block_N
++                # tiles (160 CTAs) where launching pre-gate wins.
+                 if not shared_experts_overlapping:
+                     shared_experts = self._shared_experts
+ 
+@@ -794,7 +795,7 @@ class MoERunner(MoERunnerInterface):
+                     launch_shared = _launch_shared
+                     if (
+                         not getattr(self.router, "routes_hidden_states", False)
+-                        or hidden_states.shape[0] > 32
++                        or hidden_states.shape[0] > 16
+                     ):
+                         launch_shared()
+                 experts.combine_addend = self._shared_experts.wait_output
+@@ -1194,9 +1195,15 @@ class MoERunner(MoERunnerInterface):
+         self.routed_experts._ensure_moe_quant_config_init()
+ 
+         # If using multi-stream overlap for shared experts, we must launch it
+-        # before routed expert dispatch.
++        # before routed expert dispatch unless folded shared-expert execution
++        # defers the launch to _apply_quant_method (where _post_gate_hook may
++        # hold it until right after the decode gate GEMM).
+         shared_experts_overlapping = False
+-        if self._shared_experts is not None:
++        if self._shared_experts is not None and not getattr(
++            getattr(self._quant_method, "modular_experts", None),
++            "fold_shared",
++            False,
++        ):
+             assert shared_experts_input is not None
+             if self._shared_experts.workspace_size(shared_experts_input):
+                 # Dispatch determines routed scratch sizes. Reserve both branches
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index debea5cdc..bbe63f9af 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -696,7 +696,11 @@ def reduce_scatter_rank_order(
+ 
+ 
+ def all_reduce_rank_order(
+-    comm, input_tensor: torch.Tensor, rank: int, world: int
++    comm,
++    input_tensor: torch.Tensor,
++    rank: int,
++    world: int,
++    roce_comm=None,
+ ) -> torch.Tensor:
+     """The sum over ranks of ``input_tensor`` at any size, with the one-shot
+     all-reduce's arithmetic: its rows (padded to a multiple of ``world``) are
+@@ -715,9 +719,27 @@ def all_reduce_rank_order(
+         columns.zero_(buffer[rows:])
+     else:
+         buffer = flat
+-    own = reduce_scatter_rank_order(comm, buffer, rank, world)
+-    gathered = torch.empty_like(buffer)
+-    comm.all_gather(gathered, own)
++    should_rs = getattr(roce_comm, "should_reduce_scatter", None)
++    if (
++        roce_comm is not None
++        and not getattr(roce_comm, "disabled", True)
++        and callable(should_rs)
++        and should_rs(buffer, 0)
++    ):
++        own = roce_comm.reduce_scatter(buffer, 0)
++    else:
++        own = reduce_scatter_rank_order(comm, buffer, rank, world)
++    should_ag = getattr(roce_comm, "should_all_gather", None)
++    if (
++        roce_comm is not None
++        and not getattr(roce_comm, "disabled", True)
++        and callable(should_ag)
++        and should_ag(own, 0)
++    ):
++        gathered = roce_comm.all_gather(own, 0)
++    else:
++        gathered = torch.empty_like(buffer)
++        comm.all_gather(gathered, own)
+     return gathered[:rows].view(input_tensor.shape)
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index ea0d8bc8d..d265b16f5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -2646,8 +2646,9 @@ def bf16_shards(N: int, K: int, block_N: int = 64, block_K: int = 64) -> int:
+ 
+ 
+ # Decode tile heights: rows up to DECODE_ROWS run on the shortest that holds
+-# them (one stream's verified rows fit 16; 32 rows hold four streams').
+-DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
++# them (one stream's verified rows fit 16; 32 rows hold five streams';
++# 48 rows hold six to eight streams' without padding up to 64).
++DECODE_TILE_ROWS = (16, 32, 48, DECODE_ROWS)
+ 
+ # Decode tiles of the block-32 FP8 projections by (N, K) and tile height, from
+ # the kernel-lab sweep on GB10 at the TP4 serving shapes: whole calls with the
+@@ -2656,13 +2657,28 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
+ # to B12X over the three is lowest. Every field only changes speed: each tile
+ # accumulates K in the same order, so a row's bits do not depend on the tile
+ # or on prefill.
+-# Decode Q-B (8192 x 1280) and indexer Q-B (4096 x 1280) pack their [N, K] weights
+-# into [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
++# Decode Q-B (8192 x 1280), indexer Q-B (4096 x 1280), WO-B
++# (5120 x 3072/2048/1024), shared_up (1536..640 x 5120), and DSpark
++# main_proj TP4..TP8 shards (1280..640 x 15360) pack their [N, K] weights into
++# [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
+ # contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
+ TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
+     (12288, 1280),
+     (8192, 1280),
+     (4096, 1280),
++    (5120, 3072),
++    (5120, 2048),
++    (5120, 1024),
++    (1536, 5120),
++    (1152, 5120),
++    (1024, 5120),
++    (768, 5120),
++    (640, 5120),
++    (1280, 15360),
++    (1024, 15360),
++    (896, 15360),
++    (768, 15360),
++    (640, 15360),
+ }
+ 
+ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+@@ -2672,27 +2688,32 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (12288, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=64, block_K=128, num_stages=3),
++        48: dict(block_N=64, block_K=128, num_stages=3),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+     },
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+-        32: dict(block_N=64, block_K=128, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+     },
+     (4096, 1280): {
+         16: dict(block_N=64, block_K=128, num_stages=3),
+-        32: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
+     },
+     (1792, 5120): {
+         16: dict(block_N=64, block_K=256, num_stages=2),
+         32: dict(block_N=64, block_K=256, num_stages=3),
++        48: dict(block_N=64, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     # Shared expert gate/up (TP3, TP4, TP5, TP6/TP7, TP8).
+     (1536, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=64, block_K=128, num_stages=2),
+         64: dict(block_N=64, block_K=128, num_stages=2),
+     },
+     # TP3..TP8 column-sharded target fused Q-A/KV:
+@@ -2702,78 +2723,93 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (224, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (256, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (320, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (384, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (448, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     (608, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=4),
+         32: dict(block_N=32, block_K=256, num_stages=4),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=4),
+     },
+     # TP4 shared expert: gate/up and down.
+     (1152, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=64, block_K=256, num_stages=2),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (1024, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (768, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=32, block_K=256, num_stages=2),
+     },
+     (640, 5120): {
+         16: dict(block_N=32, block_K=256, num_stages=3),
+         32: dict(block_N=32, block_K=256, num_stages=3),
++        48: dict(block_N=32, block_K=256, num_stages=3),
+         64: dict(block_N=32, block_K=256, num_stages=2),
+     },
+     # Shared expert down (TP3, TP4, TP5, TP6/TP7, TP8).
+     (5120, 768): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     (5120, 576): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+-        32: dict(block_N=128, block_K=64, num_stages=2),
+-        64: dict(block_N=64, block_K=64, num_stages=2),
++        32: dict(block_N=32, block_K=192, num_stages=4, threads=128),
++        48: dict(block_N=32, block_K=192, num_stages=4, threads=128),
++        64: dict(block_N=32, block_K=192, num_stages=4, threads=128),
+     },
+     (5120, 512): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     (5120, 384): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=64, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     (5120, 320): {
+         16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+         32: dict(block_N=128, block_K=64, num_stages=2),
++        48: dict(block_N=64, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
+     # Attention output: grouped WO-A (TP3 3 groups, TP4..7 2 groups, TP8 1 group)
+@@ -2781,37 +2817,43 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (1024, 4096, 3): {
+         16: dict(block_N=64, block_K=128, num_stages=4),
+         32: dict(block_N=64, block_K=128, num_stages=4),
++        48: dict(block_N=64, block_K=128, num_stages=4),
+         64: dict(block_N=64, block_K=128, num_stages=2),
+     },
+     (1024, 4096, 2): {
+         16: dict(block_N=64, block_K=128, num_stages=4),
+         32: dict(block_N=64, block_K=128, num_stages=4),
++        48: dict(block_N=64, block_K=128, num_stages=4),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (1024, 4096): {
+         16: dict(block_N=32, block_K=128, num_stages=4),
+         32: dict(block_N=32, block_K=128, num_stages=4),
++        48: dict(block_N=32, block_K=128, num_stages=4),
+         64: dict(block_N=32, block_K=256, num_stages=2),
+     },
+     (5120, 3072): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
++        48: dict(block_N=128, block_K=128, num_stages=2),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+         128: dict(block_N=128, block_K=128, num_stages=2, threads=256),
+     },
+     (5120, 2048): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+-        32: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         # 2026-10-13 sweep (experiments/2026-10-13-tilelang-fp8-cast): 0.87 of the
+         # default tile at 48-64 rows; a 96-row tile 0.91 of the prefill tile at 72-96.
+-        64: dict(block_N=128, block_K=128, num_stages=2),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+         128: dict(block_N=128, block_K=128, num_stages=2, threads=256),
+     },
+     (5120, 1024): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+         32: dict(block_N=128, block_K=128, num_stages=3),
++        48: dict(block_N=128, block_K=128, num_stages=2),
+         64: dict(block_N=128, block_K=128, num_stages=2),
+         96: dict(block_N=64, block_K=128, num_stages=2),
+         128: dict(block_N=128, block_K=128, num_stages=2, threads=256),
+@@ -2820,36 +2862,43 @@ DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     (6400, 6144): {
+         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+         32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
++        48: dict(block_N=32, block_K=256, num_stages=4),
+         64: dict(block_N=64, block_K=256, num_stages=2),
+     },
+     (1728, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+     },
+     (1280, 15360): {
+-        16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        16: dict(block_N=64, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (1024, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (896, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=4, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=4, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (768, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+     (640, 15360): {
+         16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         32: dict(block_N=32, block_K=256, num_stages=3, threads=128),
++        48: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+         64: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+     },
+ }
+@@ -2870,6 +2919,7 @@ SPLIT_FP8: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
+             32: dict(block_N=32, block_K=256, num_stages=2, threads=128),
++            48: dict(block_N=32, block_K=256, num_stages=2, threads=128),
+             64: dict(block_N=32, block_K=128, num_stages=3, threads=128),
+             128: dict(block_N=64, block_K=128, num_stages=2, threads=128),
+         },
+@@ -2890,6 +2940,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=64, num_stages=4, threads=128),
+             32: dict(block_N=64, num_stages=2, threads=256),
++            48: dict(block_N=64, num_stages=2, threads=256),
+             64: dict(block_N=64, num_stages=3, threads=256),
+         },
+     ),
+@@ -2899,6 +2950,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2908,6 +2960,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2917,6 +2970,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2926,6 +2980,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2935,6 +2990,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2944,6 +3000,7 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+         decode={
+             16: dict(block_N=32, num_stages=3, threads=128),
+             32: dict(block_N=32, num_stages=3, threads=128),
++            48: dict(block_N=32, num_stages=3, threads=128),
+             64: dict(block_N=32, num_stages=2, threads=256),
+         },
+     ),
+@@ -2951,9 +3008,9 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+ 
+ 
+ def split_bucket(rows: int) -> int:
+-    """Decode bucket of a split-K call: 16, 32 or 64 rows (one tile that tall), or
++    """Decode bucket of a split-K call: 16, 32, 48 or 64 rows (one tile that tall), or
+     128 (rows 65-128 in 64-row tiles)."""
+-    return next(height for height in (16, 32, 64, 128) if rows <= height)
++    return next(height for height in (16, 32, 48, 64, 128) if rows <= height)
+ 
+ 
+ def split_row_tile(rows: int) -> int:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 0b14d7bba..f53dff301 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -215,7 +215,7 @@ def provided_mxfp8(x: torch.Tensor) -> MXFP8Rows:
+ # Row tiles of the split-K partials kernel. A 64-row tile computes one decode
+ # row in twice the time of a 16-row tile; every height gives the same
+ # partials bit for bit, so each row count takes the smallest tile that fits.
+-PARTIAL_ROW_TILES = (16, 32, 64)
++PARTIAL_ROW_TILES = (16, 32, 48, 64)
+ 
+ 
+ def partials_kernel(layer: nn.Module, rows: int):
+@@ -584,7 +584,12 @@ def project_bf16_partials(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ def _block32_kernels(
+-    n: int, k: int, groups: int = 1, *, rope_mxfp4: tuple[int, int] | None = None
++    n: int,
++    k: int,
++    groups: int = 1,
++    *,
++    rope_mxfp4: tuple[int, int] | None = None,
++    split_override: dict | None = None,
+ ) -> dict:
+     """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
+     calls ``_bind_block32`` makes.
+@@ -592,7 +597,7 @@ def _block32_kernels(
+     With ``groups`` > 1 the weight stacks ``groups`` blocks of ``n / groups`` rows,
+     each applied to its own K columns of ``groups * k``-wide activations.
+     """
+-    split = SPLIT_FP8.get((n, k)) if groups == 1 else None
++    split = split_override if split_override is not None else (SPLIT_FP8.get((n, k)) if groups == 1 else None)
+     if split:
+         # A narrow projection: split-K decode rows, and prefill tiles that add the
+         # same shards in the same order.
+@@ -712,7 +717,9 @@ def _warm_casts(k: int) -> None:
+         _warm_cast(k, CAST_SMALL_BATCH_ROWS + 1)
+ 
+ 
+-def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
++def _declare_block32(
++    layer, groups: int = 1, cast: bool = True, *, split_override: dict | None = None
++) -> None:
+     """Configure a block-32 FP8 projection of ``layer.weight`` (E4M3 ``[N, K]``),
+     register it for the custom op, and declare its kernels. ``cast=False``: the
+     caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches.
+@@ -732,7 +739,11 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+         layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
+         return
+     kernels = _block32_kernels(
+-        n, k, groups, rope_mxfp4=getattr(layer, "tilelang_rope_mxfp4", None)
++        n,
++        k,
++        groups,
++        rope_mxfp4=getattr(layer, "tilelang_rope_mxfp4", None),
++        split_override=split_override,
+     )
+     part_n = (
+         getattr(layer, "part_output_size", 0)
+@@ -756,21 +767,27 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+     layer.tilelang_groups = groups
+     layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
+     layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
+-    split = SPLIT_FP8.get((n, k)) if groups == 1 else None
++    split = split_override if split_override is not None else (SPLIT_FP8.get((n, k)) if groups == 1 else None)
+     layer.tilelang_shards = split["shards"] if split else 1
+     if split:
+         layer.tilelang_split_rows = split["rows"]
+     layer.tilelang_mxfp8_input = getattr(layer, "tilelang_mxfp8_input", False)
+     if layer.tilelang_mxfp8_input:
+-        heights = (
+-            {min(bucket, 64) for bucket in split["decode"]}
++        single_heights = (
++            {min(bucket, 64) for bucket in split["decode"] if bucket <= DECODE_ROWS}
++            if split
++            else set(DECODE_TILE_ROWS)
++        )
++        multi_heights = (
++            {min(bucket, 64) for bucket in split["decode"] if bucket > DECODE_ROWS}
+             if split
+-            else {*DECODE_TILE_ROWS, *layer.tilelang_wide.values()}
++            else set(layer.tilelang_wide.values())
+         )
+         if (
+             groups != 1
+             or (split and split["rows"] > MXFP8_DECODE_ROWS)
+-            or any(DECODE_ROWS % height for height in heights)
++            or any(height <= 0 or height > DECODE_ROWS for height in single_heights)
++            or any(DECODE_ROWS % height for height in multi_heights)
+         ):
+             # A producer pads to whole DECODE_ROWS tiles (mxfp8_rows) for one GEMM.
+             raise ValueError(
+@@ -794,7 +811,7 @@ def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+     )
+ 
+ 
+-def _block32_scale_words(layer) -> None:
++def _block32_scale_words(layer, *, split_override: dict | None = None) -> None:
+     """Pack the 32x32 block-scale grid. The GEMM indexes it with ``row // 32``.
+ 
+     ``pack_scale_words(..., rows=N)`` repeats this grid once per output row.
+@@ -832,10 +849,17 @@ def _block32_scale_words(layer) -> None:
+         r1 = r0 + part_n
+         layer.shard_weight = layer.weight[r0:r1]
+         layer.shard_weight_sf = full_sf[r0 // 32 : r1 // 32]
++    groups = getattr(layer, "tilelang_groups", 1)
++    split = (
++        split_override
++        if split_override is not None
++        else (SPLIT_FP8.get((logical_n, cols)) if groups == 1 else None)
++    )
+     if (
+-        (logical_n, cols) in TILE_CONTIGUOUS_FP8
++        not split
++        and (logical_n, cols) in TILE_CONTIGUOUS_FP8
+         and logical_n == rows
+-        and getattr(layer, "tilelang_groups", 1) == 1
++        and groups == 1
+         and not getattr(layer, "tilelang_weight_packed", False)
+     ):
+         packed = pack_weight_tiles(layer.weight)
+@@ -935,6 +959,41 @@ class TileLangBlock32Rows:
+         return _apply_block32(self, x)
+ 
+ 
++class TileLangGroupedBlock32Rows:
++    """Multiple matching ``TileLangBlock32Rows`` stacked along N in one GEMM.
++
++    Concatenating identically shaped context-KV weights along N preserves each
++    output tile's exact reduction order when using the per-layer ``SPLIT_FP8``
++    schedule, while eliminating repeated activation reads and kernel launches.
++    """
++
++    def __init__(self, projections: list[TileLangBlock32Rows]):
++        if len(projections) < 2:
++            raise ValueError("grouped context projection requires at least two layers")
++        first = projections[0]
++        part_n, k = first.weight.shape
++        if any(p.weight.shape != (part_n, k) for p in projections):
++            raise ValueError("grouped context projections must share (N, K)")
++        self.part_n = part_n
++        self.slices = (part_n,) * len(projections)
++        self.weight = torch.cat([p.weight for p in projections], dim=0).contiguous()
++        self.weight_scale_inv = torch.cat(
++            [p.weight_scale_inv for p in projections], dim=0
++        ).contiguous()
++        self.tilelang_mxfp8_input = all(
++            getattr(p, "tilelang_mxfp8_input", False) for p in projections
++        )
++        _block32_scale_words(self, split_override=SPLIT_FP8.get((part_n, k)))
++
++    def declare_kernels(self) -> None:
++        """Declare kernels for the stacked N projection using the slice's split-K."""
++        k = self.weight.shape[1]
++        _declare_block32(self, split_override=SPLIT_FP8.get((self.part_n, k)))
++
++    def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
++        return _apply_block32(self, x).split(self.slices, dim=-1)
++
++
+ def _out_dtype(layer: nn.Module) -> str:
+     """The layer's output dtype as the GEMMs name it (set after construction)."""
+     return _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
+@@ -1136,10 +1195,11 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+         return dict(shards=split["shards"], blocked=split["blocked"], decode=decode)
+ 
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+-        """Pack the compressor's BF16 weight into exact 12-bit storage."""
++        """Pack the compressor's BF16 weight into exact 12-bit storage when enabled."""
+         if hasattr(layer, "_zero_pad_rows"):
+             layer._zero_pad_rows()
+-        pack_bf16_layer(layer, self._split(layer)["shards"])
++        if getattr(layer, "pack_bf16", True):
++            pack_bf16_layer(layer, self._split(layer)["shards"])
+ 
+     def _kernels(self, layer: nn.Module) -> dict:
+         """Every kernel of the split projection, as calls."""
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 040d1264a..1511c69de 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -43,6 +43,8 @@ entry:
+   routed experts) no longer cast it themselves.
+ """
+ 
++import contextlib
++import threading
+ from functools import cache
+ 
+ import tilelang
+@@ -344,6 +346,84 @@ def project_streams(
+     return mhc_project_streams
+ 
+ 
++@T.macro
++def _sinkhorn_warp(
++    P,
++    S,
++    s_val,
++    b_val,
++    post,
++    comb,
++    pre_out,
++    pid,
++    tx,
++    splits: int,
++    rms_group_size: int,
++    rms_eps: float,
++    hc_eps: float,
++    sinkhorn_repeat: int,
++    post_mult: float,
++):
++    """Warp-0 partial reduction of P/S followed by exact Sinkhorn iterations."""
++    rms_l = T.alloc_local((1,), T.float32)
++    p_acc = T.alloc_local((1,), T.float32)
++    cm_l = T.alloc_local((1,), T.float32)
++    rmax_l = T.alloc_local((1,), T.float32)
++    rsum_l = T.alloc_local((1,), T.float32)
++    csum_l = T.alloc_local((1,), T.float32)
++    s_buf = T.alloc_local((splits,), T.float32)
++    p_buf = T.alloc_local((splits,), T.float32)
++
++    rms_l[0] = 0.0
++    p_acc[0] = 0.0
++    cm_l[0] = 0.0
++    for i_split in T.unroll(splits):
++        s_buf[i_split] = S[i_split, pid, 0]
++        if tx < 24:
++            mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++            p_buf[i_split] = P[i_split, pid, 0, mix_idx]
++    for i_split in T.unroll(splits):
++        rms_l[0] += s_buf[i_split]
++        if tx < 24:
++            p_acc[0] += p_buf[i_split]
++    rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
++
++    if tx < 16:
++        cm_l[0] = p_acc[0] * rms_l[0] * s_val[0] + b_val[0]
++    elif tx < 20:
++        pre_out[pid, tx - 16] = (
++            T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0]) + hc_eps
++        )
++    elif tx < 24:
++        post[pid, tx - 20] = (
++            T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0]) * post_mult
++        )
++
++    rmax_l[0] = cm_l[0]
++    rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
++    rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
++    cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
++    rsum_l[0] = cm_l[0]
++    rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
++    rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
++    cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
++    csum_l[0] = cm_l[0]
++    csum_l[0] += T.shfl_xor(csum_l[0], 8)
++    csum_l[0] += T.shfl_xor(csum_l[0], 4)
++    cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
++    for _ in T.unroll(sinkhorn_repeat - 1):
++        rsum_l[0] = cm_l[0]
++        rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
++        rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
++        cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
++        csum_l[0] = cm_l[0]
++        csum_l[0] += T.shfl_xor(csum_l[0], 8)
++        csum_l[0] += T.shfl_xor(csum_l[0], 4)
++        cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
++    if tx < 16:
++        comb[pid, tx // MULT, tx % MULT] = cm_l[0]
++
++
+ @tilelang.jit(pass_configs=_PASS_CONFIGS)
+ def finalize(
+     hidden_size: int,
+@@ -397,17 +477,11 @@ def finalize(
+             tx = T.get_thread_binding()
+             xv = T.alloc_local((VEC,), T.bfloat16)
+             wv = T.alloc_local((steps * VEC,), T.bfloat16)
+-            yv = T.alloc_local((steps * VEC,), T.bfloat16)
+             xq = T.alloc_local((VEC,), T.float8_e4m3fn)
+             total = T.alloc_local((1,), T.float32)
+-            rms_l = T.alloc_local((1,), T.float32)
+-            p_acc = T.alloc_local((1,), T.float32)
+             s_val = T.alloc_local((1,), T.float32)
+             b_val = T.alloc_local((1,), T.float32)
+-            cm_l = T.alloc_local((1,), T.float32)
+-            rmax_l = T.alloc_local((1,), T.float32)
+-            rsum_l = T.alloc_local((1,), T.float32)
+-            csum_l = T.alloc_local((1,), T.float32)
++            q_buf = T.alloc_local((splits,), T.float32)
+ 
+             if tx < 24:
+                 mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
+@@ -425,71 +499,28 @@ def finalize(
+             pdl.chain()
+ 
+             if tx < 32:
+-                rms_l[0] = 0.0
+-                p_acc[0] = 0.0
+-                cm_l[0] = 0.0
+-                for i_split in T.unroll(splits):
+-                    rms_l[0] += S[i_split, pid, 0]
+-                    if tx < 24:
+-                        mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
+-                        p_acc[0] += P[i_split, pid, 0, mix_idx]
+-                rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
+-
+-                if tx < 16:
+-                    cm_l[0] = p_acc[0] * rms_l[0] * s_val[0] + b_val[0]
+-                elif tx < 20:
+-                    pre_out[pid, tx - 16] = (
+-                        T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0]) + hc_eps
+-                    )
+-                elif tx < 24:
+-                    post[pid, tx - 20] = (
+-                        T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0])
+-                        * post_mult
+-                    )
+-
+-                rmax_l[0] = cm_l[0]
+-                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
+-                rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
+-                cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
+-                rsum_l[0] = cm_l[0]
+-                rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
+-                rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
+-                cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
+-                csum_l[0] = cm_l[0]
+-                csum_l[0] += T.shfl_xor(csum_l[0], 8)
+-                csum_l[0] += T.shfl_xor(csum_l[0], 4)
+-                cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
+-                for _ in T.serial(sinkhorn_repeat - 1):
+-                    rsum_l[0] = cm_l[0]
+-                    rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
+-                    rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
+-                    cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
+-                    csum_l[0] = cm_l[0]
+-                    csum_l[0] += T.shfl_xor(csum_l[0], 8)
+-                    csum_l[0] += T.shfl_xor(csum_l[0], 4)
+-                    cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
+-                if tx < 16:
+-                    comb[pid, tx // MULT, tx % MULT] = cm_l[0]
++                _sinkhorn_warp(
++                    P, S, s_val, b_val, post, comb, pre_out, pid, tx,
++                    splits, rms_group_size, rms_eps, hc_eps, sinkhorn_repeat, post_mult,
++                )
+             else:
+-                # RMSNorm of the collapse, with the sublayer's weight, and its MXFP8
+-                # cast.
++                # Reduce Q first so C elements stream in one step without holding yv[steps*VEC].
+                 worker = tx - 32
+-                for step in T.unroll(steps):
+-                    chunk = step * workers + worker
+-                    if chunk < chunks:
+-                        for v in T.vectorized(VEC):
+-                            yv[step * VEC + v] = C[pid, chunk * VEC + v]
++                for i_split in T.unroll(splits):
++                    q_buf[i_split] = Q[i_split, pid]
+                 total[0] = 0.0
+                 for i_split in T.unroll(splits):
+-                    total[0] += Q[i_split, pid]
++                    total[0] += q_buf[i_split]
+                 total[0] = T.rsqrt(total[0] / hidden_size + norm_eps)
+                 for step in T.unroll(steps):
+                     chunk = step * workers + worker
+                     if chunk < chunks:
++                        for v in T.vectorized(VEC):
++                            xv[v] = C[pid, chunk * VEC + v]
+                         for v in T.unroll(VEC):
+                             xv[v] = T.Cast(
+                                 T.bfloat16,
+-                                T.Cast(T.float32, yv[step * VEC + v])
++                                T.Cast(T.float32, xv[v])
+                                 * total[0]
+                                 * T.Cast(T.float32, wv[step * VEC + v]),
+                             )
+@@ -502,6 +533,138 @@ def finalize(
+     return mhc_finalize
+ 
+ 
++def _norm_ctas(hidden_size: int) -> int:
++    """Number of CTAs per token for ``finalize_norm`` (5 covers 5120 in 1 step/thread)."""
++    chunks = hidden_size // VEC
++    return 5 if chunks % 5 == 0 and (chunks // 5) % 4 == 0 else 1
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def finalize_norm(
++    hidden_size: int,
++    norm_eps: float,
++    block_H: int = BLOCK_H,
++    k_ctas: int = 5,
++    threads: int = 128,
++):
++    """Critical-path RMSNorm + MXFP8 cast of ``C`` using ``Q`` partials only.
++
++    Keeping ``pdl.chain()`` strictly first avoids any early parameter load while
++    splitting ``C`` across ``k_ctas`` parallel CTAs per token (1 step/thread at
++    hidden_size=5120)."""
++    assert hidden_size % VEC == 0
++    splits = hidden_size // block_H
++    chunks = hidden_size // VEC
++    assert chunks % k_ctas == 0
++    chunks_per_cta = chunks // k_ctas
++    assert chunks_per_cta % 32 == 0 or (chunks_per_cta % 4 == 0 and threads % 4 == 0)
++    steps = (chunks_per_cta + threads - 1) // threads
++    sf_width = 4 * scale_words(hidden_size)
++    q_loads = (splits + threads - 1) // threads
++    M, Mq = T.dynamic("M, Mq")
++
++    @T.prim_func
++    def mhc_finalize_norm(
++        C: T.Tensor((M, hidden_size), T.bfloat16),
++        Q: T.Tensor((splits, M), T.float32),
++        weight: T.Tensor((hidden_size,), T.bfloat16),
++        y: T.Tensor((M, hidden_size), T.bfloat16),
++        yq: T.Tensor((Mq, hidden_size), T.float8_e4m3fn),
++        ysf: T.Tensor((Mq, sf_width), T.uint8),
++    ):
++        with T.Kernel(M, k_ctas, threads=threads) as (pid, k_bx):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            chunk_base = k_bx * chunks_per_cta
++            xv = T.alloc_local((VEC,), T.bfloat16)
++            wv = T.alloc_local((steps * VEC,), T.bfloat16)
++            xq = T.alloc_local((VEC,), T.float8_e4m3fn)
++            total = T.alloc_local((1,), T.float32)
++            q_sh = T.alloc_shared((splits,), T.float32)
++            rms_sh = T.alloc_shared((1,), T.float32)
++
++            for step in T.unroll(steps):
++                c_rel = step * threads + tx
++                if c_rel < chunks_per_cta:
++                    chunk = chunk_base + c_rel
++                    for v in T.vectorized(VEC):
++                        wv[step * VEC + v] = weight[chunk * VEC + v]
++            for g in T.unroll(q_loads):
++                sp = g * threads + tx
++                if sp < splits:
++                    q_sh[sp] = Q[sp, pid]
++            T.sync_threads()
++            if tx == 0:
++                t_sum = T.alloc_var(T.float32, init=0.0)
++                for i_split in T.unroll(splits):
++                    t_sum += q_sh[i_split]
++                rms_sh[0] = T.rsqrt(t_sum / hidden_size + norm_eps)
++            T.sync_threads()
++            total[0] = rms_sh[0]
++            for step in T.unroll(steps):
++                c_rel = step * threads + tx
++                if c_rel < chunks_per_cta:
++                    chunk = chunk_base + c_rel
++                    for v in T.vectorized(VEC):
++                        xv[v] = C[pid, chunk * VEC + v]
++                    for v in T.unroll(VEC):
++                        xv[v] = T.Cast(
++                            T.bfloat16,
++                            T.Cast(T.float32, xv[v])
++                            * total[0]
++                            * T.Cast(T.float32, wv[step * VEC + v]),
++                        )
++                    for v in T.vectorized(VEC):
++                        y[pid, chunk * VEC + v] = xv[v]
++                    cast_block_mxfp8(
++                        xv, xq, VEC, yq, ysf, pid, chunk * VEC
++                    )
++
++    return mhc_finalize_norm
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def finalize_sinkhorn(
++    hidden_size: int,
++    rms_group_size: int,
++    rms_eps: float,
++    hc_eps: float,
++    sinkhorn_repeat: int,
++    post_mult: float = 2.0,
++    block_H: int = BLOCK_H,
++):
++    """Off-critical-path Sinkhorn + mix-split kernel for ``post, comb, pre_out``."""
++    splits = hidden_size // block_H
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def mhc_finalize_sinkhorn(
++        P: T.Tensor((splits, M, 1, MIXES), T.float32),
++        S: T.Tensor((splits, M, 1), T.float32),
++        scale: T.Tensor((3,), T.float32),
++        base: T.Tensor((MIXES,), T.float32),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        pre_out: T.Tensor((M, MULT), T.float32),
++    ):
++        with T.Kernel(M, threads=32) as pid:
++            pdl.chain()
++            tx = T.get_thread_binding()
++            s_val = T.alloc_local((1,), T.float32)
++            b_val = T.alloc_local((1,), T.float32)
++            if tx < 24:
++                mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++                scale_idx = T.if_then_else(tx < 16, 2, (tx - 16) // MULT)
++                s_val[0] = scale[scale_idx]
++                b_val[0] = base[mix_idx]
++            _sinkhorn_warp(
++                P, S, s_val, b_val, post, comb, pre_out, pid, tx,
++                splits, rms_group_size, rms_eps, hc_eps, sinkhorn_repeat, post_mult,
++            )
++
++    return mhc_finalize_sinkhorn
++
++
+ @tilelang.jit(pass_configs=_PASS_CONFIGS)
+ def post_streams(hidden_size: int, threads: int = 128, world: int = 1):
+     """A sublayer's output ``x`` folded into the streams, TileKernels' ``mhc_post_fwd``
+@@ -1113,11 +1276,118 @@ def _project(hidden: int, mode: str, world: int, with_aux: bool = False):
+     return _make(_project_call(hidden, mode, world, with_aux))
+ 
+ 
++def _finalize_norm_call(hidden: int, rms_eps: float) -> prepare.TileLangCall:
++    """The critical-path ``finalize_norm`` call."""
++    return prepare.call(finalize_norm, hidden, rms_eps, k_ctas=_norm_ctas(hidden))
++
++
++def _finalize_sinkhorn_call(
++    hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int
++) -> prepare.TileLangCall:
++    """The off-critical-path ``finalize_sinkhorn`` call."""
++    return prepare.call(finalize_sinkhorn, hidden, k, rms_eps, hc_eps, iterations)
++
++
+ @cache
+ def _finalize(hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int):
+     return _make(_finalize_call(hidden, k, rms_eps, hc_eps, iterations))
+ 
+ 
++@cache
++def _finalize_norm(hidden: int, rms_eps: float):
++    return _make(_finalize_norm_call(hidden, rms_eps))
++
++
++@cache
++def _finalize_sinkhorn(
++    hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int
++):
++    return _make(_finalize_sinkhorn_call(hidden, k, rms_eps, hc_eps, iterations))
++
++
++_ASYNC_SINKHORN_MAX_ROWS = 128
++_SINKHORN_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
++_SINKHORN_SCRATCH: dict[torch.device, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
++_sinkhorn_state = threading.local()
++
++
++def _normalize_device(device: torch.device | None = None) -> torch.device:
++    if device is None:
++        return torch.device("cuda", torch.cuda.current_device())
++    if device.type == "cuda" and device.index is None:
++        return torch.device("cuda", torch.cuda.current_device())
++    return device
++
++
++def _sinkhorn_stream(device: torch.device) -> torch.cuda.Stream:
++    device = _normalize_device(device)
++    stream = _SINKHORN_STREAMS.get(device)
++    if stream is None:
++        from vllm.utils.torch_utils import aux_stream
++
++        shared = aux_stream()
++        if shared is not None and _normalize_device(shared.device) == device:
++            stream = shared
++        else:
++            try:
++                _, high_priority = torch.cuda.Stream.priority_range()
++                stream = torch.cuda.Stream(device=device, priority=high_priority)
++            except Exception:
++                stream = torch.cuda.Stream(device=device)
++        _SINKHORN_STREAMS[device] = stream
++    return stream
++
++
++def _sinkhorn_scratch(splits: int, tokens: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
++    device = _normalize_device(device)
++    by_splits = _SINKHORN_SCRATCH.setdefault(device, {})
++    pair = by_splits.get(splits)
++    need_p = splits * tokens * MIXES
++    need_s = splits * tokens
++    if pair is None or pair[0].numel() < need_p or pair[1].numel() < need_s:
++        cap = max(tokens, _ASYNC_SINKHORN_MAX_ROWS)
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                f"mHC async Sinkhorn buffers for {tokens} rows must be pre-allocated before capture"
++            )
++        pair = (
++            torch.empty((splits * cap * MIXES,), dtype=torch.float32, device=device),
++            torch.empty((splits * cap,), dtype=torch.float32, device=device),
++        )
++        by_splits[splits] = pair
++    return (
++        pair[0][:need_p].view(splits, tokens, 1, MIXES),
++        pair[1][:need_s].view(splits, tokens, 1),
++    )
++
++
++def _async_sinkhorn_active() -> bool:
++    return getattr(_sinkhorn_state, "depth", 0) > 0
++
++
++@contextlib.contextmanager
++def async_sinkhorn(enabled: bool = True):
++    """Run Sinkhorn on a dedicated side stream across enclosed mHC entry calls."""
++    if not enabled:
++        yield
++        return
++    _sinkhorn_state.depth = getattr(_sinkhorn_state, "depth", 0) + 1
++    try:
++        yield
++    finally:
++        _sinkhorn_state.depth -= 1
++
++
++def wait_sinkhorn(device: torch.device | None = None) -> None:
++    """Join the dedicated Sinkhorn stream onto the current CUDA stream if active."""
++    if device is None and not torch.cuda.is_available():
++        return
++    device = _normalize_device(device)
++    stream = _SINKHORN_STREAMS.get(device)
++    if stream is not None:
++        torch.cuda.current_stream(device).wait_stream(stream)
++
++
+ 
+ @cache
+ def _post(hidden: int, world: int = 1):
+@@ -1184,14 +1454,28 @@ def _mhc_pre(
+         source = residual.view(tokens, streams)
+         updated, mix_post, mix_comb = source, pre, comb
+     splits = hidden // BLOCK_H
+-    scratch = current_workspace_manager().get_simultaneous(
+-        ((splits, tokens, 1, MIXES), torch.float32),
+-        ((splits, tokens, 1), torch.float32),
+-        ((tokens, hidden), torch.bfloat16),
+-        ((splits, tokens), torch.float32),
++    use_async = (
++        _async_sinkhorn_active()
++        and residual.is_cuda
++        and tokens <= _ASYNC_SINKHORN_MAX_ROWS
+     )
+-    retain_cuda_graph_capture_resource(scratch)
+-    P, S, C, Q = scratch
++    if use_async:
++        P, S = _sinkhorn_scratch(splits, tokens, residual.device)
++        scratch = current_workspace_manager().get_simultaneous(
++            ((tokens, hidden), torch.bfloat16),
++            ((splits, tokens), torch.float32),
++        )
++        retain_cuda_graph_capture_resource(scratch)
++        C, Q = scratch
++    else:
++        scratch = current_workspace_manager().get_simultaneous(
++            ((splits, tokens, 1, MIXES), torch.float32),
++            ((splits, tokens, 1), torch.float32),
++            ((tokens, hidden), torch.bfloat16),
++            ((splits, tokens), torch.float32),
++        )
++        retain_cuda_graph_capture_resource(scratch)
++        P, S, C, Q = scratch
+     aux_args = (aux_out.view(tokens, hidden),) if with_aux else ()
+     _project(hidden, mode, world, with_aux)(
+         x if x.ndim == 3 else x.unsqueeze(0),
+@@ -1207,9 +1491,20 @@ def _mhc_pre(
+         Q,
+         *aux_args,
+     )
+-    _finalize(hidden, k, rms_eps, hc_eps, iterations)(
+-        P, S, C, Q, scale, base, norm, post, comb, pre_out, y, y_q, y_sf
+-    )
++    if use_async:
++        sh_stream = _sinkhorn_stream(residual.device)
++        sh_stream.wait_stream(torch.cuda.current_stream(residual.device))
++        for tensor in (P, S, post, comb, pre_out):
++            tensor.record_stream(sh_stream)
++        with torch.cuda.stream(sh_stream):
++            _finalize_sinkhorn(hidden, k, rms_eps, hc_eps, iterations)(
++                P, S, scale, base, post, comb, pre_out
++            )
++        _finalize_norm(hidden, rms_eps)(C, Q, norm, y, y_q, y_sf)
++    else:
++        _finalize(hidden, k, rms_eps, hc_eps, iterations)(
++            P, S, C, Q, scale, base, norm, post, comb, pre_out, y, y_q, y_sf
++        )
+ 
+ 
+ def _mhc_post(
+@@ -1352,6 +1647,7 @@ class TileKernelsMHC(nn.Module):
+     """V4.1 lagged mHC for a decoder layer: pre, post_pre, post and collapse."""
+ 
+     supports_fused_aux = True
++    supports_async_sinkhorn = True
+ 
+     def __init__(self, config):
+         super().__init__()
+@@ -1399,6 +1695,8 @@ class TileKernelsMHC(nn.Module):
+                     if mode == "post_pre"
+                 ),
+                 *(_finalize_call(hidden, k, *mix) for k in widths),
++                _finalize_norm_call(hidden, self.rms_eps),
++                *(_finalize_sinkhorn_call(hidden, k, *mix) for k in widths),
+                 *(_post_call(hidden, w) for w in post_worlds),
+                 _collapse_call(hidden),
+                 *(_post_collapse_call(hidden, w) for w in post_worlds),
+@@ -1416,6 +1714,8 @@ class TileKernelsMHC(nn.Module):
+                     _project(hidden, mode, world, True)
+             for k in widths:
+                 _finalize(hidden, k, *mix)
++                _finalize_sinkhorn(hidden, k, *mix)
++            _finalize_norm(hidden, self.rms_eps)
+             for w in post_worlds:
+                 _post(hidden, w)
+                 _post_collapse(hidden, w)
+@@ -1427,6 +1727,8 @@ class TileKernelsMHC(nn.Module):
+                 get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+                 device,
+             )
++            _sinkhorn_stream(device)
++            _sinkhorn_scratch(hidden // BLOCK_H, _ASYNC_SINKHORN_MAX_ROWS, device)
+ 
+         prepare.declare(calls, bind=bind)
+ 
+@@ -1640,6 +1942,8 @@ class TileKernelsMHC(nn.Module):
+ 
+ __all__ = [
+     "TileKernelsMHC",
++    "async_sinkhorn",
++    "wait_sinkhorn",
+     "collapse_streams",
+     "finalize",
+     "post_collapse_norm_streams",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index 5187c0ede..92df6aff5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -42,12 +42,16 @@ from .. import l2_prefetch
+ from . import prepare
+ from .gemm import (
+     SPLIT_FP8,
++    TILE_CONTIGUOUS_FP8,
++    TILE_WEIGHT_K,
+     fp8_prefill_config,
+     fp8w_bf16_gemm_cast,
+     fp8w_bf16_gemm_partials,
+     mxfp8_gemm,
++    pack_weight_tiles,
+     scale_words,
+     splitk_reduce_cast,
++    unpack_weight_tiles,
+ )
+ from .linear import (
+     _activation_specs,
+@@ -63,13 +67,15 @@ from .linear import (
+ # added in shard order, so a row's bits do not depend on the path. A bucket either
+ # splits the shards over CTAs (FP32 partials, then splitk_reduce: the SMs a narrow grid
+ # leaves idle at decode) or adds them inside the kernel (no partials to write and read
+-# back). Path and tile per bucket from the split sweeps (bits depend on neither): 64
+-# columns and two stages throughout; four shards beat two at decode, and tiles as tall
+-# as the bucket from 65 rows (2026-10-13 sweep 2: 72-96 rows 27.9-29.5 against 34.5 us,
+-# 512 rows 119.1 against 131.8 us, 8192 rows 1675 against 1758 us).
++# back). Path and tile per bucket keep bit-identity across all rows:
++# - 1..16 rows stay split with block_K=256 (fewer K-loop barriers while overlapping
++#   1-CTA 200 ns L2 prefetch);
++# - 17..128 rows retain the baseline 64-col, two-stage split tiles (avoiding
++#   in-kernel shard accumulation overhead at M=36..96 on live tp4-ring);
++# - >128 keeps 96x64x64 in-kernel prefill.
+ _WO_A_SHARDS = 4
+ _WO_A_TILES = {
+-    16: dict(split=True, block_M=16),
++    16: dict(split=True, block_M=16, block_K=256),
+     32: dict(split=True, block_M=32),
+     64: dict(split=True, block_M=64),
+     96: dict(split=True, block_M=96),
+@@ -100,15 +106,31 @@ class _Weight:
+ class _PeerWeight:
+     """A peer TP rank's WO-B shard and its prepared prefill GEMM."""
+ 
+-    __slots__ = ("weight", "tilelang_weight_sf", "tilelang_prefill")
++    __slots__ = (
++        "weight",
++        "tilelang_weight",
++        "tilelang_weight_sf",
++        "tilelang_prefill",
++    )
+ 
+     def __init__(
+         self,
+         weight: torch.Tensor,
+         tilelang_weight_sf: torch.Tensor,
+         tilelang_prefill,
++        *,
++        tilelang_weight: torch.Tensor | None = None,
+     ) -> None:
+         self.weight = weight
++        if tilelang_weight is not None:
++            self.tilelang_weight = tilelang_weight
++        elif tuple(weight.shape) in TILE_CONTIGUOUS_FP8:
++            self.tilelang_weight = weight.view(
++                weight.shape[0] * (weight.shape[1] // TILE_WEIGHT_K),
++                TILE_WEIGHT_K,
++            )
++        else:
++            self.tilelang_weight = weight
+         self.tilelang_weight_sf = tilelang_weight_sf
+         self.tilelang_prefill = tilelang_prefill
+ 
+@@ -128,16 +150,17 @@ class _GroupedBF16:
+         reduce."""
+         n, k = self.weight.shape
+         groups = self.groups
+-        return {
+-            "kernels": {
+-                bucket: prepare.call(
++        kernels = {}
++        for bucket, tile in _WO_A_TILES.items():
++            cfg = {**_WO_A_COMMON, **{m: v for m, v in tile.items() if m != "split"}}
++            kernels[bucket] = (
++                prepare.call(
+                     fp8w_bf16_gemm_partials,
+                     n // groups,
+                     k,
+                     groups,
+                     _WO_A_SHARDS,
+-                    block_M=tile["block_M"],
+-                    **_WO_A_COMMON,
++                    **cfg,
+                 )
+                 if tile["split"]
+                 else prepare.call(
+@@ -146,11 +169,11 @@ class _GroupedBF16:
+                     k,
+                     groups,
+                     shards=_WO_A_SHARDS,
+-                    block_M=tile["block_M"],
+-                    **_WO_A_COMMON,
++                    **cfg,
+                 )
+-                for bucket, tile in _WO_A_TILES.items()
+-            },
++            )
++        return {
++            "kernels": kernels,
+             "reduce": prepare.call(splitk_reduce_cast, n, _WO_A_SHARDS),
+         }
+ 
+@@ -232,12 +255,18 @@ class TileLangWOProjection:
+             if groups <= 0:
+                 continue
+             cols = groups * rank_width
++            tile_kw = (
++                {"tile_contiguous": True}
++                if (self.hidden, cols) in TILE_CONTIGUOUS_FP8
++                else {}
++            )
+             calls[cols] = prepare.call(
+                 mxfp8_gemm,
+                 self.hidden,
+                 cols,
+                 **fp8_prefill_config(self.hidden, cols, 1),
+                 groups=1,
++                **tile_kw,
+             )
+         return calls
+ 
+@@ -267,6 +296,10 @@ class TileLangWOProjection:
+             max_sf_words = scale_words(max_cols)
+             device = self.b.weight.device
+             w = self.b.weight
++            if getattr(self.b, "tilelang_weight_packed", False):
++                w = unpack_weight_tiles(
++                    self.b.tilelang_weight, self.hidden, w.shape[1]
++                )
+             if w.shape[1] < max_cols:
+                 padded_w = torch.zeros(
+                     (self.hidden, max_cols), dtype=w.dtype, device=device
+@@ -298,13 +331,26 @@ class TileLangWOProjection:
+                     continue
+                 cols = peer_groups * rank_width
+                 sf_words = scale_words(cols)
+-                shards.append(
+-                    _PeerWeight(
+-                        gathered_w[peer, :, :cols].contiguous(),
+-                        gathered_sf[peer, :, :sf_words].contiguous(),
+-                        prefill_by_cols.get(cols),
++                peer_w = gathered_w[peer, :, :cols].contiguous()
++                peer_sf = gathered_sf[peer, :, :sf_words].contiguous()
++                if (self.hidden, cols) in TILE_CONTIGUOUS_FP8:
++                    packed_peer = pack_weight_tiles(peer_w)
++                    shards.append(
++                        _PeerWeight(
++                            packed_peer.view(self.hidden, cols),
++                            peer_sf,
++                            prefill_by_cols.get(cols),
++                            tilelang_weight=packed_peer,
++                        )
++                    )
++                else:
++                    shards.append(
++                        _PeerWeight(
++                            peer_w,
++                            peer_sf,
++                            prefill_by_cols.get(cols),
++                        )
+                     )
+-                )
+             self.sp_shards = tuple(shards)
+ 
+         prepare.declare(lambda: extra_calls, bind=bind)
+-- 
+2.43.0
+

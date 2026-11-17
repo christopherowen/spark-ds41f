@@ -1,0 +1,31 @@
+{
+  "notes": "candidate-61 at tp3-triangle-4k: vLLM 0001..0822 (tree 8aa03deba93a), RM nvidiactl carve-out, 2.200 GiB KV, 4K batched, 256K ctx",
+  "extends": {
+    "config": "experiments/2026-11-16-c60-prefill/tp3-triangle-4k.json"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:candidate-61",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "8aa03deba93ac187fb1f5eb8e57ba92daea350c3"
+      },
+      "docker_run_args": [
+        "--network=host",
+        "--ipc=host",
+        "--gpus=all",
+        "--device=/dev/infiniband:/dev/infiniband:rwm",
+        "--cap-add=IPC_LOCK",
+        "--ulimit=memlock=-1:-1",
+        "--ulimit=stack=67108864:67108864",
+        "--ulimit=core=0",
+        "--security-opt=seccomp=unconfined",
+        "--security-opt=label=disable",
+        "--shm-size=16g",
+        "--memory=112g",
+        "--memory-swap=112g",
+        "--cpuset-cpus=5-9,15-19"
+      ]
+    },
+    "upstreams_config": "experiments/2026-11-16-c61-decode/upstreams.lock.json"
+  }
+}

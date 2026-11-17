@@ -1,0 +1,57 @@
+{
+  "notes": "candidate-61 at tp2-switched: vLLM 0001..0822 (tree 8aa03deba93a), RM nvidiactl carve-out, zero-copy io_uring expert slots (240/64, protect 24), 8.00 GiB KV, 256K ctx",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp3-switched.json"
+  },
+  "set": {
+    "nodes": 2,
+    "nodes_config": "config/nodes-switched2.local.json",
+    "container": {
+      "image": "spark-ds41f:candidate-61",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "8aa03deba93ac187fb1f5eb8e57ba92daea350c3",
+        "local.spark-ds41f.tilelang.tree": "741806c7357102130a149cdcae2a5f22678eab67",
+        "local.spark-ds41f.sparknet.tree": "e06f6a0675cb66638231d2c68948a2b315b69b07"
+      },
+      "docker_run_args": [
+        "--network=host",
+        "--ipc=host",
+        "--gpus=all",
+        "--device=/dev/infiniband:/dev/infiniband:rwm",
+        "--cap-add=IPC_LOCK",
+        "--ulimit=memlock=-1:-1",
+        "--ulimit=stack=67108864:67108864",
+        "--ulimit=core=0",
+        "--security-opt=seccomp=unconfined",
+        "--security-opt=label=disable",
+        "--shm-size=16g",
+        "--memory=112g",
+        "--memory-swap=112g",
+        "--cpuset-cpus=5-9,15-19"
+      ]
+    },
+    "upstreams_config": "experiments/2026-11-16-c61-decode/upstreams.lock.json",
+    "environment": {
+      "VLLM_DS41_EXPERT_SLOTS": "240",
+      "VLLM_DS41_EXPERT_DYNAMIC_SLOTS": "64",
+      "VLLM_DS41_EXPERT_CACHE_DIR": "/cache/ds41_expert_slots",
+      "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": "24",
+      "VLLM_MAX_IMAGE_PIXELS": "16777216"
+    }
+  },
+  "serve_options": {
+    "--tensor-parallel-size": "2",
+    "--nnodes": "2",
+    "--max-model-len": "262144",
+    "--max-num-seqs": "4",
+    "--max-num-batched-tokens": "4096",
+    "--kv-cache-memory-bytes": "8589934592",
+    "--max-cudagraph-capture-size": "24",
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":2,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}",
+    "--compilation-config": "{\"cudagraph_mode\":\"PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24]}",
+    "--prefix-cache-retention-interval": "8192",
+    "--long-prefill-token-threshold": "4072",
+    "--mm-processor-cache-gb": "0",
+    "--limit-mm-per-prompt": "{\"image\":67}"
+  }
+}

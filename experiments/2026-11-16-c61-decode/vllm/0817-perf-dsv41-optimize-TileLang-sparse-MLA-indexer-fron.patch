@@ -1,0 +1,2207 @@
+From 9e4acfaa599ae9b4ab7dbb0786d925d2e01f76c7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:01:30 +0100
+Subject: [PATCH 817/822] perf(dsv41): optimize TileLang sparse MLA, indexer,
+ front, and SP prefill
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-60 series applied through 0816.
+
+Rationale: Tunes decode/prefill sparse MLA, indexer top-k segments, metadata
+preparation, front projections, compressor, and SP prefill overlap on GB10.
+
+Quality implications: None; sparse MLA, front, and metadata unit tests pass
+against torch references.
+
+Tests: pytest -q -p deepseek_models tests/kernels/attention/test_deepseek_v41_tilelang.py tests/kernels/test_deepseek_v41_tilelang_front.py tests/kernels/test_deepseek_v41_tilelang_metadata.py
+
+Upstream status: local candidate-61 patch
+---
+ .../attention/test_deepseek_v41_tilelang.py   |  76 +++-
+ .../test_deepseek_v41_tilelang_front.py       |  92 ++++
+ .../test_deepseek_v41_tilelang_metadata.py    |  74 ++++
+ vllm/models/deepseek_v4_1/attention.py        | 267 +++++++----
+ vllm/models/deepseek_v4_1/compressor.py       |   7 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |  34 +-
+ vllm/models/deepseek_v4_1/tilelang/front.py   | 418 ++++++++++++------
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 256 ++++++++---
+ .../models/deepseek_v4_1/tilelang/metadata.py | 232 +++++++---
+ .../deepseek_v4_1/tilelang/sparse_mla.py      |   1 -
+ 10 files changed, 1094 insertions(+), 363 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 25126ea81..b46399c08 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -449,14 +449,6 @@ def test_indexer_dense(context, page_size=64, rows=4):
+     assert torch.equal(out, expected)
+ 
+ 
+-@pytest.mark.xfail(
+-    strict=True,
+-    raises=AssertionError,
+-    reason="the indexer's score ReLU is max(dot, 0), which drops a NaN; the NaN-keeping "
+-    "forms tried so far either serialize the per-head loop (isnan, a 32-bit bit test) or "
+-    "are folded away by TileLang's simplifier (dot != dot), so the fix waits for a "
+-    "vectorizable NaN-keeping max (spark-ds41f experiments/2026-10-14-kernel-contracts)",
+-)
+ def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
+     """An infinite index query quantizes to the UE8M0 scale ``0xFF``, which makes its
+     head's dot NaN. DeepSeek's indexer takes ``relu_`` of the score and keeps the
+@@ -474,14 +466,14 @@ def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
+         "lengths",
+         "active",
+     )
++    extent = _dense_extent(inp, width)
+     _, scores = plan.run(*(inp[k] for k in names))
+-    clean = scores.clone()
++    clean = [scores[i, : extent[i]].clone() for i in range(rows)]
+     r, h = 1, 3
+     inp["q_scales"][r, h, 0] = 0xFF
+     inp["q_packed"][r, h, 0] = 0  # a zero code: 0 x inf is NaN in any order
+     inp["q_values"] = _decode_mxfp4(inp["q_packed"], inp["q_scales"])
+     _, scores = plan.run(*(inp[k] for k in names))
+-    extent = _dense_extent(inp, width)
+     ref = _ref_scores(
+         inp, page_size, extent, lambda i: torch.arange(extent[i], device=DEVICE)
+     )
+@@ -489,7 +481,7 @@ def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
+     assert_same_nonfinite(scores[r, : extent[r]], ref[r], f"row {r}: ")
+     for i in range(rows):
+         if i != r:
+-            assert torch.equal(scores[i, : extent[i]], clean[i, : extent[i]]), i
++            assert torch.equal(scores[i, : extent[i]], clean[i]), i
+ 
+ 
+ def test_indexer_candidates(page_size=64, rows=4, context=8192):
+@@ -538,6 +530,47 @@ def test_indexer_candidates(page_size=64, rows=4, context=8192):
+     assert bool((out[rows - 1] == -1).all())
+ 
+ 
++def test_indexer_candidates_nonfinite_query_scale(page_size=64, rows=4, context=8192):
++    """The reindex (candidate) score kernel keeps a NaN head as DeepSeek's ``relu_``
++    does: a row whose index query has an infinite scale scores NaN at every unmasked
++    candidate, a masked block still scores ``-inf``, and every other row keeps its bits."""
++    inp = _index_inputs(rows, context, page_size)
++    width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
++    gen = _gen(7)
++    candidates = torch.full((rows, CANDIDATE_BLOCKS), -1, dtype=torch.int32, device=DEVICE)
++    candidate_lengths = torch.zeros(rows, dtype=torch.int32, device=DEVICE)
++    for r in range(rows):
++        visible = int(inp["lengths"][r]) - 3
++        last = (visible - 1) // CANDIDATE_BLOCK
++        n = int(torch.randint(64, last + 1, (1,), generator=gen, device=DEVICE))
++        chosen = torch.randperm(last, generator=gen, device=DEVICE)[: n - 1]
++        ids = torch.cat([chosen.sort().values, torch.tensor([last], device=DEVICE)])
++        candidates[r, :n] = ids.to(torch.int32)
++        candidate_lengths[r] = (n - 1) * CANDIDATE_BLOCK + visible - last * CANDIDATE_BLOCK
++    candidates[1, 2] = -1  # a masked block in the NaN row keeps -inf
++    plan = IndexerV41Plan(width, page_size, candidates=True)
++    names = ("q_packed", "q_scales", "weights", "pool", "page_table", "lengths", "active")
++    extent = candidate_lengths.clamp(0, width).tolist()
++    _, scores = plan.run(*(inp[k] for k in names), candidates, candidate_lengths)
++    clean = [scores[i, : extent[i]].clone() for i in range(rows)]
++    r, h = 1, 3
++    inp["q_scales"][r, h, 0] = 0xFF
++    inp["q_packed"][r, h, 0] = 0  # a zero code: 0 x inf is NaN in any order
++    inp["q_values"] = _decode_mxfp4(inp["q_packed"], inp["q_scales"])
++    _, scores = plan.run(*(inp[k] for k in names), candidates, candidate_lengths)
++    positions = _expanded(candidates, candidate_lengths)
++    ref = _ref_scores(inp, page_size, extent, lambda i: positions[i, : extent[i]])
++    masked = slice(2 * CANDIDATE_BLOCK, 3 * CANDIDATE_BLOCK)
++    assert bool(torch.isneginf(scores[r, masked]).all())
++    live = torch.ones(extent[r], dtype=torch.bool, device=DEVICE)
++    live[masked] = False
++    assert bool(ref[r][live].isnan().all())
++    assert_same_nonfinite(scores[r, : extent[r]][live], ref[r][live], f"row {r}: ")
++    for i in range(rows):
++        if i != r:
++            assert torch.equal(scores[i, : extent[i]], clean[i]), i
++
++
+ def _compute_sanitizer() -> str | None:
+     path = os.environ.get("COMPUTE_SANITIZER") or shutil.which("compute-sanitizer")
+     if path is None and os.path.exists("/usr/local/cuda/bin/compute-sanitizer"):
+@@ -591,9 +624,9 @@ def test_indexer_scores_ignore_rows_past_the_extent(page_size, rows=4, context=9
+         "lengths",
+         "active",
+     )
+-    _, clean = plan.run(*(inp[k] for k in names))
+-    clean = clean.clone()
+     extent = _dense_extent(inp, width)
++    _, scores = plan.run(*(inp[k] for k in names))
++    clean = [scores[r, : extent[r]].clone() for r in range(rows)]
+     for r in range(rows):
+         for position in range(extent[r], width):
+             page = int(inp["page_table"][r, position // page_size])
+@@ -603,7 +636,7 @@ def test_indexer_scores_ignore_rows_past_the_extent(page_size, rows=4, context=9
+             inp["pool"][page, words : words + 4] = 0xFF
+     _, poisoned = plan.run(*(inp[k] for k in names))
+     for r in range(rows):
+-        assert torch.equal(poisoned[r, : extent[r]], clean[r, : extent[r]]), r
++        assert torch.equal(poisoned[r, : extent[r]], clean[r]), r
+ 
+ 
+ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
+@@ -1319,7 +1352,7 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+     assert r16.kernels["decode"][2].get("skip_inactive", True) is True
+     assert r16.kernels["split"][2]["block_H"] == 16
+     assert r16.kernels["split"][2]["threads"] == 128
+-    assert r16.kernels["split"][2]["skip_inactive"] is False
++    assert r16.kernels["split"][2].get("skip_inactive", True) is True
+ 
+     r24 = SparseMlaV41Plan.routes(24, 128, 512, 128, swa_page_size=128, max_rows=2048)
+     assert r24.segments == 5
+@@ -1331,7 +1364,7 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+     assert r24.kernels["decode"][2]["threads"] == 256
+     assert r24.kernels["split"][2]["block_H"] == 16
+     assert r24.kernels["split"][2]["threads"] == 128
+-    assert r24.kernels["split"][2]["skip_inactive"] is False
++    assert r24.kernels["split"][2].get("skip_inactive", True) is True
+ 
+     swa24 = SparseMlaV41Plan.routes(24, 128, 0, 128, swa_page_size=128, max_rows=2048)
+     assert swa24.segments == 1
+@@ -1343,7 +1376,7 @@ def test_sparse_mla_plan_routes_right_sizes_head_block_and_decode_waves(monkeypa
+ def test_sparse_mla_short_indexed_segments_match_across_routes(heads, rows=6):
+     """Ragged indexed lengths spanning 0..300 exercise 1..4 active segments per row
+     in extend (active_segs), decode (skip_inactive=True), and split
+-    (skip_inactive=False); all three routes must match bit for bit."""
++    (skip_inactive=True); all three routes must match bit for bit."""
+     case = _mla_case(512, heads, rows)
+     case["idx_len"] = torch.tensor(
+         [0, 17, 64, 128, 129, 300][:rows], dtype=torch.int32, device=DEVICE
+@@ -1368,11 +1401,10 @@ def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():
+     assert "__tl_load_k_shared_dense(" in dense_hdr
+     assert "__tl_score_rows_dense_fast<4>(" in dense_body
+     assert "((rows + 3) >> 2)" in dense_body
+-    assert "__tl_score_rows_dense_fast<1>(" in dense_body
++    assert "((rows + 1) >> 1)" in dense_body
++    assert "__tl_score_rows_dense_fast<2>(" in dense_body
+     assert "contrib_bf16" in dense_hdr
+     assert "((sub * 64 + p_row) * 32" in dense_hdr
+-    assert "/ rows" in dense_body
+-    assert "% rows" in dense_body
+     assert "__tl_score_row_candidates_fast(" not in dense_body
+     assert "__tl_reduce_store_scores_candidates(" not in dense_body
+ 
+@@ -1386,9 +1418,9 @@ def test_indexer_score_vectorizes_kpool_loads_and_coschedules_dense_rows():
+     assert "__tl_score_rows_dense_fast<" not in cand_body
+ 
+ 
+-@pytest.mark.parametrize("rows", [6, 64, 65])
++@pytest.mark.parametrize("rows", [1, 2, 3, 5, 6, 8, 64, 65])
+ def test_indexer_dense_paired_row_tile_reuse(rows, context=2048, page_size=64):
+-    """Dense score kernels bit-exactly match the reference across <1> decode batches,
++    """Dense score kernels bit-exactly match the reference across <2> decode batches,
+     <4> prefill batches with an odd remainder row, and shared consecutive page tables."""
+     inp = _index_inputs(rows, context, page_size, seed=100 + rows)
+     for pair_base in range(0, rows - 1, 2):
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_front.py b/tests/kernels/test_deepseek_v41_tilelang_front.py
+index 2cfe007b4..94a98f7fe 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_front.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_front.py
+@@ -29,6 +29,7 @@ from vllm.models.deepseek_v4_1.tilelang.front import (  # noqa: E402
+     ROPE_DIM,
+     attention_front,
+     context_kv_front,
++    context_kv_front_3layer,
+     sp_attention_front,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.gemm import scale_words  # noqa: E402
+@@ -264,3 +265,94 @@ def test_sp_front_and_write_swa_records_empty_and_validation():
+             torch.zeros((2,), dtype=torch.int64, device=DEVICE),
+             page_size=PAGE_SIZE,
+         )
++
++
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++@pytest.mark.parametrize("rows", [1, 6, 16, 48])
++def test_context_kv_front_accepts_grouped_strided_views(rows, slot_dtype):
++    """``context_kv_front`` matches contiguous inputs on ``out.split(512, dim=1)``
++    views (stride 1536) emitted by ``TileLangGroupedBlock32Rows``."""
++    gen = torch.Generator(device=DEVICE).manual_seed(rows + 777)
++    grouped = (
++        torch.randn((rows, 3 * KV_LATENT), generator=gen, device=DEVICE) * 3
++    ).bfloat16()
++    slices = grouped.split(KV_LATENT, dim=1)
++    kv_weight = (
++        torch.randn(KV_LATENT, generator=gen, device=DEVICE) * 0.3 + 1
++    ).bfloat16()
++    positions = torch.randint(0, POSITIONS, (rows,), generator=gen, device=DEVICE)
++    slots = (
++        torch.randperm(PAGES * PAGE_SIZE, generator=gen, device=DEVICE)[:rows]
++    ).to(slot_dtype)
++    table = _table()
++    page_bytes = PAGE_SIZE * RECORD_BYTES["swa"]
++    pages_init = torch.empty((PAGES, page_bytes), dtype=torch.uint8, device=DEVICE)
++    pages_init.random_(generator=gen)
++
++    for kv_view in slices:
++        pages_strided = pages_init.clone()
++        pages_contig = pages_init.clone()
++        context_kv_front(
++            kv_view, kv_weight, EPS, positions, table, pages_strided, slots, PAGE_SIZE
++        )
++        context_kv_front(
++            kv_view.contiguous(),
++            kv_weight,
++            EPS,
++            positions,
++            table,
++            pages_contig,
++            slots,
++            PAGE_SIZE,
++        )
++        _assert_bytes_equal(pages_strided, pages_contig, "strided context kv pages")
++
++
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++@pytest.mark.parametrize("rows", [1, 6, 16, 48])
++def test_context_kv_front_3layer_matches_per_layer_bits(rows, slot_dtype):
++    """``context_kv_front_3layer`` matches three serial ``context_kv_front``
++    launches bit for bit on grouped strided views and separate layer caches."""
++    gen = torch.Generator(device=DEVICE).manual_seed(rows + 999)
++    grouped = (
++        torch.randn((rows, 3 * KV_LATENT), generator=gen, device=DEVICE) * 3
++    ).bfloat16()
++    slices = grouped.split(KV_LATENT, dim=1)
++    weights = [
++        (torch.randn(KV_LATENT, generator=gen, device=DEVICE) * 0.3 + 1).bfloat16()
++        for _ in range(3)
++    ]
++    positions = torch.randint(0, POSITIONS, (rows,), generator=gen, device=DEVICE)
++    slots = [
++        torch.randperm(PAGES * PAGE_SIZE, generator=gen, device=DEVICE)[:rows].to(
++            slot_dtype
++        )
++        for _ in range(3)
++    ]
++    slots[1][rows // 2] = -1
++    table = _table()
++    page_bytes = PAGE_SIZE * RECORD_BYTES["swa"]
++    caches_ref = [
++        torch.empty((PAGES, page_bytes), dtype=torch.uint8, device=DEVICE)
++        for _ in range(3)
++    ]
++    for c in caches_ref:
++        c.random_(generator=gen)
++    caches_fused = [c.clone() for c in caches_ref]
++
++    for i in range(3):
++        context_kv_front(
++            slices[i],
++            weights[i],
++            EPS,
++            positions,
++            table,
++            caches_ref[i],
++            slots[i],
++            PAGE_SIZE,
++        )
++    context_kv_front_3layer(
++        slices, weights, EPS, positions, table, caches_fused, slots, PAGE_SIZE
++    )
++    for ref, got in zip(caches_ref, caches_fused):
++        _assert_bytes_equal(got, ref, "fused 3-layer context kv pages")
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 4455666ec..70e1c259d 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -426,3 +426,77 @@ def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
+             getattr(builder, name).data_ptr()
+             for name in ("positions", "reqs", "slots", "lengths")
+         ]
++
++
++def test_decode_metadata_and_mask_lengths_skip_padding_rows():
++    """When ``is_padding`` marks dead/padding rows, ``mask_lengths``, ``chunk``,
++    and ``decode_metadata`` zero those rows' lengths and skip their page writes
++    while matching non-padded rows bit for bit."""
++    device = DEVICE
++    rows, width, page, window = 6, 128, 128, 128
++    pad = torch.tensor([0, 0, 1, 0, 1, 1], dtype=torch.bool, device=device)
++    lens = torch.tensor([1024, 512, 512, 256, 256, 256], dtype=torch.int32, device=device)
++    masked = metadata.mask_lengths(lens, pad, rows)
++    assert masked.tolist() == [1024, 512, 0, 256, 0, 0]
++
++    pos = torch.tensor([300, 301, 302, 303, 304, 305], dtype=torch.int64, device=device)
++    reqs = torch.zeros((rows,), dtype=torch.int32, device=device)
++    table = torch.arange(1, 33, dtype=torch.int32, device=device).unsqueeze(0).clone()
++    starts = torch.tensor([0, 6], dtype=torch.int32, device=device)
++    req_pos = torch.tensor([300], dtype=torch.int64, device=device)
++    vis = torch.tensor([512] * rows, dtype=torch.int32, device=device)
++    swa0 = torch.full((rows, width), -9, dtype=torch.int32, device=device)
++    l0 = torch.empty(rows, dtype=torch.int32, device=device)
++    top0 = torch.empty(rows, dtype=torch.int32, device=device)
++    swa1, l1, top1 = swa0.clone(), l0.clone(), top0.clone()
++    mp0 = torch.full((rows, 64), -9, dtype=torch.int32, device=device)
++    mp1 = mp0.clone()
++
++    metadata.decode_metadata(
++        pos, reqs, table, swa0, l0, top0, vis, starts, req_pos, reqs, table, mp0,
++        0, rows, 8, page=page, window=window, draft=False, main_page=128,
++    )
++    metadata.decode_metadata(
++        pos, reqs, table, swa1, l1, top1, vis, starts, req_pos, reqs, table, mp1,
++        0, rows, 8, page=page, window=window, draft=False, main_page=128,
++        is_padding=pad,
++    )
++    torch.accelerator.synchronize()
++    for r in (0, 1, 3):
++        assert l1[r] == l0[r] and top1[r] == top0[r]
++        assert torch.equal(swa1[r, : l1[r]], swa0[r, : l0[r]])
++        assert torch.equal(mp1[r, :4], mp0[r, :4])
++    for r in (2, 4, 5):
++        assert l1[r].item() == 0 and top1[r].item() == 0
++        assert bool((mp1[r] == -9).all())
++
++    metadata.chunk(
++        pos, reqs, table, swa0, l0, top0, vis, starts, req_pos,
++        0, rows, page=page, window=window, draft=False,
++    )
++    metadata.chunk(
++        pos, reqs, table, swa1, l1, top1, vis, starts, req_pos,
++        0, rows, page=page, window=window, draft=False, is_padding=pad,
++    )
++    torch.accelerator.synchronize()
++    for r in (0, 1, 3):
++        assert l1[r] == l0[r] and top1[r] == top0[r]
++        assert torch.equal(swa1[r, : l1[r]], swa0[r, : l0[r]])
++    for r in (2, 4, 5):
++        assert l1[r].item() == 0 and top1[r].item() == 0
++
++    # `pages` accepts a full-capacity `reqs` alongside a step-sized `masked` length
++    # tensor (e.g. CAP=1024 vs rows=6), matching live rows and leaving padded rows untouched.
++    reqs_long = torch.zeros((CAP,), dtype=torch.int32, device=device)
++    page_out0 = torch.full((rows, 16), -9, dtype=torch.int32, device=device)
++    page_out1 = page_out0.clone()
++    metadata.pages(reqs_long, lens, table, page_out0, 0, rows, 8, page=page)
++    metadata.pages(reqs_long, masked, table, page_out1, 0, rows, 8, page=page)
++    page_sub = torch.full((rows - 2, 16), -9, dtype=torch.int32, device=device)
++    metadata.pages(reqs_long, masked, table, page_sub, 2, rows - 2, 8, page=page)
++    torch.accelerator.synchronize()
++    live = _live_columns(reqs_long, masked, 0, rows, page, 8, 16)
++    _live_equal(page_out1, page_out0.cpu().long(), live, rows, sentinel=-9)
++    for r in (2, 4, 5):
++        assert bool((page_out1[r] == -9).all())
++    assert torch.equal(page_sub, page_out1[2:])
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 1245aafbb..4be2a0a3a 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -19,8 +19,10 @@ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+     get_tp_group,
++    model_parallel_is_initialized,
+ )
+-from vllm.forward_context import get_forward_context
++import vllm.envs as envs
++from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers import linear as linear_layers
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+@@ -779,6 +781,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             writer_call,
+         )
+         from vllm.models.deepseek_v4_1.tilelang.front import (
++            context_kv_front_3layer_call,
+             context_kv_front_call,
+             front_call,
+             sp_front_call,
+@@ -797,25 +800,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if self.is_ced_decoder
+             else (False,)
+         )
++        pads = (False, True) if not self.is_draft and not self.is_ced_decoder else (False,)
+         for replay in replays:
+-            args = (
+-                self.swa_cache_layer.block_size,
+-                self.window_size,
+-                self.swa_width,
+-                self.is_draft,
+-                replay,
+-            )
+-            if self.compress_ratio:
+-                calls.append(
+-                    prepare.call(
+-                        tl_metadata.decode_metadata_kernel,
+-                        *args,
+-                        self._main_width,
+-                        self._main_page,
+-                    )
++            for pad in pads:
++                args = (
++                    self.swa_cache_layer.block_size,
++                    self.window_size,
++                    self.swa_width,
++                    self.is_draft,
++                    replay,
+                 )
+-            else:
+-                calls.append(prepare.call(tl_metadata.chunk_kernel, *args))
++                if self.compress_ratio:
++                    calls.append(
++                        prepare.call(
++                            tl_metadata.decode_metadata_kernel,
++                            *args,
++                            self._main_width,
++                            self._main_page,
++                            pad,
++                        )
++                    )
++                else:
++                    calls.append(prepare.call(tl_metadata.chunk_kernel, *args, pad))
++        if self.indexer is not None and not self.is_draft and not self.is_ced_decoder:
++            calls.append(prepare.call(tl_metadata.mask_lengths_kernel))
+         # forward_mqa: the page tables of the index chunks, full or short.
+         if self.indexer is not None:
+             widths = {self._index_width}
+@@ -862,6 +870,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     SLOT_DTYPE,
+                 )
+             )
++            calls.append(
++                context_kv_front_3layer_call(
++                    self.kv_norm.variance_epsilon,
++                    self.swa_cache_layer.block_size,
++                    SLOT_DTYPE,
++                )
++            )
+         if self.compressor is not None:
+             calls.append(
+                 writer_call(
+@@ -1145,6 +1160,47 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             return False
+         return aux_stream() is not None
+ 
++    def _decode_index_split(self, swa, sp_rows, rows, metadata):
++        """Split target decode indexing across TP ranks when profitable.
++
++        At static small-batch CUDA graph captures (``rows < 24`` under short
++        context), the 8 synchronous RoCE ``all_gather``s cost more than full-row
++        scoring; split whenever ``rows >= 24`` or eager long-context decode
++        exceeds 16K tokens, preserving identical splits across all index layers.
++        """
++        if sp_rows is not None and not swa.is_decode:
++            return sp_rows
++        if (
++            sp_rows is None
++            and swa is not None
++            and swa.is_decode
++            and not getattr(self, "is_draft", False)
++        ):
++            tp_size = (
++                get_tensor_model_parallel_world_size()
++                if model_parallel_is_initialized()
++                else int(getattr(self, "tp_size", 1))
++            )
++            if tp_size > 1 and rows >= tp_size:
++                im_meta = (
++                    metadata.get(self.indexer.k_cache.prefix)
++                    if isinstance(metadata, dict) and self.indexer is not None
++                    else None
++                )
++                im = self._query_metadata(im_meta) if im_meta is not None else None
++                eager_long = (
++                    not torch.cuda.is_current_stream_capturing()
++                    and int(getattr(im, "max_seq_len", 0) or 0) >= 16384
++                )
++                if rows >= 24 or eager_long:
++                    tp_rank = (
++                        get_tensor_model_parallel_rank()
++                        if model_parallel_is_initialized()
++                        else int(getattr(self, "tp_rank", 0))
++                    )
++                    return sp_prefill.SPRows(rows, tp_size, tp_rank)
++        return None
++
+     def _forward_decode_overlapped(
+         self,
+         q: torch.Tensor,
+@@ -1189,13 +1245,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 torch.cuda.stream(stream),
+                 use_preallocated_workspace(aux_scratch),
+             ):
++                split = self._decode_index_split(swa, None, rows, metadata)
++                first = split.start if split is not None else 0
++                last = first + split.real_rows if split is not None else rows
+                 query = self._index_query(
+                     qr,
+                     positions,
+                     hidden_states,
+                     index_weights,
+-                    0,
+-                    rows,
++                    first,
++                    last,
+                     swa,
+                     q_cast,
+                 )
+@@ -1226,7 +1285,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 )
+             del q_cast
+             self._pending_decode_aux = stream
+-            return (*query, None, None)
++            return (*query, split, None)
+ 
+         q.record_stream(stream)
+         stream.wait_stream(main_stream)
+@@ -1242,20 +1301,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 else self.indexer.weights_proj(hidden_states)[:rows]
+             )
+         weights.record_stream(main_stream)
++        split = self._decode_index_split(swa, None, rows, metadata)
++        first = split.start if split is not None else 0
++        last = first + split.real_rows if split is not None else rows
+         with use_preallocated_workspace(main_scratch):
+-            iq_data, iq_scale, _ = self._index_query(
++            iq_data, iq_scale, split_weights = self._index_query(
+                 qr,
+                 positions,
+                 hidden_states,
+                 weights,
+-                0,
+-                rows,
++                first,
++                last,
+                 swa,
+                 q_cast,
+             )
+         del q_cast
+         main_stream.wait_stream(stream)
+-        return (iq_data, iq_scale, weights, None, None)
++        return (iq_data, iq_scale, split_weights, split, None)
+ 
+     def forward(self, positions, hidden_states, llama_4_scaling=None):
+         if hidden_states.shape[0] == 0:
+@@ -1651,9 +1713,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     # Sequence-parallel prefill: the indexer is replicated, so each
+                     # rank scores and selects only its own rows, and forward_mqa
+                     # gathers the selected positions. Every row is independent.
+-                    split = (
+-                        sp_rows if sp_rows is not None and not swa.is_decode else None
+-                    )
++                    split = self._decode_index_split(swa, sp_rows, rows, metadata)
+                     if pre_index_query is not None and split is not None and not _INDEX_SPLIT_CHECK:
+                         query = pre_index_query
+                         reference = None
+@@ -1735,46 +1795,49 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         """MXFP4 index queries and scaled head weights for rows [first, last)."""
+         rows = last - first
+         h = self.indexer.heads
+-        qr_rows = qr if (first == 0 and last == qr.shape[0]) else qr[first:last]
+-        cast_rows = (
+-            kernels.cast_mxfp8(qr_rows)
+-            if q_cast is None
+-            else kernels.slice_mxfp8(q_cast, first, last)
+-        )
+         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
+         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
+-        pos_rows = positions[first:last]
+-        if (
+-            rows <= getattr(self.indexer.wq_b, "tilelang_decode_rows", 0)
+-            and hasattr(self.indexer.wq_b, "tilelang_decode_rope_mxfp4")
+-            and "_quantize_index_query" not in self.__dict__
+-        ):
+-            from vllm.models.deepseek_v4_1.tilelang.linear import (
+-                project_block32_rope_mxfp4_decode,
++        if rows > 0:
++            qr_rows = qr if (first == 0 and last == qr.shape[0]) else qr[first:last]
++            cast_rows = (
++                kernels.cast_mxfp8(qr_rows)
++                if q_cast is None
++                else kernels.slice_mxfp8(q_cast, first, last)
+             )
++            pos_rows = positions[first:last]
++            if (
++                rows <= getattr(self.indexer.wq_b, "tilelang_decode_rows", 0)
++                and hasattr(self.indexer.wq_b, "tilelang_decode_rope_mxfp4")
++                and "_quantize_index_query" not in self.__dict__
++            ):
++                from vllm.models.deepseek_v4_1.tilelang.linear import (
++                    project_block32_rope_mxfp4_decode,
++                )
+ 
+-            with kernels.mxfp8_inputs(cast_rows):
+-                project_block32_rope_mxfp4_decode(
+-                    self.indexer.wq_b,
+-                    qr_rows,
+-                    pos_rows,
+-                    self.rotary_emb.cos_sin_cache,
++                with kernels.mxfp8_inputs(cast_rows):
++                    project_block32_rope_mxfp4_decode(
++                        self.indexer.wq_b,
++                        qr_rows,
++                        pos_rows,
++                        self.rotary_emb.cos_sin_cache,
++                        iq_data,
++                        iq_scale,
++                    )
++                del cast_rows, q_cast
++            else:
++                with kernels.mxfp8_inputs(cast_rows):
++                    iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
++                del cast_rows, q_cast
++                self._quantize_index_query(
++                    "decode" if swa.is_decode else "prefill",
++                    iq,
+                     iq_data,
+                     iq_scale,
++                    positions=pos_rows,
+                 )
+-            del cast_rows, q_cast
++                del iq
+         else:
+-            with kernels.mxfp8_inputs(cast_rows):
+-                iq = self.indexer.wq_b(qr_rows).view(rows, h, 128)
+-            del cast_rows, q_cast
+-            self._quantize_index_query(
+-                "decode" if swa.is_decode else "prefill",
+-                iq,
+-                iq_data,
+-                iq_scale,
+-                positions=pos_rows,
+-            )
+-            del iq
++            del q_cast
+         # The BF16 head-weight projection runs on every row: its GEMV rounds
+         # differently at another row count, which would move top-k selections.
+         # The FP8 wq_b quantizes per row and does not depend on the row count.
+@@ -1892,10 +1955,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+         # Only the score matrix needs row chunking. All selected positions
+         # survive in the source-owned buffer until their reuse interval ends.
++        pad_mask = self._decode_is_padding(swa, rows)
+         if self.indexer is not None:
+             index_mode = "decode" if mode == "decode" else "prefill"
+             *query, split, reference = index_query
+             im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
++            im_lengths = (
++                self._masked_cache_lengths(im.cache_lengths, pad_mask, rows)
++                if pad_mask is not None
++                else im.cache_lengths
++            )
+             lsa_enabled = os.environ.get("VLLM_DS41_LSA") == "1"
+             score_width = None
+             if (
+@@ -1982,7 +2051,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     )
+ 
+                     page_table = None
+-                    cacheable = index_rows <= chunk_rows
++                    cacheable = (
++                        index_rows <= chunk_rows
++                        and first + index_rows <= index_pages.shape[0]
++                        and reference is None
++                    )
+                     if cacheable:
+                         key = (id(im), row, count, index_width, self._index_page)
+                         shared = get_forward_context().__dict__.setdefault(
+@@ -1994,7 +2067,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     if page_table is None:
+                         tl_metadata.pages(
+                             im.req_id_per_token,
+-                            im.cache_lengths,
++                            im_lengths,
+                             im.block_table,
+                             buf,
+                             row,
+@@ -2041,6 +2114,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                                     rows,
+                                     decode_specs,
+                                     q.device,
++                                    is_padding=pad_mask,
+                                 )
+                             else:
+                                 meta_bufs = ()
+@@ -2053,7 +2127,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         q_scales=iq_scale[offset:end],
+                         query_weights=iw[offset:end],
+                         page_table=page_table,
+-                        cache_lengths=im.cache_lengths[row:row_end],
++                        cache_lengths=im_lengths[row:row_end],
+                         score_width=score_width,
+                         output_indices=selected[offset:end],
+                         **candidate_args,
+@@ -2149,7 +2223,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if output is None:
+                 output = torch.empty_like(q)
+             self._attend_split(
+-                q, output, positions, swa, main, owner, rows, decode_rows
++                q, output, positions, swa, main, owner, rows, decode_rows,
++                is_padding=pad_mask,
+             )
+             return output
+         if finish_front is not None:
+@@ -2183,7 +2258,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 )
+             )
+             metadata_buffers = self._shared_decode_metadata(
+-                swa, main, rows, shared_specs, device
++                swa, main, rows, shared_specs, device, is_padding=pad_mask
+             )
+             arena = current_workspace_manager().get_simultaneous(*scratch_specs)
+             scratch = list(arena)
+@@ -2192,7 +2267,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 *metadata_specs, *scratch_specs
+             )
+             metadata_count = len(metadata_specs)
+-            self._write_decode_metadata(arena, swa, main, rows)
++            self._write_decode_metadata(arena, swa, main, rows, is_padding=pad_mask)
+             metadata_buffers = arena[:metadata_count]
+             scratch = arena[metadata_count:]
+         if wait_selected is not None:
+@@ -2221,7 +2296,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         )
+         return output
+ 
+-    def _shared_decode_metadata(self, swa, main, rows, specs, device):
++    def _decode_is_padding(self, swa, rows: int) -> torch.Tensor | None:
++        if (
++            self.is_draft
++            or self.is_ced_decoder
++            or getattr(swa, "routing_mask", None) is not None
++            or not envs.VLLM_MOE_SKIP_PADDING
++            or not is_forward_context_available()
++        ):
++            return None
++        context = get_forward_context()
++        is_padding = getattr(context, "is_padding", None)
++        if is_padding is None:
++            return None
++        if getattr(context, "num_tokens", None) not in (None, rows):
++            return None
++        if is_padding.shape[0] < rows:
++            return None
++        return is_padding
++
++    @staticmethod
++    def _masked_cache_lengths(
++        cache_lengths: torch.Tensor, is_padding: torch.Tensor, rows: int
++    ) -> torch.Tensor:
++        context = get_forward_context()
++        cache = context.__dict__.setdefault("_ds41_masked_lengths", {})
++        key = (id(cache_lengths), id(is_padding), rows)
++        entry = cache.get(key)
++        if entry is not None and entry[0] is cache_lengths and entry[1] is is_padding:
++            return entry[2]
++        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++        masked = tl_metadata.mask_lengths(cache_lengths, is_padding, rows)
++        cache[key] = (cache_lengths, is_padding, masked)
++        return masked
++
++    def _shared_decode_metadata(
++        self, swa, main, rows, specs, device, *, is_padding=None
++    ):
+         replay = self._replay_start(swa)
+         key = (
+             id(swa),
+@@ -2231,6 +2343,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self.is_ced_decoder,
+             rows,
+             specs,
++            id(is_padding) if is_padding is not None else None,
+         )
+         context = get_forward_context()
+         shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
+@@ -2240,16 +2353,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             or entry[0] is not swa
+             or entry[1] is not main
+             or entry[2] is not replay
++            or entry[3] is not is_padding
+         ):
+             metadata_buffers = tuple(
+                 torch.empty(shape, dtype=dtype, device=device)
+                 for shape, dtype in specs
+             )
+-            self._write_decode_metadata(metadata_buffers, swa, main, rows)
+-            entry = shared[key] = (swa, main, replay, metadata_buffers)
+-        return entry[3]
++            self._write_decode_metadata(
++                metadata_buffers, swa, main, rows, is_padding=is_padding
++            )
++            entry = shared[key] = (swa, main, replay, is_padding, metadata_buffers)
++        return entry[4]
+ 
+-    def _attend_split(self, q, output, positions, swa, main, owner, rows, decode_rows):
++    def _attend_split(
++        self, q, output, positions, swa, main, owner, rows, decode_rows, *, is_padding=None
++    ):
+         """A mixed step's attention: its decode requests' rows on the decode plan,
+         the rest on the extend plan. Mixed steps run eagerly, so the per-row
+         metadata is an ordinary allocation shared across contiguous layers of the
+@@ -2287,7 +2405,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     torch.empty(shape, dtype=dtype, device=q.device)
+                     for shape, dtype in extend_specs
+                 )
+-            self._write_decode_metadata(metadata, swa, main, rows)
++            self._write_decode_metadata(metadata, swa, main, rows, is_padding=is_padding)
+             entry = context.__dict__["_ds41_split_metadata"] = (
+                 key,
+                 swa,
+@@ -2337,7 +2455,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             return self._draft_replay_start
+         return None
+ 
+-    def _write_decode_metadata(self, buffers, swa, main, rows):
++    def _write_decode_metadata(self, buffers, swa, main, rows, *, is_padding=None):
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+ 
+         swa_indices, swa_lengths, top_lengths = buffers[:3]
+@@ -2360,7 +2478,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             swa.request_positions,
+         )
+         if main is None:
+-            tl_metadata.chunk(*common, 0, rows, **window)
++            tl_metadata.chunk(*common, 0, rows, is_padding=is_padding, **window)
+         else:
+             # The window metadata and the main page table in one launch.
+             tl_metadata.decode_metadata(
+@@ -2372,6 +2490,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 rows,
+                 main.block_table.shape[1],
+                 main_page=self._main_page,
++                is_padding=is_padding,
+                 **window,
+             )
+ 
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index d4014dd83..841717228 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -220,7 +220,11 @@ class DeepseekCompressor(nn.Module):
+         tp_size = linear_layers.get_tensor_model_parallel_world_size()
+         self._sp_enabled = compress_ratio in (1, 2) and tp_size > 1
+         self._sp_weight = self._sp_kernel = None
+-        disable_tp = tp_size <= 1
++        # Replicate the 4 compressor layers (35 MiB total across the model) in
++        # uncompressed BF16 up through TP4 so decode avoids 4 RoCE all-gathers,
++        # 4 column-gather launches, and L2-resident 12-bit unpack overhead, and
++        # SP prefill aliases the same weight with zero extra copy.
++        disable_tp = tp_size <= 4
+         self.fused_wkv_wgate = _PaddedSplitColumnParallelLinear(
+             hidden_size,
+             compress_ratio,
+@@ -235,6 +239,7 @@ class DeepseekCompressor(nn.Module):
+         from vllm.models.deepseek_v4_1.tilelang.linear import TileLangSplitLinearMethod
+ 
+         # wkv and wgate (ratio 2) each project into their own buffer.
++        self.fused_wkv_wgate.pack_bf16 = not disable_tp
+         self.fused_wkv_wgate.quant_method = TileLangSplitLinearMethod(compress_ratio)
+         self.fused_wkv_wgate.out_dtype = (
+             torch.float32 if compress_ratio == 2 else torch.bfloat16
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index b5fa1b7af..8feae849b 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -162,19 +162,37 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) ->
+     if reason is not None:
+         logger.info("DeepSeek V4.1 prefill sequence parallelism off: %s", reason)
+         return 0
+-    decode_rows = max(
+-        vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+-        # Every decode row the scheduler lays out, copy drafts' included.
+-        vllm_config.max_decode_rows,
+-        parallel.tensor_parallel_size,
+-    )
+-    rows = decode_rows + 1
++    capture_rows = vllm_config.compilation_config.max_cudagraph_capture_size or 0
+     limit = _prefill_sp_capacity_bytes()
+     if limit > 0:
+         model = vllm_config.model_config
+         row_bytes = model.get_hidden_size() * model.dtype.itemsize
+         tp = parallel.tensor_parallel_size
+-        rows = max(rows, rows_above_bytes(limit, row_bytes, tp))
++        roce_rows = rows_above_bytes(limit, row_bytes, tp)
++        # Only captured CUDA graphs must stay on full rows past the one-shot
++        # RoCE all-reduce limit; uncaptured high-concurrency decode/verify steps
++        # above roce_rows - 1 run sequence-parallel instead of falling to PyNCCL.
++        decode_rows = max(capture_rows, tp)
++        rows = max(decode_rows + 1, roce_rows)
++        if rows > roce_rows:
++            logger.warning(
++                "max_cudagraph_capture_size (%d) exceeds one-shot RoCE all-reduce "
++                "capacity (%d rows, %d bytes); captured forwards of %d..%d rows "
++                "cannot use sequence parallelism or one-shot all-reduce",
++                capture_rows,
++                roce_rows - 1,
++                limit,
++                roce_rows,
++                rows - 1,
++            )
++    else:
++        decode_rows = max(
++            capture_rows,
++            # Every decode row the scheduler lays out, copy drafts' included.
++            vllm_config.max_decode_rows,
++            parallel.tensor_parallel_size,
++        )
++        rows = decode_rows + 1
+     logger.info(
+         "DeepSeek V4.1 prefill sequence parallelism from %d tokens "
+         "(capacity floor=%d bytes; independent of all-reduce dispatch)",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/front.py b/vllm/models/deepseek_v4_1/tilelang/front.py
+index 070001905..e204cab37 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/front.py
++++ b/vllm/models/deepseek_v4_1/tilelang/front.py
+@@ -496,31 +496,180 @@ def attention_front(
+     )
+ 
+ 
++@T.macro
++def _context_kv_front_body(
++    pid,
++    M,
++    pages,
++    eps: float,
++    page_size: int,
++    kv_raw,
++    kv_weight,
++    positions,
++    cos_sin,
++    cache,
++    words,
++    slots,
++):
++    """Shared TileLang KV-norm + RoPE + E4M3 SWA cache-writer CTA body."""
++    group_lanes = 32 // _VEC
++    out_scale = 1.0
++    k = _row_split(KV_LATENT)
++    half = ROPE_DIM // 2
++    rope_vec = KV_LATENT // _VEC - ROPE_DIM // _VEC
++    last = k["num_thread_vec"] - 1
++    record = RECORD_BYTES["swa"]
++    kb, kt = k["block_m"], k["row_threads"]
++
++    tid = T.get_thread_binding()
++    k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
++    k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
++    k_warp_fragment = T.alloc_fragment((kb, 1), T.float32)
++    k_sum_shared = T.alloc_shared((kb, 1), T.float32)
++    k_row_partial = T.alloc_fragment((kb, kt, 1), T.float32)
++    k_sum_reducer = T.alloc_reducer((kb, kt), T.float32, op="sum")
++    k_sum_fragment = T.alloc_fragment((kb, kt), T.float32)
++    T.annotate_layout(
++        {
++            k_sum_partial: k["row_layout"],
++            k_warp_fragment: k["warp_layout"],
++            k_row_partial: k["row_reduce_layout"],
++            k_sum_fragment: k["row_layout"],
++        }
++    )
++    k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++    k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
++    y_fp32_local = T.alloc_local((_VEC,), T.float32)
++    sum_local = T.alloc_local((2,), T.float32)
++    weight_local = T.alloc_local((_VEC,), T.bfloat16)
++    cs = T.alloc_local((_VEC,), T.float32)
++    values = T.alloc_local((_VEC,), T.float32)
++
++    row_id = tid // kt
++    lane = tid % kt
++    token_id = pid * kb + row_id
++    T.clear(sum_local)
++    for vi in T.unroll(k["num_thread_vec"]):
++        token_offset = (vi * kt + lane) * _VEC
++        if token_id < M:
++            for j in T.vectorized(_VEC):
++                k_x[vi, j] = kv_raw[token_id, token_offset + j]
++        else:
++            T.clear(k_x[vi, :])
++        for j in T.vectorized(_VEC):
++            sum_local[j % 2] += T.float32(k_x[vi, j]) * T.float32(k_x[vi, j])
++    k_sum_partial[row_id, lane] = sum_local[0] + sum_local[1]
++    T.reducer_init(k_warp_reducer)
++    for i, w, j in T.Parallel(kb, 1, kt, loop_layout=k["warp_reduce_layout"]):
++        T.reducer_update(k_warp_reducer[i, w], k_sum_partial[i, w * kt + j])
++    T.finalize_reducer(k_warp_reducer, k_warp_fragment)
++    if lane == 0:
++        k_sum_shared[row_id, 0] = k_warp_fragment[row_id, 0]
++    T.sync_threads()
++    for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
++        k_row_partial[i, j, w] = k_sum_shared[i, w]
++    T.reducer_init(k_sum_reducer)
++    for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
++        T.reducer_update(k_sum_reducer[i, j], k_row_partial[i, j, w])
++    T.finalize_reducer(k_sum_reducer, k_sum_fragment)
++
++    rstd_value = T.alloc_var(
++        T.float32,
++        init=T.rsqrt(k_sum_fragment[row_id, lane] / KV_LATENT + eps),
++    )
++    for vi in T.unroll(k["num_thread_vec"]):
++        token_offset = (vi * kt + lane) * _VEC
++        for j in T.vectorized(_VEC):
++            weight_local[j] = kv_weight[token_offset + j]
++        for j in T.vectorized(_VEC):
++            y_fp32_local[j] = (
++                T.float32(k_x[vi, j])
++                * rstd_value
++                * (T.float32(weight_local[j]) * out_scale)
++            )
++        for j in T.vectorized(_VEC):
++            k_y[vi, j] = y_fp32_local[j]
++    if (last * kt + lane >= rope_vec) & (token_id < M):
++        rope_lane = last * kt + lane - rope_vec
++        position = positions[token_id]
++        for i in T.vectorized(_VEC // 2):
++            cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
++        for i in T.vectorized(_VEC // 2):
++            cs[_VEC // 2 + i] = cos_sin[
++                position, half + rope_lane * (_VEC // 2) + i
++            ]
++        for j in T.unroll(_VEC // 2):
++            first = T.cast(k_y[last, 2 * j], T.float32)
++            second = T.cast(k_y[last, 2 * j + 1], T.float32)
++            cosine = cs[j]
++            sine = cs[_VEC // 2 + j]
++            k_y[last, 2 * j] = T.cast(
++                T.ieee_fmaf(first, cosine, -(second * sine)), T.bfloat16
++            )
++            k_y[last, 2 * j + 1] = T.cast(
++                T.ieee_fmaf(first, sine, second * cosine), T.bfloat16
++            )
++    for vi in T.unroll(k["num_thread_vec"]):
++        col = (vi * kt + lane) * _VEC
++        amax = T.alloc_var(T.float32, init=0.0)
++        for j in T.unroll(_VEC):
++            values[j] = T.cast(k_y[vi, j], T.float32)
++            amax = T.max(amax, T.abs(values[j]))
++        amax = T.max(amax, T.shfl_xor(amax, 1))
++        amax = T.max(amax, T.shfl_xor(amax, 2))
++        if token_id < M:
++            slot = T.cast(slots[token_id], T.int64)
++            page = slot // page_size
++            if (slot >= 0) & (page < pages):
++                base = (slot % page_size) * record
++                bits = T.reinterpret(
++                    T.fmul(T.max(amax, 1e-4), T.float32(1.0 / _E4M3_MAX)),
++                    T.uint32,
++                )
++                bumped = T.if_then_else(
++                    (bits & 0x7FFFFF) != 0,
++                    (bits + 0x800000) & 0x7F800000,
++                    bits,
++                )
++                exponent = T.cast(T.shift_right(bumped, 23) & 0xFF, T.int32)
++                inverse = T.reinterpret(
++                    T.cast(T.shift_left(254 - exponent, 23), T.uint32),
++                    T.float32,
++                )
++                for h in T.unroll(2):
++                    words[page, (base + col + 4 * h) // 4] = T.call_extern(
++                        "uint32",
++                        "dsv41_e4m3x4",
++                        T.fmul(values[4 * h], inverse),
++                        T.fmul(values[4 * h + 1], inverse),
++                        T.fmul(values[4 * h + 2], inverse),
++                        T.fmul(values[4 * h + 3], inverse),
++                    )
++                if lane % group_lanes == 0:
++                    cache[page, base + KV_LATENT + col // 32] = T.cast(
++                        exponent, T.uint8
++                    )
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def context_kv_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64"):
+     """The KV CTA body of ``attention_front_kernel`` on standalone ``[M, 512]`` BF16
+     ``kv_raw`` rows (DSpark's context KV projections): TileKernels' ``norm_forward``,
+     trailing 64-column ``rope_kernel`` rotation in registers, and ``cache_writer``'s
+     528-byte SWA record write in one launch, without writing the rotated BF16 row."""
+-    group_lanes = 32 // _VEC
+-    out_scale = 1.0
+     k = _row_split(KV_LATENT)
+     assert (
+         k["num_row_warps"] == 1 and k["row_threads"] == 16 and k["num_thread_vec"] == 4
+     )
+-    half = ROPE_DIM // 2
+-    rope_vec = KV_LATENT // _VEC - ROPE_DIM // _VEC
+-    last = k["num_thread_vec"] - 1
+-    record = RECORD_BYTES["swa"]
+-    kb, kt = k["block_m"], k["row_threads"]
+-    M = T.dynamic("M")
++    kb = k["block_m"]
++    M, kv_stride = T.dynamic("M, kv_stride")
+     positions_max = T.dynamic("positions_max")
+     pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
+     page_words, word_stride = T.dynamic("page_words, word_stride")
+ 
+     @T.prim_func
+     def attention_front(
+-        kv_raw: T.Tensor((M, KV_LATENT), T.bfloat16),
++        kv_raw: T.StridedTensor((M, KV_LATENT), (kv_stride, 1), T.bfloat16),
+         kv_weight: T.Tensor((KV_LATENT,), T.bfloat16),
+         positions: T.Tensor((M,), T.int64),
+         cos_sin: T.Tensor((positions_max, ROPE_DIM), T.float32),
+@@ -530,137 +679,76 @@ def context_kv_front_kernel(eps: float, page_size: int, slot_dtype: str = "int64
+     ):
+         with T.Kernel(T.ceildiv(M, kb), threads=_THREADS) as pid:
+             T.import_source(_CVT_HEADER)
++            T.assume(kv_stride % 16 == 0)
+             pdl.chain()
+-            tid = T.get_thread_binding()
+-            k_sum_partial = T.alloc_fragment((kb, kt), T.float32)
+-            k_warp_reducer = T.alloc_reducer((kb, 1), T.float32, op="sum")
+-            k_warp_fragment = T.alloc_fragment((kb, 1), T.float32)
+-            k_sum_shared = T.alloc_shared((kb, 1), T.float32)
+-            k_row_partial = T.alloc_fragment((kb, kt, 1), T.float32)
+-            k_sum_reducer = T.alloc_reducer((kb, kt), T.float32, op="sum")
+-            k_sum_fragment = T.alloc_fragment((kb, kt), T.float32)
+-            T.annotate_layout(
+-                {
+-                    k_sum_partial: k["row_layout"],
+-                    k_warp_fragment: k["warp_layout"],
+-                    k_row_partial: k["row_reduce_layout"],
+-                    k_sum_fragment: k["row_layout"],
+-                }
++            _context_kv_front_body(
++                pid,
++                M,
++                pages,
++                eps,
++                page_size,
++                kv_raw,
++                kv_weight,
++                positions,
++                cos_sin,
++                cache,
++                words,
++                slots,
+             )
+-            k_x = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+-            k_y = T.alloc_local((k["num_thread_vec"], _VEC), T.bfloat16)
+-            y_fp32_local = T.alloc_local((_VEC,), T.float32)
+-            sum_local = T.alloc_local((2,), T.float32)
+-            weight_local = T.alloc_local((_VEC,), T.bfloat16)
+-            cs = T.alloc_local((_VEC,), T.float32)
+-            values = T.alloc_local((_VEC,), T.float32)
+ 
+-            row_id = tid // kt
+-            lane = tid % kt
+-            token_id = pid * kb + row_id
+-            T.clear(sum_local)
+-            for vi in T.unroll(k["num_thread_vec"]):
+-                token_offset = (vi * kt + lane) * _VEC
+-                if token_id < M:
+-                    for j in T.vectorized(_VEC):
+-                        k_x[vi, j] = kv_raw[token_id, token_offset + j]
+-                else:
+-                    T.clear(k_x[vi, :])
+-                for j in T.vectorized(_VEC):
+-                    sum_local[j % 2] += T.float32(k_x[vi, j]) * T.float32(k_x[vi, j])
+-            k_sum_partial[row_id, lane] = sum_local[0] + sum_local[1]
+-            T.reducer_init(k_warp_reducer)
+-            for i, w, j in T.Parallel(
+-                kb, 1, kt, loop_layout=k["warp_reduce_layout"]
+-            ):
+-                T.reducer_update(k_warp_reducer[i, w], k_sum_partial[i, w * kt + j])
+-            T.finalize_reducer(k_warp_reducer, k_warp_fragment)
+-            if lane == 0:
+-                k_sum_shared[row_id, 0] = k_warp_fragment[row_id, 0]
+-            T.sync_threads()
+-            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
+-                k_row_partial[i, j, w] = k_sum_shared[i, w]
+-            T.reducer_init(k_sum_reducer)
+-            for i, j, w in T.Parallel(kb, kt, 1, loop_layout=k["row_reduce_layout"]):
+-                T.reducer_update(k_sum_reducer[i, j], k_row_partial[i, j, w])
+-            T.finalize_reducer(k_sum_reducer, k_sum_fragment)
+-
+-            rstd_value = T.alloc_var(
+-                T.float32,
+-                init=T.rsqrt(k_sum_fragment[row_id, lane] / KV_LATENT + eps),
+-            )
+-            for vi in T.unroll(k["num_thread_vec"]):
+-                token_offset = (vi * kt + lane) * _VEC
+-                for j in T.vectorized(_VEC):
+-                    weight_local[j] = kv_weight[token_offset + j]
+-                for j in T.vectorized(_VEC):
+-                    y_fp32_local[j] = (
+-                        T.float32(k_x[vi, j])
+-                        * rstd_value
+-                        * (T.float32(weight_local[j]) * out_scale)
+-                    )
+-                for j in T.vectorized(_VEC):
+-                    k_y[vi, j] = y_fp32_local[j]
+-            if (last * kt + lane >= rope_vec) & (token_id < M):
+-                rope_lane = last * kt + lane - rope_vec
+-                position = positions[token_id]
+-                for i in T.vectorized(_VEC // 2):
+-                    cs[i] = cos_sin[position, rope_lane * (_VEC // 2) + i]
+-                for i in T.vectorized(_VEC // 2):
+-                    cs[_VEC // 2 + i] = cos_sin[
+-                        position, half + rope_lane * (_VEC // 2) + i
+-                    ]
+-                for j in T.unroll(_VEC // 2):
+-                    first = T.cast(k_y[last, 2 * j], T.float32)
+-                    second = T.cast(k_y[last, 2 * j + 1], T.float32)
+-                    cosine = cs[j]
+-                    sine = cs[_VEC // 2 + j]
+-                    k_y[last, 2 * j] = T.cast(
+-                        T.ieee_fmaf(first, cosine, -(second * sine)), T.bfloat16
+-                    )
+-                    k_y[last, 2 * j + 1] = T.cast(
+-                        T.ieee_fmaf(first, sine, second * cosine), T.bfloat16
+-                    )
+-            for vi in T.unroll(k["num_thread_vec"]):
+-                col = (vi * kt + lane) * _VEC
+-                amax = T.alloc_var(T.float32, init=0.0)
+-                for j in T.unroll(_VEC):
+-                    values[j] = T.cast(k_y[vi, j], T.float32)
+-                    amax = T.max(amax, T.abs(values[j]))
+-                amax = T.max(amax, T.shfl_xor(amax, 1))
+-                amax = T.max(amax, T.shfl_xor(amax, 2))
+-                if token_id < M:
+-                    slot = T.cast(slots[token_id], T.int64)
+-                    page = slot // page_size
+-                    if (slot >= 0) & (page < pages):
+-                        base = (slot % page_size) * record
+-                        bits = T.reinterpret(
+-                            T.fmul(T.max(amax, 1e-4), T.float32(1.0 / _E4M3_MAX)),
+-                            T.uint32,
+-                        )
+-                        bumped = T.if_then_else(
+-                            (bits & 0x7FFFFF) != 0,
+-                            (bits + 0x800000) & 0x7F800000,
+-                            bits,
+-                        )
+-                        exponent = T.cast(T.shift_right(bumped, 23) & 0xFF, T.int32)
+-                        inverse = T.reinterpret(
+-                            T.cast(T.shift_left(254 - exponent, 23), T.uint32),
+-                            T.float32,
+-                        )
+-                        for h in T.unroll(2):
+-                            words[page, (base + col + 4 * h) // 4] = T.call_extern(
+-                                "uint32",
+-                                "dsv41_e4m3x4",
+-                                T.fmul(values[4 * h], inverse),
+-                                T.fmul(values[4 * h + 1], inverse),
+-                                T.fmul(values[4 * h + 2], inverse),
+-                                T.fmul(values[4 * h + 3], inverse),
+-                            )
+-                        if lane % group_lanes == 0:
+-                            cache[page, base + KV_LATENT + col // 32] = T.cast(
+-                                exponent, T.uint8
+-                            )
++    return attention_front
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def context_kv_front_3layer_kernel(eps: float, page_size: int, slot_dtype: str = "int64"):
++    """Fused 3-layer DSpark context KV front: launches 3*ceildiv(M, kb) CTAs in one
++    PDL kernel instead of three serialized single-CTA launches."""
++    k = _row_split(KV_LATENT)
++    assert (
++        k["num_row_warps"] == 1 and k["row_threads"] == 16 and k["num_thread_vec"] == 4
++    )
++    kb = k["block_m"]
++    M, kv_stride = T.dynamic("M, kv_stride")
++    positions_max = T.dynamic("positions_max")
++    pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
++    page_words, word_stride = T.dynamic("page_words, word_stride")
++
++    @T.prim_func
++    def attention_front(
++        kv0: T.StridedTensor((M, KV_LATENT), (kv_stride, 1), T.bfloat16),
++        kv1: T.StridedTensor((M, KV_LATENT), (kv_stride, 1), T.bfloat16),
++        kv2: T.StridedTensor((M, KV_LATENT), (kv_stride, 1), T.bfloat16),
++        w0: T.Tensor((KV_LATENT,), T.bfloat16),
++        w1: T.Tensor((KV_LATENT,), T.bfloat16),
++        w2: T.Tensor((KV_LATENT,), T.bfloat16),
++        positions: T.Tensor((M,), T.int64),
++        cos_sin: T.Tensor((positions_max, ROPE_DIM), T.float32),
++        c0: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
++        u0: T.StridedTensor((pages, page_words), (word_stride, 1), T.uint32),
++        s0: T.Tensor((M,), slot_dtype),
++        c1: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
++        u1: T.StridedTensor((pages, page_words), (word_stride, 1), T.uint32),
++        s1: T.Tensor((M,), slot_dtype),
++        c2: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
++        u2: T.StridedTensor((pages, page_words), (word_stride, 1), T.uint32),
++        s2: T.Tensor((M,), slot_dtype),
++    ):
++        with T.Kernel(T.ceildiv(M, kb), 3, threads=_THREADS) as (pid, lid):
++            T.import_source(_CVT_HEADER)
++            T.assume(kv_stride % 16 == 0)
++            pdl.chain()
++            if lid == 0:
++                _context_kv_front_body(
++                    pid, M, pages, eps, page_size, kv0, w0, positions, cos_sin, c0, u0, s0
++                )
++            elif lid == 1:
++                _context_kv_front_body(
++                    pid, M, pages, eps, page_size, kv1, w1, positions, cos_sin, c1, u1, s1
++                )
++            else:
++                _context_kv_front_body(
++                    pid, M, pages, eps, page_size, kv2, w2, positions, cos_sin, c2, u2, s2
++                )
+ 
+     return attention_front
+ 
+@@ -675,6 +763,16 @@ def context_kv_front_call(eps: float, page_size: int, slot_dtype: torch.dtype):
+     )
+ 
+ 
++def context_kv_front_3layer_call(eps: float, page_size: int, slot_dtype: torch.dtype):
++    """The kernel ``context_kv_front_3layer`` launches, as a ``prepare.call``."""
++    return prepare.call(
++        context_kv_front_3layer_kernel,
++        eps,
++        page_size,
++        str(slot_dtype).removeprefix("torch."),
++    )
++
++
+ def context_kv_front(
+     kv_raw: torch.Tensor,
+     kv_weight: torch.Tensor,
+@@ -703,6 +801,49 @@ def context_kv_front(
+     )
+ 
+ 
++def context_kv_front_3layer(
++    kv_raws: list[torch.Tensor] | tuple[torch.Tensor, ...],
++    kv_weights: list[torch.Tensor] | tuple[torch.Tensor, ...],
++    eps: float,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    caches: list[torch.Tensor] | tuple[torch.Tensor, ...],
++    slot_mappings: list[torch.Tensor] | tuple[torch.Tensor, ...],
++    page_size: int,
++) -> None:
++    """Fused 3-layer ``context_kv_front`` in one launch."""
++    if kv_raws[0].shape[0] == 0:
++        return
++    pages = []
++    for c in caches:
++        p = c.view(torch.uint8)
++        if p.dim() > 2:
++            p = p.flatten(1)
++        pages.append(p)
++    function, args, kwargs = context_kv_front_3layer_call(
++        eps, page_size, slot_mappings[0].dtype
++    )
++    function(*args, **kwargs)(
++        kv_raws[0],
++        kv_raws[1],
++        kv_raws[2],
++        kv_weights[0],
++        kv_weights[1],
++        kv_weights[2],
++        positions,
++        cos_sin_cache,
++        pages[0],
++        pages[0].view(torch.uint32),
++        slot_mappings[0],
++        pages[1],
++        pages[1].view(torch.uint32),
++        slot_mappings[1],
++        pages[2],
++        pages[2].view(torch.uint32),
++        slot_mappings[2],
++    )
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def sp_attention_front_kernel(eps: float):
+     """Sequence-parallel local attention front on ``qa_kv`` (``[M, 1792]`` BF16):
+@@ -999,6 +1140,9 @@ __all__ = [
+     "attention_front",
+     "attention_front_kernel",
+     "context_kv_front",
++    "context_kv_front_3layer",
++    "context_kv_front_3layer_call",
++    "context_kv_front_3layer_kernel",
+     "context_kv_front_call",
+     "context_kv_front_kernel",
+     "front_call",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 3d59dba69..c9f488804 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -286,6 +286,60 @@ __device__ __forceinline__ void __tl_reduce_store_scores_candidates(
+         }
+     }
+ }
++// The dense loader's global reads into registers, for the next tile while this one computes, and
++// their store into shared memory: together exactly __tl_load_k_shared_dense.
++__device__ __forceinline__ void __tl_fetch_k_dense(
++    const void* __restrict__ KPool,
++    const uint* __restrict__ KScale,
++    const int* __restrict__ PageTable,
++    int row, int p0, int extent, int page_size, int table_width, int pool_pages,
++    int pool_stride, int scale_stride, int scale_word0,
++    uint4 (&v)[2], uint& s
++) {
++    int tx = threadIdx.x;
++    int logical_page = min(p0 / page_size, table_width - 1);
++    int raw_page = (table_width >= 1) ? PageTable[(int64_t)row * table_width + logical_page] : 0;
++    int page = min(max(raw_page, 0), pool_pages - 1);
++    int64_t page_byte_base = ((int64_t)page * pool_stride) >> 1;
++    #pragma unroll
++    for (int half = 0; half < 2; ++half) {
++        int p = half * 32 + (tx >> 2);
++        int c = tx & 3;
++        int pos = p0 + p;
++        uint4 val = make_uint4(0, 0, 0, 0);
++        if (pos < extent && page >= 0 && page < pool_pages) {
++            val = *reinterpret_cast<const uint4*>(
++                reinterpret_cast<const uint8_t*>(KPool) + page_byte_base + ((pos % page_size) * 64) + c * 16
++            );
++        }
++        v[half] = val;
++    }
++    s = 0;
++    if (tx < 64) {
++        int pos = p0 + tx;
++        if (pos < extent && page >= 0 && page < pool_pages) {
++            s = KScale[(int64_t)page * scale_stride + scale_word0 + (pos % page_size)];
++        }
++    }
++}
++
++__device__ __forceinline__ void __tl_store_k_shared(
++    void* __restrict__ K_shared, void* __restrict__ SFK_shared, const uint4 (&v)[2], uint s
++) {
++    int tx = threadIdx.x;
++    uint4* k_smem = reinterpret_cast<uint4*>(K_shared);
++    #pragma unroll
++    for (int half = 0; half < 2; ++half) {
++        int p = half * 32 + (tx >> 2);
++        int c = tx & 3;
++        k_smem[p * 4 + (c ^ ((p >> 1) & 3))] = v[half];
++    }
++    if (tx < 64) {
++        reinterpret_cast<uint*>(SFK_shared)[tx] = s;
++    }
++    __syncthreads();
++}
++
+ template <int R>
+ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+     const fp4_e2_t* __restrict__ Q,
+@@ -336,6 +390,7 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+     fp4_e2_2_t B_reg[R][2][16];
+     uint32_t sfq_reg[R][2];
+     float2 w_reg[R][2];
++    __nv_bfloat162 w2_reg[R][2];
+ 
+     int smem_q_off = (((tx >> 2) * 64) + ((((((tx & 31) >> 4) + ((tx & 3) >> 1)) & 1) * 32)) + ((((((tx & 15) >> 3) + (tx & 1)) & 1) * 16)));
+     int ld_q_base = (((tx >> 6) * 1024) + (((tx & 31) >> 4) * 512) + ((tx & 7) * 64) + ((((((tx & 15) >> 3) + ((tx & 3) >> 1)) & 1) * 16)));
+@@ -362,12 +417,15 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+             for (int w_i = 0; w_i < 2; ++w_i) {
+                 int h0 = ((tx >> 6) * 16) + (w_i * 8) + ((tx & 3) * 2);
+                 w_reg[r][w_i] = make_float2((float)wptr[h0], (float)wptr[h0 + 1]);
++                w2_reg[r][w_i] = *reinterpret_cast<const __nv_bfloat162*>(wptr + h0);
+             }
+         } else {
+             sfq_reg[r][0] = 0;
+             sfq_reg[r][1] = 0;
+             w_reg[r][0] = make_float2(0.0f, 0.0f);
+             w_reg[r][1] = make_float2(0.0f, 0.0f);
++            w2_reg[r][0] = __float2bfloat162_rn(0.0f);
++            w2_reg[r][1] = __float2bfloat162_rn(0.0f);
+         }
+         __syncthreads();
+     }
+@@ -375,6 +433,9 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+     int num_iters = ((max(((max_ext + 63) >> 6) - cta, 0)) + ctas - 1) / ctas;
+     int sfk_base = (((tx & 63) >> 5) * 32) + ((tx & 1) * 8) + ((tx & 31) >> 2);
+ 
++    uint4 pre_v[2];
++    uint pre_s = 0;
++    int pre_p0 = -1;
+     for (int i = 0; i < num_iters; ++i) {
+         int p0 = (cta + i * ctas) * 64;
+         int lpage = min(p0 / page_size, table_width - 1);
+@@ -393,11 +454,15 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+         uint32_t sfk_reg[2];
+ 
+         if (same_k && (R > 1) && ((R & 1) == 0)) {
+-            __tl_load_k_shared_dense(
+-                KPool, KScale, PageTable, K_shared, SFK_shared,
+-                row0, p0, max_ext, page_size, table_width,
+-                pool_pages, pool_stride, scale_stride, scale_word0
+-            );
++            if (pre_p0 == p0) {
++                __tl_store_k_shared(K_shared, SFK_shared, pre_v, pre_s);
++            } else {
++                __tl_load_k_shared_dense(
++                    KPool, KScale, PageTable, K_shared, SFK_shared,
++                    row0, p0, max_ext, page_size, table_width,
++                    pool_pages, pool_stride, scale_stride, scale_word0
++                );
++            }
+             #pragma unroll
+             for (int ki = 0; ki < 2; ++ki) {
+                 #pragma unroll
+@@ -408,6 +473,17 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+             }
+             sfk_reg[0] = ((const uint*)SFK_shared)[sfk_base];
+             sfk_reg[1] = ((const uint*)SFK_shared)[sfk_base + 16];
++            // The next tile's reads go out now and land while this tile computes. A fast-path tile
++            // reads row0's pages, which every row of the group shares; any other path ignores them.
++            pre_p0 = -1;
++            if (i + 1 < num_iters) {
++                int p0n = (cta + (i + 1) * ctas) * 64;
++                __tl_fetch_k_dense(
++                    KPool, KScale, PageTable, row0, p0n, max_ext, page_size, table_width,
++                    pool_pages, pool_stride, scale_stride, scale_word0, pre_v, pre_s
++                );
++                pre_p0 = p0n;
++            }
+ 
+             #pragma unroll
+             for (int rp = 0; rp < R; rp += 2) {
+@@ -447,13 +523,11 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                     #pragma unroll
+                     for (int i_4 = 0; i_4 < 8; ++i_4) {
+                         float2 v_ = *(float2*)(acc + (i_4 * 2));
+-                        uint1 __6;
+-                        (reinterpret_cast<__nv_bfloat162*>(&__6))[0] = __float22bfloat162_rn(v_);
+-                        float2 __5 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__6))[0]);
+-                        float2 __4 = tl::max2(__5, make_float2(0.0f, 0.0f));
+-                        float2 __3 = tl::mul2(__4, w_reg[r][(i_4 & 3) >> 1]);
++                        // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it: the product of two bf16 values is exact, so one
++                        // bf16x2 multiply rounds it as the float path's rounding of the float product does.
++                        __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                         uint1 __2;
+-                        (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
++                        (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
+                         int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+                         int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
+                         int swz_col = h_col ^ ((p_row & 15) << 1);
+@@ -472,10 +546,16 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                     asm volatile("" ::: "memory");
+                     float s = 0.0f;
+                     const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + (sub * 64 + p) * 32;
+-                    int mask = (p & 15) << 1;
++                    // Heads 2k and 2k + 1 stay adjacent under the even swizzle: one 32-bit load
++                    // each, added in head order.
++                    const uint32_t* c_pair = reinterpret_cast<const uint32_t*>(c_row);
++                    int pmask = (p & 15);
+                     #pragma unroll
+-                    for (int h = 0; h < 32; ++h) {
+-                        s += (float)c_row[h ^ mask];
++                    for (int h2 = 0; h2 < 16; ++h2) {
++                        uint32_t two = c_pair[h2 ^ pmask];
++                        float2 f = tl::__tl_cvt_bf16x2_to_f32x2(*reinterpret_cast<__nv_bfloat162*>(&two));
++                        s += f.x;
++                        s += f.y;
+                     }
+                     Scores[(int64_t)row * width + j] = (bfloat16_t)s;
+                 }
+@@ -558,13 +638,11 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                 #pragma unroll
+                 for (int i_4 = 0; i_4 < 8; ++i_4) {
+                     float2 v_ = *(float2*)(acc + (i_4 * 2));
+-                    uint1 __6;
+-                    (reinterpret_cast<__nv_bfloat162*>(&__6))[0] = __float22bfloat162_rn(v_);
+-                    float2 __5 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__6))[0]);
+-                    float2 __4 = tl::max2(__5, make_float2(0.0f, 0.0f));
+-                    float2 __3 = tl::mul2(__4, w_reg[r][(i_4 & 3) >> 1]);
++                    // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it: the product of two bf16 values is exact, so one
++                    // bf16x2 multiply rounds it as the float path's rounding of the float product does.
++                    __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+                     uint1 __2;
+-                    (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
++                    (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
+                     int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+                     int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
+                     int swz_col = h_col ^ ((p_row & 15) << 1);
+@@ -578,10 +656,14 @@ __device__ __forceinline__ void __tl_score_rows_dense_fast(
+                         asm volatile("" ::: "memory");
+                         float s = 0.0f;
+                         const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + tx * 32;
+-                        int mask = (tx & 15) << 1;
++                        const uint32_t* c_pair = reinterpret_cast<const uint32_t*>(c_row);
++                        int pmask = (tx & 15);
+                         #pragma unroll
+-                        for (int h = 0; h < 32; ++h) {
+-                            s += (float)c_row[h ^ mask];
++                        for (int h2 = 0; h2 < 16; ++h2) {
++                            uint32_t two = c_pair[h2 ^ pmask];
++                            float2 f = tl::__tl_cvt_bf16x2_to_f32x2(*reinterpret_cast<__nv_bfloat162*>(&two));
++                            s += f.x;
++                            s += f.y;
+                         }
+                         Scores[(int64_t)row * width + j] = (bfloat16_t)s;
+                     }
+@@ -627,6 +709,7 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
+     fp4_e2_2_t B_reg[2][16];
+     uint32_t sfq_reg[2];
+     float2 w_reg[2];
++    __nv_bfloat162 w2_reg[2];
+ 
+     int smem_q_off = (((tx >> 2) * 64) + ((((((tx & 31) >> 4) + ((tx & 3) >> 1)) & 1) * 32)) + ((((((tx & 15) >> 3) + (tx & 1)) & 1) * 16)));
+     int ld_q_base = (((tx >> 6) * 1024) + (((tx & 31) >> 4) * 512) + ((tx & 7) * 64) + ((((((tx & 15) >> 3) + ((tx & 3) >> 1)) & 1) * 16)));
+@@ -647,6 +730,7 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
+     for (int w_i = 0; w_i < 2; ++w_i) {
+         int h0 = ((tx >> 6) * 16) + (w_i * 8) + ((tx & 3) * 2);
+         w_reg[w_i] = make_float2((float)wptr[h0], (float)wptr[h0 + 1]);
++        w2_reg[w_i] = *reinterpret_cast<const __nv_bfloat162*>(wptr + h0);
+     }
+ 
+     int num_iters = ((max(((extent + 63) >> 6) - cta, 0)) + ctas - 1) / ctas;
+@@ -700,13 +784,10 @@ __device__ __forceinline__ void __tl_score_row_candidates_fast(
+         #pragma unroll
+         for (int i_4 = 0; i_4 < 8; ++i_4) {
+             float2 v_ = *(float2*)(acc + (i_4 * 2));
+-            uint1 __6;
+-            (reinterpret_cast<__nv_bfloat162*>(&__6))[0] = __float22bfloat162_rn(v_);
+-            float2 __5 = tl::__tl_cvt_bf16x2_to_f32x2((reinterpret_cast<__nv_bfloat162*>(&__6))[0]);
+-            float2 __4 = tl::max2(__5, make_float2(0.0f, 0.0f));
+-            float2 __3 = tl::mul2(__4, w_reg[(i_4 & 3) >> 1]);
++            // bf16(relu(bf16(dot)) * w), a NaN dot kept as DeepSeek's relu_ keeps it.
++            __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
+             uint1 __2;
+-            (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __float22bfloat162_rn(__3);
++            (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[(i_4 & 3) >> 1]);
+             int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
+             int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
+             int swz_col = h_col ^ ((p_row & 15) << 1);
+@@ -992,7 +1073,7 @@ def indexer_score_v41(
+     )
+     scale_word0 = page_size * D // 2 // 4
+     if not candidates and fast_vec128:
+-        row_blocks = T.if_then_else(rows >= 64, T.ceildiv(rows, 4), rows)
++        row_blocks = T.if_then_else(rows >= 64, T.ceildiv(rows, 4), T.ceildiv(rows, 2))
+ 
+         @T.prim_func
+         def indexer_score(
+@@ -1050,7 +1131,7 @@ def indexer_score_v41(
+                 else:
+                     T.call_extern(
+                         "handle",
+-                        "__tl_score_rows_dense_fast<1>",
++                        "__tl_score_rows_dense_fast<2>",
+                         T.address_of(Q[0, 0, 0]),
+                         T.address_of(QScale[0, 0]),
+                         T.address_of(Weights[0, 0]),
+@@ -1064,7 +1145,7 @@ def indexer_score_v41(
+                         T.address_of(SFK_shared[0, 0]),
+                         T.address_of(Q_shared[0, 0]),
+                         T.address_of(contrib[0, 0]),
+-                        rb,
++                        rb * 2,
+                         cta,
+                         ctas,
+                         rows,
+@@ -1968,6 +2049,39 @@ def _final_writer(threads, topk, group):
+     return write_final, write_empty_final
+ 
+ 
++_KEY_LOAD_HEADER = r"""
++// Order-preserving uint16 keys of a dense segment's BF16 scores into the swizzled key buffer:
++// the same key in the same slot as the scalar loop, read eight scores per 16-byte load.
++template <int THREADS>
++__device__ __forceinline__ void __tl_load_keys16(
++    const bfloat16_t* __restrict__ row_scores,
++    uint16_t* __restrict__ keys,
++    int seg_start,
++    int n_active
++) {
++    int tx = threadIdx.x;
++    const uint16_t* src = reinterpret_cast<const uint16_t*>(row_scores) + seg_start;
++    int full = ((reinterpret_cast<uintptr_t>(src) & 15) == 0) ? (n_active & ~7) : 0;
++    for (int base = tx * 8; base < full; base += THREADS * 8) {
++        uint4 v = *reinterpret_cast<const uint4*>(src + base);
++        uint32_t w[4] = {v.x, v.y, v.z, v.w};
++        #pragma unroll
++        for (int k = 0; k < 8; ++k) {
++            uint32_t bits = (w[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu;
++            uint32_t key = (bits >= 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
++            int idx = base + k;
++            keys[idx ^ ((idx >> 5) & 31)] = (uint16_t)key;
++        }
++    }
++    for (int j = full + tx; j < n_active; j += THREADS) {
++        uint32_t bits = src[j];
++        uint32_t key = (bits >= 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
++        keys[j ^ ((j >> 5) & 31)] = (uint16_t)key;
++    }
++}
++"""
++
++
+ @tilelang.jit(
+     pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
+ )
+@@ -2013,6 +2127,8 @@ def indexer_topk_segment_v41(
+     segments = tilelang.cdiv(entries, segment)
+     assert not final or segments == 1, "a final segment must cover the row"
+     per = segment // threads
++    # Dense uint16 keys load eight scores a thread at a time (``__tl_load_keys16``).
++    vector_keys = group == 1 and not gather_scores and swizzle
+     threshold, compact = _select_macros(threads, topk, swizzle)
+     write_final, write_empty_final = _final_writer(threads, topk, group)
+ 
+@@ -2024,38 +2140,48 @@ def indexer_topk_segment_v41(
+         best = T.alloc_var(T.int32)
+         n_entries = T.ceildiv(extent, group)
+         n_active = T.min(segment, T.max(n_entries - seg * segment, 0))
+-        for i in T.serial(T.ceildiv(n_active, threads)):
+-            j = i * threads + tx
+-            if j < n_active:
+-                e = seg * segment + j
+-                if gather_scores:
+-                    blk = Gather[row, e // CANDIDATE_BLOCK]
+-                    pos = blk * CANDIDATE_BLOCK + e % CANDIDATE_BLOCK
+-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+-                        T.if_then_else(
+-                            blk >= 0,
+-                            _key16(Scores[row, T.min(T.max(pos, 0), width - 1)]),
+-                            0,
+-                        ),
+-                        key_dtype,
+-                    )
+-                elif group == 1:
+-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+-                        _key16(Scores[row, T.min(e, width - 1)]), key_dtype
+-                    )
+-                else:
+-                    best = 0
+-                    for o in T.serial(group):
+-                        if e * group + o < extent:
+-                            best = T.max(
+-                                best,
+-                                _key16(Scores[row, T.min(e * group + o, width - 1)]),
+-                            )
+-                    # The block holding the last visible position always survives.
+-                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
+-                        T.if_then_else(e == (extent - 1) // group, 0xFF80, best),
+-                        key_dtype,
+-                    )
++        if vector_keys:
++            T.call_extern(
++                "handle",
++                f"__tl_load_keys16<{threads}>",
++                T.address_of(Scores[row, 0]),
++                T.address_of(keys[0]),
++                seg * segment,
++                n_active,
++            )
++        else:
++            for i in T.serial(T.ceildiv(n_active, threads)):
++                j = i * threads + tx
++                if j < n_active:
++                    e = seg * segment + j
++                    if gather_scores:
++                        blk = Gather[row, e // CANDIDATE_BLOCK]
++                        pos = blk * CANDIDATE_BLOCK + e % CANDIDATE_BLOCK
++                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                            T.if_then_else(
++                                blk >= 0,
++                                _key16(Scores[row, T.min(T.max(pos, 0), width - 1)]),
++                                0,
++                            ),
++                            key_dtype,
++                        )
++                    elif group == 1:
++                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                            _key16(Scores[row, T.min(e, width - 1)]), key_dtype
++                        )
++                    else:
++                        best = 0
++                        for o in T.serial(group):
++                            if e * group + o < extent:
++                                best = T.max(
++                                    best,
++                                    _key16(Scores[row, T.min(e * group + o, width - 1)]),
++                                )
++                        # The block holding the last visible position always survives.
++                        keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                            T.if_then_else(e == (extent - 1) // group, 0xFF80, best),
++                            key_dtype,
++                        )
+         T.sync_threads()
+         threshold(keys, n_active, tx, hist, scan, params)
+         compact(keys, per, tx, scan, params, sel_idx, sel_key, n_active, warp_sums=hist)
+@@ -2073,6 +2199,8 @@ def indexer_topk_segment_v41(
+         WorkEntries,
+     ):
+         with T.Kernel(segments, rows, threads=threads) as (seg, row):
++            if vector_keys:
++                T.import_source(_KEY_LOAD_HEADER)
+             pdl.chain()
+             tx = T.get_thread_binding()
+             keys = T.alloc_shared([segment], key_dtype)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index a8cbac701..f22b0ed1c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -30,6 +30,7 @@ including which rows each launch writes:
+ # annotations eagerly, and the symbolic shape must resolve.
+ import tilelang
+ import tilelang.language as T
++import torch
+ 
+ from . import pdl
+ 
+@@ -145,18 +146,24 @@ def builder_kernel(max_requests: int, page: int, ratio: int, circular: bool):
+     return metadata_builder
+ 
+ 
+-def _window_macro(page, window, width, draft, replay, threads, per_thread):
++def _window_macro(
++    page, window, width, draft, replay, threads, per_thread, *, pad: bool = False
++):
+     """One row's sliding-window metadata (``chunk``), for a block of ``threads``
+     threads."""
+ 
+     @T.macro
+     def window_row(
+         row, tx, info, positions, reqs, table, swa, lengths, top_lengths, visible,
+-        starts, request_positions, replay_start, offset,
++        starts, request_positions, replay_start, is_padding, offset,
+     ):  # fmt: skip
+         req = reqs[offset + row]
+         pos = positions[offset + row]
+-        valid = (req >= 0) & (pos >= 0)
++        if pad:
++            padded = is_padding[offset + row] != T.uint8(0)
++            valid = (req >= 0) & (pos >= 0) & (~padded)
++        else:
++            valid = (req >= 0) & (pos >= 0)
+         if draft:
+             first = T.if_then_else(valid, T.Cast(T.int64, starts[req]), T.int64(0))
+             end = T.if_then_else(valid, T.Cast(T.int64, starts[req + 1]), T.int64(0))
+@@ -216,7 +223,9 @@ def _threads(width: int) -> tuple[int, int]:
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
++def chunk_kernel(
++    page: int, window: int, width: int, draft: bool, replay: bool, pad: bool = False
++):
+     rows = T.dynamic("rows")
+     src_rows = T.dynamic("src_rows")
+     table_rows = T.dynamic("table_rows")
+@@ -225,8 +234,38 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+     req_count = T.dynamic("req_count")
+     starts_len = T.dynamic("starts_len")
+     replay_len = T.dynamic("replay_len")
++    pad_len = T.dynamic("pad_len")
+     threads, per_thread = _threads(width)
+-    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
++    window_row = _window_macro(
++        page, window, width, draft, replay, threads, per_thread, pad=pad
++    )
++
++    if not pad:
++
++        @T.prim_func
++        def metadata_chunk(
++            positions: T.Tensor((src_rows,), T.int64),
++            reqs: T.Tensor((src_rows,), T.int32),
++            table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++            swa: T.Tensor((rows, width), T.int32),
++            lengths: T.Tensor((rows,), T.int32),
++            top_lengths: T.Tensor((rows,), T.int32),
++            visible: T.Tensor((src_rows,), T.int32),
++            starts: T.Tensor((starts_len,), T.int32),
++            request_positions: T.Tensor((req_count,), T.int64),
++            replay_start: T.Tensor((replay_len,), T.int64),
++            offset: T.int32,
++        ):
++            with T.Kernel(rows, threads=threads) as row:
++                pdl.chain()
++                tx = T.get_thread_binding()
++                info = T.alloc_local((2,), T.int64)  # window start, clamped length
++                window_row(
++                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
++                    visible, starts, request_positions, replay_start, None, offset,
++                )  # fmt: skip
++
++        return metadata_chunk
+ 
+     @T.prim_func
+     def metadata_chunk(
+@@ -240,6 +279,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+         starts: T.Tensor((starts_len,), T.int32),
+         request_positions: T.Tensor((req_count,), T.int64),
+         replay_start: T.Tensor((replay_len,), T.int64),
++        is_padding: T.Tensor((pad_len,), T.uint8),
+         offset: T.int32,
+     ):
+         with T.Kernel(rows, threads=threads) as row:
+@@ -248,7 +288,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+             info = T.alloc_local((2,), T.int64)  # window start, clamped length
+             window_row(
+                 row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+-                visible, starts, request_positions, replay_start, offset,
++                visible, starts, request_positions, replay_start, is_padding, offset,
+             )  # fmt: skip
+ 
+     return metadata_chunk
+@@ -263,6 +303,7 @@ def decode_metadata_kernel(
+     replay: bool,
+     main_width: int,
+     main_page: int,
++    pad: bool = False,
+ ):
+     """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
+     of each row: the window metadata and the main page table (block 0 and holes as
+@@ -279,18 +320,86 @@ def decode_metadata_kernel(
+     req_count = T.dynamic("req_count")
+     starts_len = T.dynamic("starts_len")
+     replay_len = T.dynamic("replay_len")
+-    # Blocks as wide as the window part; the page part covers the row's live pages
+-    # (idle threads cost the prefill rows' blocks). It loads the thread's columns
+-    # first, each load a select (predicated, no branch), then stores the live ones,
+-    # so a long context's loads issue back to back as the full-width kernel's did. A
+-    # load and its store under one branch per column wait a round trip each. Both
+-    # passes skip each group of _GROUP columns a thread past the row's live pages
+-    # with one check the block shares, so a short row's threads skip most of the
+-    # table as a loop over its live pages would.
++    pad_len = T.dynamic("pad_len")
+     threads, per_thread = _threads(width)
+-    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
++    window_row = _window_macro(
++        page, window, width, draft, replay, threads, per_thread, pad=pad
++    )
+     groups = (main_width + _GROUP * threads - 1) // (_GROUP * threads)
+ 
++    @T.macro
++    def decode_row(
++        row, part, positions, reqs, table, swa, lengths, top_lengths, visible,
++        starts, request_positions, replay_start, main_reqs, main_table,
++        main_pages, is_padding, offset, main_read_width,
++    ):  # fmt: skip
++        tx = T.get_thread_binding()
++        info = T.alloc_local((2,), T.int64)  # window start, clamped length
++        live = T.alloc_var(T.int32)  # the page part's columns
++        entries = T.alloc_local((groups * _GROUP,), T.int32)
++        if part == 0:
++            window_row(
++                row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
++                visible, starts, request_positions, replay_start, is_padding, offset,
++            )  # fmt: skip
++        else:
++            req = main_reqs[offset + row]
++            live = _live_pages(
++                visible[offset + row], main_page, T.min(main_read_width, main_width)
++            )
++            if req < 0:
++                live = 0
++            if pad:
++                if is_padding[offset + row] != T.uint8(0):
++                    live = 0
++            for g in T.unroll(groups):
++                if g * _GROUP * threads < live:
++                    for k in T.unroll(_GROUP):
++                        col = (g * _GROUP + k) * threads + tx
++                        entries[g * _GROUP + k] = T.if_then_else(
++                            col < live, main_table[req, col], 0
++                        )
++            for g in T.unroll(groups):
++                if g * _GROUP * threads < live:
++                    for k in T.unroll(_GROUP):
++                        col = (g * _GROUP + k) * threads + tx
++                        if col < live:
++                            main_pages[row, col] = T.if_then_else(
++                                entries[g * _GROUP + k] > 0,
++                                entries[g * _GROUP + k],
++                                -1,
++                            )
++
++    if not pad:
++
++        @T.prim_func
++        def metadata_decode(
++            positions: T.Tensor((src_rows,), T.int64),
++            reqs: T.Tensor((src_rows,), T.int32),
++            table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++            swa: T.Tensor((rows, width), T.int32),
++            lengths: T.Tensor((rows,), T.int32),
++            top_lengths: T.Tensor((rows,), T.int32),
++            visible: T.Tensor((src_rows,), T.int32),
++            starts: T.Tensor((starts_len,), T.int32),
++            request_positions: T.Tensor((req_count,), T.int64),
++            replay_start: T.Tensor((replay_len,), T.int64),
++            main_reqs: T.Tensor((main_src_rows,), T.int32),
++            main_table: T.StridedTensor((main_rows, main_cols), (main_stride, 1), T.int32),
++            main_pages: T.Tensor((rows, main_width), T.int32),
++            offset: T.int32,
++            main_read_width: T.int32,
++        ):
++            with T.Kernel(rows, 2, threads=threads) as (row, part):
++                pdl.chain()
++                decode_row(
++                    row, part, positions, reqs, table, swa, lengths, top_lengths,
++                    visible, starts, request_positions, replay_start, main_reqs,
++                    main_table, main_pages, None, offset, main_read_width,
++                )  # fmt: skip
++
++        return metadata_decode
++
+     @T.prim_func
+     def metadata_decode(
+         positions: T.Tensor((src_rows,), T.int64),
+@@ -306,45 +415,17 @@ def decode_metadata_kernel(
+         main_reqs: T.Tensor((main_src_rows,), T.int32),
+         main_table: T.StridedTensor((main_rows, main_cols), (main_stride, 1), T.int32),
+         main_pages: T.Tensor((rows, main_width), T.int32),
++        is_padding: T.Tensor((pad_len,), T.uint8),
+         offset: T.int32,
+         main_read_width: T.int32,
+     ):
+-        # Two blocks a row, one launch: the window metadata, then the page table.
+         with T.Kernel(rows, 2, threads=threads) as (row, part):
+             pdl.chain()
+-            tx = T.get_thread_binding()
+-            info = T.alloc_local((2,), T.int64)  # window start, clamped length
+-            live = T.alloc_var(T.int32)  # the page part's columns
+-            entries = T.alloc_local((groups * _GROUP,), T.int32)
+-            if part == 0:
+-                window_row(
+-                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+-                    visible, starts, request_positions, replay_start, offset,
+-                )  # fmt: skip
+-            else:
+-                req = main_reqs[offset + row]
+-                live = _live_pages(
+-                    visible[offset + row], main_page, T.min(main_read_width, main_width)
+-                )
+-                if req < 0:
+-                    live = 0
+-                for g in T.unroll(groups):
+-                    if g * _GROUP * threads < live:
+-                        for k in T.unroll(_GROUP):
+-                            col = (g * _GROUP + k) * threads + tx
+-                            entries[g * _GROUP + k] = T.if_then_else(
+-                                col < live, main_table[req, col], 0
+-                            )
+-                for g in T.unroll(groups):
+-                    if g * _GROUP * threads < live:
+-                        for k in T.unroll(_GROUP):
+-                            col = (g * _GROUP + k) * threads + tx
+-                            if col < live:
+-                                main_pages[row, col] = T.if_then_else(
+-                                    entries[g * _GROUP + k] > 0,
+-                                    entries[g * _GROUP + k],
+-                                    -1,
+-                                )
++            decode_row(
++                row, part, positions, reqs, table, swa, lengths, top_lengths,
++                visible, starts, request_positions, replay_start, main_reqs,
++                main_table, main_pages, is_padding, offset, main_read_width,
++            )  # fmt: skip
+ 
+     return metadata_decode
+ 
+@@ -414,18 +495,50 @@ def builder(
+     )  # fmt: skip
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def mask_lengths_kernel():
++    """Zero ``lengths[r]`` where ``is_padding[r] != 0``."""
++    rows = T.dynamic("rows")
++    pad_len = T.dynamic("pad_len")
++
++    @T.prim_func
++    def metadata_mask_lengths(
++        lengths: T.Tensor((rows,), T.int32),
++        is_padding: T.Tensor((pad_len,), T.uint8),
++        out: T.Tensor((rows,), T.int32),
++    ):
++        with T.Kernel(T.ceildiv(rows, _BLOCK), threads=_BLOCK) as bx:
++            pdl.chain()
++            r = bx * _BLOCK + T.get_thread_binding()
++            if r < rows:
++                out[r] = T.if_then_else(is_padding[r] != T.uint8(0), 0, lengths[r])
++
++    return metadata_mask_lengths
++
++
++def mask_lengths(lengths, is_padding, rows: int, out=None):
++    """Return ``lengths[:rows]`` with ``is_padding[:rows] != 0`` entries zeroed."""
++    if out is None:
++        out = lengths.new_empty(rows)
++    mask_lengths_kernel()(lengths[:rows], is_padding.view(torch.uint8), out[:rows])
++    return out[:rows]
++
++
+ def chunk(
+     positions, reqs, table, swa, lengths, top_lengths, visible, starts,
+     request_positions, offset: int, rows: int, *, page: int, window: int,
+-    draft: bool, replay_start=None,
++    draft: bool, replay_start=None, is_padding=None,
+ ) -> None:  # fmt: skip
+     """Window metadata for ``rows`` rows from source row ``offset``."""
+     width = swa.shape[1]
+     replay = replay_start is not None
+-    chunk_kernel(page, window, width, draft, replay)(
++    pad = is_padding is not None
++    extra = (is_padding.view(torch.uint8),) if pad else ()
++    chunk_kernel(page, window, width, draft, replay, pad)(
+         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
+         visible, starts, request_positions,
+-        replay_start if replay_start is not None else request_positions, offset,
++        replay_start if replay_start is not None else request_positions,
++        *extra, offset,
+     )  # fmt: skip
+ 
+ 
+@@ -433,18 +546,22 @@ def decode_metadata(
+     positions, reqs, table, swa, lengths, top_lengths, visible, starts,
+     request_positions, main_reqs, main_table, main_pages, offset: int, rows: int,
+     main_read_width: int, *, page: int, window: int, draft: bool, main_page: int,
+-    replay_start=None,
++    replay_start=None, is_padding=None,
+ ) -> None:  # fmt: skip
+     """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch; a row's
+     main page table covers the pages of its ``visible`` entries, ``main_page`` a page
+     (its other columns keep their contents)."""
+     width, main_width = swa.shape[1], main_pages.shape[1]
+     replay = replay_start is not None
+-    decode_metadata_kernel(page, window, width, draft, replay, main_width, main_page)(
++    pad = is_padding is not None
++    extra = (is_padding.view(torch.uint8),) if pad else ()
++    decode_metadata_kernel(
++        page, window, width, draft, replay, main_width, main_page, pad
++    )(
+         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
+         visible, starts, request_positions,
+         replay_start if replay_start is not None else request_positions, main_reqs,
+-        main_table, main_pages[:rows], offset, main_read_width,
++        main_table, main_pages[:rows], *extra, offset, main_read_width,
+     )  # fmt: skip
+ 
+ 
+@@ -454,12 +571,15 @@ def pages(
+     """Page tables for ``rows`` rows from source row ``offset``, over the pages of
+     each row's ``lengths`` entries (``page`` a page; ``out`` is ``[*, width]``, its
+     other columns keep their contents)."""
++    end = offset + rows
+     pages_kernel(out.shape[1], page)(
+-        reqs, lengths, table, out[:rows], offset, read_width
++        reqs[:end], lengths[:end], table, out[:rows], offset, read_width
+     )
+ 
+ 
+ __all__ = [
++    "mask_lengths",
++    "mask_lengths_kernel",
+     "builder",
+     "builder_kernel",
+     "chunk",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 9f5246895..652b74bd0 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -1163,7 +1163,6 @@ class SparseMlaV41Plan:
+                 "decode",
+                 block_H=split_block_H,
+                 threads=split_threads,
+-                skip_inactive=False,
+                 **config,
+             )
+         return SimpleNamespace(
+-- 
+2.43.0
+
