@@ -93,3 +93,18 @@ What the remaining overhead is worth, at today's tokens a step:
   streaming below the rate) needs a traced step of candidate-61, as `floor.py` read for 1022.
 - Prose single stream on tp4-ring; agent traffic adds 0.3 to 0.5 ms of KV and index-key reads a
   step at 64-100K contexts (the record's estimate).
+
+## A traced step of candidate-61
+
+What the remainder is made of needs a trace, as the record's `floor.py` read for 1022.
+[trace-tp4.json](trace-tp4.json) boots candidate-61's dev arm on tp4-ring under the torch
+profiler ([prof-tp4.json](prof-tp4.json): every rank, no Python stacks or shapes) and runs
+[profile_decode.py](profile_decode.py): three of servebench's prose prompts at 256 tokens each
+(the single-stream screen's request: temperature 0, a fixed length, thinking off), once timed
+from the server's counters and once between `/start_profile` and `/stop_profile`. The lab stops
+the cluster after a profile job and summarizes every rank's kernels
+([summarize_kernels.py](summarize_kernels.py), the indexer-decode-share experiment's).
+
+```sh
+bin/spark candidate queue tp4-ring experiments/2026-11-17-c1-floor-now/trace-tp4.json --apply
+```
