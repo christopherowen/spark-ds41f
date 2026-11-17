@@ -73,18 +73,14 @@ from .linear import (
 # 512 rows 119.1 against 131.8 us, 8192 rows 1675 against 1758 us).
 _WO_A_SHARDS = 4
 _WO_A_TILES = {
-    16: dict(split=True, block_M=16, block_N=32, block_K=128, num_stages=4),
-    32: dict(split=True, block_M=32, block_N=32, block_K=128, num_stages=3),
-    64: dict(split=True, block_M=64, block_K=128),
-    96: dict(split=True, block_M=96, block_K=128),
-    128: dict(split=True, block_M=128, block_K=128),
+    16: dict(split=True, block_M=16),
+    32: dict(split=True, block_M=32),
+    64: dict(split=True, block_M=64),
+    96: dict(split=True, block_M=96),
+    128: dict(split=True, block_M=128),
     None: dict(split=False, block_M=96),
 }
-_WO_A_COMMON = dict(block_N=64, block_K=64, num_stages=2)
-
-
-def _wo_a_tile_config(tile: dict) -> dict:
-    return {**_WO_A_COMMON, **{k: v for k, v in tile.items() if k != "split"}}
+_WO_A_COMMON = dict(block_N=64, num_stages=2)
 
 
 class _Weight:
@@ -160,7 +156,8 @@ class _GroupedBF16:
                     k,
                     groups,
                     _WO_A_SHARDS,
-                    **_wo_a_tile_config(tile),
+                    block_M=tile["block_M"],
+                    **_WO_A_COMMON,
                 )
                 if tile["split"]
                 else prepare.call(
@@ -169,7 +166,8 @@ class _GroupedBF16:
                     k,
                     groups,
                     shards=_WO_A_SHARDS,
-                    **_wo_a_tile_config(tile),
+                    block_M=tile["block_M"],
+                    **_WO_A_COMMON,
                 )
                 for bucket, tile in _WO_A_TILES.items()
             },

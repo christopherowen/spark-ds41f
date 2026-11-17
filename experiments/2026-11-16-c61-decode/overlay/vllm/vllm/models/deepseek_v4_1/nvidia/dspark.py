@@ -1018,49 +1018,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             )
         return probs
 
-    def compute_and_calibrate_confidence_step(
-        self,
-        head_hidden: torch.Tensor,
-        markov_embed: torch.Tensor,
-        out_probs: torch.Tensor,
-        estimator: object,
-        idx_mapping: torch.Tensor,
-        log_probs: torch.Tensor,
-        row_alive: torch.Tensor,
-        log_tau: torch.Tensor,
-        step: int,
-        handle_i64: int = 0,
-    ) -> None:
-        """Evaluate calibrated confidence for one draft position ``step`` and
-        update the cumulative-survival conditional handle."""
-        assert self.model.confidence_head is not None
-        head = self.model.confidence_head
-        if (
-            estimator is not None
-            and hasattr(head, "probability_step_and_gate")
-            and head_hidden.is_cuda
-            and idx_mapping.dtype == torch.int32
-        ):
-            head.probability_step_and_gate(
-                head_hidden,
-                markov_embed,
-                out_probs,
-                estimator.slope,
-                estimator.intercepts,
-                idx_mapping,
-                estimator.features,
-                estimator.predictions,
-                log_probs,
-                row_alive,
-                log_tau,
-                step,
-                handle_i64=handle_i64,
-            )
-            return
-        raise RuntimeError(
-            "Stepwise confidence gating requires TileLangConfidenceHead"
-        )
-
     # --- Weight loading ----------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
