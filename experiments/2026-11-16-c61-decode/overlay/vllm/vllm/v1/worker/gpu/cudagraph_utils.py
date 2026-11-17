@@ -83,12 +83,18 @@ def _get_cudart():
 
 
 class _PriorityCUDAGraphExec:
-    """CUDA graph executable instantiated with ``UseNodePriority`` flags."""
+    """CUDA graph executable instantiated with ``UseNodePriority`` flags.
 
-    def __init__(self, exec_handle: ctypes.c_void_p, lib, device: torch.device):
+    Retains the underlying ``torch.cuda.CUDAGraph`` so its shared allocator
+    pool reference count stays positive across subsequent graph captures on
+    the same ``pool``; calling ``graph.reset()`` eagerly during capture drops
+    ``CUDACachingAllocator`` pool ``use_count`` to zero.
+    """
+
+    def __init__(self, graph, exec_handle: ctypes.c_void_p, lib):
+        self._graph = graph
         self._exec = exec_handle
         self._lib = lib
-        self._device = device
 
     def replay(self) -> None:
         assert self._exec is not None, "CUDA graph executable has been reset"
@@ -103,6 +109,9 @@ class _PriorityCUDAGraphExec:
         if self._exec is not None:
             self._lib.cudaGraphExecDestroy(self._exec)
             self._exec = None
+        if self._graph is not None:
+            self._graph.reset()
+            self._graph = None
 
     def __del__(self) -> None:
         exec_handle = getattr(self, "_exec", None)
@@ -123,6 +132,7 @@ def _new_cudagraph():
 
 
 def _maybe_instantiate_priority_cudagraph(graph, device: torch.device):
+    del device
     raw_fn = getattr(graph, "raw_cuda_graph", None)
     if raw_fn is None:
         return graph
@@ -139,8 +149,7 @@ def _maybe_instantiate_priority_cudagraph(graph, device: torch.device):
         )
         if rc != 0 or not exec_ptr.value:
             return graph
-        graph.reset()
-        return _PriorityCUDAGraphExec(exec_ptr, lib, device)
+        return _PriorityCUDAGraphExec(graph, exec_ptr, lib)
     except Exception:
         return graph
 
