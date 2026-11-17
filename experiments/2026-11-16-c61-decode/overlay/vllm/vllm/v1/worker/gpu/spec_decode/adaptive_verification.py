@@ -60,7 +60,7 @@ SINGLE_REQ_TILE_SPILL_SCALE = 2.0
 # distinct experts per live draft row (~+2.5-4.1 ms/row) without cross-request
 # coalescing; scale the calibrated c1 row cost accordingly while leaving
 # multi-request concurrency (c2..c16) and long copy-draft proposals untouched.
-SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 1.0
+SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5
 
 
 def resolve_adaptive_cudagraph_mode(
@@ -403,23 +403,10 @@ class AdaptiveVerificationManager:
             if int(eligible_drafts.max(initial=0)) <= num_draft_steps
             else self.num_speculative_steps
         )
-        stale_confidences = self._stale_confidences[self._stale_idx].np[
-            slots, :step_steps
-        ]
-        survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
-        steps = np.arange(step_steps)
-        valid = steps[None, :] < eligible_drafts[:, None]
-        tau = self.effective_dead_rows_tau(num_reqs=num_reqs)
-        if tau > 0:
-            # Never admit draft slots on the host that the device dead-row
-            # threshold will immediately mask as padding.
-            valid &= survival_probability >= tau
-        scores = np.sort(survival_probability[valid])[::-1]
         max_draft_budget = min(
             int(eligible_drafts.sum()),
             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
         )
-        scores = scores[:max_draft_budget]
         num_drafts_per_req = {
             req_id: int(num_drafts)
             for req_id, num_drafts in zip(req_ids, eligible_drafts, strict=True)
@@ -432,14 +419,41 @@ class AdaptiveVerificationManager:
             self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
             >= self.req_states.prefill_len.np[slots]
         )
-        expected_tokens = np.concatenate(
-            ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
-        )
-        rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
-        utilities = expected_tokens / self._step_cost(
-            rows, num_sampling_requests=int(num_sampling_requests)
-        )
-        draft_budget = int(np.argmax(utilities))
+        tau = self.effective_dead_rows_tau(num_reqs=num_reqs)
+        if (
+            num_reqs == 1
+            and self._is_calibrated()
+            and float(getattr(self, "dead_rows_tau", 0.0)) > 0.0
+            and int(eligible_drafts.max(initial=0)) <= num_draft_steps
+            and int(num_sampling_requests) > 0
+        ):
+            # All <=5 DSpark slots fit in the single 16-row Tensor Core tile;
+            # let device DeadRows prune on current-step confidences rather than
+            # intersecting against 1-step-stale host confidences (p_k^2).
+            draft_budget = max_draft_budget
+        else:
+            stale_confidences = self._stale_confidences[self._stale_idx].np[
+                slots, :step_steps
+            ]
+            survival_probability = np.cumprod(
+                stale_confidences.astype(np.float64), axis=1
+            )
+            steps = np.arange(step_steps)
+            valid = steps[None, :] < eligible_drafts[:, None]
+            if tau > 0:
+                # Never admit draft slots on the host that the device dead-row
+                # threshold will immediately mask as padding.
+                valid &= survival_probability >= tau
+            scores = np.sort(survival_probability[valid])[::-1]
+            scores = scores[:max_draft_budget]
+            expected_tokens = np.concatenate(
+                ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+            )
+            rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
+            utilities = expected_tokens / self._step_cost(
+                rows, num_sampling_requests=int(num_sampling_requests)
+            )
+            draft_budget = int(np.argmax(utilities))
         # The confidences come from an estimator that learns only from admitted
         # drafts, so a long run of empty budgets would leave it without the
         # evidence to ever admit one again. Periodically verify one draft per
