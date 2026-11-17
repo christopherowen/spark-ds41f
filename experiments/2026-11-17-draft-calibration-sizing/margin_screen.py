@@ -1,9 +1,10 @@
-"""The margin screen's arms side by side: ``python margin_screen.py <dir>`` over
+"""A screen's arms side by side: ``python margin_screen.py <dir> [<label> ...]`` over
 ``<dir>/<label>/{c1,c16}.json`` (servebench results) and
 ``<dir>/greedy-<label>.jsonl`` (the determinism gate's summary line).
 
 For each workload: every arm's throughput, step rate, tokens committed and rows
-scheduled a step, drafts accepted a draft step; then margin on against off, as the
+scheduled a step, drafts accepted a draft step. Without labels, the margin screen's
+four arms and margin on against off, as the
 ratio of the two boots' means and as the mean of the paired differences of the
 workload's batches (the same seed gives the arms the same prompts in the same order;
 95% interval, t over the pairs)."""
@@ -42,10 +43,11 @@ def paired(on, off):
     return [round(mean, 2), round(mean - half, 2), round(mean + half, 2)]
 
 
-def main(root):
+def main(root, labels=()):
     res = {}
+    labels = tuple(labels) or OFF + ON
     for name in ("c1", "c16"):
-        arms = {label: load(root, label, name) for label in OFF + ON}
+        arms = {label: load(root, label, name) for label in labels}
         arms = {k: v for k, v in arms.items() if v}
         print(f"\n{name}" + "".join(f"{t:>16s}" for t, _ in KEYS) + "   failed")
         for label, a in arms.items():
@@ -70,7 +72,7 @@ def main(root):
             print(f"  {'paired batches':14s}" + "".join(f"{cmp[t]['paired_batches_pct'][0]:+15.2f}%" for t, _ in KEYS))
             print(f"  {'  95% interval':14s}" + "".join(f"{str(cmp[t]['paired_batches_pct'][1:]):>16s}" for t, _ in KEYS))
     greedy = {}
-    for label in OFF + ON:
+    for label in labels:
         path = os.path.join(root, f"greedy-{label}.jsonl")
         if os.path.exists(path):
             lines = [json.loads(line) for line in open(path) if line.strip().startswith("{")]
@@ -87,4 +89,4 @@ def main(root):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2:])

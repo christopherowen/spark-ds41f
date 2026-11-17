@@ -455,3 +455,24 @@ margin, the greedy steps always report the runner-up, and candidate-61's dev arm
 ([tp4-dev.json](../2026-11-16-c61-decode/tp4-dev.json)) mounts `confidence.py` and its tests.
 A head without the margin (the image's own `confidence.py`, when an arm does not mount the
 overlay's) is called as before and starts from the shipped intercepts.
+
+Two boots of the dev arm at `9649db2dc`
+([screen-margin-integrated-tp4.json](screen-margin-integrated-tp4.json), queue entry
+`20261117T192746`, dgx1..dgx4, 19:28 to 19:47 UTC; receipts:
+[receipts/margin-integrated](receipts/margin-integrated)). The dev arm was candidate-61's round
+19 by then, recorded once without the margin (`c61-r19`: 85.28 and 270.31).
+
+| Arm | Single stream tok/s | Steps/s | Tokens a step | Drafts verified a step | 16 streams tok/s | Greedy gate |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `c61-r19` (recorded, no margin) | 85.28 | 35.913 | 2.3839 | 2.587 | 270.31 | identical |
+| dev arm with the margin | 86.07 | 36.280 | 2.3825 | 2.538 | 273.96 | identical, `0a2dacdd` / `12fd8257` |
+| the same, second boot | 86.39 | 36.320 | 2.3873 | 2.543 | 274.30 | identical, `0a2dacdd` / `12fd8257` |
+
+The mean of the two boots is 86.23 single stream (+1.1% on round 19) and 274.13 at 16 streams
+(+1.4%): the screen's gain again, on the next round's code and without the switch. The first
+boot compiled 31 kernels on each node (the calibration kernel changed, and the top-2 selection
+kernels are now the only ones); the second compiled none. Ready in 113.5 and 114.6 s, no failed
+request, free memory after each stop 116.7 to 118.0 GiB.
+
+Against `candidate-60`'s recorded base (83.23 and 272.92): +3.6% single stream, +0.4% at 16
+streams.
