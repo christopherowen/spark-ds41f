@@ -351,6 +351,68 @@ check predicts of a score that cannot see most fixes. Warmup requests at startup
 
 **AgentX, three hours at 8 sessions:** running.
 
+### End of turn under agent traffic, and where its time goes
+
+The AgentX boot's first two hours (1,293 finish calls, 1,263 of them one turn): the end of turn takes far
+longer than in the screen, whose turns are short. Rank 0's events around the call:
+
+| Calls | n | Median | p90 | Max |
+| --- | ---: | ---: | ---: | ---: |
+| all | 1,293 | 0.47 ms | 2.70 ms | 5.87 ms |
+| one turn, 32–128 held steps | 468 | 0.21 ms | 1.78 ms | 4.62 ms |
+| one turn, 128–256 | 245 | 0.41 ms | 2.38 ms | 4.36 ms |
+| one turn, 256–384 | 136 | 0.69 ms | 2.67 ms | 3.21 ms |
+| one turn, 384–512 | 235 | 1.02 ms | 3.23 ms | 4.55 ms |
+| one turn, 512 or more | 103 | 1.03 ms | 3.36 ms | 3.99 ms |
+| observe's AgentX hour, for scale | 935 | 16.5 ms | 32.1 ms | 43.9 ms |
+
+Copies of W1 agreed across the four ranks at all five checks; 0 draft mismatches in 1,174,368 checked.
+
+[bundles/finish-bench-shadow](bundles/finish-bench-shadow) runs the learner's own `finish` on sp8 at serving
+shapes (rank 0 of four, a packed W2 shard built as at load, 16 slots, rings filled like finished turns), with
+one-GPU stand-ins for the collectives: their network time is not in it. `gpu` is the GPU's time alone (a
+spin queued ahead keeps the launches ahead of the GPU), `idle` what rank 0 logs with the GPU idle at the
+call, `host` the host's time in `finish`; medians of 15
+([receipts/finish-bench-shadow-2](receipts/finish-bench-shadow-2); run 1,
+[finish-bench-shadow-1](receipts/finish-bench-shadow-1), within 0.03 ms of it on `idle`):
+
+| Turns × kept steps | Chunks | gpu | idle | host |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 64 | 1 | 0.08 ms | 0.14 ms | 0.16 ms |
+| 1 × 128 | 1 | 0.14 ms | 0.19 ms | 0.17 ms |
+| 1 × 256 | 1 | 0.29 ms | 0.34 ms | 0.21 ms |
+| 1 × 384 | 2 | 0.42 ms | 0.48 ms | 0.30 ms |
+| 1 × 512 | 2 | 0.55 ms | 0.62 ms | 0.34 ms |
+| 2 × 512 | 4 | 1.15 ms | 1.23 ms | 0.59 ms |
+| 4 × 512 | 8 | 2.32 ms | 2.42 ms | 1.07 ms |
+| 8 × 512 | 16 | 4.58 ms | 4.83 ms | 2.15 ms |
+
+GPU time a launch, one turn of 512 steps (two chunks; events around each launch):
+
+| Launch | Launches | GPU | Host |
+| --- | ---: | ---: | ---: |
+| `shadow_update_kernel` | 2 | 0.249 ms | 0.027 ms |
+| `shadow_local_kernel` | 2 | 0.127 ms | 0.033 ms |
+| `vocab_embedding_packed` (decode) | 2 | 0.111 ms | 0.033 ms |
+| `shadow_totals_kernel` | 2 | 0.031 ms | 0.026 ms |
+| `shadow_combine_kernel` | 2 | 0.025 ms | 0.033 ms |
+| host-to-device copies | 6 | 0.023 ms | 0.137 ms |
+| `labels_kernel`, `reset_kernel` | 2 | 0.016 ms | 0.031 ms |
+| collective stand-ins | 4 | 0.008 ms | 0.062 ms |
+
+What this says:
+
+- The work is GPU-bound and linear in kept steps, about 0.28 ms a 256-step chunk; the host stays ahead.
+- The serving median at 384–512 steps (1.02 ms) is the bench's 0.62 ms plus about 0.4 ms, the two chunks'
+  network all-gather and all-reduce. The tail to 3–4 ms at every turn size is not work (the bench's range is
+  within 0.15 ms): it is waiting, the call's first collective absorbing whatever skew the ranks arrive with.
+- `shadow_update_kernel` is 45% of the GPU time and needlessly so: each owner block's threads each loop
+  serially over every later position for its row (positions² work). A block-wide search for the few
+  matching positions would take it to about 0.01 ms a chunk. Decode and the local kernel are then most of
+  it, near memory bandwidth (about 13 MB a chunk).
+- Even at that cost, a finished long turn holds the whole batch for a few hundred microseconds plus two
+  collectives, and the collectives bring the ranks' skew with them.
+
 ## Where it stands
 
 After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
