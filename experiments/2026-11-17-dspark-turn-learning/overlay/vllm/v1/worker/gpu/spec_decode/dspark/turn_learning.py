@@ -135,7 +135,9 @@ def capture_kernel(n_spec: int, words: int):
 def labels_kernel(n_spec: int):
     """A thread a kept entry of each finished request: the anchor and the
     committed tokens at the entry's ``n_spec`` predicted positions. ``labels`` is
-    -1 where nothing was committed (past the turn's end, or an empty entry);
+    -1 where nothing was committed past the turn's end, and -2 at every position
+    of an entry the ring does not hold (the host counted a draft step that wrote
+    no row, or the anchor lies outside the turn);
     ``ids`` (anchor, then the labels) holds 0 there, a valid row for the Markov
     lookups that teacher forcing makes."""
     finished_len, slots, cap = T.dynamic("finished_len, slots, cap")
@@ -180,7 +182,9 @@ def labels_kernel(n_spec: int):
                     token = all_tokens[
                         slot, T.min(T.max(q, T.int64(0)), T.cast(max_len - 1, T.int64))
                     ]
-                    labels_out[f, k, i] = T.if_then_else(ok, token, -1)
+                    labels_out[f, k, i] = T.if_then_else(
+                        ok, token, T.if_then_else(kept, -1, -2)
+                    )
                     ids_out[f, k, i + 1] = T.if_then_else(ok, token, 0)
 
     return labels
@@ -228,7 +232,10 @@ def stats_kernel(n_spec: int):
                 for s in T.serial(_STATS):
                     acc[s] = T.if_then_else(first != 0, T.int64(0), out[s])
                 for r in T.serial(rows):
-                    active = T.alloc_var(T.int64, init=meta[r, 1])
+                    held = labels[r, 0] != -2
+                    active = T.alloc_var(
+                        T.int64, init=T.if_then_else(held, meta[r, 1], T.int64(0))
+                    )
                     labeled = T.alloc_var(T.int64, init=T.int64(0))
                     run_forced = T.alloc_var(T.int64, init=T.int64(0))
                     run_draft = T.alloc_var(T.int64, init=T.int64(0))
@@ -251,7 +258,7 @@ def stats_kernel(n_spec: int):
                                 run_draft = run_draft + 1
                             else:
                                 live_draft = 0
-                        if drafted & (replay[r, i] != T.cast(drafts[r, i], T.int64)):
+                        if held & drafted & (replay[r, i] != T.cast(drafts[r, i], T.int64)):
                             mismatches = mismatches + 1
                     acc[0] = acc[0] + T.if_then_else(labeled > 0, T.int64(1), T.int64(0))
                     acc[1] = acc[1] + labeled

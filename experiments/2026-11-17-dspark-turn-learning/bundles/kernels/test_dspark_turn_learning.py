@@ -94,6 +94,7 @@ def _labels_reference(finished, tokens, total_len, meta, count, cap):
             pos = int(meta[slot, k, 0])
             kept = k < kept_entries and 0 <= pos < total
             if not kept:
+                labels[f, k] = -2
                 continue
             ids[f, k, 0] = int(tokens[slot, pos])
             for i in range(N_SPEC):
@@ -142,7 +143,8 @@ def test_reset_clears_only_the_given_rings():
 def _stats_reference(labels, drafts, meta, replay, forced, start):
     acc = list(start)
     for r in range(labels.shape[0]):
-        active = int(meta[r, 1])
+        held = int(labels[r, 0]) != -2
+        active = int(meta[r, 1]) if held else 0
         labeled = run_forced = run_draft = mismatches = 0
         live_forced = live_draft = True
         for i in range(N_SPEC):
@@ -160,7 +162,7 @@ def _stats_reference(labels, drafts, meta, replay, forced, start):
                     run_draft += 1
                 else:
                     live_draft = False
-            if drafted and int(replay[r, i]) != int(drafts[r, i]):
+            if held and drafted and int(replay[r, i]) != int(drafts[r, i]):
                 mismatches += 1
         acc[0] += labeled > 0
         acc[1] += labeled
@@ -181,6 +183,7 @@ def test_stats_count_accepted_prefixes_and_replay_mismatches(first):
     labels = torch.randint(0, vocab, (rows, N_SPEC), dtype=torch.int32)
     labels[1, 3:] = -1
     labels[4, :] = -1
+    labels[6, :] = -2  # an entry the ring does not hold: its stale replay is not counted
     drafts = torch.randint(0, vocab, (rows, N_SPEC), dtype=torch.int32)
     meta = torch.zeros((rows, 2), dtype=torch.int64)
     meta[:, 1] = torch.tensor([5, 3, 5, 1, 5, 2, 4])
@@ -188,6 +191,7 @@ def test_stats_count_accepted_prefixes_and_replay_mismatches(first):
     replay[:rows] = drafts.to(torch.int64)
     replay[2, 1] += 1  # one replay mismatch inside the drafted span
     replay[3, 4] += 1  # past the drafted span: not counted
+    replay[6, 0] += 1  # in an entry the ring does not hold: not counted
     forced = torch.randint(0, vocab, (pred_rows, N_SPEC), dtype=torch.int64)
     forced[0] = labels[0].to(torch.int64)  # a fully accepted block
     out = torch.tensor([11, 22, 33, 44, 55, 66, 77, 88], dtype=torch.int64)

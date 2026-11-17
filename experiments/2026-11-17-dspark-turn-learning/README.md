@@ -68,7 +68,7 @@ python3 scripts/lab.py kernel-local experiments/2026-11-17-dspark-turn-learning/
 
 Result: 6 passed.
 
-## Observe run (prepared)
+## Observe run
 
 [observe-tp4-switched.json](observe-tp4-switched.json), on `tp4-switched` (sp1..sp4), profile
 [tp4-switched-observe.json](tp4-switched-observe.json) (capacity 256 draft steps a request, dumps to
@@ -93,3 +93,49 @@ turn also copies its rows to the host.
 ```bash
 bin/spark candidate queue tp4-switched experiments/2026-11-17-dspark-turn-learning/observe-tp4-switched.json --apply
 ```
+
+
+### Smoke boot (2026-11-17, queue entry `20261117T015246-observe-tp4-switched`)
+
+Boot ready at 01:55Z on `candidate-60-afcaac35` with the overlay; the learner logged its ring (256 draft
+steps a request, 200 MiB of rows a rank) and wrote every finished turn to `/cache/turn-learning` on sp1.
+Turn lines up to the gates: [receipts/observe-smoke/turn-learning-lines.log](receipts/observe-smoke/turn-learning-lines.log).
+
+| | Value |
+| --- | --- |
+| Turns replayed (workload, before the gates) | 114 |
+| Entries the ring held / labeled positions | 6,878 / 34,045 |
+| Replay mismatches in held entries | 0 |
+| `draft_accepted == forced_accepted_active` | on every turn |
+| End of turn | median 10.6 ms, max 17.3 ms; 0.124 ms a kept draft step (two chains, head re-projection, dump copy) |
+| Gates (`bin/spark candidate gate`, candidate-60's hashes) | pass: log-probabilities `18d61961` / `d6568649`, text `0a2dacdd` / `12fd8257`, identical |
+
+One turn (17) reported 5 replay mismatches with 0 labeled entries: the host had counted 3 draft steps
+that wrote no ring row, and the counters compared those empty slots. The labels kernel now writes -2 for
+an entry the ring does not hold (-1 stays "past the turn's end") and the counters skip such entries; the
+kernel test covers it (6 passed on sp8 after the change). The running boot carries the earlier counters;
+its dumps are unaffected (the study reads only labels >= 0).
+
+### First offline study (smoke turns only)
+
+[bundles/study](bundles/study) on sp8 over the 147 turns the smoke boot wrote (workload and gates),
+loaded W1 and five step sizes of three update rules, each turn scored before it is learned
+([receipts/study-smoke/output.jsonl](receipts/study-smoke/output.jsonl)):
+
+- The single-GPU replay agrees with the serving drafts at 99.2% of drafted positions (different
+  arithmetic, near ties).
+- The committed token is among the draft step's block maxima at 72% of labeled positions.
+
+Teacher-forced accepted tokens a block, learned against loaded:
+
+| Turns | Blocks | Loaded | full, 0.1 | shard maxima + label, 0.1 | block maxima, 0.1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| coding conversations (1-24) | 32 | 1.19 | +42.1% | +39.5% | 0.0% |
+| held-out prompts (25-40) | 1,070 | 3.94 | +0.3% | +0.3% | +0.3% |
+| determinism and greedy gates (41+) | 9,115 | 1.65 | +34.8% | +32.5% | +16.2% |
+
+This sample does not answer the agent-traffic question. The gates send the same prompts again and
+again, so their gain is learning text that repeats; the 16 distinct held-out prompts leave little room
+(3.9 of 5 accepted) and barely move; the coding conversations kept only 32 DSpark blocks in 24 turns
+(most of their steps were copy-drafted). At step 0.1 the most-updated W1 rows moved 5.2 times their own
+norm, so a drift cap is needed. The AgentX hour is the test.
