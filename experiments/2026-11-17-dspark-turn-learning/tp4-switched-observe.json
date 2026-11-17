@@ -1,21 +1,49 @@
 {
-  "notes": "candidate-60 at tp4-switched with the DSpark turn learner in observe mode mounted from overlay/: each request's draft rows kept in a 256-step ring inside the draft graph, the turn replayed when it finishes (drafts reproduced, teacher-forced acceptance counted), rank 0 writing each turn to /cache/turn-learning; no draft or weight changes",
+  "notes": "candidate-60 (image alias candidate-60-afcaac35: the final candidate-60 build, tree afcaac35, copied from dgx4; README.md says why) at tp4-switched with the DSpark turn learner in observe mode mounted from overlay/: each request's draft rows kept in a 256-step ring inside the draft graph, the turn replayed when it finishes (drafts reproduced, teacher-forced acceptance counted), rank 0 writing each turn to /cache/turn-learning; no draft or weight changes; its own copy of candidate-60's source lock (upstreams.lock.json, unchanged), since the learner's variables are not in candidate-60's qualified profile",
   "extends": {
     "config": "experiments/2026-11-16-c60-prefill/tp4-switched.json"
   },
   "set": {
     "container": {
       "mounts": [
-        ["{checkout}/cache", "/cache", "rw"],
-        ["{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py", "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py", "ro"],
-        ["{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py", "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py", "ro"],
-        ["{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/model_runner.py", "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py", "ro"]
-      ]
+        [
+          "{home}/.cache/huggingface/hub",
+          "/hub",
+          "ro"
+        ],
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf",
+          "/glp/vector.gguf",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ]
+      ],
+      "image": "spark-ds41f:candidate-60-afcaac35"
     },
     "environment": {
       "VLLM_DSPARK_TURN_LEARNING": "observe",
       "VLLM_DSPARK_TURN_LEARNING_CAPACITY": "256",
       "VLLM_DSPARK_TURN_LEARNING_DUMP": "/cache/turn-learning"
-    }
+    },
+    "upstreams_config": "experiments/2026-11-17-dspark-turn-learning/upstreams.lock.json"
   }
 }
