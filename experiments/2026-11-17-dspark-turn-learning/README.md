@@ -566,9 +566,11 @@ calls, 934 turns, 359,043 trained positions; the copies agreed at all three chec
 | on the step (on-step shadow, its three hours) | 0.48 ms | 2.86 ms | | 5.87 ms | 1.94 s |
 
 The learner's stream time includes waiting at its collectives for the other ranks. The step's p90 of
-0.20 ms is ten times the screen boots' and the bench's: a likely cause is that the learner's stream starts on
-the staging's event, before the reset kernel, so the reset (and so the step's next work) can wait for SMs
-the learner's first kernels hold. Recording the event after the reset would remove that wait; not yet done.
+0.20 ms is ten times the screen boots' and the bench's, and its cause is not known. (Not the reset: the
+learner's stream already waits for an event recorded after the reset kernel.) The step's interval opens
+before `finish` builds the call's host-to-device copy and launches the staging, so where the GPU is idle at
+the call it includes that host work, and where other streams' work holds the SMs the staging waits for it;
+AgentX's long turns make both larger.
 
 **Attribution** ([comm-attribution-tp4-switched.json](comm-attribution-tp4-switched.json), the suite
 [model-grid-suite.json](model-grid-suite.json): the screen's model and grid steps alone): six boots
@@ -619,3 +621,33 @@ against 0.48 and 2.86 ms on the step), its outputs are candidate-60's, and c16 s
 does: its target forward is 1.2% slower with the learner present and idle, in both boots, and the
 attribution job puts that on the learner's own NCCL communicator (+0.91% alone). The exchange is what has
 to change: the step's existing communicator, a communicator off the RDMA path, or the CPU group.
+
+### The learner's exchange
+
+[overlay-exchange/speculator.py](overlay-exchange/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py):
+`VLLM_DSPARK_TURN_LEARNING_EXCHANGE` picks the communicator shadow's two exchanges a chunk go through;
+nothing else changes (`turn_learning_shadow.py` is overlay-offstep's).
+
+- `own`: the recorded design, a communicator of the learner's own on NCCL's default network (RoCE).
+- `step` ([tp4-switched-exchange-step.json](tp4-switched-exchange-step.json)): the tensor-parallel group's
+  existing pynccl communicator, which carries the step's collectives that sparknet does not (all-reduces over
+  2 MiB, all-gathers over 4 MiB, the rest); nothing is made. NCCL runs one communicator's operations in
+  issue order whatever their stream, and every rank issues the step's and the learner's in the same order,
+  so a step operation on it can wait for a learner exchange in flight.
+- `socket` ([tp4-switched-exchange-socket.json](tp4-switched-exchange-socket.json)): a communicator of the
+  learner's own made by `ncclCommInitRankConfig` with NCCL 2.30's `ncclConfig_t` and the network set to
+  Socket: TCP, no RDMA registrations or queue pairs. `NCCL_NET=IB` in the environment overrides a
+  communicator's `netName`, so it is cleared for this init only and restored; NCCL's Socket network starts at
+  this init (the step's communicators run IB only), so its interface is set for this init too, to
+  `enp1s0f0np0` (the 200 GbE port's netdev; the bootstrap's `enP7s7` is 1 GbE).
+
+One-rank checks on sp8, candidate-60 image ([receipts/socket-check](receipts/socket-check)): with
+`NCCL_NET=IB` set, the Socket config made a communicator on "network Socket" and a default one after it
+still took IB; made after an IB communicator, as in serving, the Socket network bound `enp1s0f0np0`
+(10.30.0.16), and both variables read their profile values afterwards; the subclass's path (vLLM's
+unique id, warm-up and collectives) all-reduced. The `step` exchange needs ranks; the job's model step is
+its first run.
+
+[exchange-tp4-switched.json](exchange-tp4-switched.json): the model and grid steps, six boots alternating
+the learner off, `step` and `socket`. A fix passes here if the grid reads the learner-off boots' speed; c16
+and AgentX then measure what its exchanges cost the step.
