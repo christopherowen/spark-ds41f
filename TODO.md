@@ -210,9 +210,11 @@ collectives, and DSpark drafting.
    Q-B already pack `[N // 128, K // 128, 128, 128]` tiles (`TILE_CONTIGUOUS_FP8`).
    On `sp8` (`M=3`, `block_M=16`, Cold-L2 across 10 copies), `wo_b` `(5120, 2048)`
    is bit-identical with `tile_contiguous=True` and speeds up from `51.93` to
-   `48.90 us/call` (`-3.03 us/call`, `x40 = -0.12 ms/step`); wiring it for `wo_b`
-   needs care in `TileLangWOProjection` so SP prefill's peer `sp_shards` gather and
-   GEMMs handle packed weights consistently across TP3/TP4/TP8.
+   `48.90 us/call` (`-3.03 us/call`, `x40 = -0.12 ms/step`); wired in `c61-r8`
+   for `(5120, 3072)`, `(5120, 2048)`, `(5120, 1024)` (`gemm.py` + `wo.py`
+   `_PeerWeight`, `_sp_prefill_calls`, and `bind` unpacking/repacking for
+   heterogeneous TP ranks; `69 passed` across `test_deepseek_v41_tilelang_wo`,
+   `test_tile_contiguous_fp8_matches_row_major`, and `test_deepseek_v4_1_attention`).
 4. **Vocabulary head (`128`-row token tile and per-tile epilogue summary).**
    - **A 128-row token tile:** a head call with 65–128 rows on TP4 `c16` runs a
      second 64-row tile that re-reads and unpacks the 248 MB shard from DRAM.
@@ -235,14 +237,18 @@ collectives, and DSpark drafting.
    the compressor and scores only the `n_new` ($\le M$) newly written blocks,
    merging the `n_new` scores into the sorted `k` prefix keys in a lightweight
    merge kernel before MLA. Passing `cudaGraphInstantiateFlagUseNodePriority`
-   (`0x08`) via `_PriorityCUDAGraphExec` (`cudagraph_utils.py`) with highest-priority
-   `aux_stream` (`priority=-3` on SM121 `(0, -3)`, `torch_utils.py`) is staged in
-   `c61-r7`: on `sp8` Cold-L2 40-layer `Shared + Routed MoE` (`H=5120, I=576`),
-   `pm3 + 0x08` beats `p0` by `-2.5` to `-5.7 us/call` across `live=1..4` (`live=1`:
-   `225.7 -> 223.2`, `live=2`: `342.0 -> 337.8`, `live=3`: `455.7 -> 451.6`,
-   `live=4`: `570.8 -> 565.1 us`; `-0.10` to `-0.23 ms/step`). Still open: overlapping
-   DSpark context-KV preparation and compressor/indexer-key writes on `aux_stream`,
-   plus incremental `old + new` indexer scoring. First bound how
+   (`0x08`) via `_PriorityCUDAGraphExec` (`cudagraph_utils.py`, retaining `self._graph`
+   until `reset()` so `CUDACachingAllocator` pool refcounts stay nonzero across
+   shared-pool captures) with highest-priority `aux_stream` (`priority=-3` on
+   SM121 `(0, -3)`, `torch_utils.py`) landed in `c61-r7` (`7bec4cd0b`): on `sp8`
+   Cold-L2 40-layer `Shared + Routed MoE` (`H=5120, I=576`), `pm3 + 0x08` beats
+   `p0` by `-2.5` to `-5.7 us/call` across `live=1..4` (`live=1`: `225.7 -> 223.2`,
+   `live=2`: `342.0 -> 337.8`, `live=3`: `455.7 -> 451.6`, `live=4`: `570.8 -> 565.1 us`;
+   `-0.10` to `-0.23 ms/step`), and `c61-r7-screen-tp4` measured `c1 = 83.34 tok/s`
+   (`35.81 steps/s`, `27.93 ms/step`, `2.336 tok/step`; paired `prose dec = 86.64`,
+   `code dec = 89.40`), `c16 = 271.47 tok/s`, and `greedy = identical`. Still open:
+   overlapping DSpark context-KV preparation and compressor/indexer-key writes on
+   `aux_stream`, plus incremental `old + new` indexer scoring. First bound how
    much of the latency-bound bucket is serial dependency rather than SM
    occupancy; if GB10's 48 SMs or 99 KiB per-CTA shared memory serialize
    concurrent streams during tail waves, screen co-tuning pipeline stages /
@@ -257,10 +263,18 @@ collectives, and DSpark drafting.
    those already-valid KV slots before `griddepcontrol.wait` overlaps LPDDR5X KV
    fetch latency with the upstream tail, waiting on `griddepcontrol.wait` only
    for the newly written KV rows and `q`. Likewise, in PDL-chained decode
-   projections and GEMMs (`0739`, `0755`, `0756`, `WO-B`), ensure stage-0 weight
-   and scale tile loads issue before `griddepcontrol.wait` so LPDDR5X weight
-   reads overlap the producer's final wave before the consumer waits on the
-   activation tile.
+   projections and GEMMs (`0739`, `0755`, `0756`, `MOE DOWN`, `WO-B`), ensure
+   stage-0 immutable weight and scale tile loads issue before
+   `griddepcontrol.wait` so LPDDR5X weight reads overlap the producer's final
+   wave before the consumer waits on the activation tile. In `c61-r8`,
+   `grouped_fp8_fp4_gemm(..., gather=False)` (`moe.py`) stages stage-0 TMA
+   weight tiles (`tl::tma_load`) and scale codes (`SFB`/`SFB8`) before
+   `cudaGridDependencySynchronize()` while keeping producer-written `A`/`SFA`
+   strictly after (`140 passed` in `test_deepseek_v41_tilelang_moe.py`; `sp8`
+   Cold-L2 Routed MoE full `M=4: 497.15 -> 465.46 us/L [-1.27 ms/40L]`, `M=6:
+   736.27 -> 699.36 us/L [-1.48 ms/40L]`; `M=1..3` unchanged at `134.8/243.8/353.4 us/L`).
+   Still open: stage-0 weight preload in `mxfp8_gemm_decode` (`WO-B`/`WQ-B`/`SHARED`)
+   and two-phase KV preload in `sparse_mla.py`.
 7. **Forward-fusing `mHC` stream finalize and MXFP8 quantization into consumer
    projections (plus fused `embed` + Layer-0 `project_streams`).** Unlike
    1-launch atomic `project_and_finalize_streams` (which regressed in `#946`),
@@ -385,7 +399,7 @@ Open levers:
 - **Drafter reuse of the target's token selection.** Check whether reusing the
   target model's indexer top-k selection from the anchor position in DSpark
   draft layers preserves acceptance while cutting drafter attention work.
-- **Certified `W_q` Cauchy-Schwarz screening for DSpark (`project_head_screened_markov_greedy_pairs`) and $\ell_2$-optimal `build_screen_weights`.** Commit `0f2eb0a85` (`fuses_screened_markov_greedy`, active in `c61-r5`+) screens single-request DSpark Markov drafting via 8-bit `W_q` (`cudagraph screened` `639.7 µs` vs `cudagraph dense` `678.6 µs` on `sp8`, `N=32320, K=2560, R=256, steps=5`), and `c61-r6` adds load-time per-row $\ell_2$-optimal `alpha` grid search `(1.0, 0.93, ..., 0.55)` in `build_screen_weights()` (`86 passed, 6 skipped`; tightens heavy-tailed `row_bound` while matching `alpha=1.0` on Gaussian weights). Check whether `extreme_mask` (`w_in_f`) rows still emit conservative `row_bound` on real `lm_head` checkpoints and whether widening the alpha grid or finite outlier bounds further trims `active_count`.
+- **Certified `W_q` Cauchy-Schwarz screening for DSpark (`project_head_screened_markov_greedy_pairs`) and $\ell_2$-optimal `build_screen_weights`.** Commit `0f2eb0a85` (`fuses_screened_markov_greedy`, active in `c61-r5`+) screens single-request DSpark Markov drafting via 8-bit `W_q` (`cudagraph screened` `639.7 µs` vs `cudagraph dense` `678.6 µs` on `sp8`, `N=32320, K=2560, R=256, steps=5`), and `c61-r6` adds load-time per-row $\ell_2$-optimal `alpha` grid search `(1.0, 0.93, ..., 0.55)` in `build_screen_weights()` (`86 passed, 6 skipped`; tightens heavy-tailed `row_bound` while matching `alpha=1.0` on Gaussian weights). On `sp8` Cold-L2 at Flash TP4 head geometry (`V=32320, H=5120, K_m=512`), `lm_head_greedy` runs in `844.4 / 825.1 / 828.9 us/step` (`M=1/3/6`), `screen_head_base(M=5)` runs in `801.3 us/step`, and screened+5×Markov (`M=2/3/5`) saves `-240.1 / -221.7 / -111.0 us/step` over dense (`1338.3 -> 1098.3`, `1413.1 -> 1191.4`, `1563.5 -> 1452.5 us/step`). Check whether `extreme_mask` (`w_in_f`) rows still emit conservative `row_bound` on real `lm_head` checkpoints and whether widening the alpha grid or finite outlier bounds further trims `active_count`.
 - **Load-time scale-code search for online NVFP4 draft projections.** If
   revisiting `Nvfp4OnlineLinearMethod` / `prepare_nvfp4_head` (`0647`) for
   DSpark draft or Markov projections (where target verification keeps outputs
@@ -671,8 +685,11 @@ Don't repeat these without a new reason:
   same-context stream, regressing per-layer decode latency by `+5.3` to
   `+8.1 µs/layer` [`+1.4–3.5%`] against `VLLM_L2_PREFETCH_GRID=2`); Decode #10
   multi-row SWA KV sharing in `sparse_mla.py` (`sp8`: `rows=1..6` adds only
-  `+0.14..0.21 µs/layer` because L2 already serves shared SWA KV); Decode #6 global
-  reads before `T.pdl_sync()` (`PDL CHAIN` contract forbids pre-sync global reads);
+  `+0.14..0.21 µs/layer` because L2 already serves shared SWA KV); Decode #6
+  speculative pre-sync reads of producer-written dynamic buffers (`PDL CHAIN`
+  forbids reading upstream outputs before `T.pdl_sync()`, whereas static metadata
+  and immutable checkpoint weights like `moe_down` `B`/`SFB` preloaded in `c61-r8`
+  are safe per `pdl.py`);
   Decode #8 `q` RoPE piggyback (`0.59 µs/layer` on `aux_stream`, KV-RoPE already
   fused in `attention_front`); and Decode #13 mid-network Layer 16/20 routed-MoE
   pruning (DS4.1 safetensors carry no intermediate Layer 16/20 LM head/probe

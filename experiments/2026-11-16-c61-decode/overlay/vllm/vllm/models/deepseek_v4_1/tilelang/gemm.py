@@ -2657,13 +2657,17 @@ DECODE_TILE_ROWS = (16, 32, 48, DECODE_ROWS)
 # to B12X over the three is lowest. Every field only changes speed: each tile
 # accumulates K in the same order, so a row's bits do not depend on the tile
 # or on prefill.
-# Decode Q-B (8192 x 1280) and indexer Q-B (4096 x 1280) pack their [N, K] weights
-# into [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
+# Decode Q-B (8192 x 1280), indexer Q-B (4096 x 1280), and WO-B
+# (5120 x 3072/2048/1024) pack their [N, K] weights into
+# [N // 128, K // 128, 128, 128] tiles so each decode and prefill tile reads a
 # contiguous 128-wide slab per K step while keeping bit-identity with row-major [N, K].
 TILE_CONTIGUOUS_FP8: set[tuple[int, int]] = {
     (12288, 1280),
     (8192, 1280),
     (4096, 1280),
+    (5120, 3072),
+    (5120, 2048),
+    (5120, 1024),
 }
 
 DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
