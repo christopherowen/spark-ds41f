@@ -621,8 +621,9 @@ Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 
 against 0.48 and 2.86 ms on the step), its outputs are candidate-60's, and c16 shows no cost. The grid
 does: its target forward is 1.2% slower with the learner present and idle, in both boots, and c16 is
 too prefill-heavy to rule that out for served decode. The learner's own communicator alone costs +0.91%;
-moving the exchange to the step's communicator leaves +0.58% and to a Socket one +1.28%, so the cost follows
-something both share, possibly the memory held from load, rather than the exchange's path.
+moving the exchange to the step's communicator leaves +0.58% and to a Socket one +1.28%, and memory held from
+load alone costs nothing. The cost follows NCCL work done for the learner, and grows with the step's rows the
+way its all-reduces do.
 
 ### The learner's exchange
 
@@ -684,3 +685,23 @@ alternating the learner off and the learner off with 150 or 350 MiB merely held 
 theirs; [tp4-switched-reserve-150.json](tp4-switched-reserve-150.json),
 [tp4-switched-reserve-350.json](tp4-switched-reserve-350.json)). If the grid slows with the amount, the cost
 is memory held from load, whatever holds it; if not, it is in what the learner and a communicator do.
+
+Queue entry `20261117T183957-reserve-tp4-switched`, commit `3eca953c9`; receipts [reserve](receipts/reserve)
+(grids, startup memory, telemetry, verdicts, [grid-split.txt](receipts/reserve/grid-split.txt), each reserve
+boot's log line). All four reserve boots logged their amount.
+
+| Grid against the learner off (geometric mean, 20 shapes) | Whole step | Target forward |
+| --- | ---: | ---: |
+| 150 MiB held from load | −0.17% | −0.15% |
+| 350 MiB held from load | +0.01% | +0.07% |
+| learner off, repeat | +0.23% | +0.21% |
+
+**Memory held from load costs nothing.** The costs above follow NCCL work done for the learner: the
+communicator alone (made, and exercised 16 times on a side stream at load), the learner's exchanges over a
+Socket communicator, and the learner's exchanges over the step's own communicator from the learner's stream.
+The grid's forward time is GPU time between CUDA events on the step's stream (the steps queue back to back,
+one sync at the end), and the cost has a shape: within ±0.15 ms up to 16 rows, then growing with the rows
+(the communicator alone: +0.11 to +0.19 ms at 24 rows, +0.40 ms at 32, +0.53 to +0.62 ms at 48, +0.77 ms at
+72, +1.13 ms at 96). The step's all-reduces grow the same way (96 rows is a 1.4 MB message, which sparknet's
+one-shot RoCE all-reduce carries with its CPU proxy), so the step's own collectives are the first suspect; a
+per-kernel profile of the grid with and without the communicator would show it.
