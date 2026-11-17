@@ -127,6 +127,12 @@ finished turn on rank 0: a data-collection run, not a speed comparison.
 bin/spark candidate queue tp4-switched experiments/2026-11-17-copy-drafter-reach/observe-tp4-switched.json --apply
 ```
 
+First attempt (queue entry `20261117T204003`, at `fa29a52cf`): the boot failed on every rank
+with `ModuleNotFoundError: ... dspark.turn_learning_shadow`. The turn-learning experiment's
+speculator now imports its shadow module in every mode, and its observe profile, which this
+arm extends, predates that and does not mount it. The arm now mounts it too. No request was
+served and nothing was dumped.
+
 ## Limits
 
 - AgentX at 8 sessions on candidate-60; the copy drafter of candidate-61 differs in its guards
