@@ -773,3 +773,14 @@ an idle communicator holds is threads (its proxy's, the network's) and, once exe
 step's critical path lengthens after its collectives, whose completion sparknet's CPU proxy drives. Next to
 separate: the communicator made, exercised and destroyed (threads and connections gone); and made with its
 threads confined to the cores sparknet's proxy and the worker do not use.
+
+**The communicator's threads** ([commthreads-tp4-switched.json](commthreads-tp4-switched.json); the model and
+grid steps, six boots alternating): the learner off; the communicator alone, exercised and then destroyed
+([tp4-switched-comm-destroyed.json](tp4-switched-comm-destroyed.json)); and the communicator alone made and
+exercised from a thread confined to the efficiency cores 0–4 and 10–14 (capacity 718–731 against 997–1024 on
+5–9 and 15–19, all four nodes), so the threads NCCL starts inherit them (`NCCL_IGNORE_CPU_AFFINITY=1`), then
+left idle ([tp4-switched-comm-little.json](tp4-switched-comm-little.json)).
+[overlay-commthreads/](overlay-commthreads) is overlay-comm's speculator with both switches; it logs the
+threads the communicator started and their cores, and what remains after a destroy. If confining the threads
+removes the cost, it is CPU interference with the step's proxy or worker, and the learner keeps its
+communicator made that way; if only a destroy removes it, it is what a live communicator holds.
