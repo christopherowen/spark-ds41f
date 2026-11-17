@@ -1503,6 +1503,22 @@ class QualifiedRecipeProblemsTest(unittest.TestCase):
         self.assertTrue(any("SPARKNET_ROCE_MAX_COLLECTIVE_BYTES='4194304', expected qualified '2097152'" in w for w in warnings))
         self.assertTrue(any("serve_args differ from qualified profile" in w for w in warnings))
 
+    def test_profiler_arm_is_not_serve_args_drift(self) -> None:
+        import copy
+
+        c55_lock = spark.read_json("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/upstreams.lock.json")
+        tp4 = spark.read_cluster("experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp4.json")
+        nodes = self._nodes("tp4-ring")
+        self.assertEqual(spark.qualified_recipe_problems(tp4, nodes, c55_lock), [])
+        profiled = copy.deepcopy(tp4)
+        profiled["serve_args"] = profiled["serve_args"] + ["--profiler-config", '{"profiler": "torch"}']
+        self.assertEqual(spark.qualified_recipe_problems(profiled, nodes, c55_lock), [])
+        # Another argument beside it is still drift.
+        profiled["serve_args"] = profiled["serve_args"] + ["--disable-log-requests"]
+        warnings = spark.qualified_recipe_problems(profiled, nodes, c55_lock)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("serve_args differ from qualified profile", warnings[0])
+
 
 if __name__ == "__main__":
     unittest.main()

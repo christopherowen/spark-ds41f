@@ -83,6 +83,9 @@ _RENDERED_ENV_KEYS = frozenset((
     "VLLM_HOST_IP",
 )) | frozenset(cluster_recipe.SWITCHED_DIRECT_ENV)
 _REPORTING_SERVE_ARGS = frozenset(("--enable-prompt-tokens-details", "--enable-per-request-metrics"))
+# Diagnostic arguments with a value: a profiler arm (the lab's `profile` job reads its trace
+# directory from --profiler-config) is its base profile plus this one argument.
+_DIAGNOSTIC_SERVE_OPTIONS = frozenset(("--port", "--profiler-config"))
 _L2_PREFETCH_DEFAULT_RE = {
     key: re.compile(rf'_mb\("{re.escape(key)}",\s*"(\d+)"\)')
     for key, _ in _L2_PREFETCH_DEFAULT_MB
@@ -174,7 +177,7 @@ def _comparable_serve_args(args: list) -> list[str]:
         if skip_next:
             skip_next = False
             continue
-        if item == "--port":
+        if item in _DIAGNOSTIC_SERVE_OPTIONS:
             skip_next = True
             continue
         if item in _REPORTING_SERVE_ARGS:
