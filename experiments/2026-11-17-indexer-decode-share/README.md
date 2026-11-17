@@ -179,8 +179,43 @@ The engine grid's fixed step, boot 1 (124 steps a window, both shapes together; 
 The fixed step's score kernel takes 17.6 µs at every context length, where a real step's
 takes 331 µs at 1,001K: the fixed step does not score the long context. Its MoE kernels own
 0.08 ms against 14.1 ms in a real step (the grouped expert GEMM takes 5.3 µs a launch
-against 176 µs), which is the difference between the fixed step and a real one. Why the
-fixed step's expert GEMM and scoring do so little is not examined here.
+against 176 µs), which is the difference between the fixed step and a real one.
+
+### Why the fixed step does so little
+
+Read in the image's vLLM tree (`afcaac3594ac`); the kernel times are sp1's, boot 1, per
+launch, real step at 4K / fixed step at 4K (the fixed step's are the same at 999K).
+
+- **Every dummy row is a padding row, and the routers skip padding rows.**
+  `InputBatch.make_dummy` (`vllm/v1/worker/gpu/input_batch.py`) fills `is_padding` with
+  True for all of the step's rows and its token ids with zero. With
+  `VLLM_MOE_SKIP_PADDING` (on by default) the routing gives a padding row expert -1 and
+  weight 0 and the dispatch skips it (`models/deepseek_v4_1/tilelang/router.py`; in this
+  stack since `patches/vllm/0035-tilelang-routing-skips-padding.patch`). So a dummy step
+  routes no row: the grouped expert GEMM takes 174.7 / 5.3 µs, the dispatch 13.8 / 4.1 µs,
+  the SwiGLU cast 32.7 / 2.0 µs and the router 25.1 / 11.9 µs.
+  `patches/vllm/0009-dspark-profile-distinct-tokens.patch` describes the same hole in the
+  DSpark cost profile and closed it for that profile only (pseudo-random tokens marked as
+  real rows); the image no longer has that switch, and the engine grid runs the plain dummy
+  step.
+- **A dummy row sees no compressed context, whatever `context_len` is.**
+  `set_dummy_context` gives the dummy requests sequence lengths, positions and block
+  tables, but the dummy slot mappings stay `PAD_SLOT_ID` (-1,
+  `BlockTables.get_dummy_slot_mappings`). The DS4.1 metadata builder
+  (`models/deepseek_v4_1/tilelang/metadata.py`, `metadata_builder`) marks a row of a
+  non-ring cache group valid only when its slot is not negative, and gives an invalid row
+  a visible length of 0. The indexer's lengths are those visible lengths, so the score
+  kernel has no live tile (26.6 / 18.2 µs; 331.9 µs in a real step at 1,001K), the top-k
+  segment kernel selects nothing (12.5 / 4.5 µs) and the sparse attention kernels read no
+  compressed position (22.4 / 14.2 µs). Only the sliding-window ring, whose validity does
+  not depend on the slot, keeps its context.
+
+So the grid's decode shapes time a step without routed-expert work and without
+long-context selection or attention over compressed positions: its context lengths change
+only the metadata. A change to the expert GEMM, the dispatch or the indexer at depth does
+not move the grid, and the rest of the step weighs about twice what it does in a real
+step. The grid's prefill shape builds its batch with the same `make_dummy`; it was not
+profiled here.
 
 ## Conclusion
 
@@ -204,8 +239,11 @@ fixed step's expert GEMM and scoring do so little is not examined here.
   256K and 1016K shapes do not measure long-context decode.
 - A real one-stream step takes 28.9 ms at 4K, twice the fixed step's 13.6 to 14.6 ms at 3
   to 6 rows. The difference is the MoE expert GEMM, which owns 14.1 ms of a real step and
-  0.08 ms of the fixed step.
+  0.08 ms of the fixed step: the grid's dummy rows are flagged as padding and the routers
+  skip them. Its dummy rows also have no valid cache slot, so they see no compressed
+  context at any context length.
 
-Not covered: why the fixed step's
-expert GEMM and scoring do so little work, the per-stream tail at depth, other content than
-Python source, more than one stream, and shapes other than `tp4-switched`.
+Not covered: a fixed step that routes its rows and reads its context (a change to the
+dummy step would start a new grid, not comparable with the recorded ones), the grid's
+prefill shape, the per-stream tail at depth, other content than Python source, more than
+one stream, and shapes other than `tp4-switched`.
