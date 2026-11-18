@@ -20,6 +20,8 @@ import datetime
 import hashlib
 import json
 import math
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -89,6 +91,34 @@ def output_name(step: dict) -> str:
     return f"{step['id']}.json.gz" if step["command"] == "model" else f"{step['id']}.json"
 
 
+def cool_if_configured(phase: str, log=print) -> None:
+    """Cool cluster nodes when ``SPARK_BENCH_COOL`` was exported by ``bin/spark bench``."""
+    raw = os.environ.get("SPARK_BENCH_COOL")
+    if not raw:
+        return
+    spec = json.loads(raw)
+    below_c = float(spec["cool_below"])
+    if below_c <= 0:
+        return
+    import argparse
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import spark_ds41f.bench as sb
+    import spark_ds41f.config as sc
+    cluster, nodes, _ = sc.configuration(
+        argparse.Namespace(cluster_config=spec["cluster_config"], shape=None, nodes_config=None)
+    )
+    log(f"servebench: cooling before {phase} (< {below_c:g} C)")
+    sb.cool_nodes(
+        nodes,
+        nodes["nodes"],
+        below_c,
+        float(spec["cool_timeout"]),
+        fan_control=sb.fan_control_enabled(cluster),
+    )
+
+
 def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, corpus: str | None = None,
         metadata: dict | None = None, log=print, model_evidence: dict | None = None) -> dict:
     """Run every step through servebench's ``main`` and write ``suite.json``."""
@@ -115,7 +145,9 @@ def run(main, url: str, suite: dict, out_dir: str, *, label: str | None = None, 
              "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "steps": []}
     if metadata is not None:
         index["metadata"] = metadata
-    for step in suite["steps"]:
+    for step_idx, step in enumerate(suite["steps"]):
+        if step_idx > 0 and step["command"] != "prefill":
+            cool_if_configured(f"step:{step['id']}", log=log)
         output = str(out / output_name(step))
         began = time.monotonic()
         log(f"servebench suite {suite['name']}: step {step['id']} ({step['command']})")

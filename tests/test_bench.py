@@ -903,7 +903,8 @@ class ReferenceShapeTest(unittest.TestCase):
             def close(self): return {"dgx1": {"min_available_gib": 20.0}}
 
         class Child:
-            def __init__(self, argv, cwd):
+            def __init__(self, argv, cwd, env=None):
+                self.env = env
                 metadata = json.loads(Path(argv[argv.index("--metadata") + 1]).read_text())
                 out.mkdir(parents=True, exist_ok=True)
                 (out / "suite.json").write_text(json.dumps({"metadata": metadata}))
@@ -1010,6 +1011,80 @@ class ReferenceShapeTest(unittest.TestCase):
                 )
         del cluster["benchmark_reference"]
         self.assertEqual(spark.benchmark_reference_problems(cluster, nodes), [])
+
+    def test_suite_prefill_includes_262144_under_256k_and_skips_larger(self) -> None:
+        all_sizes = [32768, 131072, 262144, 524288, 1000000]
+        for max_model_len, expected in ((262144, [32768, 131072, 262144]), (1048576, all_sizes)):
+            seen: list[str] = []
+
+            class FakeBench:
+                def run(self, label, payloads, **kwargs):
+                    seen.append(label)
+                    return {"requests": [{"ok": True, "prompt_tokens": 100, "ttft_s": 0.1}]}
+
+            options = argparse.Namespace(
+                prefill_text="source",
+                prefill_sizes=all_sizes,
+                max_model_len=max_model_len,
+                prefill_repeats=1,
+                model="m",
+            )
+            result = spark.suite_prefill(FakeBench(), options, random.Random(0))
+            self.assertEqual(sorted(int(k) for k in result["points"]), expected)
+            self.assertEqual(sorted(int(lbl.split()[-1]) for lbl in seen), expected)
+
+    def test_servebench_suite_and_prefill_cool_when_configured_and_keep_digest(self) -> None:
+        from servebench import prefill as sb_prefill
+        from servebench import suite as sb_suite
+
+        recorded = json.loads(
+            (ROOT / "manifests/suites/2026-11-07-spark-ds41f-1107-tp4/suite.json").read_text()
+        )
+        loaded = sb_suite.load("release")
+        self.assertEqual(sb_suite.digest(loaded), recorded["suite_sha256"])
+
+        calls: list[tuple[str, float, float]] = []
+        fake_cfg = ({"host": {}, "environment": {}}, {"nodes": [{"name": "dgx1"}]}, {})
+
+        def fake_cool(nodes, targets, below_c, timeout_s, **kwargs):
+            calls.append(("cool", below_c, timeout_s))
+            return []
+
+        spec = json.dumps({"cluster_config": "config/cluster.json", "cool_below": 55, "cool_timeout": 900})
+        mini_suite = {
+            "name": "mini",
+            "steps": [
+                {"id": "model", "command": "model", "args": {}},
+                {"id": "grid", "command": "engine", "args": {}},
+                {"id": "prefill", "command": "prefill", "args": {"sizes": [32768, 131072], "repeats": 1}},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict("os.environ", {"SPARK_BENCH_COOL": spec}), \
+                mock.patch("spark_ds41f.config.configuration", return_value=fake_cfg), \
+                mock.patch("spark_ds41f.bench.fan_control_enabled", return_value=True), \
+                mock.patch("spark_ds41f.bench.cool_nodes", side_effect=fake_cool), \
+                mock.patch.object(sb_prefill, "document", return_value=("doc", 32000)), \
+                mock.patch.object(
+                    sb_prefill.client,
+                    "stream_chat",
+                    return_value={"first": 2.0, "sent": 1.0, "prompt_tokens": 32000, "error": None},
+                ):
+            def fake_main(argv):
+                calls.append(("step:" + argv[0], 0.0, 0.0))
+                if argv[0] == "prefill":
+                    sb_prefill.run("http://127.0.0.1:8000", "m", [32768, 131072], repeats=1, vllm=False)
+                return 0
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                sb_suite.run(fake_main, "http://127.0.0.1:8000", mini_suite, tmp)
+
+        # step 0 (model) starts uncooled (bench_suite cools right before Popen);
+        # step 1 (grid) cools before starting; step 2 (prefill) cools before each size sample.
+        self.assertEqual(
+            [c[0] for c in calls],
+            ["step:model", "cool", "step:engine", "step:prefill", "cool", "cool"],
+        )
 
 
 if __name__ == "__main__":

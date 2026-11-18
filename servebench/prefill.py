@@ -29,9 +29,11 @@ def document(base_url: str, model: str, size: int, seed: int, vllm: bool) -> tup
 
 def run(base_url: str, model: str, sizes: list[int], *, repeats: int = 3, vllm: bool = True,
         extra_body: dict | None = None, log=lambda message: None) -> list[dict]:
+    from .suite import cool_if_configured
     samples = []
     for repeat in range(repeats):
         for index, size in enumerate(sizes):
+            cool_if_configured(f"prefill:{size}:r{repeat + 1}", log=log)
             text, counted = document(base_url, model, size, seed=1000 * repeat + index, vllm=vllm)
             body = {"model": model, "messages": [{"role": "user", "content": f"{text}\n\n{QUESTION}"}],
                     "max_tokens": 1, "temperature": 0}

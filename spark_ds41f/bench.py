@@ -1952,7 +1952,7 @@ def suite_sampled(bench: Bench, options: argparse.Namespace, rng: random.Random)
 def suite_prefill(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
     """Cold prefill: unique uncached prompts, one output token."""
     prefill_text = {"filler": filler, "novel": novel_text, "source": source_text}[options.prefill_text]
-    sizes = [size for size in options.prefill_sizes if size < options.max_model_len - 64]
+    sizes = [size for size in options.prefill_sizes if int(size * 0.97) < options.max_model_len - 64]
     samples: dict[str, list[dict]] = {str(size): [] for size in sizes}
     cool_fn = getattr(bench, "cool_phase", None)
     for repeat in range(options.prefill_repeats):
@@ -2465,8 +2465,17 @@ def bench_suite(args: argparse.Namespace, cluster: dict, nodes: dict, config_nam
             argv += ["--corpus", args.corpus]
         print(f"benchmarking {base} ({config_name}) with suite {definition['name']} {digest[:12]}; writing {output}",
               flush=True)
+        suite_env = os.environ.copy()
+        if args.cool_below > 0:
+            suite_env["SPARK_BENCH_COOL"] = json.dumps({
+                "cluster_config": config_name,
+                "cool_below": args.cool_below,
+                "cool_timeout": args.cool_timeout,
+            })
+        else:
+            suite_env.pop("SPARK_BENCH_COOL", None)
         try:
-            child["process"] = subprocess.Popen(argv, cwd=ROOT)
+            child["process"] = subprocess.Popen(argv, cwd=ROOT, env=suite_env)
             try:
                 returncode = child["process"].wait()
             except KeyboardInterrupt:
