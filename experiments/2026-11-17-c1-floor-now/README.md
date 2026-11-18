@@ -169,7 +169,8 @@ indexer 3.3, LM heads and screens 1.7, GLP steer 1.4.
 The trace's floor and its launch costs used the record's fit of 1022's kernels.
 [bundles/expert-rate](bundles/expert-rate) is the record's bundle on candidate-61's plan (the
 dispatch and kernels of a call from the plan at its tile height; a layer's three launches also
-timed together), on candidate-60's image with candidate-61's overlay.
+timed together), on candidate-60's image with candidate-61's overlay (the bundle as of
+`62a1873f9`; from 2026-11-18 it names candidate-61's image, see the last section).
 
 - sp8, twice, from a copy staged under `~/spark-lab`: pass in 27 s each
   ([runs/expert-rate-sp8-1.txt](runs/expert-rate-sp8-1.txt), `-2`);
@@ -244,3 +245,84 @@ between two runs a minute apart, so the rate is not a constant of the hardware.
 - The October numbers are that record's receipts, not remeasured under October's conditions.
 - A cause is not shown. A reboot of one node with the bundle before and after would say whether
   the time since boot is it.
+
+## dgx4 rebooted
+
+One node, one variable: dgx4 rebooted at 2026-11-17T23:07Z (back in 41 s; state before and after
+in [runs/reboot-dgx4-before.txt](runs/reboot-dgx4-before.txt) and
+[runs/reboot-dgx4-after.txt](runs/reboot-dgx4-after.txt)), dgx1 left up since 2026-11-07. Then
+October's bundle on October's image on both, as before
+([expert-rate-1025-tp4.json](expert-rate-1025-tp4.json) again;
+[runs/expert-rate-1025-image-dgx4-after-reboot.txt](runs/expert-rate-1025-image-dgx4-after-reboot.txt),
+`-dgx1-after-reboot`).
+
+| | FC1 at 21 experts | FC1 marginal | Plain read |
+| --- | ---: | ---: | ---: |
+| dgx4 before, up ten days | 232.3 GB/s | 243.4 GB/s | 229.4, 235.8 GB/s |
+| dgx4 after the reboot | 253.5 | 266.4 | 249.6, 253.6 |
+| dgx1 before | 233.0 | 243.6 | 236.7, 235.8 |
+| dgx1 again, not rebooted | 233.3 | 243.4 | 236.8, 235.5 |
+
+The reboot restores October's rate in this bundle; FC2's marginal rate barely moved (263.5 to
+266.0 GB/s). Free memory on dgx4
+went from nothing at the two largest orders to 233 blocks of 512 MiB.
+
+## What holds the large blocks
+
+[memory_blocks.py](memory_blocks.py) on copies of `/proc/kpageflags` and `/proc/kpagecount`
+([receipts/memory-blocks.txt](receipts/memory-blocks.txt)):
+
+- dgx1, up ten days, idle, 106.6 GiB free: every one of its 248 blocks of 512 MiB holds pages
+  the kernel cannot move (slab 1.3 GiB, other kernel pages 5.6 GiB; a median of 41 pages, 2.6
+  MiB, a block). 104.9 GiB is free inside those blocks and cannot form a whole one.
+- dgx4, an hour after its reboot, with a build's file cache: 97 blocks entirely free, 50 more
+  hold only movable pages.
+- sp8 (4 KiB pages, never stopped by a cluster start): 30 GiB of slab and 51 GiB of file cache;
+  58,332 of its 63,503 blocks of 2 MiB hold unmovable pages.
+
+The unmovable total is about 7 GiB on dgx1 and on dgx4 alike: the pages are not leaked, they are
+spread. Which kernel code owns the scattered ones is not shown (it needs the `page_owner` boot
+parameter, a host setting).
+
+## Where the engine's memory sits
+
+The loader's sponge (vLLM patch 0800, `direct_loader.py`): the driver takes GPU memory from the
+kernel's page allocator in 64 KiB pieces, and the allocator serves its smallest free fragments
+first. Before the weights are placed the loader allocates throwaway GPU memory in 128 MiB chunks
+until `/proc/buddyinfo` shows blocks of the target size being consumed, places the weight arena
+and the expert slabs, keeps the sponge through post-load processing, and releases it. The target
+is 512 MiB when the free 512 MiB blocks can hold the weights (64 KiB kernels), else 2 MiB, then
+1 MiB, then 512 KiB.
+
+- The ring's logs: 72 sponge lines in the engine logs kept on dgx1, every one with a 2 MiB
+  target; in boot `c61-r13` it soaked 4.8 to 8.6 GiB a node for 73.6 GiB of weights. No recorded
+  ring boot placed weights in 512 MiB blocks.
+- sp1 with an engine loaded (4 KiB pages, candidate-60, 90.6 GiB of GPU memory; a copy of
+  `/proc/kpageflags` read at low priority, [engine_pages.py](engine_pages.py),
+  [receipts/engine-pages-sp1.txt](receipts/engine-pages-sp1.txt)): 89.3 GiB in 1,463,457
+  allocations of 64 KiB; 88% of it in contiguous runs of 2 MiB or more, 73% inside whole aligned
+  2 MiB blocks, 11.7% in runs under 2 MiB, 0.7% under 256 KiB. The map does not tell weights from
+  the engine's other memory.
+
+**What this says about the bundle.** The bundle and the plain read do not go through the loader:
+no sponge, so their buffers take the smallest free fragments. dgx1 holds 10.7 GiB free in
+fragments under 2 MiB (2.9 GiB at 256 KiB or less); dgx4 after its reboot held almost none. The
+7 to 9% the bundle lost on nodes up ten days may therefore be the case the sponge exists for,
+and the engine, whose weights sit in blocks of 2 MiB or more on old and fresh nodes alike, may
+not pay it. Not shown either way: the first traced boot had all four ranks up ten days and they
+agree within 0.6% ([rank_compare.py](rank_compare.py),
+[receipts/rank-compare.json](receipts/rank-compare.json): FC1 206 to 207 µs a call, the target's
+LM head 1071 to 1078 µs, step 27.28 ms). The second traced boot
+([trace-after-reboot-tp4.json](trace-after-reboot-tp4.json)), with dgx4 rebooted and the other
+three not, decides it: a faster rank on dgx4 means serving pays for the time since boot too.
+
+## Runs after the reboot
+
+- `c1-floor-now-expert-rate-after-reboot-tp4` (queue entry `20261118T003759` at `4dea1ea17`):
+  **failed on all four nodes in under a second, nothing measured.** The bundle mounted
+  candidate-61's overlay files, and the overlay left the repository when candidate-61 was built
+  as an image (patches 0817 to 0822): the mount sources did not exist.
+- The bundle now names `spark-ds41f:candidate-61` and mounts only its script
+  ([expert-rate-c61-image-tp4.json](expert-rate-c61-image-tp4.json), run
+  `c1-floor-now-expert-rate-c61-image-tp4`). The image is a second variable against the runs
+  above; dgx1 to dgx3, not rebooted, are the control for it.
