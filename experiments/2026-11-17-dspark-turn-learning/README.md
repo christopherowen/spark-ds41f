@@ -603,26 +603,7 @@ communicator slows the grid's dummy forward, and why c16's served steps do not s
 dummy runs take the same collective policy as served steps (sparknet for eligible all-reduce and all-gather,
 pynccl for the rest).
 
-## Where it stands
-
-After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
-1.5% with the full-vocabulary rule and about 0.9% with the rule serving can run from the block maxima it
-already computes (exact, and under serving's BF16 rounding), both still rising at the end of the hour.
-Teacher-forced acceptance is an upper bound of what verification realizes; no serving speed has been
-measured with learned drafts.
-
-Shadow mode is built and tested: a capture that costs a few hundredths of a microsecond a step when
-forked over a tail that leaves the SMs free, and an end-of-turn score and update in TileLang. What it
-cannot do is measure the gain: the block maxima show what a learned table breaks and miss most of what it
-fixes. The gain needs exact replays (observe and the offline study) or drafts read from the learned table
-(on). Learning resets at every restart unless the learned rows are saved.
-
-Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 ms at p90 under AgentX,
-against 0.48 and 2.86 ms on the step) and its outputs are candidate-60's. The grid's decode forward pays for the
-learner: about 1.06% with its communicator made at load, 0.43% with it made at the first exchange or with the
-step's communicator instead. The 0.43% is the learner's own, from what it runs rather than what it holds.
-
-### The learner's exchange
+### What slows the grid: the learner's communicator and the learner
 
 [overlay-exchange/speculator.py](overlay-exchange/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py):
 `VLLM_DSPARK_TURN_LEARNING_EXCHANGE` picks the communicator shadow's two exchanges a chunk go through;
@@ -876,3 +857,22 @@ against the pool of the 15 learner-off boots (one profile and image in every job
   streams, or its NCCL operations (each costs nothing alone); what is left is what it runs: the capture
   kernel in the draft graph (the draft step's time is unchanged, +9 and −2 µs), and its end-of-turn work
   in the model step before the grid (its kernels' first loads, its exchanges).
+
+## Where it stands
+
+After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
+1.5% with the full-vocabulary rule and about 0.9% with the rule serving can run from the block maxima it
+already computes (exact, and under serving's BF16 rounding), both still rising at the end of the hour.
+Teacher-forced acceptance is an upper bound of what verification realizes; no serving speed has been
+measured with learned drafts.
+
+Shadow mode is built and tested: a capture that costs a few hundredths of a microsecond a step when
+forked over a tail that leaves the SMs free, and an end-of-turn score and update in TileLang. What it
+cannot do is measure the gain: the block maxima show what a learned table breaks and miss most of what it
+fixes. The gain needs exact replays (observe and the offline study) or drafts read from the learned table
+(on). Learning resets at every restart unless the learned rows are saved.
+
+Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 ms at p90 under AgentX,
+against 0.48 and 2.86 ms on the step) and its outputs are candidate-60's. The grid's decode forward pays for the
+learner: about 1.06% with its communicator made at load, 0.43% with it made at the first exchange or with the
+step's communicator instead. The 0.43% is the learner's own, from what it runs rather than what it holds.
