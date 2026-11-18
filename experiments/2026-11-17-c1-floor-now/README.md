@@ -326,3 +326,35 @@ three not, decides it: a faster rank on dgx4 means serving pays for the time sin
   ([expert-rate-c61-image-tp4.json](expert-rate-c61-image-tp4.json), run
   `c1-floor-now-expert-rate-c61-image-tp4`). The image is a second variable against the runs
   above; dgx1 to dgx3, not rebooted, are the control for it.
+  Queue entry `20261118T004302` at `4f449bee9`: pass on each node
+  ([runs/expert-rate-dgx1-c61-image.txt](runs/expert-rate-dgx1-c61-image.txt) to `-dgx4`; each
+  file starts with the node's boot time and its `/proc/buddyinfo` line at collection).
+
+| Node | FC1 marginal, before | on candidate-61's image | FC2 marginal, before | now | Plain read, before | now | Free under 2 MiB | Free 512 MiB blocks |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| dgx1 | 247.7 GB/s | 247.1 | 253.2 | 254.5 | 237.3, 235.6 | 238.1, 236.0 | 10.9 GiB | 0 |
+| dgx2 | 250.3 | 249.4 | 257.7 | 255.7 | 235.2, 236.7 | 235.6, 237.2 | 6.6 GiB | 0 |
+| dgx3 | 249.6 | 249.6 | 257.5 | 257.5 | 237.7, 236.3 | 238.3, 236.4 | 6.4 GiB | 0 |
+| dgx4, rebooted 97 minutes before | 247.6 | 253.1 | 256.6 | 260.5 | 237.4, 235.1 | 244.6, 241.3 | 0.65 GiB | 68 |
+
+  - The image is not a variable here: the three nodes that were not rebooted read within 0.4%
+    of their runs on candidate-60's image with the overlay.
+  - dgx4 reads 2.2% faster in FC1 and 3% faster in the plain read than before its reboot, where
+    October's bundle read 9.4% faster four minutes after it. Between the two runs dgx4 ran an
+    image build and the release tests; its free 512 MiB blocks went from 233 to 68. Either the
+    gain fades as the node's memory is used, or the two bundles respond differently: October's
+    bundle again on dgx1 and dgx4
+    ([expert-rate-1025-later-tp4.json](expert-rate-1025-later-tp4.json)) separates the two.
+  - The bundle allocates the raw weights (1.7 GB), then the prepared FC1 weights (1.17 GB),
+    then FC2's (0.58 GB), and the allocator serves its smallest free blocks first. By that
+    order (not mapped), FC1's weights sat in fragments under 1 MiB on dgx1 and in blocks of
+    about 8 MiB on dgx4 today, and FC2's in larger blocks than FC1's on every node, which is
+    consistent with FC2's rate barely moving in any of these runs.
+- `c1-floor-now-trace-after-reboot-tp4` (queue entry `20261118T004321` at `4f449bee9`):
+  **refused before any boot** ("qualified config drift for tp4-ring: serve_args differ from
+  qualified profile"). [prof-tp4.json](prof-tp4.json) carries candidate-61's dev arm's resolved
+  arguments, and that arm's KV cache went from 10.5 to 16.5 GiB when candidate-61 was built
+  (`--kv-cache-memory-bytes` 11274289152 to 17716740096). The arm now carries the current
+  value. So the second traced boot differs from the first in the image, the KV cache size and
+  dgx4's reboot; its question is answered inside the boot (dgx4's rank against the other
+  three), not against the first trace.
