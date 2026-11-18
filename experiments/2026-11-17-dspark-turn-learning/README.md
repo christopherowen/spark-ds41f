@@ -866,6 +866,29 @@ whole learner with its communicator made at the first exchange (tp4-switched-laz
 learner's kernels are declared for the startup warm-up in both learner arms, so the difference between them is
 the end of turn's running.
 
+Queue entry `20261118T002423-split-tp4-switched`, commit `4dea1ea17`; receipts [split](receipts/split) (grids,
+startup memory, telemetry, verdicts, [grid-split.txt](receipts/split/grid-split.txt), the pooled table again,
+the learner boots' log lines: the capture boots logged the end of turn skipped and made no learner call; the
+whole-learner boots made their communicator at the first exchange and ran 148 and 157 calls). Within the job:
+the capture alone +0.47% (boots 0.01% apart), the whole learner +0.31% (boots 0.48% apart), against learner-off
+boots 0.23% apart. Against the day's 17 learner-off boots (sd 0.15%):
+
+| Arm | Boots | Grid |
+| --- | ---: | ---: |
+| the learner, end of turn skipped (the capture alone) | 2 | +0.48% (+0.49, +0.48) |
+| the whole learner, its communicator made at its first exchange | 4 | +0.37% (+0.41, +0.45, +0.56, +0.08) |
+| the whole learner, the step's communicator | 4 | +0.42% |
+
+**The end of turn costs nothing measurable; the learner's 0.4% comes with the capture.** It is the target
+forward's time (+0.57% within the job) while the draft step's is unchanged (+6.5 µs), and the capture's
+kernel cannot overlap the target forward: it is forked onto the learner's side stream after the last
+position's maxima and joined before the draft graph ends. What shadow changes besides the end of turn is all
+set up at load or captured into the draft graph: the learner's allocations and streams (each costing
+nothing alone), its kernels compiled and loaded for the warm-up, a draft graph with a forked branch, and the
+draft step's variants that keep each position's maxima (the first position's fused pairs with its tiles'
+maxima, the partials in per-position scratch). On-step shadow, the same capture, read +0.40% against
+candidate-60's recorded screen a day apart (+0.2% beyond that day's drift).
+
 ## Where it stands
 
 After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
@@ -883,4 +906,5 @@ fixes. The gain needs exact replays (observe and the offline study) or drafts re
 Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 ms at p90 under AgentX,
 against 0.48 and 2.86 ms on the step) and its outputs are candidate-60's. The grid's decode forward pays for the
 learner: about 1.06% with its communicator made at load, 0.43% with it made at the first exchange or with the
-step's communicator instead. The 0.43% is the learner's own, from what it runs rather than what it holds.
+step's communicator instead. That 0.4% comes with the per-step capture, not the end of turn, which costs
+nothing measurable once its communicator is made after startup.
