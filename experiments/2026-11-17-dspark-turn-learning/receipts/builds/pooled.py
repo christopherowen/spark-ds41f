@@ -1,4 +1,4 @@
-"""Every grid of 2026-11-17's jobs on tp4-switched, by arm, against the pool of that day's learner-off boots
+"""Every grid of the 2026-11-17 jobs (to 01:05 on 11-18) on tp4-switched, by arm, against the pool of that day's learner-off boots
 (the same profile and image in every job); run from the repository root."""
 import json, math, statistics
 
@@ -6,7 +6,8 @@ R = "experiments/2026-11-17-dspark-turn-learning/receipts/"
 ARMS = {  # arm: [(receipt dir, boot labels)]
     "learner off": [("offstep-screen", ["off-1", "off-2"]), ("comm-attribution", ["off-1", "off-2"]),
                     ("exchange", ["off-1", "off-2"]), ("reserve", ["off-1", "off-2"]), ("streams", ["off-1", "off-2"]),
-                    ("stepops", ["off-1", "off-2"]), ("builds", ["off-1", "off-2"]), ("commthreads-2", ["off-1"])],
+                    ("stepops", ["off-1", "off-2"]), ("builds", ["off-1", "off-2"]), ("commthreads-2", ["off-1"]),
+                    ("split", ["off-1", "off-2"])],
     "memory held from load (150, 350 MiB)": [("reserve", ["reserve150-1", "reserve150-2", "reserve350-1", "reserve350-2"])],
     "three bare streams": [("streams", ["streams3-1", "streams3-2"])],
     "the learner's NCCL operations at load, step's communicator": [("stepops", ["learnerops-1", "learnerops-2"])],
@@ -16,7 +17,8 @@ ARMS = {  # arm: [(receipt dir, boot labels)]
     "learner, its own communicator made at load (RoCE)": [("offstep-screen", ["offstep-1", "offstep-2"]), ("comm-attribution", ["offstep-1", "offstep-2"])],
     "learner, its own communicator made at load (Socket)": [("exchange", ["socket-1", "socket-2"])],
     "learner, the step's communicator": [("exchange", ["step-1", "step-2"]), ("builds", ["shared-1", "shared-2"])],
-    "learner, its own communicator made at its first exchange": [("builds", ["lazy-1", "lazy-2"])],
+    "learner, its own communicator made at its first exchange": [("builds", ["lazy-1", "lazy-2"]), ("split", ["lazy-1", "lazy-2"])],
+    "learner, end of turn skipped (the capture alone)": [("split", ["capture-1", "capture-2"])],
 }
 
 
