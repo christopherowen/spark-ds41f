@@ -1094,15 +1094,23 @@ def roce_gid_problems(node_name: str, index: int, hcas: list[str], output: str,
 
 # Free memory by block size (/proc/buddyinfo). A freshly booted GB10 has almost all of
 # its free memory in the largest blocks (dgx4, 2026-11-18: 233 of 512 MiB, 96% of 124
-# GiB); after ten days of engine boots dgx1..dgx4 had none there, and the same kernels
-# then streamed weights 7 to 9% slower (experiments/2026-11-17-c1-floor-now). The share
-# below which this warns is between the two states measured, not a measured threshold.
+# GiB); after ten days of engine boots dgx1..dgx4 had none there. Memory taken from such
+# a node as it comes (a kernel-lab bundle, the read probe below) read 7 to 9% slower. The
+# engine is mostly spared: its loader soaks the small fragments first and places the
+# weights in blocks of 2 MiB or more, and a rebooted node's rank was 2% faster in two
+# kernels, at most 0.6% of a single-stream step (experiments/2026-11-17-c1-floor-now).
+# The share below which this warns is between the two states measured, not a measured
+# threshold, and it does not predict the read rate: two hours and an image build after
+# its reboot dgx4 still had most of its free memory in 512 MiB blocks and read 238 to 245.
 MEMORY_BLOCKS_MIN_SHARE = 0.5
 MEMORY_BLOCKS_MIN_FREE_GIB = 32.0
 
 # The plain read of experiments/2026-10-26-c1-100tps's expert-rate bundle: torch.sum
 # over cold 220 MiB FP32 buffers, the L2 flushed before each replay. A freshly booted
-# GB10 reads 249 to 254 GB/s; the nodes up ten days read 229 to 237.
+# GB10 reads 249 to 254 GB/s; the nodes up ten days read 229 to 237, and dgx4 two hours
+# and an image build after its reboot 238 to 245. It is the rate of memory taken now, as
+# it comes: what a kernel-lab timing on this node will see, not what a running engine
+# has (see above).
 STREAM_RATE_MIN_GBS = 245.0
 STREAM_RATE_PROBE = r"""
 import json, statistics, torch
@@ -1154,7 +1162,9 @@ def memory_block_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
     A node whose GPU a process holds is not judged: its free memory is what the engine
     left. ``cluster start`` drops caches and compacts before a launch
     (``host.defragment_before_start``), which does not rebuild blocks that kernel
-    allocations have split; a reboot does.
+    allocations have split; a reboot does. The warning is about timings taken on the
+    node, not a reason to reboot a serving node: the engine's loader places its weights
+    in blocks of 2 MiB or more either way.
     """
     if facts.get("gpu_apps", "0") not in ("", "0"):
         return []
@@ -1167,9 +1177,10 @@ def memory_block_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
     return [
         Warn(
             f"{node_name}: {share:.0%} of the {free_gib:.0f} GiB free is in {block_mib} MiB blocks, "
-            "the largest (a 64 KiB node after a boot: 96% in 512 MiB blocks); GB10 nodes without "
-            "them streamed weights 7 to 9% slower (experiments/2026-11-17-c1-floor-now). Measure "
-            "it with doctor --live --stream-rate; a reboot restores the blocks"
+            "the largest (a 64 KiB node after a boot: 96% in 512 MiB blocks). Kernel-lab timings "
+            "on such nodes read memory 7 to 9% slower; the engine lost at most 0.6% of a step "
+            "(experiments/2026-11-17-c1-floor-now). Measure the node with doctor --live "
+            "--stream-rate; a reboot restores the blocks until the memory is used again"
         )
     ]
 
@@ -1213,7 +1224,8 @@ def stream_rate_findings(node_name: str, output: str, stderr: str = "") -> tuple
     return line, [
         Warn(
             f"{node_name}: memory reads at {rate:.1f} GB/s, below {STREAM_RATE_MIN_GBS:.0f} "
-            "(a freshly booted GB10 reads 249 to 254; experiments/2026-11-17-c1-floor-now)"
+            "(a freshly booted GB10 reads 249 to 254): kernel-lab timings here will read low "
+            "against a fresh node's; the engine is mostly spared (experiments/2026-11-17-c1-floor-now)"
         )
     ]
 
