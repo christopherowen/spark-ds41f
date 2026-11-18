@@ -618,12 +618,9 @@ fixes. The gain needs exact replays (observe and the offline study) or drafts re
 (on). Learning resets at every restart unless the learned rows are saved.
 
 Off the step, the end of turn holds the step 0.02 ms a call at the median (0.20 ms at p90 under AgentX,
-against 0.48 and 2.86 ms on the step), its outputs are candidate-60's, and c16 shows no cost. The grid
-does: its target forward is 1.2% slower with the learner present and idle, in both boots, and c16 is
-too prefill-heavy to rule that out for served decode. The learner's own communicator alone costs +0.91%;
-moving the exchange to the step's communicator leaves +0.58% and to a Socket one +1.28%, and memory held from
-load alone costs nothing. The cost follows NCCL work done for the learner, and grows with the step's rows the
-way its all-reduces do.
+against 0.48 and 2.86 ms on the step) and its outputs are candidate-60's. The grid's decode forward pays for the
+learner: about 1.06% with its communicator made at load, 0.43% with it made at the first exchange or with the
+step's communicator instead. The 0.43% is the learner's own, from what it runs rather than what it holds.
 
 ### The learner's exchange
 
@@ -849,3 +846,33 @@ step's own communicator, none made ([tp4-switched-exchange-step.json](tp4-switch
 exchange, after startup has made the KV cache and captured the graphs
 ([tp4-switched-lazycomm.json](tp4-switched-lazycomm.json), [overlay-lazycomm/](overlay-lazycomm)). The first
 end of turn comes after both (a boot's log: model loaded, KV cache made, graphs captured, then requests).
+
+Queue entry `20261117T233008-builds-tp4-switched`, commit `659b3ff8b`; receipts [builds](receipts/builds) (grids,
+startup memory, telemetry, verdicts, [grid-split.txt](receipts/builds/grid-split.txt), the learner boots' log
+lines: each logged its exchange, 151 to 157 calls in its model step, no error). Within the job, against its two
+learner-off boots (19.103 and 19.178 ms, +0.39% apart): the step's communicator +0.49%, the communicator made at
+the first exchange +0.51%, the two builds 0.01% apart.
+
+**All of the day's grids** ([pooled.py](receipts/builds/pooled.py), [pooled.txt](receipts/builds/pooled.txt)),
+against the pool of the 15 learner-off boots (one profile and image in every job; 19.156 ms, sd 0.15%):
+
+| Arm | Boots | Grid (whole step, geometric mean) |
+| --- | ---: | ---: |
+| memory held from load (150, 350 MiB) | 4 | +0.04% |
+| three bare streams at load | 2 | +0.05% |
+| the learner's NCCL operations at load, on the step's communicator | 2 | −0.13% |
+| BF16 all-reduces at load, on the step's communicator | 2 | +0.05% |
+| a second communicator made at load, idle | 4 | +1.13% |
+| a second communicator made at load, destroyed | 1 | +1.23% |
+| the learner, its own communicator made at load (RoCE) | 4 | +1.06% |
+| the learner, its own communicator made at load (Socket) | 2 | +1.13% |
+| **the learner, the step's communicator** | 4 | **+0.43%** |
+| **the learner, its own communicator made at its first exchange** | 2 | **+0.43%** |
+
+- **A communicator made at load costs about 0.6 of the learner's 1.06%, and making it at the first exchange
+  removes that part.** Why a communicator made at load slows the grid's decode forward, and keeps doing so
+  once destroyed, is not known; one made after startup does not.
+- **The learner's own part is about 0.43%, whichever communicator it uses.** It is not its memory, its
+  streams, or its NCCL operations (each costs nothing alone); what is left is what it runs: the capture
+  kernel in the draft graph (the draft step's time is unchanged, +9 and −2 µs), and its end-of-turn work
+  in the model step before the grid (its kernels' first loads, its exchanges).
