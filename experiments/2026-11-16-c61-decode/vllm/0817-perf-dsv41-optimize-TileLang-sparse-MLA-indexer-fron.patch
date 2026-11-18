@@ -1,4 +1,4 @@
-From 44a023ad1ccc20de68b18960084b47b284b58f65 Mon Sep 17 00:00:00 2001
+From 02c22fc2eac462430d39597df46d7b77ae63e29d Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:50:34 +0100
 Subject: [PATCH 817/822] perf(dsv41): optimize TileLang sparse MLA, indexer,
@@ -20,15 +20,16 @@ Upstream status: local candidate-61 patch
  .../attention/test_deepseek_v41_tilelang.py   |  76 +++-
  .../test_deepseek_v41_tilelang_front.py       |  92 ++++
  .../test_deepseek_v41_tilelang_metadata.py    |  74 ++++
+ tests/models/test_deepseek_v4_1_attention.py  |  92 ++++
  tests/models/test_deepseek_v4_1_compressor.py |  42 +-
- vllm/models/deepseek_v4_1/attention.py        | 288 ++++++++----
+ vllm/models/deepseek_v4_1/attention.py        | 292 ++++++++----
  vllm/models/deepseek_v4_1/compressor.py       |   7 +-
  vllm/models/deepseek_v4_1/sp_prefill.py       |  34 +-
  vllm/models/deepseek_v4_1/tilelang/front.py   | 418 ++++++++++++------
  vllm/models/deepseek_v4_1/tilelang/indexer.py | 256 ++++++++---
  .../models/deepseek_v4_1/tilelang/metadata.py | 232 +++++++---
  .../deepseek_v4_1/tilelang/sparse_mla.py      |   1 -
- 11 files changed, 1143 insertions(+), 377 deletions(-)
+ 12 files changed, 1238 insertions(+), 378 deletions(-)
 
 diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
 index 25126ea81..b46399c08 100644
@@ -386,6 +387,106 @@ index 4455666ec..70e1c259d 100644
 +    for r in (2, 4, 5):
 +        assert bool((page_out1[r] == -9).all())
 +    assert torch.equal(page_sub, page_out1[2:])
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index e1fd95311..8019f38a9 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -2098,3 +2098,95 @@ def test_sp_prefill_with_replicated_fused_wqa_wkv_gathers_mxfp8_and_swa_records(
+     else:
+         assert torch.equal(weights, local_weights[:n_real])
+         assert ref is None
++
++
++@pytest.mark.parametrize("n_local_heads", [16, 0])
++def test_sp_front_without_swa_keeps_uniform_collective_on_zero_head_ranks(
++    monkeypatch, n_local_heads
++):
++    """When ``swa`` is None (dummy memory profiling), ``_sp_front`` must issue
++    the same ``gather_mxfp8`` collective on every TP rank, including trailing
++    ranks whose padded ``n_local_heads`` trimmed to 0."""
++    from vllm.models.deepseek_v4_1 import attention, kernels, sp_prefill
++    from vllm.models.deepseek_v4_1.tilelang.linear import MXFP8Rows
++
++    module = _tilelang_layer(layer_id=0)
++    module._ready = True
++    module.q_lora_rank = 1280
++    module.n_groups = 10
++    module.n_local_heads = n_local_heads
++    module.indexer = None
++    module._l2pf_wo = None
++    module._l2pf_comp = None
++    module.swa_cache_layer = SimpleNamespace(prefix="swa", kv_cache=None, block_size=64)
++    module.q_norm = lambda x: x.contiguous()
++    module.kv_norm = lambda x: x.contiguous()
++    module.q_norm.weight = torch.ones(1280, dtype=torch.bfloat16)
++    module.q_norm.variance_epsilon = 1e-6
++    module.kv_norm.weight = torch.ones(512, dtype=torch.bfloat16)
++    module.kv_norm.variance_epsilon = 1e-6
++
++    local_x = torch.ones((4, 32), dtype=torch.bfloat16)
++    gathered_q = MXFP8Rows(
++        rows=torch.empty((20, 1280), dtype=torch.bfloat16),
++        values=torch.ones((64, 1280), dtype=torch.float8_e4m3fn),
++        scales=torch.ones((64, 40), dtype=torch.uint8),
++    )
++    gathered_kv = torch.ones((20, 512), dtype=torch.bfloat16)
++    events = []
++
++    class _FakeSPRows:
++        num_tokens = 20
++        local_rows = 4
++        start = 16 if n_local_heads == 0 else 0
++        real_rows = 4
++
++        def gather_mxfp8(self, x_q, *extra):
++            events.append(("gather_mxfp8", tuple(x_q.rows.shape), len(extra)))
++            return (gathered_q, gathered_kv)
++
++        def gather_many(self, *tensors):
++            raise AssertionError(
++                "zero-head rank diverged onto gather_many while peer ranks called gather_mxfp8"
++            )
++
++    def rep_wqa_wkv(h):
++        return torch.ones((h.shape[0], 1280 + 512), dtype=torch.bfloat16), None
++
++    rep_wqa_wkv.tp_size = 5
++    rep_wqa_wkv.replicated_sp_prefill = True
++    module.fused_wqa_wkv = rep_wqa_wkv
++    monkeypatch.setattr(
++        kernels,
++        "cast_mxfp8",
++        lambda rows: (
++            events.append(("cast_mxfp8", tuple(rows.shape))),
++            MXFP8Rows(
++                rows,
++                torch.ones((64, rows.shape[1]), dtype=torch.float8_e4m3fn),
++                torch.ones((64, 40), dtype=torch.uint8),
++            ),
++        )[1],
++    )
++    module.wq_b = lambda qr: torch.ones(
++        (qr.shape[0], n_local_heads * 512), dtype=torch.bfloat16
++    )
++    module._rope = lambda x, pos, role: x
++    module._o_proj = lambda output, sp_rows=None: (
++        events.append(("o_proj", tuple(output.shape))),
++        torch.zeros((4, 32), dtype=torch.bfloat16),
++    )[1]
++    monkeypatch.setattr(
++        attention,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata=None),
++    )
++    monkeypatch.setattr(sp_prefill, "current", lambda: _FakeSPRows())
++
++    out = module._forward(torch.arange(20), local_x)
++    assert out.shape == (4, 32)
++    assert events == [
++        ("cast_mxfp8", (4, 1280)),
++        ("gather_mxfp8", (4, 1280), 1),
++        ("o_proj", (20, n_local_heads, 512)),
++    ]
 diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
 index c84b2ab06..53d543c46 100644
 --- a/tests/models/test_deepseek_v4_1_compressor.py
@@ -448,7 +549,7 @@ index c84b2ab06..53d543c46 100644
                  assert comp.fused_wkv_wgate.tp_size == tp_size
                  assert hasattr(comp.fused_wkv_wgate, "packed_bf16_exponent_base")
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 1245aafbb..117b335e0 100644
+index 1245aafbb..9d505b1f6 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
 @@ -19,8 +19,10 @@ from vllm.distributed import (
@@ -637,7 +738,18 @@ index 1245aafbb..117b335e0 100644
  
      def forward(self, positions, hidden_states, llama_4_scaling=None):
          if hidden_states.shape[0] == 0:
-@@ -1651,9 +1713,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1416,7 +1478,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 index_weights = index_weights[: sp_rows.real_rows]
+         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+         qr, kv = self.q_norm(qr), self.kv_norm(kv)
+-        if self.n_local_heads > 0 or self.indexer is not None:
++        # Keep collective arity identical across TP ranks even when trailing
++        # ranks trim local heads to 0 after padding.
++        if getattr(self, "n_groups", self.n_local_heads) > 0 or self.indexer is not None:
+             local_q_cast = kernels.cast_mxfp8(qr)
+             q_cast, kv = sp_rows.gather_mxfp8(local_q_cast, kv)
+             qr = q_cast.rows
+@@ -1651,9 +1715,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      # Sequence-parallel prefill: the indexer is replicated, so each
                      # rank scores and selects only its own rows, and forward_mqa
                      # gathers the selected positions. Every row is independent.
@@ -648,7 +760,7 @@ index 1245aafbb..117b335e0 100644
                      if pre_index_query is not None and split is not None and not _INDEX_SPLIT_CHECK:
                          query = pre_index_query
                          reference = None
-@@ -1735,46 +1795,49 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1735,46 +1797,49 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          """MXFP4 index queries and scaled head weights for rows [first, last)."""
          rows = last - first
          h = self.indexer.heads
@@ -730,7 +842,7 @@ index 1245aafbb..117b335e0 100644
          # The BF16 head-weight projection runs on every row: its GEMV rounds
          # differently at another row count, which would move top-k selections.
          # The FP8 wq_b quantizes per row and does not depend on the row count.
-@@ -1892,10 +1955,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1892,10 +1957,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
  
          # Only the score matrix needs row chunking. All selected positions
          # survive in the source-owned buffer until their reuse interval ends.
@@ -747,7 +859,7 @@ index 1245aafbb..117b335e0 100644
              lsa_enabled = os.environ.get("VLLM_DS41_LSA") == "1"
              score_width = None
              if (
-@@ -1982,7 +2051,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1982,7 +2053,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      )
  
                      page_table = None
@@ -760,7 +872,7 @@ index 1245aafbb..117b335e0 100644
                      if cacheable:
                          key = (id(im), row, count, index_width, self._index_page)
                          shared = get_forward_context().__dict__.setdefault(
-@@ -1994,7 +2067,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1994,7 +2069,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      if page_table is None:
                          tl_metadata.pages(
                              im.req_id_per_token,
@@ -769,7 +881,7 @@ index 1245aafbb..117b335e0 100644
                              im.block_table,
                              buf,
                              row,
-@@ -2041,6 +2114,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2041,6 +2116,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                                      rows,
                                      decode_specs,
                                      q.device,
@@ -777,7 +889,7 @@ index 1245aafbb..117b335e0 100644
                                  )
                              else:
                                  meta_bufs = ()
-@@ -2053,7 +2127,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2053,7 +2129,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                          q_scales=iq_scale[offset:end],
                          query_weights=iw[offset:end],
                          page_table=page_table,
@@ -786,7 +898,7 @@ index 1245aafbb..117b335e0 100644
                          score_width=score_width,
                          output_indices=selected[offset:end],
                          **candidate_args,
-@@ -2148,8 +2222,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2148,8 +2224,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  q = self._rope(q, positions, "q")
              if output is None:
                  output = torch.empty_like(q)
@@ -798,7 +910,7 @@ index 1245aafbb..117b335e0 100644
              )
              return output
          if finish_front is not None:
-@@ -2169,6 +2245,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2169,6 +2247,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          # metadata beside, not overlapping, the native attention scratch.
          metadata_specs = self._attention_workspace_specs[mode]
          scratch_specs = self._attention_scratch_specs(mode, rows)
@@ -806,7 +918,7 @@ index 1245aafbb..117b335e0 100644
          # Layers sharing cache groups map identical pages, so the first layer of
          # each group keeps its metadata for the rest of the forward on decode and
          # decode-sized extend steps. Every replay rewrites it before use, so it
-@@ -2183,7 +2260,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2183,7 +2262,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  )
              )
              metadata_buffers = self._shared_decode_metadata(
@@ -815,7 +927,7 @@ index 1245aafbb..117b335e0 100644
              )
              arena = current_workspace_manager().get_simultaneous(*scratch_specs)
              scratch = list(arena)
-@@ -2192,7 +2269,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2192,7 +2271,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  *metadata_specs, *scratch_specs
              )
              metadata_count = len(metadata_specs)
@@ -824,7 +936,7 @@ index 1245aafbb..117b335e0 100644
              metadata_buffers = arena[:metadata_count]
              scratch = arena[metadata_count:]
          if wait_selected is not None:
-@@ -2221,16 +2298,56 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2221,16 +2300,56 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          )
          return output
  
@@ -884,7 +996,7 @@ index 1245aafbb..117b335e0 100644
          )
          context = get_forward_context()
          shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
-@@ -2240,16 +2357,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2240,16 +2359,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              or entry[0] is not swa
              or entry[1] is not main
              or entry[2] is not replay
@@ -913,7 +1025,7 @@ index 1245aafbb..117b335e0 100644
          """A mixed step's attention: its decode requests' rows on the decode plan,
          the rest on the extend plan. Mixed steps run eagerly, so the per-row
          metadata is an ordinary allocation shared across contiguous layers of the
-@@ -2266,8 +2391,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2266,8 +2393,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              id(swa),
              id(main),
              id(replay),
@@ -924,7 +1036,7 @@ index 1245aafbb..117b335e0 100644
              rows,
              extend_specs,
          )
-@@ -2287,7 +2412,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2287,7 +2414,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      torch.empty(shape, dtype=dtype, device=q.device)
                      for shape, dtype in extend_specs
                  )
@@ -933,7 +1045,7 @@ index 1245aafbb..117b335e0 100644
              entry = context.__dict__["_ds41_split_metadata"] = (
                  key,
                  swa,
-@@ -2331,13 +2456,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2331,13 +2458,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          self._draft_replay_start = replay_start
  
      def _replay_start(self, swa):
@@ -950,7 +1062,7 @@ index 1245aafbb..117b335e0 100644
          from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
  
          swa_indices, swa_lengths, top_lengths = buffers[:3]
-@@ -2345,7 +2470,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2345,7 +2472,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          window = dict(
              page=self.swa_cache_layer.block_size,
              window=self.window_size,
@@ -959,7 +1071,7 @@ index 1245aafbb..117b335e0 100644
              replay_start=self._replay_start(swa),
          )
          common = (
-@@ -2360,7 +2485,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2360,7 +2487,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              swa.request_positions,
          )
          if main is None:
@@ -968,7 +1080,7 @@ index 1245aafbb..117b335e0 100644
          else:
              # The window metadata and the main page table in one launch.
              tl_metadata.decode_metadata(
-@@ -2372,6 +2497,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2372,6 +2499,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  rows,
                  main.block_table.shape[1],
                  main_page=self._main_page,

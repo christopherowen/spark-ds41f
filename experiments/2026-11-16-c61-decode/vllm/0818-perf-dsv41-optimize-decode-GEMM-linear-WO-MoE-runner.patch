@@ -1,4 +1,4 @@
-From 7c639268b83411e66c713348699d072441ea002a Mon Sep 17 00:00:00 2001
+From 73c0e8249f2fed3d4cfef38c50e56e456c8383bf Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:50:34 +0100
 Subject: [PATCH 818/822] perf(dsv41): optimize decode GEMM, linear, WO, MoE
@@ -26,8 +26,8 @@ Upstream status: local candidate-61 patch
  vllm/models/deepseek_v4_1/tilelang/gemm.py    |  83 +++-
  vllm/models/deepseek_v4_1/tilelang/linear.py  |  90 +++-
  vllm/models/deepseek_v4_1/tilelang/mhc.py     | 446 +++++++++++++++---
- vllm/models/deepseek_v4_1/tilelang/wo.py      |  88 +++-
- 9 files changed, 666 insertions(+), 135 deletions(-)
+ vllm/models/deepseek_v4_1/tilelang/wo.py      |  95 +++-
+ 9 files changed, 673 insertions(+), 135 deletions(-)
 
 diff --git a/tests/kernels/deepseek_v41_pdl_sources.py b/tests/kernels/deepseek_v41_pdl_sources.py
 index 35d259ea0..2fb24f861 100644
@@ -1318,7 +1318,7 @@ index 040d1264a..1511c69de 100644
      "finalize",
      "post_collapse_norm_streams",
 diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
-index 5187c0ede..92df6aff5 100644
+index 5187c0ede..a228b6968 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/wo.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
 @@ -42,12 +42,16 @@ from .. import l2_prefetch
@@ -1461,7 +1461,21 @@ index 5187c0ede..92df6aff5 100644
              if w.shape[1] < max_cols:
                  padded_w = torch.zeros(
                      (self.hidden, max_cols), dtype=w.dtype, device=device
-@@ -298,13 +331,26 @@ class TileLangWOProjection:
+@@ -282,6 +315,13 @@ class TileLangWOProjection:
+                 padded_sf[:, : sf.shape[1]].copy_(sf)
+             else:
+                 padded_sf = sf
++            if world > 1 and torch.distributed.is_initialized():
++                from vllm.distributed import get_tp_group, model_parallel_is_initialized
++
++                # Ranks arrive out of _prepare_kernels at different compilation
++                # speeds; align on the host CPU group before the 10s RoCE gather.
++                if model_parallel_is_initialized():
++                    torch.distributed.barrier(group=get_tp_group().cpu_group)
+             gathered_w = tensor_model_parallel_all_gather(padded_w, dim=0).view(
+                 world, self.hidden, max_cols
+             )
+@@ -298,13 +338,26 @@ class TileLangWOProjection:
                      continue
                  cols = peer_groups * rank_width
                  sf_words = scale_words(cols)
