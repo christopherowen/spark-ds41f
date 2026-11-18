@@ -1,4 +1,4 @@
-From 10c7ab875e0edfba00f9fbd1d5dc00a66d86976a Mon Sep 17 00:00:00 2001
+From 9fdc76d5ca0b29444fdc6aa6c71aa8265d483cbf Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:50:35 +0100
 Subject: [PATCH 820/822] perf(spec-decode): optimize DSpark, margin confidence
@@ -19,21 +19,23 @@ Upstream status: local candidate-61 patch
 ---
  .../test_deepseek_v41_tilelang_confidence.py  |  139 ++
  ...st_deepseek_v41_tilelang_dspark_context.py |   86 ++
- .../spec_decode/test_adaptive_verification.py |   64 +-
+ .../spec_decode/test_acceptance_estimator.py  |   61 +
+ .../spec_decode/test_adaptive_verification.py |  263 +++-
  .../v1/spec_decode/test_margin_confidence.py  |  164 +++
+ vllm/config/speculative.py                    |   36 +-
  vllm/model_executor/models/qwen3_dspark.py    |   28 +-
  vllm/models/deepseek_v4_1/nvidia/dspark.py    |  225 +++-
  .../deepseek_v4_1/tilelang/confidence.py      |   61 +-
  vllm/v1/worker/gpu/cudagraph_utils.py         |  133 +-
- vllm/v1/worker/gpu/model_runner.py            |  522 ++++++-
+ vllm/v1/worker/gpu/model_runner.py            |  542 +++++++-
  .../v1/worker/gpu/sample/tilelang_sampling.py |  445 +++++-
- .../gpu/spec_decode/acceptance_estimator.py   |  135 +-
- .../gpu/spec_decode/adaptive_verification.py  |  116 +-
+ .../gpu/spec_decode/acceptance_estimator.py   |  170 ++-
+ .../gpu/spec_decode/adaptive_verification.py  |  339 ++++-
  .../gpu/spec_decode/dspark/speculator.py      |  239 +++-
  .../gpu/spec_decode/greedy_verification.py    |  121 ++
  .../worker/gpu/spec_decode/tilelang_copy.py   |   91 +-
  .../gpu/spec_decode/tilelang_rejection.py     | 1195 ++++++++++++++++-
- 16 files changed, 3539 insertions(+), 225 deletions(-)
+ 18 files changed, 4088 insertions(+), 250 deletions(-)
  create mode 100644 tests/v1/spec_decode/test_margin_confidence.py
 
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
@@ -277,8 +279,77 @@ index cc8eeae38..2f05a567d 100644
 +                assert rec_pos is positions
 +                assert rec_slot is slots
 +                assert torch.equal(got.view(torch.int16), expected[idx].view(torch.int16))
+diff --git a/tests/v1/spec_decode/test_acceptance_estimator.py b/tests/v1/spec_decode/test_acceptance_estimator.py
+index 6f0678200..cf63b6a2b 100644
+--- a/tests/v1/spec_decode/test_acceptance_estimator.py
++++ b/tests/v1/spec_decode/test_acceptance_estimator.py
+@@ -527,3 +527,64 @@ def test_confidence_head_online_irls_reduces_survival_mae():
+     assert raw_mae > 0.15
+     assert cal_mae < 0.03
+     assert calibrated_survival[3].item() < 0.11
++
++
++def test_warm_start_irls_fisher_retention_damps_alternating_domain_swings():
++    """Alternating code and prose rounds must keep intercepts bounded without
++    erasing curvature, while stationary shifts still converge."""
++    device = torch.device("cuda")
++    torch.manual_seed(7)
++    est = OnlineAcceptanceEstimator.for_confidence_head(
++        8, 5, device, warm_start=True
++    )
++    est.reset_for_confidence_head(warm_start=True, with_margin=True)
++    est.REFIT_INTERVAL = 25
++    slots = torch.arange(8, device=device, dtype=torch.int32)
++    raw_probs = torch.full((8, 5), 0.75, dtype=torch.float32, device=device)
++    idx_mapping = slots.repeat_interleave(5)
++
++    # Alternate between high-acceptance code (p_0~0.75) and prose (p_0~0.55)
++    # rounds of 25 steps each; retained Fisher info damps per-round swing.
++    b0_history = []
++    for round_idx in range(8):
++        p_target = (
++            torch.tensor([0.75, 0.65, 0.58, 0.55, 0.52], device=device)
++            if round_idx % 2 == 0
++            else torch.tensor([0.55, 0.45, 0.40, 0.38, 0.35], device=device)
++        )
++        for _ in range(est.REFIT_INTERVAL):
++            probs = raw_probs.clone()
++            est.calibrate_confidence_probs(probs, idx_mapping)
++            draws = torch.rand(8, 5, device=device) < p_target
++            all_ok = draws.all(dim=1)
++            first_fail = (~draws).int().argmax(dim=1)
++            accepted = torch.where(all_ok, torch.full_like(first_fail, 5), first_fail)
++            num_sampled = (accepted + 1).to(torch.int32)
++            num_rejected = (5 - accepted).to(torch.int32)
++            est.step(slots, num_sampled, num_rejected)
++        b0_history.append(float(est.intercepts[0].item()))
++
++    max_swing = max(abs(b - a) for a, b in zip(b0_history, b0_history[1:]))
++    assert max_swing < 0.25, f"intercept swung by {max_swing:.3f}: {b0_history}"
++
++    # Under a sustained stationary regime, Fisher retention still adapts smoothly.
++    est_stat = OnlineAcceptanceEstimator.for_confidence_head(
++        8, 5, device, warm_start=True
++    )
++    est_stat.reset_for_confidence_head(warm_start=True, with_margin=True)
++    est_stat.REFIT_INTERVAL = 25
++    target_high = torch.tensor([0.85, 0.80, 0.75, 0.72, 0.70], device=device)
++    b0_start = float(est_stat.intercepts[0].item())
++    for _ in range(12 * est_stat.REFIT_INTERVAL):
++        probs = raw_probs.clone()
++        est_stat.calibrate_confidence_probs(probs, idx_mapping)
++        draws = torch.rand(8, 5, device=device) < target_high
++        all_ok = draws.all(dim=1)
++        first_fail = (~draws).int().argmax(dim=1)
++        accepted = torch.where(all_ok, torch.full_like(first_fail, 5), first_fail)
++        est_stat.step(
++            slots,
++            (accepted + 1).to(torch.int32),
++            (5 - accepted).to(torch.int32),
++        )
++    assert float(est_stat.intercepts[0].item()) > b0_start + 0.35
 diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
-index 95c2b90c0..901243c3c 100644
+index 95c2b90c0..c8c090405 100644
 --- a/tests/v1/spec_decode/test_adaptive_verification.py
 +++ b/tests/v1/spec_decode/test_adaptive_verification.py
 @@ -863,8 +863,10 @@ def test_dead_rows_tau_excludes_sub_tau_slots_from_host_budget():
@@ -294,7 +365,7 @@ index 95c2b90c0..901243c3c 100644
      # Typical calibrated c1 conditional probs -> survival [0.677, 0.376, 0.149, 0.0686, 0.0438]
      typical = np.array([[0.677, 0.556, 0.396, 0.460, 0.638]], dtype=np.float32)
      manager = make_manager(typical, row_cost=0.035)
-@@ -872,30 +874,56 @@ def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
+@@ -872,30 +874,59 @@ def test_calibrated_confidence_matches_dead_rows_tau_to_c1_survival():
      manager.dead_rows_tau = 0.20
      manager.calibrated_confidence = True
  
@@ -303,9 +374,12 @@ index 95c2b90c0..901243c3c 100644
 +    c1_row_cost = 0.035 * 2.5
 +    c1_tau = 2.0 * c1_row_cost / (1.0 + 3.0 * c1_row_cost)
 +    assert np.isclose(manager.effective_dead_rows_tau(num_reqs=1), c1_tau)
++    c2_row_cost = 0.035 * (
++        1.0 + adaptive_module.SMALL_BATCH_L2_ROW_COST_BONUS / 2.0
++    )
 +    assert np.isclose(
 +        manager.effective_dead_rows_tau(num_reqs=2),
-+        2.0 * 0.035 / (1.0 + 3.0 * 0.035),
++        2.0 * c2_row_cost / (1.0 + 3.0 * c2_row_cost),
 +    )
      total = manager.get_num_tokens({"r0": 6}, {"r0": [1, 2, 3, 4, 5]})
      _, _, draft_budget = manager._batch_budget
@@ -367,6 +441,206 @@ index 95c2b90c0..901243c3c 100644
  
  
  def test_get_verified_draft_counts_clamps_to_dead_row_cut_and_clears_when_no_drafts():
+@@ -1170,3 +1201,199 @@ def test_single_request_tile_spill_caps_16th_copy_draft_at_16_rows() -> None:
+     )
+     assert mgr_c2._batch_budget[2] == 32
+     assert total_c2 == 34
++
++
++def test_mixed_prefill_decode_step_isolates_decode_draft_utility():
++    # A large concurrent mid-prefill chunk must not sink decode draft utility
++    # into admitting sub-break-even draft rows or collapsing DeadRows tau.
++    typical = np.array(
++        [
++            [0.68, 0.55, 0.50, 0.48, 0.46],
++            [1.0, 1.0, 1.0, 1.0, 1.0],
++        ],
++        dtype=np.float32,
++    )
++    manager = make_manager(typical, row_cost=0.035)
++    manager.req_states.req_id_to_index = {"dec0": 0, "prefill": 1}
++    manager.req_states.num_computed_tokens_np = np.array([100, 0], dtype=np.int32)
++    manager.req_states.prefill_len = SimpleNamespace(
++        np=np.array([100, 12000], dtype=np.int32)
++    )
++    manager.dead_rows_tau = 0.20
++    manager.calibrated_confidence = True
++    manager._confidence_probs = torch.ones((2, 5), dtype=torch.float32)
++    manager._dead_row_cut = torch.empty((2,), dtype=torch.int32)
++
++    total = manager.get_num_tokens(
++        {"dec0": 6, "prefill": 6144},
++        {"dec0": [1, 2, 3, 4, 5]},
++    )
++    _, _, draft_budget = manager._batch_budget
++    assert draft_budget == 3
++    assert total == 6145 + 3
++
++    dead = manager.dead_row_args(torch.zeros(total, dtype=torch.bool), 2)
++    assert dead is not None
++    c1_tau = manager.effective_dead_rows_tau(num_reqs=1)
++    assert np.exp(dead.log_tau) >= c1_tau - 1e-6
++
++    # Multi-stream decode beside a 6K prefill chunk keeps c4 marginal break-even.
++    conf4 = np.vstack(
++        [
++            np.tile(np.array([[0.68, 0.548, 0.504, 0.511, 0.552]], dtype=np.float32), (4, 1)),
++            np.ones((1, 5), dtype=np.float32),
++        ]
++    )
++    mgr4 = make_manager(conf4, row_cost=0.049)
++    mgr4.single_req_calibrated_row_cost_scale = 1.79
++    mgr4.calibrated_high_row_cost_scale = 0.75
++    mgr4.wide_row_cost_knee = 24
++    mgr4.calibrated_wide_row_cost_scale = 0.78
++    mgr4.req_states.req_id_to_index = {f"d{i}": i for i in range(4)} | {"prefill": 4}
++    mgr4.req_states.num_computed_tokens_np = np.array([100, 100, 100, 100, 0], dtype=np.int32)
++    mgr4.req_states.prefill_len = SimpleNamespace(
++        np=np.array([100, 100, 100, 100, 12000], dtype=np.int32)
++    )
++    mgr4.dead_rows_tau = 0.20
++    mgr4.calibrated_confidence = True
++    mgr4._confidence_probs = torch.ones((5, 5), dtype=torch.float32)
++    mgr4._dead_row_cut = torch.empty((5,), dtype=torch.int32)
++
++    num_tokens_map = {f"d{i}": 6 for i in range(4)} | {"prefill": 6144}
++    draft_map = {f"d{i}": [1, 2, 3, 4, 5] for i in range(4)}
++    mgr4.get_num_tokens(num_tokens_map, draft_map)
++    assert mgr4._batch_budget[2] == 8
++    dead4 = mgr4.dead_row_args(torch.zeros(6156, dtype=torch.bool), 5)
++    assert dead4 is not None
++    assert np.exp(dead4.log_tau) >= 0.20 - 1e-6
++
++
++def test_calibrated_wide_copy_budget_is_continuous_across_base_block():
++    for conf, expected_budget in ((0.718, 5), (0.720, 6), (0.95, 15)):
++        manager = make_manager(np.full((1, 16), conf, dtype=np.float32), row_cost=0.035)
++        manager.req_states.req_id_to_index = {"r0": 0}
++        manager.num_draft_steps = 5
++        manager.dead_rows_tau = 0.20
++        manager.calibrated_confidence = True
++        total = manager.get_num_tokens({"r0": 17}, {"r0": list(range(16))})
++        assert manager._batch_budget[2] == expected_budget
++        assert total == 1 + expected_budget
++
++
++def test_calibrated_row_cost_configs_parameterize_budgets():
++    # Conditional probs matching TP3 servebench survival [0.680, 0.373, 0.188, 0.096, 0.053]
++    cond_serve = np.array(
++        [[0.680, 0.373 / 0.680, 0.188 / 0.373, 0.096 / 0.188, 0.053 / 0.096]],
++        dtype=np.float32,
++    )
++    cond_prose_lo = np.array([[0.50, 0.38, 0.34, 0.32, 0.30]], dtype=np.float32)
++    cond_prose_typ = np.array([[0.58, 0.44, 0.38, 0.35, 0.33]], dtype=np.float32)
++    cond_code_hi = np.array([[0.84, 0.72, 0.58, 0.48, 0.42]], dtype=np.float32)
++    cond_prose_hi = np.array([[0.72, 0.50, 0.42, 0.38, 0.35]], dtype=np.float32)
++    cond_prose_dip = np.array([[0.22, 0.34, 0.32, 0.30, 0.30]], dtype=np.float32)
++    init_prior = np.array([adaptive_module._CALIBRATED_INIT_PROBS], dtype=np.float32)
++
++    for concurrency, expected_budget in ((4, 8), (8, 16)):
++        mgr_tp3 = make_manager(np.repeat(cond_serve, concurrency, axis=0), row_cost=0.049)
++        mgr_tp3.single_req_calibrated_row_cost_scale = 1.79
++        mgr_tp3.calibrated_high_row_cost_scale = 0.75
++        mgr_tp3.wide_row_cost_knee = 24
++        mgr_tp3.calibrated_wide_row_cost_scale = 0.78
++        mgr_tp3.req_states.req_id_to_index = {f"r{i}": i for i in range(concurrency)}
++        mgr_tp3.dead_rows_tau = 0.20
++        mgr_tp3.calibrated_confidence = True
++        mgr_tp3._confidence_probs = torch.ones((concurrency, 5), dtype=torch.float32)
++        mgr_tp3._dead_row_cut = torch.empty((concurrency,), dtype=torch.int32)
++        mgr_tp3.get_num_tokens(
++            {f"r{i}": 6 for i in range(concurrency)},
++            {f"r{i}": [1, 2, 3, 4, 5] for i in range(concurrency)},
++        )
++        assert mgr_tp3._batch_budget[2] == expected_budget
++        dead = mgr_tp3.dead_row_args(torch.zeros(6 * concurrency, dtype=torch.bool), concurrency)
++        assert dead is not None
++        expected_tau = mgr_tp3.effective_dead_rows_tau(num_reqs=concurrency)
++        assert np.isclose(np.exp(dead.log_tau), expected_tau)
++
++    for cond, expected_c16 in ((cond_prose_lo, 16), (cond_prose_typ, 32), (cond_code_hi, 48)):
++        mgr_tp4 = make_manager(np.repeat(cond, 16, axis=0), row_cost=0.035)
++        mgr_tp4.req_states.req_id_to_index = {f"r{i}": i for i in range(16)}
++        mgr_tp4.dead_rows_tau = 0.20
++        mgr_tp4.calibrated_confidence = True
++        mgr_tp4.get_num_tokens(
++            {f"r{i}": 6 for i in range(16)},
++            {f"r{i}": [1, 2, 3, 4, 5] for i in range(16)},
++        )
++        assert mgr_tp4._batch_budget[2] == expected_c16
++
++    # Staggered Step-2 prose admission (1 prose + 15 initial-prior slots) catches
++    # up cleanly on full 2*M wave (32 drafts) without stalling reqs 1..15.
++    stag_join = np.vstack([cond_prose_typ, np.repeat(init_prior, 15, axis=0)])
++    mgr_join = make_manager(stag_join, row_cost=0.035)
++    mgr_join.req_states.req_id_to_index = {f"r{i}": i for i in range(16)}
++    mgr_join.dead_rows_tau = 0.20
++    mgr_join.calibrated_confidence = True
++    mgr_join.get_num_tokens(
++        {f"r{i}": 6 for i in range(16)},
++        {f"r{i}": [1, 2, 3, 4, 5] for i in range(16)},
++    )
++    assert mgr_join._batch_budget[2] == 32
++
++    for concurrency in (8, 16):
++        stag = np.vstack([cond_prose_hi, np.repeat(cond_prose_dip, concurrency - 1, axis=0)])
++        mgr_stag = make_manager(stag, row_cost=0.035)
++        mgr_stag.req_states.req_id_to_index = {f"r{i}": i for i in range(concurrency)}
++        mgr_stag.dead_rows_tau = 0.20
++        mgr_stag.calibrated_confidence = True
++        mgr_stag.get_num_tokens(
++            {f"r{i}": 6 for i in range(concurrency)},
++            {f"r{i}": [1, 2, 3, 4, 5] for i in range(concurrency)},
++        )
++        assert mgr_stag._batch_budget[2] == concurrency
++
++    # Copy-draft planned_confidences=True must still shrink stale first-draft
++    # DSpark probabilities when eligible_drafts <= num_draft_steps.
++    planned_dip = np.tile(np.array([0.22, 0.32, 0.30, 0.30, 0.30] + [1.0] * 11, dtype=np.float32), (16, 1))
++    mgr_planned = make_manager(planned_dip, row_cost=0.035)
++    mgr_planned.num_speculative_steps = 16
++    mgr_planned.num_draft_steps = 5
++    mgr_planned.planned_confidences = True
++    mgr_planned._confidence_buffer = torch.empty((2, 16, 16), dtype=torch.float32)
++    mgr_planned.req_states.req_id_to_index = {f"r{i}": i for i in range(16)}
++    mgr_planned.dead_rows_tau = 0.20
++    mgr_planned.calibrated_confidence = True
++    mgr_planned.get_num_tokens(
++        {f"r{i}": 6 for i in range(16)},
++        {f"r{i}": [1, 2, 3, 4, 5] for i in range(16)},
++    )
++    assert mgr_planned._batch_budget[2] == 16
++
++
++def test_adaptive_verification_scale_fields_require_adaptive_dspark():
++    for kwargs in (
++        {"adaptive_verification_single_req_row_cost_scale": 1.79},
++        {"adaptive_verification_high_row_cost_scale": 0.75},
++        {"adaptive_verification_wide_row_cost_knee": 24},
++        {"adaptive_verification_wide_row_cost_scale": 0.78},
++    ):
++        with pytest.raises(
++            ValueError,
++            match="requires DSpark adaptive verification",
++        ):
++            SpeculativeConfig(
++                method="ngram",
++                num_speculative_tokens=1,
++                **kwargs,
++            )
++
++
++def test_calibrated_new_request_stale_confidences_start_at_warm_prior():
++    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
++    manager.num_speculative_steps = 5
++    manager.calibrated_confidence = True
++    manager._stale_confidences = [SimpleNamespace(np=np.ones((2, 5), dtype=np.float32))]
++    manager._stale_idx = 0
++    manager._pending_resets = []
++    manager._new_rows = []
++    manager.add_request(1)
++    expected = np.array(adaptive_module._CALIBRATED_INIT_PROBS, dtype=np.float32)
++    np.testing.assert_allclose(manager._stale_confidences[0].np[1], expected)
 diff --git a/tests/v1/spec_decode/test_margin_confidence.py b/tests/v1/spec_decode/test_margin_confidence.py
 new file mode 100644
 index 000000000..d0607a70f
@@ -537,6 +811,61 @@ index 000000000..d0607a70f
 +    with_margin, _ = run(margin_buffer[:num_reqs])
 +    without, _ = run(None)
 +    assert not torch.equal(with_margin, without)
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index d7cf118ba..b99baaa60 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -617,6 +617,25 @@ class SpeculativeConfig:
+     A recipe constant, so the draft schedule is a rule of the inputs, the same
+     on every build and boot, with no measured costs."""
+ 
++    adaptive_verification_single_req_row_cost_scale: float = Field(
++        default=2.5, gt=0.0
++    )
++    """Scale applied to ``adaptive_verification_row_cost`` for single-request
++    calibrated DSpark verification (e.g. to price cold-L2 MoE routing)."""
++
++    adaptive_verification_high_row_cost_scale: float = Field(default=0.65, gt=0.0)
++    """Marginal row-cost multiplier above ``HIGH_ROW_COST_KNEE`` (16 rows) up
++    to ``adaptive_verification_wide_row_cost_knee`` for multi-request calibrated
++    DSpark verification."""
++
++    adaptive_verification_wide_row_cost_knee: int = Field(default=32, ge=16)
++    """Row threshold separating the high-row band from the wide-row band in
++    multi-request calibrated DSpark verification."""
++
++    adaptive_verification_wide_row_cost_scale: float = Field(default=0.50, gt=0.0)
++    """Marginal row-cost multiplier above ``adaptive_verification_wide_row_cost_knee``
++    for multi-request calibrated DSpark verification."""
++
+     @staticmethod
+     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
+         """Mean acceptance length to unconditional per-position rates, using
+@@ -1794,12 +1813,19 @@ class SpeculativeConfig:
+                 "materializes. Disable one of them."
+             )
+ 
+-        if self.adaptive_verification_row_cost != 0.02 and (
+-            self.method != "dspark" or not self.enable_adaptive_verification
++        for field_name, default_value in (
++            ("adaptive_verification_row_cost", 0.02),
++            ("adaptive_verification_single_req_row_cost_scale", 2.5),
++            ("adaptive_verification_high_row_cost_scale", 0.65),
++            ("adaptive_verification_wide_row_cost_knee", 32),
++            ("adaptive_verification_wide_row_cost_scale", 0.50),
+         ):
+-            raise ValueError(
+-                "adaptive_verification_row_cost requires DSpark adaptive verification"
+-            )
++            if getattr(self, field_name) != default_value and (
++                self.method != "dspark" or not self.enable_adaptive_verification
++            ):
++                raise ValueError(
++                    f"{field_name} requires DSpark adaptive verification"
++                )
+ 
+         if (
+             self.method == "dspark"
 diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
 index 38acbd1d7..756554ca2 100644
 --- a/vllm/model_executor/models/qwen3_dspark.py
@@ -1269,7 +1598,7 @@ index 770d8960e..61b889dc2 100644
      torch.accelerator.empty_cache()
 +    trim_host_heap()
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 059a06e7e..1e176715d 100644
+index 059a06e7e..ee3931e8b 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -75,7 +75,12 @@ from vllm.multimodal.encoder_budget import (
@@ -1305,7 +1634,34 @@ index 059a06e7e..1e176715d 100644
          # Late admission: the event each step records at VLLM_LATE_ADMISSION_LAYER.
          self.layer_progress: LayerProgress | None = None
  
-@@ -837,12 +847,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -830,6 +840,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 if self.speculative_config is not None
+                 else 0.02
+             ),
++            adaptive_verification_single_req_row_cost_scale=(
++                self.speculative_config.adaptive_verification_single_req_row_cost_scale
++                if self.speculative_config is not None
++                else 2.5
++            ),
++            adaptive_verification_high_row_cost_scale=(
++                self.speculative_config.adaptive_verification_high_row_cost_scale
++                if self.speculative_config is not None
++                else 0.65
++            ),
++            adaptive_verification_wide_row_cost_knee=(
++                self.speculative_config.adaptive_verification_wide_row_cost_knee
++                if self.speculative_config is not None
++                else 32
++            ),
++            adaptive_verification_wide_row_cost_scale=(
++                self.speculative_config.adaptive_verification_wide_row_cost_scale
++                if self.speculative_config is not None
++                else 0.50
++            ),
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
+             planned_confidences=self.copy_drafter is not None,
+@@ -837,12 +867,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  self.speculator, "tp_invariant_confidence", False
              ),
              calibrated_confidence=lambda: (
@@ -1330,7 +1686,7 @@ index 059a06e7e..1e176715d 100644
                  and getattr(self.speculator, "use_confidence_head", False)
              ),
          )
-@@ -1004,11 +1021,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1004,11 +1041,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          The steps are the cost profile's dummy runs: identical work on every build,
          with no text, acceptance or scheduling in them. Run only on an idle server,
          and reset the prefix cache afterwards, since dummy steps write KV slots.
@@ -1363,7 +1719,7 @@ index 059a06e7e..1e176715d 100644
  
          def run(shape: dict) -> None:
              kwargs: dict[str, Any] = {
-@@ -1019,6 +1057,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1019,6 +1077,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  kwargs["single_request_prefill"] = True
              elif shape.get("num_reqs") is not None:
                  kwargs["profile_num_reqs"] = int(shape["num_reqs"])
@@ -1372,7 +1728,7 @@ index 059a06e7e..1e176715d 100644
              self._dummy_run(**kwargs)
  
          for shape in shapes:
-@@ -1043,6 +1083,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1043,6 +1103,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          results = [
              {
                  "shape": shape,
@@ -1380,7 +1736,7 @@ index 059a06e7e..1e176715d 100644
                  "step_ms": [],
                  "forward_ms": [],
                  "drafter_ms": [],
-@@ -1070,6 +1111,132 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1070,6 +1131,132 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              "shapes": results,
          }
  
@@ -1513,7 +1869,7 @@ index 059a06e7e..1e176715d 100644
      @torch.inference_mode()
      @step_eplb_after(is_dummy=True)
      def _dummy_run(
-@@ -1085,12 +1252,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1085,12 +1272,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          valid_dummy_state_slots: bool = False,
          single_request_prefill: bool = False,
          profile_all_kv_cache_groups: bool = False,
@@ -1529,7 +1885,7 @@ index 059a06e7e..1e176715d 100644
  
          # Create a dummy scheduler output.
          num_reqs = (
-@@ -1157,6 +1327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1157,6 +1347,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  context_len=context_len,
                  valid_dummy_state_slots=valid_dummy_state_slots,
                  profile_all_kv_cache_groups=profile_all_kv_cache_groups,
@@ -1537,7 +1893,7 @@ index 059a06e7e..1e176715d 100644
              )
          self.kv_connector.set_disabled(False)
  
-@@ -1317,6 +1488,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1317,6 +1508,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      dummy_input_batch.cu_num_logits,
                      steps,
                  )
@@ -1587,7 +1943,7 @@ index 059a06e7e..1e176715d 100644
  
      @torch.inference_mode()
      def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
-@@ -1384,10 +1598,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1384,10 +1618,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # transient peak instead of an unreachable sum of both passes.
          torch.accelerator.synchronize()
          del hidden_states, sample_hidden_states
@@ -1600,7 +1956,7 @@ index 059a06e7e..1e176715d 100644
  
      @torch.inference_mode()
      def _profile_deepseek_v4_attention(
-@@ -1516,6 +1732,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1516,6 +1752,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          start_time = time.perf_counter()
          with freeze_gc_for_cudagraph_capture():
              torch.accelerator.empty_cache()
@@ -1608,7 +1964,7 @@ index 059a06e7e..1e176715d 100644
              start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
  
              with self.maybe_setup_dummy_loras(self.lora_config):
-@@ -1559,8 +1776,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1559,8 +1796,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      self.cudagraph_manager.captured_token_counts(),
                  )
                  self.adaptive_verification.load_draft_budget_kernels()
@@ -1619,7 +1975,7 @@ index 059a06e7e..1e176715d 100644
          end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
  
          if not profile_only:
-@@ -2186,6 +2405,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2186,6 +2425,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  assert output.num_rejected is not None
                  return output, output.num_sampled, output.num_rejected
              input_batch.ensure_expanded_idx_mapping(self.input_buffers)
@@ -1644,7 +2000,7 @@ index 059a06e7e..1e176715d 100644
              logits = self.model.compute_logits(sample_hidden_states)
  
          if grammar_output is not None:
-@@ -2286,6 +2523,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2286,6 +2543,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              )
          return self._greedy_verification
  
@@ -1670,7 +2026,7 @@ index 059a06e7e..1e176715d 100644
      def declare_step_kernels(self) -> None:
          """Declare the kernels that input preparation, sampling, greedy
          verification and the drafter launch: for the runner's buffers, the loaded
-@@ -2517,6 +2773,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2517,6 +2793,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      )
                  ),
              )
@@ -1699,7 +2055,7 @@ index 059a06e7e..1e176715d 100644
          if isinstance(self.speculator, DFlashSpeculator):
              self.speculator.register_warmups(
                  self._draft_block_table_layouts(kv_cache_groups, kernel_block_sizes)
-@@ -2772,6 +3050,193 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2772,6 +3070,193 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  )
          return output
  
@@ -1893,7 +2249,7 @@ index 059a06e7e..1e176715d 100644
      def _init_sink(self, config: SinkConfig, custom_sampler: bool) -> None:
          """Builds the sink detector's sampling state, after the samplers, and
          refuses the configurations it does not handle."""
-@@ -3009,6 +3474,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3009,6 +3494,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          context_len: int = 0,
          valid_dummy_state_slots: bool = False,
          profile_all_kv_cache_groups: bool = False,
@@ -1901,7 +2257,7 @@ index 059a06e7e..1e176715d 100644
      ) -> ModelRunnerOutput | IntermediateTensors | None:
          if not dummy_run:
              # Update the request states.
-@@ -3243,6 +3709,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3243,6 +3729,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      or int(input_batch.num_scheduled_tokens.max()),
                      self.kv_cache_config.num_blocks,
                  )
@@ -1915,7 +2271,7 @@ index 059a06e7e..1e176715d 100644
  
          attn_metadata = None
          slot_mappings_by_layer = None
-@@ -3335,6 +3808,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3335,6 +3828,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  inputs_embeds = self.model_state.dummy_inputs_embeds(
                      input_batch.num_tokens_after_padding
                  )
@@ -1929,7 +2285,7 @@ index 059a06e7e..1e176715d 100644
              else:
                  scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
                  if self.supports_mm_inputs and self.lora_config is not None:
-@@ -3386,6 +3866,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3386,6 +3886,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.model_config, input_batch.num_tokens, ubatch_slices
          )
  
@@ -1948,7 +2304,7 @@ index 059a06e7e..1e176715d 100644
          self.step_timing.record_batch(
              input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
          )
-@@ -3512,9 +4004,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3512,9 +4024,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # Non-last PP rank: return IntermediateTensors for sending.
              assert output_intermediate_tensors is not None
              assert self.pp_handler is not None
@@ -1967,7 +2323,7 @@ index 059a06e7e..1e176715d 100644
          if self.layer_progress is not None and not dummy_run:
              # The engine core decides the next step once this one reaches the layer.
              return self.layer_progress.reply()
-@@ -3898,6 +4398,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3898,6 +4418,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          model_runner_output.kv_connector_output = kv_connector_output
          model_runner_output.ec_connector_output = ec_connector_output
  
@@ -1981,7 +2337,7 @@ index 059a06e7e..1e176715d 100644
          return async_output
  
      def take_draft_token_ids(self) -> DraftTokenIds | None:
-@@ -3986,6 +4493,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3986,6 +4513,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          gc.collect()
          torch.accelerator.empty_cache()
@@ -2463,7 +2819,7 @@ index 531a30de5..49863971c 100644
      """``calls`` without repeats (a call's keyword arguments are unhashable)."""
      seen: set = set()
 diff --git a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
-index ce4feae24..36d48093a 100644
+index ce4feae24..cbd76e31a 100644
 --- a/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py
 @@ -26,6 +26,61 @@ _INIT_BIAS = -0.2
@@ -2528,7 +2884,45 @@ index ce4feae24..36d48093a 100644
  
  @triton.jit
  def _accumulate_kernel(
-@@ -371,6 +426,9 @@ def _calibrate_confidence_kernel(
+@@ -130,6 +185,7 @@ def _refit_kernel(
+     MAX_STEP: tl.constexpr,
+     MAX_SLOPE: tl.constexpr,
+     MAX_ABS_INTERCEPT: tl.constexpr,
++    INFO_RETENTION: tl.constexpr,
+     BLOCK: tl.constexpr,
+ ):
+     k = tl.arange(0, BLOCK)
+@@ -138,7 +194,8 @@ def _refit_kernel(
+     # Load the stats accumulated over this round to solve (XᵀWX + λI) Δθ = Xᵀr.
+     a_k = tl.load(info_ptr + k * info_row_stride + 0, mask=mask, other=0.0)
+     b_k = tl.load(info_ptr + k * info_row_stride + 1, mask=mask, other=0.0)
+-    c_k = tl.load(info_ptr + k * info_row_stride + 2, mask=mask, other=0.0) + L2
++    c_raw = tl.load(info_ptr + k * info_row_stride + 2, mask=mask, other=0.0)
++    c_k = c_raw + L2
+     a = tl.sum(a_k, axis=0) + L2
+     g0_k = tl.load(grad_ptr + k * grad_row_stride + 0, mask=mask, other=0.0)
+     g1_k = tl.load(grad_ptr + k * grad_row_stride + 1, mask=mask, other=0.0)
+@@ -188,13 +245,14 @@ def _refit_kernel(
+     tl.store(slope_ptr, new_w)
+     tl.store(intercepts_ptr + k, new_bias, mask=mask)
+ 
+-    # Start the round clean by clearing the per-round statistics.
+-    tl.store(info_ptr + k * info_row_stride + 0, 0.0, mask=mask)
+-    tl.store(info_ptr + k * info_row_stride + 1, 0.0, mask=mask)
+-    tl.store(info_ptr + k * info_row_stride + 2, 0.0, mask=mask)
++    # Retain exponentially decayed Fisher curvature so refits track regime shifts
++    # without erasing multi-round curvature; clear gradients once applied.
++    tl.store(info_ptr + k * info_row_stride + 0, a_k * INFO_RETENTION, mask=mask)
++    tl.store(info_ptr + k * info_row_stride + 1, b_k * INFO_RETENTION, mask=mask)
++    tl.store(info_ptr + k * info_row_stride + 2, c_raw * INFO_RETENTION, mask=mask)
+     tl.store(grad_ptr + k * grad_row_stride + 0, 0.0, mask=mask)
+     tl.store(grad_ptr + k * grad_row_stride + 1, 0.0, mask=mask)
+-    tl.store(counts_ptr + k, 0.0, mask=mask)
++    tl.store(counts_ptr + k, n * INFO_RETENTION, mask=mask)
+ 
+ 
+ @triton.jit
+@@ -371,6 +429,9 @@ def _calibrate_confidence_kernel(
      step = token_idx - batch_idx * NUM_SPECULATIVE_STEPS
  
      raw_prob = tl.load(conf_ptr + batch_idx * conf_stride + step).to(tl.float32)
@@ -2538,7 +2932,19 @@ index ce4feae24..36d48093a 100644
      eps = 1e-6
      clamped = tl.minimum(tl.maximum(raw_prob, eps), 1.0 - eps)
      feature = tl.log(clamped / (1.0 - clamped))
-@@ -439,6 +497,7 @@ class OnlineAcceptanceEstimator:
+@@ -422,6 +483,11 @@ class OnlineAcceptanceEstimator:
+     # Largest change of any coefficient in one refit, and coefficient bounds.
+     # A single confidently wrong draft otherwise moved an intercept by ~-20,
+     # predicting ~1e-8 acceptance for everything after it.
++    # Exponential Fisher curvature retention across refit windows (~400-step
++    # effective horizon at 0.75 while zeroing consumed gradients each round).
++    INFO_RETENTION = 0.75
++    _WARM_PRIOR_CURVATURE = 40.0
++    _WARM_PRIOR_COUNTS = 200.0
+     MAX_STEP = 1.0
+     MAX_SLOPE = 4.0
+     MAX_ABS_INTERCEPT = 8.0
+@@ -439,6 +505,7 @@ class OnlineAcceptanceEstimator:
          self.device = device
          self._steps_since_refit = 0
          self._refits = 0
@@ -2546,7 +2952,7 @@ index ce4feae24..36d48093a 100644
  
          # The learned coefficients used for predicting acceptance.
          self.slope = torch.full((1,), init_slope, dtype=torch.float32, device=device)
-@@ -496,26 +555,72 @@ class OnlineAcceptanceEstimator:
+@@ -496,26 +563,82 @@ class OnlineAcceptanceEstimator:
          self._local_max_buf: torch.Tensor | None = None
          self._local_sumexp_buf: torch.Tensor | None = None
  
@@ -2618,14 +3024,44 @@ index ce4feae24..36d48093a 100644
 +            self.intercepts.copy_(
 +                torch.tensor(vals, dtype=torch.float32, device=self.device)
 +            )
++            self.info[:, 0].fill_(
++                (self._WARM_PRIOR_CURVATURE * 4.0) / self.num_speculative_steps
++            )
++            self.info[:, 1].zero_()
++            self.info[:, 2].fill_(self._WARM_PRIOR_CURVATURE)
++            self.grad.zero_()
++            self.counts.fill_(self._WARM_PRIOR_COUNTS)
 +            self._warm_started = True
 +        else:
 +            self.intercepts.fill_(_INIT_CONFIDENCE_HEAD_BIAS)
++            self.info.zero_()
++            self.grad.zero_()
++            self.counts.zero_()
 +            self._warm_started = False
  
      def step(
          self,
-@@ -775,23 +880,31 @@ class OnlineAcceptanceEstimator:
+@@ -585,6 +708,7 @@ class OnlineAcceptanceEstimator:
+             MAX_STEP=self.MAX_STEP,
+             MAX_SLOPE=self.MAX_SLOPE,
+             MAX_ABS_INTERCEPT=self.MAX_ABS_INTERCEPT,
++            INFO_RETENTION=self.INFO_RETENTION,
+             BLOCK=triton.next_power_of_2(self.num_speculative_steps),
+         )
+         self._refits += 1
+@@ -747,9 +871,9 @@ class OnlineAcceptanceEstimator:
+         )
+         self.slope[0] = new_w
+         self.intercepts.copy_(new_bias)
+-        self.info.zero_()
++        self.info.mul_(self.INFO_RETENTION)
+         self.grad.zero_()
+-        self.counts.zero_()
++        self.counts.mul_(self.INFO_RETENTION)
+         self._refits += 1
+ 
+     def calibrate_confidence_probs(
+@@ -775,23 +899,31 @@ class OnlineAcceptanceEstimator:
              token_idx_mapping = idx_mapping[:num_tokens]
  
          if confidence_probs.device.type != "cuda":
@@ -2663,10 +3099,10 @@ index ce4feae24..36d48093a 100644
  
          _calibrate_confidence_kernel[(num_tokens,)](
 diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-index 81bac7496..0adb2309e 100644
+index 81bac7496..8ae4f20a5 100644
 --- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 +++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-@@ -56,6 +56,11 @@ EXPLORE_AFTER_IDLE_STEPS = 32
+@@ -56,6 +56,32 @@ EXPLORE_AFTER_IDLE_STEPS = 32
  HIGH_ROW_COST_KNEE = 16
  HIGH_ROW_COST_SCALE = 0.55
  SINGLE_REQ_TILE_SPILL_SCALE = 2.0
@@ -2675,10 +3111,110 @@ index 81bac7496..0adb2309e 100644
 +# coalescing; scale the calibrated c1 row cost accordingly while leaving
 +# multi-request concurrency (c2..c16) and long copy-draft proposals untouched.
 +SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5
++WIDE_ROW_COST_KNEE = 32
++CALIBRATED_HIGH_ROW_COST_SCALE = 0.65
++CALIBRATED_WIDE_ROW_COST_SCALE = 0.50
++SMALL_BATCH_L2_ROW_COST_BONUS = 0.76
++SMALL_BATCH_COALESCE_REQS = 8
++CALIBRATED_TILE_COST_SHARE = 0.30
++CALIBRATED_STEP_TAU_CAP = 0.25
++CALIBRATED_STALE_FIRST_DRAFT_SHRINK = 0.25
++CALIBRATED_STALE_FIRST_DRAFT_PRIOR = 0.60
++_CALIBRATED_INIT_PROBS: tuple[float, ...] = (0.68, 0.55, 0.50, 0.48, 0.46)
++
++
++def _wave_padded_rows(rows: np.ndarray, num_reqs: int) -> np.ndarray:
++    """Round admitted draft counts up to full active-request waves."""
++    r = np.asarray(rows, dtype=np.int64)
++    if r.size == 0 or num_reqs <= 1:
++        return r.astype(np.float64)
++    base = int(r.reshape(-1)[0])
++    drafts = np.maximum(r - base, 0)
++    padded = base + ((drafts + num_reqs - 1) // num_reqs) * num_reqs
++    return padded.astype(np.float64)
  
  
  def resolve_adaptive_cudagraph_mode(
-@@ -287,6 +292,33 @@ class AdaptiveVerificationManager:
+@@ -97,6 +123,10 @@ class AdaptiveVerificationManager:
+         *,
+         tp_invariant_confidence: bool = False,
+         calibrated_confidence: bool | Callable[[], bool] = False,
++        single_req_calibrated_row_cost_scale: float = SINGLE_REQ_CALIBRATED_ROW_COST_SCALE,
++        calibrated_high_row_cost_scale: float = CALIBRATED_HIGH_ROW_COST_SCALE,
++        wide_row_cost_knee: int = WIDE_ROW_COST_KNEE,
++        calibrated_wide_row_cost_scale: float = CALIBRATED_WIDE_ROW_COST_SCALE,
+     ):
+         self.req_states = req_states
+         self.num_speculative_steps = req_states.num_speculative_steps
+@@ -119,8 +149,16 @@ class AdaptiveVerificationManager:
+         self.single_req_tile_spill_scale = SINGLE_REQ_TILE_SPILL_SCALE
+         self.tp_invariant_confidence = tp_invariant_confidence
+         self.calibrated_confidence = calibrated_confidence
++        self.planned_confidences = bool(planned_confidences)
++        self.single_req_calibrated_row_cost_scale = float(
++            single_req_calibrated_row_cost_scale
++        )
++        self.calibrated_high_row_cost_scale = float(calibrated_high_row_cost_scale)
++        self.wide_row_cost_knee = int(wide_row_cost_knee)
++        self.calibrated_wide_row_cost_scale = float(calibrated_wide_row_cost_scale)
+         self.dead_rows_tau = _DEAD_ROWS_TAU
+         self._has_admitted_drafts = False
++        self._step_dead_rows_tau: float | None = None
+         self._dead_row_cut = torch.empty(
+             req_states.max_num_reqs, dtype=torch.int32, device=device
+         )
+@@ -163,11 +201,26 @@ class AdaptiveVerificationManager:
+         # The new requests' confidence rows, set to 1 together (apply_staged_writes).
+         self._new_rows: list[int] = []
+         self._stale_idx = 0
++        init_stale = self._initial_stale_values()
+         for slot in self._stale_confidences:
+-            slot.np.fill(1.0)
++            slot.np[:] = init_stale
++
++    def _initial_stale_values(self) -> np.ndarray:
++        if self._is_calibrated():
++            priors = _CALIBRATED_INIT_PROBS
++            return np.array(
++                [
++                    priors[min(i, len(priors) - 1)]
++                    for i in range(self.num_speculative_steps)
++                ],
++                dtype=np.float32,
++            )
++        return np.ones(self.num_speculative_steps, dtype=np.float32)
+ 
+     def add_request(self, req_idx: int) -> None:
+-        self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
++        self._stale_confidences[self._stale_idx].np[req_idx] = (
++            self._initial_stale_values()
++        )
+         self._pending_resets.append(req_idx)
+         self._new_rows.append(req_idx)
+ 
+@@ -233,7 +286,9 @@ class AdaptiveVerificationManager:
+         with gpu_sync_allowed():
+             self._copy_events[ready_idx].synchronize()
+         if self._pending_resets:
+-            self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
++            self._stale_confidences[ready_idx].np[self._pending_resets] = (
++                self._initial_stale_values()
++            )
+             self._pending_resets.clear()
+         # Last step's copy has landed: budgets read it, this step overwrites the
+         # slot they were reading before.
+@@ -260,7 +315,9 @@ class AdaptiveVerificationManager:
+                 mid_prefill_slots = input_batch.idx_mapping_np[
+                     incomplete_prefill_np
+                 ].tolist()
+-                self._stale_confidences[self._stale_idx].np[mid_prefill_slots] = 1.0
++                self._stale_confidences[self._stale_idx].np[mid_prefill_slots] = (
++                    self._initial_stale_values()
++                )
+                 self._pending_resets.extend(mid_prefill_slots)
+                 self._new_rows.extend(mid_prefill_slots)
+                 self.apply_staged_writes()
+@@ -287,20 +344,122 @@ class AdaptiveVerificationManager:
              write_slot.copy_to_cpu()
              self._copy_events[write_idx].record()
  
@@ -2688,17 +3224,10 @@ index 81bac7496..0adb2309e 100644
 +            return bool(calibrated())
 +        return bool(calibrated)
 +
-+    def _c1_calibrated_row_cost(self, *, num_reqs: int = 1, max_rows: int = 0) -> float:
-+        base_block = int(
-+            getattr(self, "num_bonus_tokens", 1)
-+            + getattr(self, "num_draft_steps", getattr(self, "num_speculative_steps", 5))
-+        )
-+        if (
-+            num_reqs == 1
-+            and self.row_cost > 0.0
-+            and self._is_calibrated()
-+            and (max_rows <= 0 or max_rows <= base_block)
-+        ):
++    def _calibrated_row_cost(self, *, num_reqs: int = 1) -> float:
++        if not (self.row_cost > 0.0 and self._is_calibrated()):
++            return self.row_cost
++        if num_reqs <= 1:
 +            c1_scale = float(
 +                getattr(
 +                    self,
@@ -2707,28 +3236,119 @@ index 81bac7496..0adb2309e 100644
 +                )
 +            )
 +            return self.row_cost * c1_scale
-+        return self.row_cost
++        l2_bonus = float(
++            getattr(
++                self,
++                "small_batch_l2_row_cost_bonus",
++                SMALL_BATCH_L2_ROW_COST_BONUS,
++            )
++        )
++        req_scale = (
++            1.0 + l2_bonus / float(num_reqs)
++            if num_reqs < SMALL_BATCH_COALESCE_REQS
++            else 1.0
++        )
++        return self.row_cost * req_scale
++
++    def _c1_calibrated_row_cost(self, *, num_reqs: int = 1, max_rows: int = 0) -> float:
++        del max_rows
++        return self._calibrated_row_cost(num_reqs=num_reqs)
 +
      def _step_cost(
          self, rows: np.ndarray, *, num_sampling_requests: int = 1
      ) -> np.ndarray:
-@@ -301,6 +333,10 @@ class AdaptiveVerificationManager:
-         acceptance justifies the second wave.
+-        """Relative verification step cost with a 16-row Tensor Core MMA tile knee.
+-
+-        Across concurrent decode requests (``num_sampling_requests > 1``), rows
+-        above ``HIGH_ROW_COST_KNEE`` (16) share already-launched expert and
+-        dense weight tiles at a discounted marginal cost (``high_row_cost_scale``).
+-        For a single decode request (``num_sampling_requests <= 1``), crossing
+-        16 rows spills 1 row into a second 16-row Tensor Core MMA wave and the
+-        24-row CUDA graph, facing a higher marginal cost unless sustained copy
+-        acceptance justifies the second wave.
++        """Relative verification step cost with Tensor Core MMA and MoE knees.
++
++        With calibrated confidences, prices each base-block / post-knee region
++        continuously without discontinuities across batch sizes or TP ranks.
          """
          knee = getattr(self, "high_row_cost_knee", HIGH_ROW_COST_KNEE)
-+        max_rows = int(np.max(rows)) if rows.size > 0 else 0
-+        eff_row_cost = self._c1_calibrated_row_cost(
-+            num_reqs=num_sampling_requests, max_rows=max_rows
-+        )
++        if self._is_calibrated() and self.row_cost > 0.0:
++            if num_sampling_requests <= 1:
++                base_block = int(
++                    getattr(self, "num_bonus_tokens", 1)
++                    + getattr(
++                        self,
++                        "num_draft_steps",
++                        getattr(self, "num_speculative_steps", 5),
++                    )
++                )
++                c1_rc = self._calibrated_row_cost(num_reqs=1)
++                spill = float(
++                    getattr(
++                        self,
++                        "single_req_tile_spill_scale",
++                        SINGLE_REQ_TILE_SPILL_SCALE,
++                    )
++                )
++                r1 = np.minimum(rows, base_block)
++                if knee > base_block:
++                    r2 = np.maximum(np.minimum(rows, knee) - base_block, 0)
++                    r3 = np.maximum(rows - knee, 0)
++                    return 1.0 + c1_rc * r1 + self.row_cost * r2 + (c1_rc * spill) * r3
++                return (
++                    1.0
++                    + c1_rc * r1
++                    + (c1_rc * spill) * np.maximum(rows - base_block, 0)
++                )
++            eff_rc = self._calibrated_row_cost(num_reqs=num_sampling_requests)
++            custom_hi = getattr(self, "high_row_cost_scale", HIGH_ROW_COST_SCALE)
++            if custom_hi != HIGH_ROW_COST_SCALE:
++                hi_scale = float(custom_hi)
++            else:
++                hi_scale = float(
++                    getattr(
++                        self,
++                        "calibrated_high_row_cost_scale",
++                        CALIBRATED_HIGH_ROW_COST_SCALE,
++                    )
++                )
++            wide_knee = int(getattr(self, "wide_row_cost_knee", WIDE_ROW_COST_KNEE))
++            wide_scale = float(
++                getattr(
++                    self,
++                    "calibrated_wide_row_cost_scale",
++                    CALIBRATED_WIDE_ROW_COST_SCALE,
++                )
++            )
++            tile_share = float(
++                getattr(self, "calibrated_tile_cost_share", CALIBRATED_TILE_COST_SHARE)
++            )
++            if knee > 0:
++
++                def _piecewise(x: np.ndarray) -> np.ndarray:
++                    r1 = np.minimum(x, knee)
++                    if wide_knee > knee:
++                        r2 = np.maximum(np.minimum(x, wide_knee) - knee, 0)
++                        r3 = np.maximum(x - wide_knee, 0)
++                        return r1 + hi_scale * r2 + wide_scale * r3
++                    return r1 + hi_scale * np.maximum(x - knee, 0)
++
++                rows_f64 = np.asarray(rows, dtype=np.float64)
++                effective_rows = (1.0 - tile_share) * _piecewise(rows_f64)
++                if tile_share > 0.0:
++                    effective_rows = effective_rows + tile_share * _piecewise(
++                        _wave_padded_rows(rows, int(num_sampling_requests))
++                    )
++            else:
++                effective_rows = rows
++            return 1.0 + eff_rc * effective_rows
++
          if num_sampling_requests <= 1:
              scale = getattr(
                  self,
-@@ -315,26 +351,16 @@ class AdaptiveVerificationManager:
-             )
-         else:
+@@ -317,24 +476,14 @@ class AdaptiveVerificationManager:
              effective_rows = rows
--        return 1.0 + self.row_cost * effective_rows
-+        return 1.0 + eff_row_cost * effective_rows
+         return 1.0 + self.row_cost * effective_rows
  
 -    def effective_dead_rows_tau(self) -> float:
 -        """Survival threshold for dead-row pruning on host and device.
@@ -2751,12 +3371,12 @@ index 81bac7496..0adb2309e 100644
 -        if calibrated and self.row_cost > 0.0:
 -            return min(tau, 2.0 * self.row_cost / (1.0 + 3.0 * self.row_cost))
 +        if self._is_calibrated() and self.row_cost > 0.0:
-+            eff_row_cost = self._c1_calibrated_row_cost(num_reqs=num_reqs)
++            eff_row_cost = self._calibrated_row_cost(num_reqs=num_reqs)
 +            return min(tau, 2.0 * eff_row_cost / (1.0 + 3.0 * eff_row_cost))
          return tau
  
      def get_num_tokens(
-@@ -377,23 +403,10 @@ class AdaptiveVerificationManager:
+@@ -377,23 +526,10 @@ class AdaptiveVerificationManager:
              if int(eligible_drafts.max(initial=0)) <= num_draft_steps
              else self.num_speculative_steps
          )
@@ -2780,7 +3400,7 @@ index 81bac7496..0adb2309e 100644
          num_drafts_per_req = {
              req_id: int(num_drafts)
              for req_id, num_drafts in zip(req_ids, eligible_drafts, strict=True)
-@@ -406,14 +419,41 @@ class AdaptiveVerificationManager:
+@@ -406,14 +542,97 @@ class AdaptiveVerificationManager:
              self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
              >= self.req_states.prefill_len.np[slots]
          )
@@ -2792,7 +3412,10 @@ index 81bac7496..0adb2309e 100644
 -            rows, num_sampling_requests=int(num_sampling_requests)
 -        )
 -        draft_budget = int(np.argmax(utilities))
-+        tau = self.effective_dead_rows_tau(num_reqs=num_reqs)
++        verifying_mask = eligible_drafts > 0
++        num_verification_reqs = int(np.count_nonzero(verifying_mask))
++        eff_reqs = num_verification_reqs if num_verification_reqs > 0 else num_reqs
++        tau = self.effective_dead_rows_tau(num_reqs=eff_reqs)
 +        if (
 +            num_reqs == 1
 +            and self._is_calibrated()
@@ -2804,13 +3427,33 @@ index 81bac7496..0adb2309e 100644
 +            # let device DeadRows prune on current-step confidences rather than
 +            # intersecting against 1-step-stale host confidences (p_k^2).
 +            draft_budget = max_draft_budget
++            self._step_dead_rows_tau = tau
 +        else:
 +            stale_confidences = self._stale_confidences[self._stale_idx].np[
 +                slots, :step_steps
 +            ]
-+            survival_probability = np.cumprod(
-+                stale_confidences.astype(np.float64), axis=1
-+            )
++            stale_f64 = stale_confidences.astype(np.float64, copy=True)
++            if self._is_calibrated() and stale_f64.shape[1] > 0:
++                dspark_mask = eligible_drafts <= num_draft_steps
++                shrink0 = float(
++                    getattr(
++                        self,
++                        "calibrated_stale_first_draft_shrink",
++                        CALIBRATED_STALE_FIRST_DRAFT_SHRINK,
++                    )
++                )
++                prior0 = float(
++                    getattr(
++                        self,
++                        "calibrated_stale_first_draft_prior",
++                        CALIBRATED_STALE_FIRST_DRAFT_PRIOR,
++                    )
++                )
++                if shrink0 > 0.0 and np.any(dspark_mask):
++                    stale_f64[dspark_mask, 0] = (
++                        1.0 - shrink0
++                    ) * stale_f64[dspark_mask, 0] + shrink0 * prior0
++            survival_probability = np.cumprod(stale_f64, axis=1)
 +            steps = np.arange(step_steps)
 +            valid = steps[None, :] < eligible_drafts[:, None]
 +            if tau > 0:
@@ -2819,26 +3462,93 @@ index 81bac7496..0adb2309e 100644
 +                valid &= survival_probability >= tau
 +            scores = np.sort(survival_probability[valid])[::-1]
 +            scores = scores[:max_draft_budget]
-+            expected_tokens = np.concatenate(
-+                ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
-+            )
-+            rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
-+            utilities = expected_tokens / self._step_cost(
-+                rows, num_sampling_requests=int(num_sampling_requests)
-+            )
++            if 0 < num_verification_reqs < num_reqs:
++                # Isolate decode-draft utility from sunk concurrent prefill rows.
++                base_tokens = num_verification_reqs * self.num_bonus_tokens
++                expected_tokens = np.concatenate(
++                    ([base_tokens], base_tokens + np.cumsum(scores))
++                )
++                rows = int(num_non_draft_tokens[verifying_mask].sum()) + np.arange(
++                    len(scores) + 1
++                )
++                costs = self._step_cost(
++                    rows, num_sampling_requests=num_verification_reqs
++                )
++            else:
++                expected_tokens = np.concatenate(
++                    ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
++                )
++                rows = int(num_non_draft_tokens.sum()) + np.arange(len(scores) + 1)
++                costs = self._step_cost(
++                    rows, num_sampling_requests=int(num_sampling_requests)
++                )
++            utilities = expected_tokens / costs
 +            draft_budget = int(np.argmax(utilities))
++            if (
++                0 < num_verification_reqs < num_reqs
++                and self._is_calibrated()
++                and tau > 0.0
++                and draft_budget > 0
++                and len(scores) > 0
++            ):
++                k_ref = min(draft_budget, len(scores) - 1)
++                marginal_s = float(
++                    expected_tokens[k_ref]
++                    * (costs[k_ref + 1] - costs[k_ref])
++                    / costs[k_ref]
++                )
++                step_cap = float(
++                    getattr(self, "calibrated_step_tau_cap", CALIBRATED_STEP_TAU_CAP)
++                )
++                self._step_dead_rows_tau = max(tau, min(step_cap, marginal_s))
++            else:
++                self._step_dead_rows_tau = tau
          # The confidences come from an estimator that learns only from admitted
          # drafts, so a long run of empty budgets would leave it without the
          # evidence to ever admit one again. Periodically verify one draft per
-@@ -488,7 +528,7 @@ class AdaptiveVerificationManager:
+@@ -488,7 +707,13 @@ class AdaptiveVerificationManager:
          The confidences are the current drafts', broadcast from rank 0, so
          every rank marks the same rows.
          """
 -        tau = self.effective_dead_rows_tau()
-+        tau = self.effective_dead_rows_tau(num_reqs=num_reqs)
++        step_tau = getattr(self, "_step_dead_rows_tau", None)
++        self._step_dead_rows_tau = None
++        tau = (
++            self.effective_dead_rows_tau(num_reqs=num_reqs)
++            if step_tau is None
++            else float(step_tau)
++        )
          if tau <= 0 or not getattr(self, "_has_admitted_drafts", True):
              return None
          return DeadRows(
+@@ -590,6 +815,10 @@ def maybe_create_adaptive_verification_manager(
+     max_total_logits: int,
+     vllm_config: "VllmConfig",
+     adaptive_verification_row_cost: float = 0.02,
++    adaptive_verification_single_req_row_cost_scale: float = SINGLE_REQ_CALIBRATED_ROW_COST_SCALE,
++    adaptive_verification_high_row_cost_scale: float = CALIBRATED_HIGH_ROW_COST_SCALE,
++    adaptive_verification_wide_row_cost_knee: int = WIDE_ROW_COST_KNEE,
++    adaptive_verification_wide_row_cost_scale: float = CALIBRATED_WIDE_ROW_COST_SCALE,
+     target_layer_names: set[str] | None = None,
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+     planned_confidences: bool = False,
+@@ -671,6 +900,16 @@ def maybe_create_adaptive_verification_manager(
+         or None,
+         tp_invariant_confidence=tp_invariant_confidence,
+         calibrated_confidence=calibrated_confidence,
++        single_req_calibrated_row_cost_scale=(
++            adaptive_verification_single_req_row_cost_scale
++        ),
++        calibrated_high_row_cost_scale=(
++            adaptive_verification_high_row_cost_scale
++        ),
++        wide_row_cost_knee=adaptive_verification_wide_row_cost_knee,
++        calibrated_wide_row_cost_scale=(
++            adaptive_verification_wide_row_cost_scale
++        ),
+     )
+ 
+ 
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 index 0a03b9d4a..48d9cd6d4 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
@@ -4657,5 +5367,5 @@ index ff5017a33..2e68c4fee 100644
 +        )
 +    )
 -- 
-2.54.0 (Apple Git-157)
+2.43.0
 
