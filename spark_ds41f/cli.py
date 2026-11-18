@@ -90,6 +90,11 @@ def parser() -> argparse.ArgumentParser:
         help="show detailed per-node live diagnostic warnings and correction commands",
     )
     doctor.add_argument(
+        "--stream-rate", action="store_true",
+        help="with --live: also read 220 MiB of GPU memory on every node whose GPU is idle (one container, "
+             "about a second of GPU time) and print the rate; a node whose GPU is held is skipped",
+    )
+    doctor.add_argument(
         "--fragmentation-commands", action="store_true",
         help="check remote checkpoint fragmentation and print correction commands only; never execute them",
     )
