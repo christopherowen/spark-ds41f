@@ -1,6 +1,6 @@
-From fa72a9c2ce13b1a32cde574d96b6f2c72eefefdd Mon Sep 17 00:00:00 2001
+From df879a1f4e1ab3a8398fc6bfd80f2135b9dcc2df Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
-Date: Wed, 18 Nov 2026 00:01:31 +0100
+Date: Wed, 18 Nov 2026 01:50:35 +0100
 Subject: [PATCH 820/822] perf(spec-decode): optimize DSpark, margin confidence
  head, and verification
 
@@ -25,7 +25,7 @@ Upstream status: local candidate-61 patch
  vllm/models/deepseek_v4_1/nvidia/dspark.py    |  225 +++-
  .../deepseek_v4_1/tilelang/confidence.py      |   61 +-
  vllm/v1/worker/gpu/cudagraph_utils.py         |  133 +-
- vllm/v1/worker/gpu/model_runner.py            |  519 ++++++-
+ vllm/v1/worker/gpu/model_runner.py            |  522 ++++++-
  .../v1/worker/gpu/sample/tilelang_sampling.py |  445 +++++-
  .../gpu/spec_decode/acceptance_estimator.py   |  135 +-
  .../gpu/spec_decode/adaptive_verification.py  |  116 +-
@@ -33,7 +33,7 @@ Upstream status: local candidate-61 patch
  .../gpu/spec_decode/greedy_verification.py    |  121 ++
  .../worker/gpu/spec_decode/tilelang_copy.py   |   91 +-
  .../gpu/spec_decode/tilelang_rejection.py     | 1195 ++++++++++++++++-
- 16 files changed, 3536 insertions(+), 225 deletions(-)
+ 16 files changed, 3539 insertions(+), 225 deletions(-)
  create mode 100644 tests/v1/spec_decode/test_margin_confidence.py
 
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
@@ -1269,7 +1269,7 @@ index 770d8960e..61b889dc2 100644
      torch.accelerator.empty_cache()
 +    trim_host_heap()
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 059a06e7e..a719e1618 100644
+index 059a06e7e..1e176715d 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -75,7 +75,12 @@ from vllm.multimodal.encoder_budget import (
@@ -1670,11 +1670,14 @@ index 059a06e7e..a719e1618 100644
      def declare_step_kernels(self) -> None:
          """Declare the kernels that input preparation, sampling, greedy
          verification and the drafter launch: for the runner's buffers, the loaded
-@@ -2517,6 +2773,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2517,6 +2773,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      )
                  ),
              )
-+        if self.rejection_sampler is not None and self._sampled_verification_available():
++        if (
++            self.rejection_sampler is not None
++            and getattr(self, "_sampled_verification_available", lambda: False)()
++        ):
 +            assert head is not None and processor is not None
 +            register_sampled_verification_warmups(
 +                logits_dtype=processor.head_dtype,
@@ -1696,7 +1699,7 @@ index 059a06e7e..a719e1618 100644
          if isinstance(self.speculator, DFlashSpeculator):
              self.speculator.register_warmups(
                  self._draft_block_table_layouts(kv_cache_groups, kernel_block_sizes)
-@@ -2772,6 +3047,193 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2772,6 +3050,193 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  )
          return output
  
@@ -1890,7 +1893,7 @@ index 059a06e7e..a719e1618 100644
      def _init_sink(self, config: SinkConfig, custom_sampler: bool) -> None:
          """Builds the sink detector's sampling state, after the samplers, and
          refuses the configurations it does not handle."""
-@@ -3009,6 +3471,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3009,6 +3474,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          context_len: int = 0,
          valid_dummy_state_slots: bool = False,
          profile_all_kv_cache_groups: bool = False,
@@ -1898,7 +1901,7 @@ index 059a06e7e..a719e1618 100644
      ) -> ModelRunnerOutput | IntermediateTensors | None:
          if not dummy_run:
              # Update the request states.
-@@ -3243,6 +3706,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3243,6 +3709,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      or int(input_batch.num_scheduled_tokens.max()),
                      self.kv_cache_config.num_blocks,
                  )
@@ -1912,7 +1915,7 @@ index 059a06e7e..a719e1618 100644
  
          attn_metadata = None
          slot_mappings_by_layer = None
-@@ -3335,6 +3805,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3335,6 +3808,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  inputs_embeds = self.model_state.dummy_inputs_embeds(
                      input_batch.num_tokens_after_padding
                  )
@@ -1926,7 +1929,7 @@ index 059a06e7e..a719e1618 100644
              else:
                  scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
                  if self.supports_mm_inputs and self.lora_config is not None:
-@@ -3386,6 +3863,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3386,6 +3866,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.model_config, input_batch.num_tokens, ubatch_slices
          )
  
@@ -1945,7 +1948,7 @@ index 059a06e7e..a719e1618 100644
          self.step_timing.record_batch(
              input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
          )
-@@ -3512,9 +4001,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3512,9 +4004,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # Non-last PP rank: return IntermediateTensors for sending.
              assert output_intermediate_tensors is not None
              assert self.pp_handler is not None
@@ -1964,7 +1967,7 @@ index 059a06e7e..a719e1618 100644
          if self.layer_progress is not None and not dummy_run:
              # The engine core decides the next step once this one reaches the layer.
              return self.layer_progress.reply()
-@@ -3898,6 +4395,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3898,6 +4398,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          model_runner_output.kv_connector_output = kv_connector_output
          model_runner_output.ec_connector_output = ec_connector_output
  
@@ -1978,7 +1981,7 @@ index 059a06e7e..a719e1618 100644
          return async_output
  
      def take_draft_token_ids(self) -> DraftTokenIds | None:
-@@ -3986,6 +4490,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -3986,6 +4493,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          gc.collect()
          torch.accelerator.empty_cache()
@@ -4654,5 +4657,5 @@ index ff5017a33..2e68c4fee 100644
 +        )
 +    )
 -- 
-2.43.0
+2.54.0 (Apple Git-157)
 

@@ -1,6 +1,6 @@
-From 9e4acfaa599ae9b4ab7dbb0786d925d2e01f76c7 Mon Sep 17 00:00:00 2001
+From 44a023ad1ccc20de68b18960084b47b284b58f65 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
-Date: Wed, 18 Nov 2026 00:01:30 +0100
+Date: Wed, 18 Nov 2026 01:50:34 +0100
 Subject: [PATCH 817/822] perf(dsv41): optimize TileLang sparse MLA, indexer,
  front, and SP prefill
 
@@ -20,14 +20,15 @@ Upstream status: local candidate-61 patch
  .../attention/test_deepseek_v41_tilelang.py   |  76 +++-
  .../test_deepseek_v41_tilelang_front.py       |  92 ++++
  .../test_deepseek_v41_tilelang_metadata.py    |  74 ++++
- vllm/models/deepseek_v4_1/attention.py        | 267 +++++++----
+ tests/models/test_deepseek_v4_1_compressor.py |  42 +-
+ vllm/models/deepseek_v4_1/attention.py        | 288 ++++++++----
  vllm/models/deepseek_v4_1/compressor.py       |   7 +-
  vllm/models/deepseek_v4_1/sp_prefill.py       |  34 +-
  vllm/models/deepseek_v4_1/tilelang/front.py   | 418 ++++++++++++------
  vllm/models/deepseek_v4_1/tilelang/indexer.py | 256 ++++++++---
  .../models/deepseek_v4_1/tilelang/metadata.py | 232 +++++++---
  .../deepseek_v4_1/tilelang/sparse_mla.py      |   1 -
- 10 files changed, 1094 insertions(+), 363 deletions(-)
+ 11 files changed, 1143 insertions(+), 377 deletions(-)
 
 diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
 index 25126ea81..b46399c08 100644
@@ -385,8 +386,69 @@ index 4455666ec..70e1c259d 100644
 +    for r in (2, 4, 5):
 +        assert bool((page_out1[r] == -9).all())
 +    assert torch.equal(page_sub, page_out1[2:])
+diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
+index c84b2ab06..53d543c46 100644
+--- a/tests/models/test_deepseek_v4_1_compressor.py
++++ b/tests/models/test_deepseek_v4_1_compressor.py
+@@ -533,12 +533,11 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+ 
+         tp1 = build_rank(0, 1)
+         assert tp1.fused_wkv_wgate.tp_size == 1
+-        assert hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
+-        assert tp1.fused_wkv_wgate.weight.shape == (
+-            512 * ratio,
+-            hidden + hidden // 2,
+-        )
+-        assert unpack_bf16_layer(tp1.fused_wkv_wgate).shape == (512 * ratio, hidden)
++        assert not hasattr(tp1.fused_wkv_wgate, "packed_bf16_exponent_base")
++        assert tp1.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
++        assert torch.equal(tp1.fused_wkv_wgate.weight[:512], wkv)
++        if ratio == 2:
++            assert torch.equal(tp1.fused_wkv_wgate.weight[512:], wgate)
+ 
+         x = torch.randn(
+             (capacity, hidden), generator=gen, device=device, dtype=torch.bfloat16
+@@ -556,8 +555,37 @@ def test_compressor_tp_sharded_fused_wkv_wgate_matches_tp1(monkeypatch, ratio):
+         from vllm.models.deepseek_v4_1.tilelang.linear import project_parts
+ 
+         for tp_size in (2, 3, 4, 5, 6, 7, 8):
+-            part_cols = _compressor_part_cols(tp_size)
+             ranks = [build_rank(r, tp_size) for r in range(tp_size)]
++            if tp_size <= 4:
++                for comp in ranks:
++                    assert comp.fused_wkv_wgate.tp_size == 1
++                    assert not hasattr(comp.fused_wkv_wgate, "packed_bf16_exponent_base")
++                    assert comp.fused_wkv_wgate.weight.shape == (512 * ratio, hidden)
++                    assert torch.equal(comp.fused_wkv_wgate.weight[:512], wkv)
++                    if ratio == 2:
++                        assert torch.equal(comp.fused_wkv_wgate.weight[512:], wgate)
++
++                monkeypatch.setattr(
++                    comp_mod,
++                    "tensor_model_parallel_all_gather",
++                    lambda *a, **k: pytest.fail("TP<=4 compressor must not all_gather"),
++                )
++                for rows in (1, 7, 16, 64, 160):
++                    inp = x[:rows]
++                    ref_values, ref_gates = expected_by_rows[rows]
++                    for comp in ranks:
++                        comp._project(inp)
++                        assert torch.equal(
++                            comp._values[:rows], ref_values
++                        ), f"tp={tp_size} rows={rows}"
++                        if ratio == 2:
++                            assert torch.equal(
++                                comp._gates[:rows], ref_gates
++                            ), f"tp={tp_size} rows={rows}"
++                        assert not comp.fused_wkv_wgate.tilelang_counters.any()
++                continue
++
++            part_cols = _compressor_part_cols(tp_size)
+             for r, comp in enumerate(ranks):
+                 assert comp.fused_wkv_wgate.tp_size == tp_size
+                 assert hasattr(comp.fused_wkv_wgate, "packed_bf16_exponent_base")
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 1245aafbb..4be2a0a3a 100644
+index 1245aafbb..117b335e0 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
 @@ -19,8 +19,10 @@ from vllm.distributed import (
@@ -724,43 +786,53 @@ index 1245aafbb..4be2a0a3a 100644
                          score_width=score_width,
                          output_indices=selected[offset:end],
                          **candidate_args,
-@@ -2149,7 +2223,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2148,8 +2222,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 q = self._rope(q, positions, "q")
              if output is None:
                  output = torch.empty_like(q)
++            pad_kw = {"is_padding": pad_mask} if pad_mask is not None else {}
              self._attend_split(
 -                q, output, positions, swa, main, owner, rows, decode_rows
 +                q, output, positions, swa, main, owner, rows, decode_rows,
-+                is_padding=pad_mask,
++                **pad_kw,
              )
              return output
          if finish_front is not None:
-@@ -2183,7 +2258,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2169,6 +2245,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # metadata beside, not overlapping, the native attention scratch.
+         metadata_specs = self._attention_workspace_specs[mode]
+         scratch_specs = self._attention_scratch_specs(mode, rows)
++        pad_kw = {"is_padding": pad_mask} if pad_mask is not None else {}
+         # Layers sharing cache groups map identical pages, so the first layer of
+         # each group keeps its metadata for the rest of the forward on decode and
+         # decode-sized extend steps. Every replay rewrites it before use, so it
+@@ -2183,7 +2260,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  )
              )
              metadata_buffers = self._shared_decode_metadata(
 -                swa, main, rows, shared_specs, device
-+                swa, main, rows, shared_specs, device, is_padding=pad_mask
++                swa, main, rows, shared_specs, device, **pad_kw
              )
              arena = current_workspace_manager().get_simultaneous(*scratch_specs)
              scratch = list(arena)
-@@ -2192,7 +2267,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2192,7 +2269,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  *metadata_specs, *scratch_specs
              )
              metadata_count = len(metadata_specs)
 -            self._write_decode_metadata(arena, swa, main, rows)
-+            self._write_decode_metadata(arena, swa, main, rows, is_padding=pad_mask)
++            self._write_decode_metadata(arena, swa, main, rows, **pad_kw)
              metadata_buffers = arena[:metadata_count]
              scratch = arena[metadata_count:]
          if wait_selected is not None:
-@@ -2221,7 +2296,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2221,16 +2298,56 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          )
          return output
  
 -    def _shared_decode_metadata(self, swa, main, rows, specs, device):
 +    def _decode_is_padding(self, swa, rows: int) -> torch.Tensor | None:
 +        if (
-+            self.is_draft
-+            or self.is_ced_decoder
++            getattr(self, "is_draft", False)
++            or getattr(self, "is_ced_decoder", False)
 +            or getattr(swa, "routing_mask", None) is not None
 +            or not envs.VLLM_MOE_SKIP_PADDING
 +            or not is_forward_context_available()
@@ -796,17 +868,23 @@ index 1245aafbb..4be2a0a3a 100644
 +        self, swa, main, rows, specs, device, *, is_padding=None
 +    ):
          replay = self._replay_start(swa)
++        is_draft = getattr(self, "is_draft", False)
++        is_ced_decoder = getattr(self, "is_ced_decoder", False)
          key = (
              id(swa),
-@@ -2231,6 +2343,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
-             self.is_ced_decoder,
+             id(main),
+             id(replay),
+-            self.is_draft,
+-            self.is_ced_decoder,
++            is_draft,
++            is_ced_decoder,
              rows,
              specs,
 +            id(is_padding) if is_padding is not None else None,
          )
          context = get_forward_context()
          shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
-@@ -2240,16 +2353,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2240,16 +2357,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              or entry[0] is not swa
              or entry[1] is not main
              or entry[2] is not replay
@@ -819,9 +897,12 @@ index 1245aafbb..4be2a0a3a 100644
 -            self._write_decode_metadata(metadata_buffers, swa, main, rows)
 -            entry = shared[key] = (swa, main, replay, metadata_buffers)
 -        return entry[3]
-+            self._write_decode_metadata(
-+                metadata_buffers, swa, main, rows, is_padding=is_padding
-+            )
++            if is_padding is None:
++                self._write_decode_metadata(metadata_buffers, swa, main, rows)
++            else:
++                self._write_decode_metadata(
++                    metadata_buffers, swa, main, rows, is_padding=is_padding
++                )
 +            entry = shared[key] = (swa, main, replay, is_padding, metadata_buffers)
 +        return entry[4]
  
@@ -832,7 +913,18 @@ index 1245aafbb..4be2a0a3a 100644
          """A mixed step's attention: its decode requests' rows on the decode plan,
          the rest on the extend plan. Mixed steps run eagerly, so the per-row
          metadata is an ordinary allocation shared across contiguous layers of the
-@@ -2287,7 +2405,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2266,8 +2391,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             id(swa),
+             id(main),
+             id(replay),
+-            self.is_draft,
+-            self.is_ced_decoder,
++            getattr(self, "is_draft", False),
++            getattr(self, "is_ced_decoder", False),
+             rows,
+             extend_specs,
+         )
+@@ -2287,7 +2412,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                      torch.empty(shape, dtype=dtype, device=q.device)
                      for shape, dtype in extend_specs
                  )
@@ -841,7 +933,15 @@ index 1245aafbb..4be2a0a3a 100644
              entry = context.__dict__["_ds41_split_metadata"] = (
                  key,
                  swa,
-@@ -2337,7 +2455,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2331,13 +2456,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self._draft_replay_start = replay_start
+ 
+     def _replay_start(self, swa):
+-        if self.is_ced_decoder:
++        if getattr(self, "is_ced_decoder", False):
+             return swa.swa_replay_start
+-        if self._draft_replays:
++        if getattr(self, "_draft_replays", False):
              return self._draft_replay_start
          return None
  
@@ -850,7 +950,16 @@ index 1245aafbb..4be2a0a3a 100644
          from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
  
          swa_indices, swa_lengths, top_lengths = buffers[:3]
-@@ -2360,7 +2478,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2345,7 +2470,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         window = dict(
+             page=self.swa_cache_layer.block_size,
+             window=self.window_size,
+-            draft=self.is_draft,
++            draft=getattr(self, "is_draft", False),
+             replay_start=self._replay_start(swa),
+         )
+         common = (
+@@ -2360,7 +2485,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
              swa.request_positions,
          )
          if main is None:
@@ -859,7 +968,7 @@ index 1245aafbb..4be2a0a3a 100644
          else:
              # The window metadata and the main page table in one launch.
              tl_metadata.decode_metadata(
-@@ -2372,6 +2490,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -2372,6 +2497,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  rows,
                  main.block_table.shape[1],
                  main_page=self._main_page,
@@ -2203,5 +2312,5 @@ index 9f5246895..652b74bd0 100644
              )
          return SimpleNamespace(
 -- 
-2.43.0
+2.54.0 (Apple Git-157)
 

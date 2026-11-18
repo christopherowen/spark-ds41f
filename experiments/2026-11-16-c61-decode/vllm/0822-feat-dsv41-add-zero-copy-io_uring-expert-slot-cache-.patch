@@ -1,6 +1,6 @@
-From b65de405e122c3aa921fc041dc0f0e7e12c2c4a6 Mon Sep 17 00:00:00 2001
+From efbaf5142c409b3f8ee6b610af395ed3f4a120ca Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
-Date: Wed, 18 Nov 2026 00:01:31 +0100
+Date: Wed, 18 Nov 2026 01:50:35 +0100
 Subject: [PATCH 822/822] feat(dsv41): add zero-copy io_uring expert slot cache
  and moe_down PDL preload
 
@@ -20,16 +20,16 @@ Upstream status: local candidate-61 patch (incorporates PR #981)
 ---
  .../moe/test_deepseek_v41_expert_slots.py     | 1241 +++++++++
  vllm/envs.py                                  |   25 +
- .../layers/fused_moe/tilelang.py              |  130 +-
+ .../layers/fused_moe/tilelang.py              |  131 +-
  .../layers/quantization/mxfp4.py              |   84 +-
  .../deepseek_v4_1/expert_slots/__init__.py    |   57 +
  .../deepseek_v4_1/expert_slots/_native.py     |  172 ++
  .../deepseek_v4_1/expert_slots/_reader.c      |  802 ++++++
  .../deepseek_v4_1/expert_slots/cache.py       | 2343 +++++++++++++++++
- vllm/models/deepseek_v4_1/nvidia/model.py     |  266 ++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  267 ++
  vllm/models/deepseek_v4_1/nvidia/vl_model.py  |   16 +
  vllm/models/deepseek_v4_1/tilelang/moe.py     |  461 +++-
- 11 files changed, 5442 insertions(+), 155 deletions(-)
+ 11 files changed, 5444 insertions(+), 155 deletions(-)
  create mode 100644 tests/kernels/moe/test_deepseek_v41_expert_slots.py
  create mode 100644 vllm/models/deepseek_v4_1/expert_slots/__init__.py
  create mode 100644 vllm/models/deepseek_v4_1/expert_slots/_native.py
@@ -1327,7 +1327,7 @@ index e23bac7fa..2a1087b3d 100755
      # the served model name whose requests alone it steers (vllm/weightless.py),
      # set together or not at all. Part of the compile key, as every variable here
 diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
-index a45b67116..d31ec9e75 100644
+index a45b67116..5222db5d1 100644
 --- a/vllm/model_executor/layers/fused_moe/tilelang.py
 +++ b/vllm/model_executor/layers/fused_moe/tilelang.py
 @@ -20,6 +20,7 @@ rest of the batch.
@@ -1465,7 +1465,7 @@ index a45b67116..d31ec9e75 100644
          # Tile-major copies replace the checkpoint layout, so each GEMM tile's
          # weights and scale codes are contiguous. A K that ends 64 past a multiple
          # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
-@@ -337,15 +436,28 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+@@ -337,15 +436,29 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
              shared = self.combine_addend
          if self.defer_combine:
              assert self.fold_shared, "only a folded combine is deferred"
@@ -1478,8 +1478,9 @@ index a45b67116..d31ec9e75 100644
 -            workspace,
 -            shared,
 -        )
-+        if self._slot_cache is not None:
-+            combine = self._slot_cache.run(
++        slot_cache = getattr(self, "_slot_cache", None)
++        if slot_cache is not None:
++            combine = slot_cache.run(
 +                self._plan,
 +                _provided_mxfp8(hidden_states),
 +                topk_ids,
@@ -1487,7 +1488,7 @@ index a45b67116..d31ec9e75 100644
 +                None if self.defer_combine else output,
 +                workspace,
 +                shared,
-+                next_lookahead=self._next_lookahead,
++                next_lookahead=getattr(self, "_next_lookahead", None),
 +                lookahead_hidden=hidden_states,
 +            )
 +        else:
@@ -5064,7 +5065,7 @@ index 000000000..c1b5dc6c7
 +                "prepared_experts_total": self.prepared_experts_total,
 +            }
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index e72f38df9..b227d494e 100644
+index e72f38df9..b73f9acd6 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -1,9 +1,12 @@
@@ -5164,7 +5165,7 @@ index e72f38df9..b227d494e 100644
  
          # Hashing reads the runner's accepted-only lookback, never KV slot state.
          self.engram_hash: NgramHashState | None = None
-@@ -1428,6 +1501,187 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1428,6 +1501,188 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              else:
                  layer.hc_attn_fn_broadcast.copy_(broadcast)
  
@@ -5301,8 +5302,9 @@ index e72f38df9..b227d494e 100644
 +        return disk_cache
 +
 +    def finalize_expert_slot_cache(self) -> None:
-+        if self._expert_disk_cache is not None:
-+            stats = self._expert_disk_cache.loading_done()
++        disk_cache = getattr(self, "_expert_disk_cache", None)
++        if disk_cache is not None:
++            stats = disk_cache.loading_done()
 +            logger.info("DS4.1 expert disk cache stats: %s", stats)
 +
 +        moe_entries = list(self._iter_slot_cached_moe_layers())
@@ -5352,7 +5354,7 @@ index e72f38df9..b227d494e 100644
  
  def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
      """Native block32 linears retain the checkpoint-compatible scale name."""
-@@ -1523,6 +1777,17 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
+@@ -1523,6 +1778,17 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
          return hidden_states
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -5370,7 +5372,7 @@ index e72f38df9..b227d494e 100644
          loader = AutoWeightsLoader(self)
          # AutoWeightsLoader may revisit this child for another contiguous
          # prefix group. Finalize only in the root model's post-load hook.
-@@ -1535,3 +1800,4 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
+@@ -1535,3 +1801,4 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
                  module.setup_wo_projection()
              if isinstance(module, Engram):
                  module.process_weights_after_loading()
@@ -6121,5 +6123,5 @@ index 476278a89..37ee82fb9 100644
          if callable(shared):
              shared = shared()
 -- 
-2.43.0
+2.54.0 (Apple Git-157)
 
