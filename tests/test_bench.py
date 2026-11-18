@@ -604,6 +604,139 @@ class BenchAbortCleanupTest(unittest.TestCase):
                 self.assertEqual(report["workload"]["concurrency"], [1, 2, 4, 8, 16])
 
 
+class BetweenBenchCoolingTest(unittest.TestCase):
+    """Cooling runs between suites and before every individual prefill sample."""
+
+    def test_command_bench_cools_between_suites_and_before_each_prefill_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cluster = spark.read_cluster("config/cluster.json", "tp4-ring")
+            nodes = spark.read_json("config/examples/nodes-ring4.json")
+            options = spark.parser().parse_args([
+                "--cluster-config", "config/cluster.json", "bench",
+                "--compare", "none",
+                "--suites", "quality,decode,prefill",
+                "--prefill-sizes", "32768,131072",
+                "--prefill-repeats", "2",
+                "--output", tmp,
+            ])
+            identity = {"live_warnings": [], "live_problems": []}
+            events: list[str] = []
+
+            class Watch:
+                def __init__(self, *args): pass
+                def wait_ready(self): pass
+                def check(self): pass
+                def thermal_summary(self): return {}
+                def close(self): return {}
+
+            def fake_cool(*args, **kwargs):
+                events.append("cool")
+                return [{"node": "dgx1", "final_c": 50.0}]
+
+            def fake_quality(bench, opts, rng):
+                events.append("quality")
+                return {"ok": True, "passed": 1, "runs": []}
+
+            def fake_decode(bench, opts, rng):
+                events.append("decode")
+                return {"points": {}}
+
+            def fake_prefill_run(self_bench, label, payloads, **kwargs):
+                events.append(f"run:{label}")
+                return {
+                    "wall_s": 1.0,
+                    "requests": [{"ok": True, "prompt_tokens": 100, "ttft_s": 0.1}],
+                    "metrics": {},
+                    "peak": {},
+                }
+
+            orig_cool_phase = spark.Bench.cool_phase
+
+            def spy_cool_phase(self_bench, phase):
+                events.append(f"phase:{phase}")
+                return orig_cool_phase(self_bench, phase)
+
+            def spy_wait_idle(self_bench, timeout=300):
+                events.append("wait_idle")
+                return {}
+
+            with mock.patch.object(spark, "configuration", return_value=(cluster, nodes, {})), \
+                    mock.patch.object(spark, "bench_identity", return_value=identity), \
+                    mock.patch.object(spark, "MemoryWatch", Watch), \
+                    mock.patch.object(spark, "cool_nodes", side_effect=fake_cool), \
+                    mock.patch.object(spark, "start_fan_curve", return_value=[]), \
+                    mock.patch.object(spark, "fan_curve_problems", return_value=[]), \
+                    mock.patch.object(spark, "stop_fan_curve", return_value=[]), \
+                    mock.patch.object(spark.Bench, "cool_phase", spy_cool_phase), \
+                    mock.patch.object(spark.Bench, "wait_idle", spy_wait_idle), \
+                    mock.patch.object(spark.Bench, "run", fake_prefill_run), \
+                    mock.patch.dict(spark.BENCH_SUITE_FUNCTIONS, {
+                        "quality": fake_quality,
+                        "decode": fake_decode,
+                    }), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                status = options.func(options)
+
+            self.assertEqual(status, 0)
+            report = json.loads((Path(tmp) / "bench.json").read_text())
+            self.assertEqual(events[0:4], ["cool", "quality", "wait_idle", "phase:suite:decode"])
+            self.assertEqual(events[4:6], ["cool", "decode"])
+            prefill_phases = [entry["phase"] for entry in report["between_cooling"]]
+            self.assertEqual(prefill_phases[0], "suite:decode")
+            self.assertEqual(len(prefill_phases), 5)
+            self.assertEqual([p.split(":")[0] for p in prefill_phases[1:]], ["prefill"] * 4)
+            self.assertTrue(any(p.endswith(":r1") for p in prefill_phases[1:]))
+            self.assertTrue(any(p.endswith(":r2") for p in prefill_phases[3:]))
+
+    def test_between_bench_cooling_failure_aborts_and_stops_fan_curve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cluster = spark.read_cluster("config/cluster.json", "tp4-ring")
+            nodes = spark.read_json("config/examples/nodes-ring4.json")
+            options = spark.parser().parse_args([
+                "--cluster-config", "config/cluster.json", "bench",
+                "--compare", "none",
+                "--suites", "quality,decode",
+                "--output", tmp,
+            ])
+            identity = {"live_warnings": [], "live_problems": []}
+            calls = {"cool": 0, "stop_fan": 0}
+
+            class Watch:
+                def __init__(self, *args): pass
+                def wait_ready(self): pass
+                def check(self): pass
+                def thermal_summary(self): return {}
+                def close(self): return {}
+
+            def fake_cool(*args, **kwargs):
+                calls["cool"] += 1
+                if calls["cool"] == 2:
+                    raise RuntimeError("sensor timeout")
+                return [{"node": "dgx1", "final_c": 50.0}]
+
+            with mock.patch.object(spark, "configuration", return_value=(cluster, nodes, {})), \
+                    mock.patch.object(spark, "bench_identity", return_value=identity), \
+                    mock.patch.object(spark, "MemoryWatch", Watch), \
+                    mock.patch.object(spark, "cool_nodes", side_effect=fake_cool), \
+                    mock.patch.object(spark, "start_fan_curve", return_value=[{"node": "dgx1", "started": True}]), \
+                    mock.patch.object(spark, "fan_curve_problems", return_value=[]), \
+                    mock.patch.object(spark, "stop_fan_curve", side_effect=lambda *a, **k: calls.__setitem__("stop_fan", calls["stop_fan"] + 1) or []), \
+                    mock.patch.object(spark.Bench, "wait_idle", return_value={}), \
+                    mock.patch.dict(spark.BENCH_SUITE_FUNCTIONS, {
+                        "quality": lambda b, o, r: {"ok": True, "passed": 1, "runs": []},
+                        "decode": lambda b, o, r: self.fail("decode should not run after cooling failure"),
+                    }), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                status = options.func(options)
+
+            self.assertEqual(status, 1)
+            self.assertEqual(calls["stop_fan"], 1)
+            report = json.loads((Path(tmp) / "bench.json").read_text())
+            self.assertEqual(report["aborted"], "cooling failed (suite:decode): sensor timeout")
+            self.assertIn("quality", report["suites"])
+            self.assertNotIn("decode", report["suites"])
+
+
 class ReferenceShapeTest(unittest.TestCase):
     TP3_REFERENCE = "manifests/benchmarks/2026-10-12-karmic-kraken-r6h.json"
     TP4_REFERENCE = "manifests/suites/2026-10-15-karmic-kraken-r6n-tp4"

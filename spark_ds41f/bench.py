@@ -26,7 +26,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1262,7 +1262,13 @@ def stop_fan_curve(nodes: dict, targets: list[dict], records: list[dict]) -> lis
 
 
 class Bench:
-    def __init__(self, base: str, nodes: dict, floor_gib: float) -> None:
+    def __init__(
+        self,
+        base: str,
+        nodes: dict,
+        floor_gib: float,
+        cool: Callable[[str], list[dict]] | None = None,
+    ) -> None:
         self.base = base
         self.stop = threading.Event()
         self.reason: str | None = None
@@ -1271,11 +1277,18 @@ class Bench:
         self.start_total: float | None = None
         self.discarded: list[dict] = []
         self.memory = MemoryWatch(nodes, floor_gib, self.halt)
+        self.cool = cool
 
     def halt(self, reason: str) -> None:
         if not self.stop.is_set():
             self.reason = reason
             self.stop.set()
+
+    def cool_phase(self, phase: str) -> list[dict]:
+        """Cool cluster nodes before a benchmark phase when a hook is configured."""
+        if self.cool is None:
+            return []
+        return self.cool(phase)
 
     def wait_idle(self, timeout: float = 300) -> dict:
         deadline = time.monotonic() + timeout
@@ -1941,8 +1954,13 @@ def suite_prefill(bench: Bench, options: argparse.Namespace, rng: random.Random)
     prefill_text = {"filler": filler, "novel": novel_text, "source": source_text}[options.prefill_text]
     sizes = [size for size in options.prefill_sizes if size < options.max_model_len - 64]
     samples: dict[str, list[dict]] = {str(size): [] for size in sizes}
-    for _ in range(options.prefill_repeats):
+    cool_fn = getattr(bench, "cool_phase", None)
+    for repeat in range(options.prefill_repeats):
         for size in rng.sample(sizes, len(sizes)):
+            if cool_fn is not None:
+                if hasattr(bench, "wait_idle"):
+                    bench.wait_idle()
+                cool_fn(f"prefill:{size}:r{repeat + 1}")
             payload = {
                 "model": options.model,
                 "prompt": prefill_text(int(size * 0.97), rng.randrange(1 << 30)) + "\n\nReply with the word ok.",
@@ -2623,7 +2641,20 @@ def command_bench(args: argparse.Namespace) -> int:
 
     print(f"benchmarking {base} ({config_name}); writing {report_path}", flush=True)
     rng = random.Random(args.seed)
-    bench = Bench(base, nodes, floor_gib)
+
+    def cool_phase(phase: str) -> list[dict]:
+        try:
+            records = cool_nodes(
+                nodes, nodes["nodes"], args.cool_below, args.cool_timeout,
+                fan_control=fan_control_enabled(cluster),
+            )
+        except RuntimeError as error:
+            raise BenchAbort(f"cooling failed ({phase}): {error}") from error
+        report.setdefault("between_cooling", []).append({"phase": phase, "records": records})
+        save()
+        return records
+
+    bench = Bench(base, nodes, floor_gib, cool=cool_phase)
     fan_failures: list[str] = []
     try:
         try:
@@ -2641,14 +2672,19 @@ def command_bench(args: argparse.Namespace) -> int:
             for problem in missing_curve:
                 print(f"WARN: {problem}", flush=True)
         bench.memory.wait_ready()
+        ran_suite = False
         for suite in BENCH_SUITES:
             if suite not in suites:
                 continue
+            if ran_suite and suite != "prefill":
+                bench.wait_idle()
+                bench.cool_phase(f"suite:{suite}")
             print(f"{suite}:", flush=True)
             report["suites"][suite] = BENCH_SUITE_FUNCTIONS[suite](bench, args, rng)
             save()
             if suite == "quality" and not report["suites"][suite]["ok"]:
                 raise BenchAbort("the quality gate failed; performance numbers would be meaningless")
+            ran_suite = True
     except BenchAbort as abort:
         report["aborted"] = str(abort)
     except OSError as error:
