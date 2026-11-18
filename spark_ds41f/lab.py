@@ -2287,7 +2287,7 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             elif step["kind"] == "fresh_inventory":
                 fresh_inventory(step.get("config"))
             elif step["kind"] == "stop":
-                if container_running() and not stop_cluster(remove=step.get("remove", False)):
+                if (step.get("remove") or container_running()) and not stop_cluster(remove=step.get("remove", False)):
                     failed = "stop failed"
                     break
             elif step["kind"] == "analyze":
