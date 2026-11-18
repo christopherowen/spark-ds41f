@@ -1,7 +1,7 @@
 # The FFN prefetch window's pace
 
-Date: 2026-11-18. Base commit: `5ecae76a0` (main). Image: `spark-ds41f:candidate-61`. Nothing is built: four vLLM
-files are mounted over the image.
+Date: 2026-11-18. Base commit: `c0e4124f7` (main). Image: `spark-ds41f:candidate-61` as rebuilt on 18 November (vLLM
+tree `42332c66ca46`). Nothing is built: four vLLM files are mounted over the image.
 
 ## Question
 
@@ -49,6 +49,10 @@ pace, and the FFN plan its own:
 
 At the default pace the FFN plan, the kernel's call and the launcher are the image's own. The layer's log line
 names the pace (`FFN ... [pace 100 ns]`).
+
+The arms name the experiment's own copy of candidate-61's source lock ([upstreams.lock.json](upstreams.lock.json),
+byte for byte `experiments/2026-11-16-c61-decode/upstreams.lock.json`): under candidate-61's own lock the lab reads
+an arm's variable as drift from candidate-61's profile and refuses the arm.
 
 ## Prediction, before the runs
 
@@ -115,3 +119,12 @@ bin/spark candidate queue tp4-ring experiments/2026-11-18-ffn-prefetch-pace/swee
 ## Results
 
 Pending.
+
+### Entries that did not boot
+
+Five queue entries of the sweep (`20261118T005001`, `T005410`, `T005840`, `T022031`, `T041728`) stopped at the
+run's validation, before any boot: `invalid spec: ... qualified config drift for tp4-ring:
+environment['VLLM_DS41_L2_PREFETCH_FFN_PACE_NS']='100', expected None` (and the same for 0 and 50). The arms then
+named candidate-61's lock, whose directory holds the profile the lab compares an arm with. Nothing was measured.
+Candidate-61's image was rebuilt meanwhile (tree `8aa03deba93a` to `42332c66ca46`); the overlay's `nvidia/model.py`
+is the rebuilt image's file with the one line changed, and the three prefetch files' bases are unchanged in it.

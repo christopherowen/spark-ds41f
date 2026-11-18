@@ -1634,8 +1634,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return disk_cache
 
     def finalize_expert_slot_cache(self) -> None:
-        if self._expert_disk_cache is not None:
-            stats = self._expert_disk_cache.loading_done()
+        disk_cache = getattr(self, "_expert_disk_cache", None)
+        if disk_cache is not None:
+            stats = disk_cache.loading_done()
             logger.info("DS4.1 expert disk cache stats: %s", stats)
 
         moe_entries = list(self._iter_slot_cached_moe_layers())
