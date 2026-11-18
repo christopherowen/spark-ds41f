@@ -1,0 +1,51 @@
+{
+  "notes": "attribution arm: tp4-switched-lazycomm.json (the learner, its communicator made at its first exchange) with the end of turn reduced to clearing the finished and preempted rings: the draft step's capture as shadow runs it, nothing staged, scored, exchanged or trained, so no communicator is made (overlay-skipend/turn_learning_shadow.py, VLLM_DSPARK_TURN_LEARNING_SKIP_END=1)",
+  "extends": {
+    "config": "experiments/2026-11-17-dspark-turn-learning/tp4-switched-lazycomm.json"
+  },
+  "set": {
+    "environment": {
+      "VLLM_DSPARK_TURN_LEARNING": "shadow",
+      "VLLM_DSPARK_TURN_LEARNING_SKIP_END": "1"
+    },
+    "container": {
+      "mounts": [
+        [
+          "{home}/.cache/huggingface/hub",
+          "/hub",
+          "ro"
+        ],
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf",
+          "/glp/vector.gguf",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay-skipend/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning_shadow.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/turn_learning_shadow.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay-lazycomm/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-17-dspark-turn-learning/overlay/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ]
+      ]
+    }
+  }
+}

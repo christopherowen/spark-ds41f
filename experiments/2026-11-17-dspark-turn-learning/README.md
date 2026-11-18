@@ -858,6 +858,14 @@ against the pool of the 15 learner-off boots (one profile and image in every job
   kernel in the draft graph (the draft step's time is unchanged, +9 and −2 µs), and its end-of-turn work
   in the model step before the grid (its kernels' first loads, its exchanges).
 
+**The capture against the end of turn** ([split-tp4-switched.json](split-tp4-switched.json); the model and grid
+steps, six boots alternating): the learner off; the learner with its end of turn reduced to clearing the rings
+([tp4-switched-skipend.json](tp4-switched-skipend.json), [overlay-skipend/](overlay-skipend): the draft step's
+capture as shadow runs it, nothing staged, scored, exchanged or trained, so no communicator is made); and the
+whole learner with its communicator made at the first exchange (tp4-switched-lazycomm.json again). The
+learner's kernels are declared for the startup warm-up in both learner arms, so the difference between them is
+the end of turn's running.
+
 ## Where it stands
 
 After an hour of AgentX traffic, end-of-turn W1 learning raises teacher-forced accepted tokens by about
