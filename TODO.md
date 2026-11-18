@@ -750,7 +750,11 @@ Don't repeat these without a new reason:
   stages 16B-coalesced L2-hot `inp` in-kernel) and `sp8` Cold-L2 `COPIES=12`
   measurements showed `wo_b` `pin+fence` `+2.30..+51.06 us/L` slower (`M=1..48`)
   and `moe_chain` `+0.14..+1.00 us/L` slower (`M=3, 6, 48`, vs `-0.30..-2.51 us/L`
-  for `skip_stage` alone).
+  for `skip_stage` alone). A faster pace for the FFN prefetch window alone (`100`,
+  `50`, `0 ns` against `200 ns`, candidate-61 at `tp4-ring`) was `0.48–0.64%`
+  slower on the grid's geometric mean than both reference boots, and about `2%`
+  slower on the one-request shapes
+  (`experiments/2026-11-18-ffn-prefetch-pace`).
 - **Prefill:** M32 MoE tile (+1%); fused M32 MoE (no gain, less headroom);
   `NCCL_PROTO=Simple` (no gain); `--max-parallel-prefills 8` (four-64K mean TTFT
   41 → 67 s); sequence parallelism below 205 tokens (+12 ms TTFT on short

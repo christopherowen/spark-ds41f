@@ -118,7 +118,42 @@ bin/spark candidate queue tp4-ring experiments/2026-11-18-ffn-prefetch-pace/swee
 
 ## Results
 
-Pending.
+Queue entry `20261118T052142-sweep-tp4.json`, five boots, 05:47 to 06:04 UTC on 18 November
+([receipts/sweep-tp4-table.txt](receipts/sweep-tp4-table.txt)). The grid's geometric mean over its 20 shapes, in
+milliseconds a step, and the six shapes of one request (1x2, 1x3 at four context lengths, 1x6):
+
+| Arm | FFN pace | Grid geometric mean | against `pace-ref` | against `pace-ref-again` | One-request shapes, against the two reference boots' mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pace-ref` | 200 ns | 19.468 | | -0.05% | |
+| `pace-100` | 100 ns | 19.571 | +0.53% | +0.48% | +1.93% |
+| `pace-0` | 0 ns | 19.592 | +0.64% | +0.59% | +1.92% |
+| `pace-50` | 50 ns | 19.572 | +0.53% | +0.48% | +1.56% |
+| `pace-ref-again` | 200 ns | 19.478 | +0.05% | | |
+
+- **Every faster pace is slower than both reference boots,** by 0.48 to 0.64% of the grid's geometric mean. The two
+  reference boots, first and last, agree to 0.05%, and the table's interval on the geometric mean is 0.11%.
+- **The loss is in the shapes the prediction named.** 1x2 rows: 13.56 and 13.51 ms at 200 ns, 13.93, 13.81 and
+  13.90 ms at 100, 50 and 0 ns. Each arm is slower than both reference boots in 9 to 11 of the 20 shapes and faster
+  than both in 6 (8x16, 4x12, 2x12 and 4x24 in every arm), by less.
+- **The arms acted.** Each boot mounted the four files, and the paced arms' containers held the variable
+  ([receipts/sweep-tp4-boots.txt](receipts/sweep-tp4-boots.txt), [receipts/sweep-tp4-overlays.txt](receipts/sweep-tp4-overlays.txt)).
+  The kernel cache gained three fill kernels during the sweep, `l2_prefetch_segments_paced<65536, 2, 100>`, `<..., 50>`
+  and `<..., 0>`. The last reference boot's log has the image's own kernel line and no pace on its FFN plan. The paced
+  arms' own log lines were not kept (the watcher cut them before the pace suffix).
+
+## Conclusion
+
+Sweep mark 3: no arm is lower than both reference boots, so nothing more runs. **The FFN window keeps the 200 ns
+pace** of the other windows; the variable and the overlay stay in this directory and enter no stack.
+
+The prediction was wrong in sign. Inside one boot a late FFN fill went with a slow shared up-projection, but ending
+the fill earlier made the step of one request about 2% slower, not 0.2 to 0.3% faster. The sweep does not say why:
+no arm was traced. Two readings the trace could separate, neither measured here: the faster fill takes memory
+bandwidth from the attention all-reduce and the mHC mix it runs beside, or lines that arrive earlier are evicted
+before the shared expert reads them (the NEXT window follows on the same stream).
+
+The switched shapes and TP3 were not run. A faster pace that loses at `tp4-ring` could not have become one constant
+for every shape, which was the only form it would have been adopted in.
 
 ### Entries that did not boot
 
