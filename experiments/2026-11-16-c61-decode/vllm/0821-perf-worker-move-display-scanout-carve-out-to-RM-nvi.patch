@@ -1,4 +1,4 @@
-From 2b7b565242c790976de465645bfbade5f597dec1 Mon Sep 17 00:00:00 2001
+From 709d244d35b6e016dc9e6566206412adc3b1328d Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:50:35 +0100
 Subject: [PATCH 821/822] perf(worker): move display scanout carve-out to RM
@@ -20,7 +20,7 @@ Upstream status: local candidate-61 patch
  .../model_loader/test_direct_loader_cuda.py   |   4 +-
  tests/v1/worker/test_display_carveout.py      | 218 +++++-
  .../device_communicators/shm_broadcast.py     |  54 +-
- .../model_loader/direct_loader.py             |  24 +-
+ .../model_loader/direct_loader.py             |  36 +-
  vllm/models/deepseek_v4_1/tilelang/prepare.py |  19 +-
  vllm/utils/gc_utils.py                        |   4 +
  vllm/utils/mem_utils.py                       | 150 +++-
@@ -28,7 +28,7 @@ Upstream status: local candidate-61 patch
  vllm/v1/executor/multiproc_executor.py        |  11 +-
  vllm/v1/worker/display_carveout.py            | 708 ++++++++++++++----
  vllm/v1/worker/gpu_worker.py                  |  68 +-
- 11 files changed, 1012 insertions(+), 254 deletions(-)
+ 11 files changed, 1014 insertions(+), 264 deletions(-)
 
 diff --git a/tests/model_executor/model_loader/test_direct_loader_cuda.py b/tests/model_executor/model_loader/test_direct_loader_cuda.py
 index 28c1882a4..d2e24e65b 100644
@@ -542,7 +542,7 @@ index 78e848d6f..fbb7af920 100644
              self.remote_socket.poll(timeout=timeout_ms)
          else:
 diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
-index 462cd653c..6dbbc1e2d 100644
+index 462cd653c..c792f7330 100644
 --- a/vllm/model_executor/model_loader/direct_loader.py
 +++ b/vllm/model_executor/model_loader/direct_loader.py
 @@ -40,6 +40,7 @@ progress panel.
@@ -561,7 +561,39 @@ index 462cd653c..6dbbc1e2d 100644
  from vllm.model_executor.model_loader import weight_utils
  from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
  from vllm.model_executor.model_loader.direct_io import (
-@@ -488,14 +490,7 @@ def release_weight_arena_sponge(
+@@ -275,7 +277,7 @@ def _allocate_order13_sponge(
+     *,
+     required_bytes: int,
+     buddyinfo_path: Path = Path("/proc/buddyinfo"),
+-    meminfo_path: Path | None = None,
++    meminfo_path: Path | None = Path("/proc/meminfo"),
+     page_bytes: int | None = None,
+     headroom_bytes: int = _SPONGE_HEADROOM_BYTES,
+     chunk_bytes: int = _SPONGE_CHUNK_BYTES,
+@@ -301,12 +303,7 @@ def _allocate_order13_sponge(
+     )
+     if sub_target_bytes < eff_chunk or high_target_bytes < _SPONGE_MIN_CHUNK_BYTES:
+         return []
+-    default_meminfo = (
+-        Path("/proc/meminfo")
+-        if meminfo_path is None and buddyinfo_path == Path("/proc/buddyinfo")
+-        else meminfo_path
+-    )
+-    avail_bytes = _available_uma_or_gpu_bytes(device, meminfo_path=default_meminfo)
++    avail_bytes = _available_uma_or_gpu_bytes(device, meminfo_path=meminfo_path)
+     if avail_bytes <= 0:
+         return []
+     if (
+@@ -479,23 +476,13 @@ def release_weight_arena_sponge(
+     device: torch.device | None = None,
+ ) -> None:
+     """Release a retained ``model._direct_buddy_sponge`` after post-load processing."""
+-    import ctypes
+-    import gc
+-
+     sponge = getattr(model, "_direct_buddy_sponge", None)
+     if hasattr(model, "_direct_buddy_sponge"):
+         delattr(model, "_direct_buddy_sponge")
      had_sponge = bool(sponge)
      if sponge:
          sponge.clear()
@@ -577,7 +609,7 @@ index 462cd653c..6dbbc1e2d 100644
  
  
  def _refresh_module_weight_views(model: torch.nn.Module) -> None:
-@@ -710,15 +705,10 @@ def bind_weight_arena(
+@@ -710,15 +697,10 @@ def bind_weight_arena(
          if not kept_sponge:
              if sponge:
                  sponge.clear()
@@ -596,7 +628,7 @@ index 462cd653c..6dbbc1e2d 100644
  
      return arena
  
-@@ -787,7 +777,7 @@ class DirectModelLoader(DefaultModelLoader):
+@@ -787,7 +769,7 @@ class DirectModelLoader(DefaultModelLoader):
                  stats = session.stats()
              finally:
                  self._session = None
