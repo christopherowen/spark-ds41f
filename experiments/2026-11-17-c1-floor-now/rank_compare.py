@@ -44,7 +44,8 @@ def main(roots):
                             acc[name].append(k[1])
                             break
             table[os.path.basename(folder)] = {"steps": len(six), "step_ms": round(statistics.mean((b - a) for _, _, a, b in six) / 1e3, 3),
-                                               **{name: round(statistics.mean(v), 2) for name, v in acc.items()}}
+                                               **{name: round(statistics.mean(v), 2) for name, v in acc.items()},
+                                               "ms_a_step": {name: round(sum(v) / len(six) / 1e3, 3) for name, v in acc.items()}}
         out[os.path.basename(os.path.normpath(root))] = table
         nodes = list(table)
         print(f"\n{root}: mean us a call ({table[nodes[0]]['steps']} six-row steps)")
@@ -53,6 +54,7 @@ def main(roots):
             vals = [table[n][name] for n in nodes]
             others = statistics.mean(vals[:-1])
             print(f"  {name:32s}" + "".join(f"{v:10.2f}" for v in vals) + f"   {100 * (vals[-1] / others - 1):+6.1f}%")
+        print("  ms a step on " + nodes[0] + ": " + ", ".join(f"{k} {v}" for k, v in table[nodes[0]]["ms_a_step"].items()))
     json.dump(out, sys.stdout if False else open("receipts/rank-compare.json", "w"), indent=1)
 
 

@@ -1,17 +1,21 @@
 """Where a loaded engine's memory sits, from one copy of /proc/kpageflags.
 
-usage: engine_pages.py FLAGS_FILE PAGE_BYTES
+usage: engine_pages.py FLAGS_FILE PAGE_BYTES [IDLE_FLAGS_FILE]
 
 On GB10 the GPU shares system RAM: the driver takes the engine's memory from the kernel's page
 allocator as plain kernel pages, so they carry none of the slab, page-table, LRU or free flags.
 With an engine loaded that class is the engine (an idle node holds well under 1 GiB of it
 outside the boot-time reservations). The driver's allocations are compound pages, so the head
 and tail flags give the size of each allocation; runs of adjacent pages give how contiguous the
-memory is physically, whatever the allocation size."""
+memory is physically, whatever the allocation size. On a 64 KiB kernel the driver's 64 KiB piece
+is a single page with no compound flags: there the engine is the plain kernel pages that were
+not plain kernel pages in IDLE_FLAGS_FILE, a map of the same node since its last boot with no
+engine loaded."""
 import sys
 import numpy as np
 
 path, page = sys.argv[1], int(sys.argv[2])
+idle_path = sys.argv[3] if len(sys.argv) > 3 else None
 flags = np.fromfile(path, dtype=np.uint64)
 n = len(flags)
 bit = lambda b: (flags >> np.uint64(b)) & np.uint64(1) == 1
@@ -64,11 +68,19 @@ drv = np.zeros(n, dtype=bool)
 hs = idx[sizes == unit]
 for k in range(unit):
     drv[hs + k] = True
-if unit * cnt[np.argmax(vals * cnt)] < 0.5 * total:   # no engine loaded: describe the whole class
+if idle_path:
+    idle = np.fromfile(idle_path, dtype=np.uint64)[:n]
+    ib = lambda b: (idle >> np.uint64(b)) & np.uint64(1) == 1
+    idle_other = ~ib(20) & ~ib(32) & ~ib(10) & ~ib(7) & ~ib(26) & ~ib(5)
+    drv = other & ~idle_other
+    print(f"  taking the plain kernel pages that were not such on the idle node as the engine: {gib(drv.sum()):.1f} GiB "
+          f"({gib((other & idle_other).sum()):.2f} GiB were already plain kernel pages)")
+elif unit * cnt[np.argmax(vals * cnt)] < 0.5 * total:   # no engine loaded: describe the whole class
     drv = other.copy()
+else:
+    print(f"  taking the {label(unit * page)} allocations as the engine: {gib(drv.sum()):.1f} GiB")
 other, total = drv, drv.sum()
 o = other.astype(np.int8)
-print(f"  taking the {label(unit * page)} allocations as the engine: {gib(total):.1f} GiB" if drv is not None else "")
 e = np.flatnonzero(np.diff(np.concatenate(([0], o, [0]))))
 rs, re_ = e[::2], e[1::2]
 rl = re_ - rs

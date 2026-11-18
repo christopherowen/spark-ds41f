@@ -358,3 +358,76 @@ three not, decides it: a faster rank on dgx4 means serving pays for the time sin
   value. So the second traced boot differs from the first in the image, the KV cache size and
   dgx4's reboot; its question is answered inside the boot (dgx4's rank against the other
   three), not against the first trace.
+- October's bundle once more, 101 minutes after dgx4's reboot (queue entry `20261118T004758`):
+  pass on dgx1 and dgx4
+  ([runs/expert-rate-1025-image-dgx4-later.txt](runs/expert-rate-1025-image-dgx4-later.txt),
+  `-dgx1-later`).
+
+| October's bundle and image | FC1 marginal | FC2 marginal | Plain read |
+| --- | ---: | ---: | ---: |
+| dgx4 before its reboot | 243.5 GB/s | 263.5 | 229.4, 235.8 |
+| dgx4 four minutes after | 266.4 | 266.0 | 249.6, 253.6 |
+| dgx4 101 minutes after | 248.8 | 261.1 | 239.5, 238.3 |
+| dgx1, not rebooted: the three runs | 243.6, 243.4, 243.9 | 260.8, 260.1, 261.5 | 235 to 237 |
+
+  **The reboot's gain fades with use, not with the bundle**: the same bundle on the same node
+  keeps 2.2% of the 9.4% after 100 minutes in which the node ran an image build, the release
+  tests and two bundle runs. The `/proc/buddyinfo` lines in the run files are from collection,
+  seconds after each run (once, on dgx4, after the next job's cluster start had begun): they
+  are not the state a run saw, and which blocks its buffers took is not recorded.
+- The second traced boot (queue entry `20261118T004804` at `8d85f750d`, 105 minutes after
+  dgx4's reboot): candidate-61's image; the job ended clean, 305 six-row steps on every rank as
+  in the first.
+
+## The rebooted rank in serving
+
+[rank_compare.py](rank_compare.py) on both traced boots
+([receipts/rank-compare.json](receipts/rank-compare.json)): dgx4's mean time a call against the
+mean of the other three ranks.
+
+| Kernel | ms a step | First trace, all four up ten days | Second trace, dgx4 rebooted | Change |
+| --- | ---: | ---: | ---: | ---: |
+| FC1 (target routed experts) | 8.24 | +0.2% | -2.0% | -2.2 |
+| FC2 (target routed experts) | 3.98 | +0.3% | -0.5% | -0.8 |
+| Target LM head | 1.07 | +0.6% | -1.4% | -2.0 |
+| Drafter head screen | 0.65 | +0.1% | +1.4% | +1.3 |
+| Dense projections | 7.04 | +2.5% | +3.3% | +0.8 |
+| L2 prefetch | 8.70 | +0.7% | +2.0% | +1.3 |
+| Step | 27.41 (27.28 in the first) | lockstep | lockstep | |
+
+- **In serving the rebooted node is 2% faster in FC1 and the target's LM head, and no faster
+  elsewhere.** Summed over the stream kernels (prefetch aside, it runs beside them) that is
+  0.17 ms of the 27.4 ms step: +0.6% if every rank had it. The three old ranks differ from each
+  other by up to 0.9% in these kernels (0.2% in FC1), so FC1's change stands clear of the spread
+  and the LM head's barely. One boot.
+- **The 7 to 9% the bundles showed does not carry over to the engine.** The byte floor section
+  above called the memory rate the largest item (1.7 ms, +6.7%) on the bundle's figure; on this
+  trace a reboot is worth a tenth of that to serving, and the bundle's figure itself falls to
+  2.2% within two hours of use.
+- **Where the two engines sat** ([receipts/engine-pages-ring.txt](receipts/engine-pages-ring.txt),
+  maps read with the engine loaded, the engine taken as the plain kernel pages that were not
+  such on the node's idle map):
+
+| | dgx1, up ten days | dgx4, rebooted |
+| --- | ---: | ---: |
+| Engine memory | 93.1 GiB | 92.1 GiB |
+| Sponge target; soaked before the weights | 2 MiB; 7.4 GiB | 2 MiB; 1.9 GiB |
+| In contiguous runs of 32 MiB or more | 55.2% | 82.4% |
+| In runs of 2 to 32 MiB | 42.0% | 15.7% |
+| In runs under 2 MiB | 2.8% | 2.0% |
+| Inside whole aligned 2 MiB blocks | 88.6% | 94.1% |
+| Inside whole aligned 32 MiB blocks | 22.7% | 55.7% |
+| Inside whole aligned 512 MiB blocks | 0 | 0 |
+
+  The sponge did its work on both: nine tenths of the engine in whole 2 MiB blocks, under 3% in
+  fragments. dgx4's engine sits in longer runs, and is 2% faster in two kernels. Neither node
+  got the 512 MiB target: dgx4 had 68 free 512 MiB blocks (34 GiB) at the last reading before
+  the boot, against 73.6 GiB of weights.
+
+### Not measured
+
+- A boot on a node just rebooted, when the 233 free 512 MiB blocks (116 GiB) would give the
+  sponge its 512 MiB target. Every recorded ring boot, this one included, placed the weights
+  with the 2 MiB target; the bundle's 266 GB/s was read in that just-rebooted state.
+- Why contiguity past 2 MiB would matter (the loader's note names only fragments of 64 to 256
+  KiB), and why the drafter's head and the dense projections did not gain.
