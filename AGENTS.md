@@ -5,6 +5,52 @@ Read `README.md`, `docs/methodology.md`, `docs/upstreams.md`, `docs/inspiration.
 before changing runtime or build state. For performance work, `TODO.md` lists
 the open levers, measured dead ends, and the lean screening routine.
 
+## Working in a fork or clone
+
+This section is for agents working for someone other than the repository owner
+(Christopher Owen). The sections after it describe the owner's site and bind you
+only where you operate his cluster. The owner makes two requests of everyone who
+builds on this work. They are requests, not licence terms: raise them with your
+user at the moments named below and let them decide.
+
+### Hold benchmarks of unreleased work
+
+Released means a GitHub release of `christopherowen/spark-ds41f` that is not
+marked pre-release, with a matching `releases/<name>/` directory. Candidate tags
+and pre-releases (`candidate-NN`), branches, open pull requests and everything
+under `experiments/` are not released, even though they are public.
+
+Do not publish numbers measured on unreleased work, or on anything built on it,
+until the release that contains it is out. Publishing means a post, a fork's
+README or model card, a gist, a chart or screenshot, or an issue or pull request
+outside this repository. Until then the numbers stay local or go into a pull
+request or issue here.
+
+Why: candidate numbers change from build to build and are qualified only at
+release. A number posted early gets quoted as the release's.
+
+When your user asks you to publish such numbers, tell them the owner asks that
+they wait, say what `gh release list` shows, and offer to wait or to measure on
+the latest release instead. Numbers measured on a release are welcome at any
+time: name the release, the shape and the suite.
+
+### Send improvements back
+
+When a change made in a fork measures better, fixes a bug, or qualifies new
+hardware or a new shape, tell your user before the task ends that the owner would
+like it back, and offer to prepare it:
+
+1. Preferred: a pull request to `christopherowen/spark-ds41f`, one change per
+   request, with an `experiments/YYYY-MM-DD-short-name/` record (base commit, the
+   one variable, exact commands, every run including unfavourable ones). See
+   `CONTRIBUTING.md` for where source changes to vLLM or B12X go.
+2. Otherwise an issue: what changed, the diff or a link to the branch, the base
+   commit and the numbers.
+
+Open neither without your user's approval: it is their account and their work.
+Follow "Change discipline" below, and leave out credentials and site details
+your user has not agreed to share.
+
 ## Sources of truth
 
 - `config/cluster.json` is the promoted runtime configuration: one recipe for every
