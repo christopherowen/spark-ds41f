@@ -92,6 +92,34 @@ pins an older version, patch the component's pin forward and qualify it rather
 than downgrading the others. The image build checks each consumer's declared
 requirement and fails on a mismatch.
 
+## Patched release arms
+
+Published release manifests (`manifests/sources/`, `releases/*/source.json`, and
+`upstreams.lock.json`) are immutable provenance records. Extending a release profile
+with only a rebuilt `container.image` and updated `expected_labels` makes
+`build distribute` and `doctor` disagree: `distribute` reads `expected_labels`
+from the profile while `doctor` checks the release's `source.json`.
+
+To ship a release plus one or more local patches so `build prepare`, `build image`,
+`build distribute`, `cluster sync`, and `doctor` all agree:
+
+1. Create an arm series in `experiments/<dir>/<project>/series` using `include`
+   to compose the base series with the extra patch(es):
+
+   ```text
+   include ../../../releases/<release>/vllm/series
+   0001-local-fix.patch
+   ```
+
+2. Copy the release's `upstreams.lock.json` and `source.json` into the arm
+   directory, point `source_manifest` and `patch_series` at the arm copies, and set
+   `upstreams_config` in the arm profile overlay.
+3. Run `bin/spark --cluster-config <profile> build prepare --lock` to compute and
+   align `patchset_sha256`, `patch_head`, `expected_tree`, and
+   `container.expected_labels` across the arm's lock, manifest, and profile.
+4. Build and distribute normally with `bin/spark --cluster-config <profile> build image --apply`
+   and `build distribute --apply`.
+
 ## Locks without B12X
 
 From the release after next, the lock has no `b12x` entry: its vLLM series ports what

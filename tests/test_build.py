@@ -881,5 +881,135 @@ class PackageStructureTest(unittest.TestCase):
         self.assertTrue((ROOT / "pyproject.toml").is_file())
 
 
+class SeriesIncludeCompositionTest(unittest.TestCase):
+    """Patch series may compose a release series with extra patches via ``include`` (#1049)."""
+
+    def test_single_file_series_keeps_exact_legacy_patchset_sha256(self) -> None:
+        upstreams = spark.read_json("upstreams.lock.json")
+        source = upstreams["sources"]["vllm"]
+        series_path = ROOT / source["patch_series"]
+        digest = hashlib.sha256()
+        digest.update(series_path.read_bytes())
+        for patch_name in spark.read_series(series_path):
+            if not patch_name.startswith("TODO-"):
+                digest.update(patch_name.encode())
+                digest.update(b"\0")
+                digest.update((series_path.parent / patch_name).read_bytes())
+        self.assertEqual(spark.patchset_sha256(source), digest.hexdigest())
+
+    def test_nested_include_prepare_lock_invalidation_missing_and_cycles(self) -> None:
+        import argparse
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            upstream = root / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.name", "Test Author"], cwd=upstream, check=True)
+            subprocess.run(["git", "config", "user.email", "author@example.com"], cwd=upstream, check=True)
+            (upstream / "file.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "file.txt"], cwd=upstream, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=upstream, check=True)
+            base_revision = spark.git_output(upstream, "rev-parse", "HEAD")
+
+            (upstream / "file.txt").write_text("base\np1\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "--quiet", "-am", "base patch"], cwd=upstream, check=True)
+            (upstream / "file.txt").write_text("base\np1\np2\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "--quiet", "-am", "arm patch"], cwd=upstream, check=True)
+
+            all_patches = root / "tmp_patches"
+            all_patches.mkdir()
+            subprocess.run(
+                ["git", "format-patch", "--quiet", "-o", str(all_patches), base_revision],
+                cwd=upstream,
+                check=True,
+            )
+            p1, p2 = sorted(all_patches.glob("*.patch"))
+
+            base_dir = root / "releases" / "r1" / "vllm"
+            arm_dir = root / "experiments" / "arm" / "vllm"
+            base_dir.mkdir(parents=True)
+            arm_dir.mkdir(parents=True)
+            (base_dir / p1.name).write_bytes(p1.read_bytes())
+            (base_dir / "series").write_text(f"{p1.name}\n", encoding="utf-8")
+            (arm_dir / p2.name).write_bytes(p2.read_bytes())
+            (arm_dir / "series").write_text(
+                f"include ../../../releases/r1/vllm/series\n{p2.name}\n",
+                encoding="utf-8",
+            )
+
+            expected = [f"../../../releases/r1/vllm/{p1.name}", p2.name]
+            self.assertEqual(spark.read_series(arm_dir / "series"), expected)
+
+            (root / "experiments" / "arm" / "cluster.json").write_text(
+                json.dumps({"upstreams_config": "experiments/arm/upstreams.lock.json"}),
+                encoding="utf-8",
+            )
+            (root / "experiments" / "arm" / "source.json").write_text(
+                json.dumps({"vllm": {}}),
+                encoding="utf-8",
+            )
+            lock_doc = {
+                "source_manifest": "experiments/arm/source.json",
+                "sources": {
+                    "vllm": {
+                        "upstream": str(upstream),
+                        "revision": base_revision,
+                        "patch_series": "experiments/arm/vllm/series",
+                    },
+                    "nccl": {"upstream": str(upstream), "revision": base_revision},
+                },
+            }
+            (root / "experiments" / "arm" / "upstreams.lock.json").write_text(
+                json.dumps(lock_doc),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(spark, "ROOT", root), \
+                    mock.patch.object(spark, "BUILD_ROOT", root / ".work/build"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spark.lock_build_identifiers(
+                    argparse.Namespace(cluster_config="experiments/arm/cluster.json"),
+                    copy.deepcopy(lock_doc),
+                    parts=["vllm"],
+                )
+                locked = json.loads((root / "experiments" / "arm" / "source.json").read_text(encoding="utf-8"))
+                record = {
+                    "upstream": str(upstream),
+                    "revision": base_revision,
+                    **locked["vllm"],
+                }
+                build_dir = root / "build"
+                spark.prepare_project(build_dir, "vllm", record)
+                self.assertEqual(
+                    (build_dir / "src" / "vllm" / "file.txt").read_text(encoding="utf-8"),
+                    "base\np1\np2\n",
+                )
+                sha_before = spark.patchset_sha256(lock_doc["sources"]["vllm"])
+                # Editing an included base patch invalidates the child's patchset_sha256.
+                (base_dir / p1.name).write_text(
+                    (base_dir / p1.name).read_text(encoding="utf-8") + "\n# note\n",
+                    encoding="utf-8",
+                )
+                sha_after = spark.patchset_sha256(lock_doc["sources"]["vllm"])
+                self.assertNotEqual(sha_before, sha_after)
+
+                # Missing included series is reported cleanly by missing_patches.
+                (base_dir / "series").unlink()
+                self.assertEqual(
+                    spark.missing_patches(lock_doc["sources"]["vllm"]),
+                    ["releases/r1/vllm/series"],
+                )
+
+                # Include cycle raises SystemExit instead of recursing forever.
+                (base_dir / "series").write_text(
+                    "include ../../../experiments/arm/vllm/series\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(SystemExit, "include cycle"):
+                    spark.read_series(arm_dir / "series")
+
+
 if __name__ == "__main__":
     unittest.main()

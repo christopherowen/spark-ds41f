@@ -42,12 +42,49 @@ from .config import *  # noqa: F401,F403
 from .doctor import *  # noqa: F401,F403
 from .cluster import *  # noqa: F401,F403
 
+def series_files_and_entries(path: Path) -> tuple[tuple[Path, ...], list[str]]:
+    """Read an ordered patch series, expanding ``include <relative-series>`` lines."""
+    root_dir = path.parent
+    root_resolved = root_dir.resolve()
+    visited: list[Path] = []
+    entries: list[str] = []
+
+    def walk(current: Path, ancestors: tuple[Path, ...]) -> None:
+        resolved = current.resolve()
+        if resolved in ancestors:
+            raise SystemExit(f"patch series include cycle: {current}")
+        if current not in visited:
+            visited.append(current)
+        next_ancestors = (*ancestors, resolved)
+        current_resolved_dir = current.parent.resolve()
+        for raw_line in current.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("include") and (len(line) == 7 or line[7].isspace()):
+                parts = line.split(None, 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    raise SystemExit(f"{current}: include directive requires a series path")
+                target = current.parent / parts[1].strip()
+                if target.resolve() in next_ancestors:
+                    raise SystemExit(f"patch series include cycle: {target}")
+                if not target.is_file():
+                    entries.append(Path(os.path.relpath(target.resolve(), root_resolved)).as_posix())
+                    continue
+                walk(target, next_ancestors)
+                continue
+            if line.startswith("TODO-") or current.parent == root_dir:
+                entries.append(line)
+            else:
+                resolved_patch = (current_resolved_dir / line).resolve()
+                entries.append(Path(os.path.relpath(resolved_patch, root_resolved)).as_posix())
+
+    walk(path, ())
+    return tuple(visited), entries
+
+
 def read_series(path: Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    return series_files_and_entries(path)[1]
 
 
 def checked(command: list[str], cwd: Path | None = None) -> None:
@@ -184,7 +221,9 @@ def expected_wheel_hashes() -> dict[str, str]:
     return expected
 
 
-_PATCHSET_SHA256_CACHE: dict[tuple[Path, str | None, int | None, tuple[str, ...]], str] = sys.__dict__.setdefault(
+_PATCHSET_SHA256_CACHE: dict[
+    tuple[Path, str | None, tuple[tuple[Path, int | None], ...] | None, tuple[str, ...]], str
+] = sys.__dict__.setdefault(
     "_spark_patchset_sha256_cache", {}
 )
 
@@ -194,8 +233,16 @@ def patchset_sha256(source: dict) -> str:
     series = source.get("patch_series")
     series_path = ROOT / series if series else None
     cacheable = getattr(read_series, "__module__", None) == __name__
-    mtime_ns = series_path.stat().st_mtime_ns if cacheable and series_path and series_path.is_file() else None
-    key = (ROOT, series, mtime_ns, commits)
+    if cacheable and series_path and series_path.is_file():
+        series_files, entries = series_files_and_entries(series_path)
+        mtimes: tuple[tuple[Path, int | None], ...] | None = tuple(
+            (f.resolve(), f.stat().st_mtime_ns if f.is_file() else None)
+            for f in series_files
+        )
+    else:
+        series_files, entries = ((), [])
+        mtimes = None
+    key = (ROOT, series, mtimes, commits)
     if cacheable and key in _PATCHSET_SHA256_CACHE:
         return _PATCHSET_SHA256_CACHE[key]
     digest = hashlib.sha256()
@@ -203,8 +250,16 @@ def patchset_sha256(source: dict) -> str:
         digest.update(revision.encode())
         digest.update(b"\0")
     if series_path is not None:
-        digest.update(series_path.read_bytes())
-        for patch_name in read_series(series_path):
+        if cacheable and len(series_files) > 1:
+            digest.update(b"series-include-v1\0")
+            for included in series_files:
+                digest.update(included.read_bytes())
+                digest.update(b"\0")
+            patch_names = entries
+        else:
+            digest.update(series_path.read_bytes())
+            patch_names = read_series(series_path)
+        for patch_name in patch_names:
             if patch_name.startswith("TODO-"):
                 continue
             digest.update(patch_name.encode())

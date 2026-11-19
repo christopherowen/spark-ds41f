@@ -131,12 +131,21 @@ def source_problems(cluster: dict, upstreams: dict, manifest: dict) -> list[str]
         # The series still has the switch, which defaults to B12X.
         errors.append(f"kernel_backend tilelang requires {ENVIRONMENT}=tilelang")
     labels = cluster.get("container", {}).get("expected_labels", {})
+    manifest_name = upstreams.get("source_manifest", "source.json")
+    upstreams_hint = (
+        ""
+        if cluster.get("upstreams_config")
+        else "; a profile for a patched image must set its own upstreams_config lock and source_manifest "
+             "(then run bin/spark --cluster-config <profile> build prepare --lock)"
+    )
     for name in ("vllm", *SOURCES):
         tree = manifest.get(name, {}).get("expected_tree")
-        if tree is None or source_labels.get(labels, f"{name}.tree") != tree:
+        actual = source_labels.get(labels, f"{name}.tree")
+        if tree is None or actual != tree:
             errors.append(
                 f"kernel_backend tilelang requires container.expected_labels "
-                f"{source_labels.key(labels, f'{name}.tree')} to match its source manifest tree"
+                f"{source_labels.key(labels, f'{name}.tree')} to match its source manifest tree "
+                f"({manifest_name}: expected {tree!r}, profile has {actual!r}){upstreams_hint}"
             )
     if (
         "b12x" not in upstreams.get("sources", {})

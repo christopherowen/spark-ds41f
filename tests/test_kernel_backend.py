@@ -546,6 +546,22 @@ class KernelBackendTest(unittest.TestCase):
                     if spark.topology.argument(data, "--attention-backend") == "B12X":
                         self.assertEqual(kernel_backend.problems(data), [])
 
+    def test_expected_labels_mismatch_names_manifest_and_upstreams_config_hint(self):
+        cluster, lock, manifest, _ = self.ready()
+        cluster.pop("upstreams_config", None)
+        labels = cluster["container"]["expected_labels"]
+        labels[source_labels.key(labels, "vllm.tree")] = "f" * 40
+        errors = kernel_backend.source_problems(cluster, lock, manifest)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(lock["source_manifest"], errors[0])
+        self.assertIn("upstreams_config", errors[0])
+        self.assertIn("build prepare --lock", errors[0])
+        cluster["upstreams_config"] = "experiments/arm/upstreams.lock.json"
+        errors_with_lock = kernel_backend.source_problems(cluster, lock, manifest)
+        self.assertEqual(len(errors_with_lock), 1)
+        self.assertIn(lock["source_manifest"], errors_with_lock[0])
+        self.assertNotIn("upstreams_config lock", errors_with_lock[0])
+
 
 @functools.lru_cache(maxsize=1)
 def _experiment_configs_and_locks() -> tuple[tuple[str, dict], ...]:

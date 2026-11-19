@@ -135,9 +135,13 @@ def local_image(cluster: dict, tag: str, cluster_config: str) -> tuple[dict | No
         labels = image["Config"].get("Labels") or {}
         for key, wanted in cluster["container"].get("expected_labels", {}).items():
             if labels.get(key) != wanted:
-                return None, (f"this host's {tag} is another build (label {key}={labels.get(key)!r}, "
-                            f"the profile expects {wanted!r}): provide the profile's exact qualified "
-                            "image; do not replace an immutable tag")
+                return None, (
+                    f"this host's {tag} is another build (label {key}={labels.get(key)!r}, "
+                    f"the profile expects {wanted!r}): provide the profile's exact qualified "
+                    "image or give a patched build its own upstreams_config lock and "
+                    f"source_manifest (then run bin/spark --cluster-config {cluster_config} "
+                    "build prepare --lock); do not replace an immutable tag"
+                )
     return identity, None
 
 

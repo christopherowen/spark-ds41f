@@ -387,8 +387,19 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
             problems.append(f"{topology.transport(cluster)} requires an image with {SPARKNET_CAPABILITY} and the lock's sparknet source")
         else:
             label = source_labels.get(cluster.get("container", {}).get("expected_labels", {}), "sparknet.tree")
-            if label != source_manifest["sparknet"]["expected_tree"]:
-                problems.append("sparknet image tree does not match its source manifest")
+            expected_tree = source_manifest["sparknet"]["expected_tree"]
+            if label != expected_tree:
+                manifest_name = upstreams.get("source_manifest", "source.json")
+                hint = (
+                    ""
+                    if cluster.get("upstreams_config")
+                    else "; a profile for a patched image must set its own upstreams_config lock and "
+                         "source_manifest (then run bin/spark --cluster-config <profile> build prepare --lock)"
+                )
+                problems.append(
+                    f"sparknet image tree does not match its source manifest "
+                    f"({manifest_name}: expected {expected_tree!r}, profile has {label!r}){hint}"
+                )
             # Before 0.5.0 sparknet reads one GID slot (3 when none is set), so a
             # configuration that pins none must run one that finds GIDs by address.
             version = upstreams["sources"]["sparknet"].get("version") or "0"
