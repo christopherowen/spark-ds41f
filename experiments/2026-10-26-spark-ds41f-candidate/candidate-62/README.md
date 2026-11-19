@@ -1,14 +1,14 @@
-# `candidate-62` — Python-Only Fixes & Host Tooling Rollup (Benchmarks Carried Over from `candidate-61` / `candidate-61-r2`)
+# `candidate-62` — Python Fixes, Default-Off LSA Upgrade & `TP4+` 32-Seat Rollup (Benchmarks Carried Over from `candidate-61` / `candidate-61-r2`)
 
 ## Summary
 
-`candidate-62` layers five pure-Python vLLM fixes (`0823..0827`, zero kernel/CUDA/TileLang/graph/loader/collective changes, `jit_new_files = 0`) onto `candidate-61-r2` (`experiments/2026-11-16-c61-decode/`, vLLM `0001..0822`) alongside the merged host-Python PRs (`#1224`, `#1049`, `#1232`, `#958`).
+`candidate-62` layers five pure-Python vLLM fixes (`0823..0827`) plus the strictly opt-in `VLLM_DS41_LSA=1` FP8 group-32 dominance upgrade (`0828`, PR `#954`) onto `candidate-61-r2` (`experiments/2026-11-16-c61-decode/`, vLLM `0001..0822`) alongside the merged host-Python PRs (`#1224`, `#1049`, `#1232`, `#958`) and LSA evidence/watchlist PRs (`#976`, `#1014`, `#1017`). With `VLLM_DS41_LSA` unset (the default across every `candidate-62` shape), default serving keeps the 68-byte index cache, declares zero LSA kernels (`jit_new_files = 0`), and executes the exact `candidate-61-r2` hot paths.
 
 - **vLLM base revision**: `19f2c20ed4d64ae22bd009ceacadd85e2a81e354`
-- **vLLM patch series**: [`vllm/series`](vllm/series) (`700` active patches, ending at `0827`)
-- **vLLM patch head**: `8538c3a0a410507129e903de1c60ff69f363642d`
-- **vLLM expected tree**: `e61742443dbd6a458e1edb3ce13608770d5ee587`
-- **Patchset SHA-256**: `db151286acb510242ecb5814b26a15016a668b8fc15fd9a4a59e14deff7b3748`
+- **vLLM patch series**: [`vllm/series`](vllm/series) (`701` active patches, ending at `0828`)
+- **vLLM patch head**: `45ec62399b1e9265564b075cdc614f5e3e404dee`
+- **vLLM expected tree**: `b6acfcc12b3a23fde43d28dab1c9f57dc5bcfe01`
+- **Patchset SHA-256**: `93a85c59539360ad7774b4e8040fe7423c5069eac971607aa58b88fe3bf3bcf4`
 - **TileLang / TileKernels / SparkNet / NCCL / Model weights**: Identical to `experiments/2026-11-16-c61-decode/` (`upstreams.lock.json` differs only in `vllm`).
 - **32-sequence concurrency on `TP4+` (`tp4`..`tp8-switched`)**: Adopts `--max-num-seqs 32` (`--max-cudagraph-capture-size 192`) across all `TP4..TP8` profiles (`TP1..TP3` unchanged at `4`/`8` seats), backed by `#1230` (`+37%` aggregate decode scaling at `c32`, `+19%` mixed-load tasks/h), single-slot 2 MiB RoCE compatibility (`192 × 10,240 B = 1.875 MiB <= 2.0 MiB`), patch `0823` (`544`-row structured-output bitmask), and `0783`/`0784` (`128`-row decode tiles and `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16`).
 
@@ -32,7 +32,7 @@
 3. **PR `#1232`**: `doctor`: free memory by block size and `--stream-rate` per idle node (`23b24a022`).
 4. **PR `#958`**: Verify TP3 6-channel bidirectional Ring NCCL profile and align topology checks (`d99dd9514`).
 
-## Included vLLM Python Patches (`0823..0827`)
+## Included vLLM Patches (`0823..0828`)
 
 | Patch | Issue / PR | Scope | Memory & Kernel Impact | Gate Test Added |
 |---|---|---|---|---|
@@ -41,10 +41,11 @@
 | [`0825`](vllm/0825-fix-serve-bind-SSE-keep-alive-done-callback-per-wait.patch) | `#1210` | `vllm/entrypoints/serve/utils/sse_keep_alive.py` binds per-wait done callbacks (`watched_task`, `waiter`), guards `while not next_task.done():`, and removes callbacks in `finally:` so stale queued callbacks cannot resolve a later chunk's waiter (`InvalidStateError`). | Async SSE transport wrapper only; zero engine/worker/kernel changes. | `tests/entrypoints/serve/utils/test_sse_keep_alive_race.py` |
 | [`0826`](vllm/0826-feat-responses-support-CustomTool-and-OpenResponses-.patch) | `#1206` | Non-Harmony Responses API support for `CustomTool` (`"type": "custom"`), `custom_tool_call` / `custom_tool_call_output` history replay, custom-tool streaming events, tool schema/xgrammar helpers, and OpenResponses input normalization (grammar-format custom tools rejected with `400`). | Responses API frontend & schema helpers only; zero chat-completion, kernel, weight, graph, or collective changes. | `tests/entrypoints/openai/test_responses_custom_tools.py` |
 | [`0827`](vllm/0827-fix-dsv41-rename-quantization-ignored-layers-into-th.patch) | PR `#1235` (owner request, 2026-11-19) | The V4.1 VL wrapper (`vllm/models/deepseek_v41/nvidia/vl_model.py`, inherited by the GB10 wrapper) gets a class-level `hf_to_vllm_mapper` with its module renames, so `configure_quant_config` renames a quantization config's `ignored_layers` (`layers.1.engram.wkv` -> `language_model.model.layers.1.engram.wkv`) before any layer is built. | Inert on the served checkpoints: `DeepSeek-V4.1-Flash` and `-Flash-1017` list no ignored layers and store both Engram projections as FP8, so every layer keeps its method. Zero kernel, weight, graph, or collective changes. | `tests/models/test_deepseek_v4_1_quant_ignore.py` |
+| [`0828`](vllm/0828-perf-dsv41-lsa-group32-dominance-fp8-summary.patch) | PR `#954` (backed by `#976`, `#1014`, `#1017`) | Upgrades opt-in `VLLM_DS41_LSA=1` from BF16 block-8 mean summaries (`STATE_BYTES=100`) to `float8_e4m3fn` Group-32 dominance-blended summaries (`0.85 * mean + 0.15 * k*`, `STATE_BYTES=84`) and routes `r=1` decode at `score_width >= 262144` through `PageShortlistPlan`. | **Default-off invariant (`VLLM_DS41_LSA` unset/`0`)**: keeps `state_content_bytes=68`, declares zero LSA kernels (`summarize_blocks`/`QueryReusePlan` skipped, `jit_new_files = 0`), writes no summaries, and uses `IndexerV41Plan` unchanged. When `VLLM_DS41_LSA=1`, halves LSA summary overhead (`+16` vs `+32 B/slot`). | `tests/models/test_deepseek_v4_1_lsa.py` (updated) |
 
 ## Benchmark Carry-Over & Qualification Scope
 
-Per the `rc12 -> rc13 -> rc14` carry-over precedent recorded in [`manifests/baselines/2026-10-30-spark-ds41f-1030.json`](../../../manifests/baselines/2026-10-30-spark-ds41f-1030.json), because `candidate-62` preserves `candidate-61-r2`'s exact TileLang/TileKernels/NCCL/SparkNet bits (`jit_new_files = 0`), weights, and unconstrained `/v1/chat/completions` hot paths:
+Per the `rc12 -> rc13 -> rc14` carry-over precedent recorded in [`manifests/baselines/2026-10-30-spark-ds41f-1030.json`](../../../manifests/baselines/2026-10-30-spark-ds41f-1030.json), because `candidate-62` keeps `VLLM_DS41_LSA` unset across every cluster shape (`0828` is strictly gated behind `VLLM_DS41_LSA=1` — zero LSA kernel declarations or JIT compilation, identical 68-byte index cache, identical `IndexerV41Plan` execution) and preserves `candidate-61-r2`'s exact active TileLang/TileKernels/NCCL/SparkNet bits (`jit_new_files = 0`), weights, and unconstrained `/v1/chat/completions` hot paths:
 
 - **`TP1–TP3` (`tp1`, `tp2-direct`, `tp2-switched`, `tp3`, `tp3-switched`, `tp3-triangle-4k`)**: Carry over `candidate-61` and `candidate-61-r2` hardware benchmarks directly (`serving()` configuration is unchanged aside from container image tag, `local.spark-ds41f.vllm.tree`, and `upstreams_config`).
 - **`TP4–TP8` (`tp4`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`)**: Raise `--max-num-seqs` to `32`, `--max-cudagraph-capture-size` to `192`, and shift `--long-prefill-token-threshold` by `-96` (`-96` tokens on multi-chunk prefill boundaries), plus KV headroom adjustments on `tp6-switched` (`13.00 GiB`) and `tp8-switched` (`25.50 GiB`). Once active `candidate-61-r2` waves conclude, record 2-boot 32-seat startup-memory, determinism, `release`/`bench`, and `--suite c32` ([`config/suites/c32.json`](../../../config/suites/c32.json)) receipts across `TP4..TP8`.
