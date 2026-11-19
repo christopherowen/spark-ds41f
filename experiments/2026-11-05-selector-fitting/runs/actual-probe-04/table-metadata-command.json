@@ -1,0 +1,28 @@
+{
+  "argv": [
+    "docker",
+    "run",
+    "--rm",
+    "--runtime",
+    "runc",
+    "--network",
+    "none",
+    "--read-only",
+    "--memory",
+    "2g",
+    "--env",
+    "NVIDIA_VISIBLE_DEVICES=void",
+    "--env",
+    "CUDA_VISIBLE_DEVICES=",
+    "-v",
+    "/home/chris/spark-lab/inputs/selector-fitting-20261105/operands:/inputs:ro",
+    "--entrypoint",
+    "python3",
+    "sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713",
+    "-c",
+    "from pathlib import Path\nimport torch,json\nreports=[]\nfor path in sorted(Path('/inputs').glob('*-rank-0-*.pt')):\n d=torch.load(path,weights_only=True,map_location='cpu');page=d['page_size'];width=d['width'];rows=len(d['q'])\n assert width%page==0 and int(d['active'][0])<=width and int(d['lengths'].max())<=width\n copied=min(d['table'].shape[1],width//page)\n assert copied*page>=int(d['lengths'].max())\n table=torch.zeros(rows,width//page,dtype=torch.int32)\n table[:,:copied].copy_(d['table'][:,:copied])\n assert torch.equal(table[:,:copied],d['table'][:,:copied]) and not bool(table[:,copied:].any())\n assert int(table.min())>=0 and int(table.max())<len(d['pool'])\n reports.append({'file':path.name,'page':page,'planned_width':width,'visible_min':int(d['lengths'].min()),'visible_max':int(d['lengths'].max()),'captured_table_columns':d['table'].shape[1],'proxy_table_columns':table.shape[1],'visible_mappings_preserved':True,'unused_suffix_initialized':True})\nassert len(reports)==12\nprint(json.dumps({'passed':True,'files':reports}))\n"
+  ],
+  "cwd": "/home/chris/spark-lab/checkouts/clustered-indexer",
+  "source_commit": "6a9558215f263068b72db86dfddd67f8676edb24",
+  "at": "2026-11-05T12:52:28.268177+00:00"
+}

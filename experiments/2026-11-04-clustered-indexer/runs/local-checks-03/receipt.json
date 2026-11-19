@@ -1,0 +1,90 @@
+{
+  "at": "2026-11-04T16:33:11.773133+00:00",
+  "runtime_commit": "bc004ccedbcf9266fb52f6496d0b2975e1c8df43",
+  "checks": [
+    {
+      "name": "doctor",
+      "argv": [
+        "bin/spark",
+        "--cluster-config",
+        "experiments/2026-11-04-clustered-indexer/serving/candidate.json",
+        "doctor"
+      ],
+      "exit": 0,
+      "accepted": true
+    },
+    {
+      "name": "sources",
+      "argv": [
+        "python3",
+        "experiments/2026-11-04-clustered-indexer/check_sources.py"
+      ],
+      "exit": 0,
+      "accepted": true
+    },
+    {
+      "name": "reference",
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "experiments/2026-11-04-clustered-indexer",
+        "-p",
+        "test_reference.py",
+        "-v"
+      ],
+      "exit": 0,
+      "accepted": true
+    },
+    {
+      "name": "client",
+      "argv": [
+        "python3",
+        "experiments/2026-11-04-clustered-indexer/serving/check_client.py"
+      ],
+      "exit": 0,
+      "accepted": true
+    },
+    {
+      "name": "requests",
+      "argv": [
+        "python3",
+        "experiments/2026-11-04-clustered-indexer/serving/summarize_requests.py"
+      ],
+      "exit": 0,
+      "accepted": true
+    },
+    {
+      "name": "archive",
+      "argv": [
+        "python3",
+        "experiments/2026-11-04-clustered-indexer/summarize_native.py"
+      ],
+      "exit": 0,
+      "accepted": true
+    },
+    {
+      "name": "build",
+      "argv": [
+        "bin/spark",
+        "build",
+        "check"
+      ],
+      "exit": 1,
+      "accepted": true,
+      "limitation": "complete image build inputs absent; no new image build claimed"
+    },
+    {
+      "name": "whitespace",
+      "argv": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit": 0,
+      "accepted": true
+    }
+  ]
+}

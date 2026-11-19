@@ -1,0 +1,74 @@
+{
+  "commit": "e9eab4604cf4e46996d28c0bfba8c9fe75f7d282",
+  "split": "heldout",
+  "native_config": "experiments/2026-11-05-query-reuse/native.json",
+  "candidate_config": "experiments/2026-11-05-query-reuse/full.json",
+  "sources_lock": {
+    "benchmark": "LongBench v2",
+    "repository": "https://github.com/THUDM/LongBench.git",
+    "revision": "2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+    "files": {
+      "pred.py": "ab63f77866a1c0dc770582bc3fe6b014c3b4be4667399b0ee267075780c6a138",
+      "prompts/0shot.txt": "68a162252bc9ff71d5d7abca3d69bb31aac3c35f832d657a2866f2018b8a6950",
+      "LICENSE": "bf7f05f274d65931bdf14f060b6855f1c359b8424eb74fd3091d25de89d700c3"
+    },
+    "dataset": {
+      "url": "https://huggingface.co/datasets/zai-org/LongBench-v2/resolve/ac35867b9c9436dc81c4c7535fe640ba7cf47877/data.json",
+      "revision": "ac35867b9c9436dc81c4c7535fe640ba7cf47877",
+      "sha256": "15d61c22d92c96900b3c4948b6aeea218d3214b676a65df48e7b8555604c7fe2",
+      "license": "Apache-2.0"
+    },
+    "model": {
+      "checkpoint": "v41-flash-1017@1bae0e1088993b9b82de08f59de5be5a34e42170",
+      "tokenizer": "/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170/tokenizer.json"
+    },
+    "protocol": {
+      "temperature": 0,
+      "seed": 0,
+      "thinking": true,
+      "reasoning_effort": "high",
+      "max_tokens": 65536,
+      "request_timeout_s": 1800,
+      "pilot_per_domain_bin": 1,
+      "heldout_per_domain_bin": 4,
+      "token_bins": {
+        "short": [
+          8192,
+          65536
+        ],
+        "long": [
+          65536,
+          262144
+        ]
+      },
+      "split_seed": "answer-quality-2026-11-05-v2",
+      "selection": "SHA256(seed + domain + bin + id), select pilot first and heldout next; unique document-context hashes across both splits; no truncation",
+      "pilot_phases": [
+        {
+          "name": "serial-cold",
+          "concurrency": 1,
+          "cache_reuse": false
+        }
+      ],
+      "heldout_phases": [
+        {
+          "name": "serial-cold",
+          "concurrency": 1,
+          "cache_reuse": false
+        },
+        {
+          "name": "four-cold",
+          "concurrency": 4,
+          "cache_reuse": false
+        },
+        {
+          "name": "four-cached",
+          "concurrency": 4,
+          "cache_reuse": true
+        }
+      ],
+      "sparse_strata": "up to four heldout independent contexts per stratum, at least one; freeze before generation"
+    },
+    "selection_sha256": "6b5f2108068004401ad18c7514d1e524b9198a73a175089b82dfb1f2b85815b2"
+  }
+}

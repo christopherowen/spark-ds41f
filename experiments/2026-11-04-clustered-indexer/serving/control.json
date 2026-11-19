@@ -1,0 +1,57 @@
+{
+  "extends": {
+    "config": "experiments/2026-11-04-clustered-indexer/serving/restore.json"
+  },
+  "set": {
+    "container": {
+      "image": "sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "cc0fdf582d0bddff71c6a853e237bc9e87587832"
+      },
+      "mounts": [
+        [
+          "{home}/projects/spark-ds41f/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/replay/overlay/indexer.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/bundle/overlay/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/bundle/overlay/vllm/models/deepseek_v4_1/tilelang/source_indexer.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/source_indexer.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/serving/overlay/clustered_serving.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/clustered_serving.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/serving/overlay/attention.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/attention.py",
+          "ro"
+        ]
+      ]
+    },
+    "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/upstreams.lock.json",
+    "environment": {
+      "VLLM_DS41_CLUSTERED_SEARCH": "0"
+    },
+    "deployment": {
+      "path": "{home}/spark-lab/checkouts/clustered-serving",
+      "ready_url": "http://127.0.0.1:8001/v1/models"
+    }
+  },
+  "serve_options": {
+    "--port": "8001"
+  },
+  "notes": "Unreleased C36 paired control; same shared scratch-read guard and attention factory as LSA candidate, exact site shape unchanged."
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "base_commit": "213a614e",
+  "one_variable": "share a freshly rebuilt owned source snapshot across query rows instead of rebuilding per row",
+  "status": "six cases pass in two control and two grouped processes; full six-case initcheck/memcheck and two-case racecheck pass; 1-row overhead, 8/128/256-row gains retained",
+  "contract": "one explicit full-width owner table, 1..256 queries, fresh maximum visible extent each call, no persistence",
+  "unchanged": "all existing GPU-kernel ASTs; native source scorer/cutoff/handoff/reindex order",
+  "gates": [
+    "every native top512 key and ordered2048 block ID/count",
+    "bitwise evaluated score bits and full bound dominance",
+    "following reindex query",
+    "captured rollback, empty and restore",
+    "written cache mutation including changed source handoff",
+    "two fresh control and candidate processes",
+    "allocation and all three sanitizers"
+  ]
+}

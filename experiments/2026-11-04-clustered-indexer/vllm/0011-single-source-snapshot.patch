@@ -1,0 +1,28 @@
+From 1477117bd68009988e44e09234c33364453a1688 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 14:38:53 +0100
+Subject: [PATCH] Use the native table shape for one owned source query
+
+Base: promoted vLLM tree ea1281f880e7535e3d87725be0156a8e38fc2fb2 plus the first ten experiment patches. Rationale: sharing one source snapshot helps multiple queries but adds an unnecessary maximum reduction and table expansion for exactly one query. Route that statically known shape through the unchanged per-row source path; the shared-metadata bound has the same one-row shape and arithmetic. Quality: no GPU kernel changes, no numerical or handoff change, all other row counts follow the same method body. Tests: fresh patch/source and AST checks; bounded two-process one-row source/handoff/reindex/graph, initialization and memory screens pending. Upstream status: local experiment, not submitted.
+---
+ vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py b/vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py
+index 306241c153..78d36bbf9b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/grouped_source_indexer.py
+@@ -29,6 +29,10 @@ class GroupedSourceClusteredIndexerPlan(SourceClusteredIndexerPlan):
+             raise ValueError('grouped source search requires 1..256 queries and one owned page table')
+         if table.shape[1] * self.page_size < self.width:
+             raise ValueError('owned table must cover the planned width')
++        if rows == 1:
++            # The owned table already has the native one-query shape; its
++            # extent is the query's own length. No expansion/reduction is needed.
++            return super().run(q, scales, weights, pool, table, lengths, active)
+         expanded = torch.empty((rows, table.shape[1]), dtype=torch.int32, device=q.device)
+         self.tables(table, lengths, active, expanded)
+         if self.native_fallback:
+-- 
+2.54.0 (Apple Git-157)
+

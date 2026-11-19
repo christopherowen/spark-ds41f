@@ -1,0 +1,77 @@
+From a3ca55cff9e6954b2b7df7603b3a812599932641 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 11:29:49 +0100
+Subject: [PATCH] Stream cluster coordinates with bounded register state
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the promoted
+series (tree ea1281f880e7535e3d87725be0156a8e38fc2fb2) and experimental
+patches 0001 and 0002.
+
+Rationale: candidate-only GB10 profiling puts about 85 percent of snapshot
+kernel time in envelope reduction. Keep two coordinate endpoints per lane
+and stream the same 64 visible keys rather than materializing two reduction
+fragments. This changes only envelope execution resource use.
+
+Quality: each coordinate visits the same keys, uses the same decoder and
+unsupported-scale fallback, and computes identical interval endpoints.
+Query bounds, exact scorer, threshold and stable tie ordering are unchanged.
+No persistent metadata or serving integration is introduced.
+
+Tests: Python syntax and fresh patch application. GPU exact-selection,
+endpoint identity, graph, sanitizer and repeated timing gates remain pending
+for this resource-layout candidate; older receipts do not qualify it.
+
+Upstream status: local experimental candidate, not submitted upstream.
+---
+ .../tilelang/clustered_indexer.py             | 30 ++++++++++---------
+ 1 file changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py b/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
+index 47fa7bdcdb..dd52aeafe4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/clustered_indexer.py
+@@ -54,25 +54,27 @@ def cluster_envelopes(width: int, page_size: int):
+         Upper: T.Tensor([rows, clusters, INDEX_DIM], T.float32),
+     ):
+         with T.Kernel(clusters, rows, threads=128) as (cluster, row):
+-            lo = T.alloc_fragment([CLUSTER, INDEX_DIM], T.float32)
+-            hi = T.alloc_fragment([CLUSTER, INDEX_DIM], T.float32)
++            # One coordinate per lane. Streaming over positions keeps just two
++            # endpoints live instead of two 64x128 reduction fragments.
+             lmin = T.alloc_fragment([INDEX_DIM], T.float32)
+             hmax = T.alloc_fragment([INDEX_DIM], T.float32)
+             extent = T.min(T.max(Lengths[row], 0), T.max(T.min(Active[0], width), 0))
+-            for p, d in T.Parallel(CLUSTER, INDEX_DIM):
++            for d in T.Parallel(INDEX_DIM):
++                lmin[d] = T.infinity(T.float32)
++                hmax[d] = -T.infinity(T.float32)
++            for p in T.serial(CLUSTER):
+                 pos = cluster * CLUSTER + p
+-                lo[p, d] = T.infinity(T.float32)
+-                hi[p, d] = -T.infinity(T.float32)
+                 if pos < extent:
+-                    physical = Table[row, pos // page_size]
+-                    offset = pos % page_size
+-                    scale = Pool[physical, page_size * 64 + offset * 4 + d // 32]
+-                    value = _decode(Pool[physical, offset * 64 + d // 2], scale, d)
+-                    valid = (scale >= MIN_SCALE) & (scale <= MAX_SCALE)
+-                    lo[p, d] = T.if_then_else(valid, value, -T.infinity(T.float32))
+-                    hi[p, d] = T.if_then_else(valid, value, T.infinity(T.float32))
+-            T.reduce_min(lo, lmin, dim=0)
+-            T.reduce_max(hi, hmax, dim=0)
++                    for d in T.Parallel(INDEX_DIM):
++                        physical = Table[row, pos // page_size]
++                        offset = pos % page_size
++                        scale = Pool[physical, page_size * 64 + offset * 4 + d // 32]
++                        value = _decode(Pool[physical, offset * 64 + d // 2], scale, d)
++                        valid = (scale >= MIN_SCALE) & (scale <= MAX_SCALE)
++                        lmin[d] = T.min(lmin[d], T.if_then_else(
++                            valid, value, -T.infinity(T.float32)))
++                        hmax[d] = T.max(hmax[d], T.if_then_else(
++                            valid, value, T.infinity(T.float32)))
+             for d in T.Parallel(INDEX_DIM):
+                 Lower[row, cluster, d] = lmin[d]
+                 Upper[row, cluster, d] = hmax[d]
+-- 
+2.54.0 (Apple Git-157)
+

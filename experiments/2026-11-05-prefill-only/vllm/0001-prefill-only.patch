@@ -1,0 +1,24 @@
+# Upstream base: C36 vLLM 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
+# Requires the ordered nine preceding native guard, LSA and direct merge patches.
+# Rationale: retain compact prefill, select existing native plans for generation
+# and verification to test draft efficiency and final-answer quality.
+# Quality: native generation selection over the existing cache prefix; no new
+# approximation, score change, reference work or data-dependent host copy.
+# Tests: CPU dispatch for both modes, covered extents, row counts and already-native
+# source/reindex plans; existing strict12-batch native-prefix equivalence.
+# Independent model startup, graph/admission, answer and repeated-speed gates required.
+# Upstream status: unpromoted local experiment, not submitted upstream.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 0ccc0bc8a0..d395b844b2 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -369,6 +369,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+     ):
+         plans = self._tilelang()
+         plan = plans.index[mode]
++        if (mode == "decode" and os.environ.get("VLLM_DS41_PAGE_NATIVE_DECODE") == "1"
++                and isinstance(plan, PageShortlistPlan)):
++            plan = plans.native_index[mode]
+         # Outside graph capture, the existing conservative prefill extent can
+         # prove that every key would be kept. Avoid the entire coarse pipeline.
+         if (score_width is not None and isinstance(plan, PageShortlistPlan)

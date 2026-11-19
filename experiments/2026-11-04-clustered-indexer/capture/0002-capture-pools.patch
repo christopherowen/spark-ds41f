@@ -1,0 +1,81 @@
+From fcac44ca96114638583e9fba751448e87d6916a5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Wed, 4 Nov 2026 12:33:36 +0100
+Subject: [PATCH] Capture three distinct indexer pools without changing scoring
+
+Upstream base: candidate-36 prepared tree
+cc0fdf582d0bddff71c6a853e237bc9e87587832 plus capture patch 0001.
+
+Rationale: one query from one owned cache cannot establish pruning across
+layers. Once explicitly armed, retain one visible query from each of the
+first three eligible distinct cache pools per rank. Keep the 8192-key
+minimum and skip CUDA graph capture. Refuse existing targets.
+
+Quality: diagnostic copying only; native scorer, model weights and
+attention arithmetic are unchanged. Results cannot be used as timings.
+
+Tests: patch/overlay identity, Python syntax and exact original-source
+recovery; coordinated capture hardware execution remains pending.
+
+Upstream status: local experimental instrumentation, not submitted upstream.
+---
+ .../tilelang/clustered_capture.py              | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py b/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
+index caa8808dfe..59ec1f26bd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
++++ b/vllm/models/deepseek_v4_1/tilelang/clustered_capture.py
+@@ -6,16 +6,18 @@ from pathlib import Path
+ 
+ import torch
+ 
+-_done = False
++_captured = set()
+ 
+ 
+ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_size):
+-    global _done
+     directory = os.environ.get('VLLM_DS41_CLUSTER_CAPTURE')
+-    if _done or not directory or q.shape[0] == 0 or not Path(directory, 'arm').is_file():
++    if not directory or q.shape[0] == 0 or not Path(directory, 'arm').is_file():
+         return
+     if torch.cuda.is_current_stream_capturing():
+         return
++    key = pool.data_ptr()
++    if key in _captured or len(_captured) >= 3:
++        return
+     limit = min(int(active[0].item()), width)
+     row = int(lengths.argmax().item())
+     extent = min(int(lengths[row].item()), limit)
+@@ -32,7 +34,10 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
+         selected[-1, tail * 64:page_size * 64] = 0
+         selected[-1, page_size * 64 + tail * 4:] = 0
+     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+-    target = Path(directory, f'rank-{rank}.pt')
++    pool_ordinal = len(_captured)
++    target = Path(directory, f'rank-{rank}-pool-{pool_ordinal}.pt')
++    if target.exists():
++        raise RuntimeError(f'refusing to overwrite a real-input capture: {target}')
+     snapshot = {
+         'q': q[row:row+1].detach().cpu(),
+         'scales': scales[row:row+1].detach().cpu(),
+@@ -44,11 +49,14 @@ def maybe_capture(q, scales, weights, pool, table, lengths, active, width, page_
+         'page_size': page_size,
+         'width': logical_pages * page_size,
+         'rank': rank,
++        'pool_ordinal': pool_ordinal,
+         'source': 'candidate-36, tree cc0fdf582d0bddff71c6a853e237bc9e87587832',
+     }
+     # Atomic publication: a partial capture is never replayed as an input.
+     temporary = target.with_suffix('.tmp')
++    if temporary.exists():
++        raise RuntimeError(f'refusing to overwrite a partial capture: {temporary}')
+     torch.save(snapshot, temporary)
+     temporary.replace(target)
+-    _done = True
++    _captured.add(key)
+     print(f'clustered indexer snapshot rank={rank} extent={extent} path={target}', flush=True)
+-- 
+2.54.0 (Apple Git-157)
+

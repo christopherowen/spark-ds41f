@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Project only block-clustering features; store original-space centroids.
+
+Experimental construction kernel, not installed in serving. The map is fitted
+separately. No references, activation copies or grading execute here.
+"""
+import tilelang
+import tilelang.language as T
+from .paged_shortlist import STATE_BYTES
+from .shortlist_indexer import decode,BLOCK,BUCKET
+
+
+@tilelang.jit
+def summarize_pages_metric(page: int, latent: int = 32, slot_dtype: str = 'int64'):
+    """One active CTA per completed written page, never a query-side rebuild."""
+    assert latent == 32
+    rows, pool_pages, stride = T.dynamic('rows, pool_pages, stride')
+    blocks, buckets = page//BLOCK, page//BUCKET
+    levels = buckets.bit_length()-1
+
+    @T.prim_func
+    def update(Pool: T.StridedTensor([pool_pages,page*STATE_BYTES],[stride,1],T.uint8),
+               Half: T.StridedTensor([pool_pages,page*STATE_BYTES//2],[stride//2,1],T.bfloat16),
+               Slots: T.Tensor([rows],slot_dtype),
+               Metric: T.Tensor([128,latent],T.bfloat16)):
+        with T.Kernel(rows,threads=128) as row:
+            point = T.alloc_fragment([blocks,128],T.float32)
+            feature = T.alloc_shared([blocks,latent],T.float32)
+            inputs = T.alloc_shared([blocks,128],T.bfloat16)
+            transform = T.alloc_shared([latent,128],T.bfloat16)
+            embedded = T.alloc_fragment([blocks,latent],T.float32)
+            centroid_terms = T.alloc_fragment([blocks,128],T.float32)
+            center = T.alloc_fragment([128],T.float32)
+            norm_terms = T.alloc_fragment([blocks,latent],T.float32)
+            norms = T.alloc_fragment([blocks],T.float32)
+            labels = T.alloc_shared([blocks],T.int32)
+            next_labels = T.alloc_fragment([blocks],T.int32)
+            ids = T.alloc_fragment([blocks],T.int32)
+            minimum = T.alloc_fragment([1],T.int32)
+            maximum = T.alloc_fragment([1],T.int32)
+            a = T.alloc_fragment([latent],T.float32)
+            b = T.alloc_fragment([latent],T.float32)
+            direction = T.alloc_shared([latent],T.float32)
+            terms = T.alloc_fragment([blocks,latent],T.float32)
+            projection = T.alloc_shared([blocks],T.float32)
+            projection_frag = T.alloc_fragment([blocks],T.float32)
+            pairs = T.alloc_fragment([blocks,blocks],T.int32)
+            ranks = T.alloc_shared([blocks],T.int32)
+            rank_frag = T.alloc_fragment([blocks],T.int32)
+            slot = Slots[row]
+            if (slot >= 0) & (slot % page == page-1) & (slot//page < pool_pages):
+                physical = slot//page
+                T.fill(point,0.)
+                for k in T.serial(BLOCK):
+                    for block,d in T.Parallel(blocks,128):
+                        token = block*BLOCK+k
+                        point[block,d] += decode(Pool[physical,token*64+d//2],
+                            Pool[physical,page*64+token*4+d//32],d)*.125
+                for block,d in T.Parallel(blocks,128):
+                    inputs[block,d] = T.cast(point[block,d],T.bfloat16)
+                for f,d in T.Parallel(latent,128):
+                    transform[f,d] = Metric[d,f]
+                T.gemm(inputs,transform,embedded,transpose_B=True,clear_accum=True)
+                for block,d in T.Parallel(blocks,latent):
+                    norm_terms[block,d] = embedded[block,d]*embedded[block,d]
+                T.reduce_sum(norm_terms,norms,dim=1)
+                for block,d in T.Parallel(blocks,latent):
+                    feature[block,d] = embedded[block,d]*T.rsqrt(T.max(norms[block],1.e-30))
+                for block in T.Parallel(blocks):
+                    labels[block] = 0
+                T.sync_threads()
+                for level in T.unroll(levels):
+                    for group in T.serial(1 << level):
+                        for block in T.Parallel(blocks):
+                            ids[block] = T.if_then_else(labels[block] == group,block,blocks)
+                        T.reduce_min(ids,minimum,dim=0)
+                        for block in T.Parallel(blocks):
+                            ids[block] = T.if_then_else(labels[block] == group,block,-1)
+                        T.reduce_max(ids,maximum,dim=0)
+                        for d in T.Parallel(latent):
+                            direction[d] = feature[minimum[0],d]-feature[maximum[0],d]
+                        T.sync_threads()
+                        for iteration in T.serial(4):
+                            for block,d in T.Parallel(blocks,latent):
+                                terms[block,d] = feature[block,d]*direction[d]
+                            T.reduce_sum(terms,projection_frag,dim=1)
+                            T.copy(projection_frag,projection)
+                            T.sync_threads()
+                            for i,j in T.Parallel(blocks,blocks):
+                                pairs[i,j] = T.cast((labels[j] == group) &
+                                    ((projection[j] < projection[i]) |
+                                     ((projection[j] == projection[i]) & (j < i))),T.int32)
+                            T.reduce_sum(pairs,rank_frag,dim=1)
+                            T.copy(rank_frag,ranks)
+                            T.sync_threads()
+                            for block,d in T.Parallel(blocks,latent):
+                                terms[block,d] = T.if_then_else((labels[block] == group) &
+                                    (ranks[block] < blocks//(2 << level)),feature[block,d],0.)
+                            T.reduce_sum(terms,a,dim=0)
+                            for block,d in T.Parallel(blocks,latent):
+                                terms[block,d] = T.if_then_else((labels[block] == group) &
+                                    (ranks[block] >= blocks//(2 << level)),feature[block,d],0.)
+                            T.reduce_sum(terms,b,dim=0)
+                            for d in T.Parallel(latent):
+                                direction[d] = (a[d]-b[d])/(blocks//(2 << level))
+                            T.sync_threads()
+                        for block in T.Parallel(blocks):
+                            if labels[block] == group:
+                                next_labels[block] = group*2+T.cast(ranks[block] >= blocks//(2 << level),T.int32)
+                    T.copy(next_labels,labels)
+                    T.sync_threads()
+                for bucket in T.serial(buckets):
+                    for block,d in T.Parallel(blocks,128):
+                        centroid_terms[block,d] = T.if_then_else(labels[block] == bucket,point[block,d],0.)
+                    T.reduce_sum(centroid_terms,center,dim=0)
+                    for d in T.Parallel(128):
+                        Half[physical,page*68//2+bucket*128+d] = T.cast(center[d]/8,T.bfloat16)
+                for block in T.Parallel(blocks):
+                    Pool[physical,page*72+block] = T.cast(labels[block],T.uint8)
+    return update

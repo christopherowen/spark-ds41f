@@ -1,0 +1,173 @@
+# Cache-write page shortlist
+
+Follow-up variable: replace snapshot-only metadata with summaries owned by each
+physical native cache page. A completed page partitions its native eight-key
+blocks into balanced64-key buckets. Four cosine split iterations per level run
+only when a cache write includes the final slot of that page. Every partial
+visible page is scored directly. Rewrites after rejected speculation refresh the
+summary on completion; reused pages cannot publish summaries from an old owner.
+No request identity is inferred from a query tensor or a shared page table.
+
+The cache specification reserves73 bytes per indexed key instead of68, including
+BF16 centers, block membership and alignment. Metadata lives beside the native
+records in the same physical allocation, follows prefix-cache reuse, and counts
+toward memory admission. The native record layout remains the first68 bytes per
+key. No CPU activation copies or correctness checks belong in these kernels.
+
+This is a new grouping geometry, not an equivalence claim for the snapshot
+clusterer. Separate tests must cover page completion, partial visibility, mixed
+owners, physical-page reuse, graph replay and source/reindex handoff. A full-model
+raw-token gate and complete request measurements remain required. No promotion.
+
+The first two fresh lifecycle processes pass all eight cases each:128/256-key
+pages,1/2/9 rows, mixed owners, partial-page boundaries, native key-record bytes,
+balanced summary references, evaluated-score bit equality, graph replay and
+physical-page recycling. Runtime commit`bf8d5eb3`; raw receipts are retained in
+`../runs/paged-window-01`. These are kernel and lifecycle results, not a token gate.
+
+`control.json` and `candidate.json` keep the same admitted73-byte cache geometry,
+native scratch-read guard and C36 image. The control runs native queries and no
+summary maintenance; the candidate pays for both cache-write summaries and
+shortlist queries. Reindex and small planned domains stay native. All scratch
+is reserved before profiling and every kernel declared before the cache freezes.
+
+`run_serving.py` uses a clean published source commit and the existing exclusive
+three-node idle-window protocol. The predeclared order is control-A, shortlist-A,
+shortlist-B, control-B. Every arm performs a separate raw-token capture: six short
+tasks and synthetic notebook contexts of32768/131072/262144 tokens, greedy,
+seed0, up to128 output tokens. Tokenization and private capture occur only on the
+node. Any mismatch stops the screen. No benchmark requests ask for token IDs.
+
+Request timing covers131072 tokens at concurrency1/4 and262144 at concurrency1.
+Each point charges its first cold request to the measured boot, followed by three
+explicit same-prompt cache repeats. Both arms must report actual cache-hit usage,
+output counts and response digests; no cold request is relabeled as cached. This
+small synthetic screen does not qualify production-agent quality or throughput.
+
+The first serving trial is **rejected** by the raw-token gate. All six short
+requests match, while the32768/131072/262144-token notebooks first differ at
+zero-based generated-token indices15/9/73. Length128 and termination match but
+are insufficient. No quality superiority has been established. The controller
+stops before candidate performance measurement or further boots, preserves the
+native control measurements, and restores C37 at20:48:50UTC. Independent
+three-node restoration/clean-checkout/no-reservation evidence is retained.
+See `../runs/paged-serving-01/token-divergence.json`. No request-speedup claim.
+
+The direct candidate-construction follow-up preserves the existing selector's
+ordered keys/counts/padding. It visits only selected pages and replaces three
+full-context scan/prefix/scatter launches with one page-local compaction launch.
+It does not repair the failed selector's token fidelity. Separate candidate-list,
+graph, owner-remap and native-lifecycle gates precede any timing or serving use.
+
+Both direct-compaction processes at`4a7fa4e9` pass12 geometries x32 selection/
+visibility patterns (384 per process), plus eight native lifecycle cases each.
+The independent set reference and the original assembler agree on every ordered
+candidate, count and padding slot; graph replay includes changed physical maps.
+A separate `benchmark_direct.py` measures only one arm per process, with no
+reference or comparison work. Its synthetic results do not establish request
+speed or fix the rejected low-budget selector's output changes.
+
+The next token-only calibration retains native source selection and changes the
+dense bucket budget to256 and1024 (16384/65536 keys plus the visible tail), using
+the qualified direct assembler. Source summaries are skipped when that cache
+owner has no shortlist consumer. These presets are not accepted configurations.
+The predeclared sequence is dense256, dense1024-A, dense1024-B against the saved
+native raw-token reference. Failed presets remain failed; this calibration may
+continue after a mismatch to record the next preset. It performs no request
+benchmark. A pass must include a case that actually prunes keys; all-key coverage
+on shorter prompts alone would not qualify approximate selection.
+
+The coordinated next window runs two scan and two direct compaction performance
+processes first, then the three token-only boots, and restores C37 once. The
+same immutable C36 control capture/corpus stays node-local; no released runtime
+is retimed. All new sources and the independent guard apply in a fresh named
+C36 tree, with all six mounted source files verified byte for byte.
+
+The calibration at`989e5f63` remains rejected: dense256 matches7/9; dense1024
+matches8/9 on both fresh boots and still differs on the262144-token notebook.
+C37 was restored at21:39:32UTC, independently checked on all three clean nodes.
+All four isolated compaction timing processes pass matched input hashes. Point
+speedups are2.15–4.10x for dense and1.11–2.70x for source shapes; n=2 confidence
+intervals are broad or undefined for several points. These are synthetic
+compaction-only results, retained with complete samples and uncertainty in
+`../runs/calibration-window-01/compact-comparison.json`.
+
+The batching follow-up tests an explicit interaction: a256-row bounded workspace,
+native prefill selection when every visible key is covered, and a device identity
+gather that omits centroid math in covered decode domains. Each query computes
+its answer through the selected path. Reference execution and comparisons stay
+in separate programs. The native source phase already reserves a larger arena;
+all new scratch is nevertheless declared and reserved before profiling.
+
+`dense-1536-fast.json` retains98304 dense keys plus the visible tail and uses
+native source selection. Its262K notebook still prunes dense keys, so a pass
+cannot come solely from all-key coverage. This preset tests fidelity, not a
+promise of acceleration. The256-row boundary gate checks1/255/256/257 rows;
+non-power-of-two compaction is checked independently. Two fresh row8/row256
+performance processes per arm use synthetic repeated captured inputs, include
+separate eager-wall and graph-GPU timings, and report required construction cost.
+
+The next paired request order is native-A, fast1536-A, fast1536-B, native-B. A
+saved native capture is first replayed to check baseline stability. Separate
+raw-token runs cover serial and four-concurrent requests; the native parallel
+reference is itself repeated before candidate measurements. Any mismatch stops
+ordinary qualification before candidate timing. Timed requests still omit token
+metadata. A finite synthetic screen does not qualify production-agent traffic.
+
+`batch-window-01` preserves a compiler failure before any model trial: both1536
+mechanical-compaction geometries pass, but the whole-domain compactor fails in
+`LegalizeNegativeIndex` with an int32/handle type error. No batch-boundary or
+request-speed pass is claimed. The controller restores C37 at22:11:30UTC; an
+independent all-node check at06:33:38UTC on November5 confirms clean checkouts,
+no experimental mounts/environment, and no reservations. The retry uses sp8
+and simplifies the identity loop to a static bound with guarded stores and a
+local predicate, retaining the same candidate identities/counts.
+
+
+At`a9c76f5d`, sp8 passes both fresh boundary/lifecycle processes and all four
+synthetic pipeline timing processes. The row256 versus row8 graph-GPU speedup
+is1.225x at32768 keys (joint95% interval1.147–1.309) and1.091x at131072 keys
+(interval0.938–1.299). These compare batching only, not LSA against native or
+whole requests. Workspace rises from3,074,112 to98,371,584 bytes. Required plan
+construction is reported separately. Complete samples and lifecycle receipts
+are in`../runs/sp8-batch-02`; the exclusive sp8 reservation and containers were
+removed after completion.
+
+The next screen measures diagnostic request performance independently of token
+qualification. Earlier screens stopped timing on any mismatch, leaving the
+request-performance question unanswered. An explicitly failed raw-token gate may
+now retain timings; it still disqualifies acceptance. Identity errors, absent raw
+IDs or malformed responses stop the screen. Reference and token comparisons stay
+outside timed requests. The repository's cooling, fan and memory controls cover
+all three nodes during each timed boot; thermal slowdown invalidates comparison.
+
+Predeclared interaction: use the qualified row256/covered-domain implementation
+with two selector operating points, aggressive64/512 and dense1536/native-source.
+Both differ from the same native control only through shortlist query/maintenance
+work; all admit the same73-byte cache geometry. The six fresh-process order is
+native-A, aggressive-A, wide-A, wide-B, aggressive-B, native-B. Compare each
+candidate against the two native boots; repeat the saved serial native gate and
+the current four-concurrent native gate to test reference stability. This is a
+synthetic screen, not production-agent qualification. No changed-token quality
+superiority is established. The window restores tracked C37 once on completion.
+
+Exact next invocation, from a clean published controller checkout on sp5:
+
+```sh
+python3 experiments/2026-11-04-token-lsa/paged/run_serving.py \
+  --out /home/chris/spark-lab/results/clustered-indexer/request-diagnostic-01 \
+  --reference-private /home/chris/spark-lab/private/token-lsa-paged/paged-serving-01 \
+  --diagnostic-profiles control-a:control aggressive-a:aggressive-fast \
+  wide-a:dense-1536-fast wide-b:dense-1536-fast aggressive-b:aggressive-fast control-b:control
+```
+
+
+The six-boot diagnostic screen is complete at`df2af0bc`: native raw-token repeats
+match9/9; aggressive64/512 matches6/9 and wide1536/native-source8/9 on both boots,
+serially and at concurrency4. Aggressive cached request throughput improves
+8–14% in point estimates, while wide is effectively flat; neither meets token
+acceptance. Broad n=2 uncertainty remains reported. All six timed boots have no
+thermal slowdown, swap growth or memory-guard events. C37 is restored once at
+07:46:26UTC on November5 and independently verified on all three nodes, with
+clean source roots and all reservations removed. See the [complete request
+results](request-results.md) and retained raw receipts. No promotion.

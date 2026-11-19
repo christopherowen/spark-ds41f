@@ -1,0 +1,107 @@
+# Upstream base: C36 vLLM 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
+# Requires the ordered ten preceding native guard and LSA/exact fusion patches.
+# Rationale: coalesced loads and cooperative scale maxima reduce serial summary work.
+# Quality: byte-identical eight-key means, sequential key accumulation, BF16
+# rounding and native MXFP4 encoding; no changed candidate, budget or arithmetic.
+# Tests: four frozen captures, synthetic wide scales, skipped/unwritten/recycled
+# pages, zero initialization/race errors and two maintenance timing processes;
+# integrated frozen-call, actual/fine-score, lifecycle and timing requalification required.
+# Full independent final-answer, request and admission gates remain required.
+# Upstream status: unpromoted local experiment, not submitted upstream.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compact_shortlist.py b/vllm/models/deepseek_v4_1/tilelang/compact_shortlist.py
+index 193959dff5..a6d5e96a19 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/compact_shortlist.py
++++ b/vllm/models/deepseek_v4_1/tilelang/compact_shortlist.py
+@@ -11,7 +11,7 @@ from . import prepare
+ from .block_shortlist import BlockMeanShortlistPlan
+ from .indexer import (
+     CANDIDATE_BLOCK, CANDIDATE_BLOCKS, IndexerTopK, IndexerV41Plan,
+-    _mxfp4_byte, indexer_score_v41,
++    _e2m1_code, indexer_score_v41,
+ )
+ from .shortlist_indexer import decode, remap_blocks
+ from .fused_candidates import FusedCoarse
+@@ -20,48 +20,44 @@ STATE_BYTES = 80
+ 
+ 
+ @tilelang.jit
+-def summarize_compact(page: int, slot_dtype: str = 'int64'):
+-    rows, pool_pages, stride = T.dynamic('rows, pool_pages, stride')
+-    small = page // 8
+-    assert page in (128, 256)
+-
++def summarize_compact(page:int,slot_dtype:str='int64'):
++    rows,pages,stride=T.dynamic('rows,pages,stride')
++    small=page//8;groups=small*4
++    assert page in (128,256)
+     @T.prim_func
+-    def update(Pool: T.StridedTensor([pool_pages, page*STATE_BYTES], [stride, 1], T.uint8),
+-               Half: T.StridedTensor([pool_pages, page*STATE_BYTES//2], [stride//2, 1], T.bfloat16),
+-               Slots: T.Tensor([rows], slot_dtype)):
+-        with T.Kernel(rows, threads=128) as row:
+-            tx = T.get_thread_binding()
+-            slot = Slots[row]
+-            vals = T.alloc_local([32], T.bfloat16)
+-            sums = T.alloc_local([32], T.float32)
+-            amax = T.alloc_var(T.float32)
+-            if (slot >= 0) & (slot % page == page-1) & (slot // page < pool_pages):
+-                physical = slot // page
+-                for group in T.serial(T.ceildiv(small*4, 128)):
+-                    g = group*128+tx
+-                    block, part = g//4, g%4
+-                    if g < small*4:
+-                        T.fill(sums, 0.)
+-                        for k in T.serial(8):
+-                            for i in T.serial(32):
+-                                d = part*32+i
+-                                token = block*8+k
+-                                sums[i] += decode(Pool[physical, token*64+d//2],
+-                                    Pool[physical, page*64+token*4+part], d)*.125
+-                        amax = 6.0 * 2.0**-126
+-                        for i in T.serial(32):
+-                            vals[i] = T.cast(sums[i], T.bfloat16)
+-                            amax = T.max(amax, T.abs(T.cast(vals[i], T.float32)))
+-                        bits = T.reinterpret(T.fmul(amax, T.float32(1.0/6.0)), T.uint32)
+-                        sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
+-                            (bits & 0x7FFFFF) != 0, T.int32)
+-                        scale = T.reinterpret(T.cast(T.shift_left(254-sf, 23), T.uint32), T.float32)
+-                        for i in T.serial(16):
+-                            Pool[physical, page*68+block*64+part*16+i] = _mxfp4_byte(vals, 2*i, scale)
+-                        Pool[physical, page*68+small*64+block*4+part] = T.cast(sf, T.uint8)
++    def update(Pool:T.StridedTensor([pages,page*80],[stride,1],T.uint8),
++               Half:T.StridedTensor([pages,page*40],[stride//2,1],T.bfloat16),
++               Slots:T.Tensor([rows],slot_dtype)):
++        with T.Kernel(rows,threads=512) as row:
++            slot=Slots[row]
++            sums=T.alloc_fragment([groups,32],T.float32)
++            terms=T.alloc_fragment([groups,32],T.float32)
++            maximum=T.alloc_fragment([groups],T.float32)
++            means=T.alloc_shared([groups,32],T.bfloat16)
++            inverse=T.alloc_shared([groups],T.float32)
++            if (slot>=0)&(slot%page==page-1)&(slot//page<pages):
++                physical=slot//page
++                T.fill(sums,0.)
++                for k in T.serial(8):
++                    for g,i in T.Parallel(groups,32):
++                        d=g%4*32+i;token=g//4*8+k
++                        sums[g,i]+=decode(Pool[physical,token*64+d//2],
++                            Pool[physical,page*64+token*4+g%4],d)*.125
++                for g,i in T.Parallel(groups,32):
++                    means[g,i]=T.cast(sums[g,i],T.bfloat16)
++                    terms[g,i]=T.max(T.abs(T.cast(T.cast(sums[g,i],T.bfloat16),T.float32)),6.0*2.0**-126)
++                T.reduce_max(terms,maximum,dim=1)
++                for g in T.Parallel(groups):
++                    bits=T.reinterpret(T.fmul(maximum[g],T.float32(1.0/6.0)),T.uint32)
++                    sf=T.cast(T.shift_right(bits,23)&0xFF,T.int32)+T.cast((bits&0x7FFFFF)!=0,T.int32)
++                    inverse[g]=T.reinterpret(T.cast(T.shift_left(254-sf,23),T.uint32),T.float32)
++                    Pool[physical,page*68+small*64+g]=T.cast(sf,T.uint8)
++                for g,i in T.Parallel(groups,16):
++                    lo=_e2m1_code(T.fmul(T.cast(means[g,2*i],T.float32),inverse[g]))
++                    hi=_e2m1_code(T.fmul(T.cast(means[g,2*i+1],T.float32),inverse[g]))
++                    Pool[physical,page*68+g//4*64+g%4*16+i]=T.cast(lo|(hi<<4),T.uint8)
+     return update
+ 
+-
+ class CompactShortlistPlan(BlockMeanShortlistPlan):
+     def __init__(self, width, page, *, candidate_blocks=False, budget=None, row_cap=256):
+         self.width, self.page, self.source, self.row_cap = width, page, candidate_blocks, row_cap

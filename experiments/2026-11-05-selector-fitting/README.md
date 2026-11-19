@@ -1,0 +1,215 @@
+# Native operand batches for selector fitting
+
+Base `65c6e62f`, immutable C36 image and source pin
+`6d4e49d1cdbb6513819e47145e0e52fdab327b6b`. This is separate from the
+completed-answer benchmark. One intended variable for this preparation is
+collecting 64 native query rows per layer instead of a single row. Native model
+weights, scoring and attention remain unchanged; the live-list scratch guard is
+retained. Four maps are now fitted out of band; the validation result below
+does not justify integrating this fixed-32D probe into serving.
+
+The diagnostic hook requires an explicit case/prompt hash in `arm.json`, skips
+startup and graph capture, and records three dense layers plus one source layer
+per rank and case. It waits for 64 queries with at least 32,769 visible keys,
+retains each query's table/length and copies only written native key and scale
+prefixes. Distinct query tables are supported. A 512 MiB host-side union limit
+refuses excessive captures. Raw inputs and future fitted weights remain
+node-local, outside Git.
+
+Use separate seeded public source prompts for fitting and validation. No
+LongBench pilot or held-out questions may supply training activations. Separate
+documents, not adjacent query rows, define validation independence. The first
+mechanical checks must cover both native page sizes, multiple query tables,
+partial/aliased pages, skipped startup, explicit caller identity and overwrite
+refusal. Full native replay must validate every captured row before fitting.
+
+This profile is untimed: copies and synchronization perturb execution. Never
+mount this capture hook in a timed LSA or native control profile. Collection uses
+the authorized, reserved all-node window and restores C37 after its jobs. The
+completed collection below establishes no performance or quality improvement.
+
+Preparation applies the scratch guard and this experiment's ordered patch in a
+fresh named C36 tree; all three overlays match byte-for-byte and `diff --check`
+passes (`runs/local/source-check.json`). An initial attempt used a repository
+without the C36 object; that refusal and the correction are retained. The
+CPU-only pinned-container copy checks pass on sp8 for 128/256-key pages, 64 rows,
+different query tables, physical aliases, partial pages, zeroed saved tails,
+arming/graph/decode skips and overwrite refusal (`runs/copy-check-01`). The
+container and reservation are removed. These checks do not replace native GPU
+replay, which is still required before any fit.
+
+All-row synthetic native replay then passes on sp8 (`runs/replay-check-02`),
+including exact visible BF16 score bits, selected keys and source handoff/counts
+for both page sizes and 64 rows. A separate process with the CUDA allocator cache
+disabled and strict compute-sanitizer initcheck reports zero errors
+(`runs/initcheck-01`). The first replay launch used the wrong working directory
+and did not start a GPU container; that error is retained in `runs/replay-check-01`.
+Every standalone reservation is released and no containers remain.
+
+`collect.py` prepares two fitting documents and one validation document from
+entire, SHA-deduplicated Python standard-library files assigned to disjoint
+cohorts before capture. It uses no benchmark questions. The original file hashes,
+actual tokenizer counts, exact commit and every response/capture identity are
+recorded; prompts, responses and tensors stay private on the nodes. Replicated
+ranks are mechanical checks, not independent training examples: use rank 0 for a
+fit and keep document-level validation separate.
+
+Successful collection command, from the clean published sp5 controller checkout
+at `8d1a73108628e81fce673666c6d19368cbac4477`:
+
+```sh
+python3 experiments/2026-11-05-selector-fitting/collect.py \
+  --out /home/chris/spark-lab/results/selector-fitting/capture-02
+```
+
+The runner performs all-node preflight, a quiet-service guard, exclusive native
+reservations, heartbeat/watchdog, published commit sync and named coherent
+capture startup. Each explicitly armed document has one untimed generation
+request. It disarms every node and restores C37 once before releasing holds.
+Every actual captured batch still needs exact native replay before fitting.
+
+Before collection, source captures are explicitly delayed to 65,537 visible
+keys; dense captures retain 32,769. Both require 64 eligible rows. This gives the
+source validation a domain larger than its 32,768-key aggressive shortlist.
+The thresholds are in each arm record and captured metadata, and every request
+must cover both domains. Mechanical fixtures retain their smaller test domains;
+the collector's full requests remain untimed. The revised series again applies
+to a fresh named C36 base with the scratch guard and identical overlays.
+
+The predeclared fitting probe is a 32-dimensional query-weighted clustering
+metric. `fit_metric.py` forms `M = mean(w_h² q_h q_hᵀ)` from native query heads in
+`fit-a`/`fit-b`, then keeps its leading 32 eigen-directions weighted by square-root
+eigenvalue. It reports retained query-direction energy on the untouched
+`validation-a` document. This is a clustering proxy, not an exclusion bound or a
+quality guarantee. Native BF16 score rounding and final answers still need their
+own checks. The planned use projects block features only during summary updates;
+it introduces no reference or grading work into queries. Actual key-retention
+validation and construction timing must precede any serving candidate. Fitting follows
+exact native replay; the completed fit and validation are recorded below. This
+probe remains outside serving.
+
+The revised capture-threshold checks and metric arithmetic contracts pass in the
+CPU-only pinned container (`runs/copy-check-03`): all MXFP4 codes/scales, the
+leading 32 directions, and invariance to query-weight sign for the squared
+metric. The container and reservation are removed. This is a synthetic contract
+check; that stage uses synthetic inputs rather than a model-derived fitted map.
+
+`metric/` prepares the construction-only implementation of the fixed 32D probe.
+It projects block means for grouping, then writes the original 128D centroids in
+the same 73-byte layout. Query scoring and fine scoring are unchanged. The synthetic gate uses
+untrained maps; no current serving profile loads a fitted map. Its separate GPU
+fixture must check map-sensitive partitioning, exact original-space centroids,
+untouched native records, partial-write no-ops, graph replay and page recycling.
+No component speed or model-quality result is claimed.
+
+The first synthetic projected-summary GPU gate passes on sp8
+(`metric/runs/metric-summary-check-01`). Switching the 32D map changes grouping
+as the independent partition oracle predicts; original-space centroids are
+bit-exact for the fixture, native bytes are untouched, partial writes are no-ops,
+and graph replay/page recycling pass at both page sizes. No trained map or model
+quality is tested. A separate strict initialization process is prepared next.
+
+`metric/runs/metric-screen-01` retains the zero-error strict initialization run
+and two fresh construction-timing processes. For 1024 completed pages, projected
+construction is slower in point estimates: 0.216 versus 0.124 ms at page128,
+and 0.625 versus 0.463 ms at page256. All samples, original-before/after arms,
+process medians and broad two-process intervals remain in the comparison JSON.
+These synthetic construction results establish no request gain or quality gain.
+At this construction-screen stage the map is unfitted; it remains outside serving. Its extra work
+would need to earn back cost through improved retained-key quality or a cheaper
+query operating point. Every standalone container and reservation is removed.
+
+`metric/validate_retention.py` prepares the next untimed selection check. After
+all actual rank-0 captures replay natively and `fit_metric.py` fits on the two
+training documents, it compares original versus projected grouping on only the
+separate validation document. Both use dense budget64/source budget512 and the
+same native fine scorer. It measures overlap with native top512 keys and source
+handoff blocks, refusing padding/unsorted IDs as matches. Per-query values are
+reported, with independent document count one; replicated ranks and adjacent
+rows do not inflate N. Compact-address proxy execution has no timing claim and
+does not replace native geometry replay or completed-answer evaluation. No
+actual retention result is available before native replay and fitting.
+
+The first actual collection launch (`runs/capture-01`) fails before any model
+request or operand capture: its arming program reads JSON from stdin, while the
+existing native remote helper supplies a `DATA` global and consumes stdin for
+program source. The all-node C37 restoration completes at12:05:35 UTC and passes
+independent verification, with reservations removed. Every error/cleanup receipt
+is retained. The controller now uses `DATA`; a test exercises that exact prefix
+contract through arm/disarm/overwrite refusal and 12-file manifest hashing. A
+file-handle warning found by the test is fixed with scoped reads; the test passes
+with resource warnings treated as errors. The next attempt keeps native model
+arithmetic and the same disjoint documents unchanged.
+
+The corrected collection succeeds in `runs/capture-02`: three untimed documents
+at 122,789, 131,180 and 126,023 actual prompt tokens, respectively. Each rank
+saves 12 batches (three documents by four layers), with 64 eligible query rows
+per batch. All 36 file sizes and SHA-256 identities are retained; raw operands
+remain node-local. Rank-0 inputs are copied directly to sp8 for exact native
+replay before fitting. The controller restores C37 at 12:15:01 UTC; an independent
+all-node check at 12:16:24 verifies the expected image, clean matching checkouts,
+no experimental mounts/environment, and no remaining reservations. No capture
+request is a completed-answer benchmark. The earlier failure remains preserved.
+
+Actual native replay passes in `runs/actual-probe-01`: all 12 rank-0 batches
+(768 rows) preserve selected native keys, visible BF16 score bits and source
+handoff/counts under reconstruction of the native physical geometry. This is
+untimed. The following CPU fit exits before training because its script is
+mounted at `/source`, shallower than its repository-root check expects. No map
+is written. The window releases its reservation with no containers remaining.
+The corrected command mounts the complete clean checkout at `/checkout`; it
+reuses the exact successful replay receipt rather than repeating the GPU job.
+
+`runs/actual-probe-02` fits the predeclared maps on only `fit-a`/`fit-b`, after
+verifying the native replay receipt. The 32D subspaces retain 79.5–82.0% of
+training query energy and 60.7–66.6% on the separate validation document. Those
+energy values establish neither key retention nor answer quality. The map SHA
+and all input identities are recorded; weights remain private on sp8. The GPU
+retention runner then refuses an ABI mismatch before returning a retention
+result: captures save only visible table prefixes, while the page-score plan requires
+a fixed planned-width table. The first correction assumes the opposite direction
+and refuses the compact input in `runs/actual-probe-03`. The diagnostic now pads
+the unreachable table suffix with valid initialized addresses, preserving every
+visible mapping and the original Lengths/Active domain. Exact native physical
+geometry replay remains a separate prerequisite. All failed attempts and clean
+releases are retained; no serving code or arithmetic changes in this fix.
+
+The next CPU metadata attempt (`runs/actual-probe-04`) fails before GPU work:
+the read-only container lacks a writable temporary directory required by the
+PyTorch import. The corrected command supplies a bounded `/tmp` filesystem.
+The error and clean release are preserved.
+
+`runs/actual-probe-05` completes the actual validation at published commit
+`6a9558215f263068b72db86dfddd67f8676edb24`. CPU checks first verify all 12
+captures, preserving every visible table mapping and initializing unreachable
+suffixes. GPU execution then compares original versus fitted grouping on only
+`validation-a`, with dense budget64/source budget512 unchanged. Mean overlap
+with native selections is:
+
+| Interface | Original | Fitted | Difference |
+|---|---:|---:|---:|
+| Dense layer2, top512 keys | 62.06% | 62.30% | +0.24 points |
+| Dense layer8, top512 keys | 71.58% | 71.69% | +0.12 points |
+| Dense layer14, top512 keys | 79.01% | 79.47% | +0.46 points |
+| Source layer20, top512 keys | 86.17% | 86.05% | -0.12 points |
+| Source layer20, handoff blocks | 66.77% | 66.31% | -0.46 points |
+
+Every per-query value remains in the receipt. These are 64 adjacent prefill rows
+per interface from **one independent validation document**, not 256 independent
+quality trials. Dense rows see 33,624–33,656 keys; source rows see
+125,960–126,023. The larger planned widths do not inflate the visible domain.
+There is no decode, completed-answer or request-speed result for this map.
+
+Conclusion: this fixed-32D probe does not earn serving integration. Its small
+dense recall gains and source regression do not justify the slower construction
+measured earlier. This is a selection proxy, so it establishes no final-answer
+quality ranking. The existing unlearned serving candidate and its independent
+answer-quality evidence remain unchanged. No model configuration or release
+baseline is promoted.
+
+The untimed validation completes within its 16 GiB container limit without an
+OOM; peak host/GPU memory is not sampled and model memory remains unqualified.
+The reservation is removed at 12:53:46 UTC. Independent verification at
+12:54:07 finds no reservation, container or GPU process and a clean checkout at
+the exact runtime commit. The other waiting work is notified that sp8 is free.
+Both serving clusters remain untouched by these standalone checks.

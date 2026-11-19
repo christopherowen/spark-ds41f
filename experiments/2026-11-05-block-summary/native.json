@@ -1,0 +1,37 @@
+{
+  "extends": {
+    "config": "experiments/2026-11-04-token-lsa/paged/control.json"
+  },
+  "set": {
+    "container": {
+      "image": "sha256:3795255f485ea5c1a9db54c742921dd9b2917daad0799361e5c6f56a70119713",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "cc0fdf582d0bddff71c6a853e237bc9e87587832"
+      },
+      "mounts": [
+        [
+          "{home}/projects/spark-ds41f/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-04-clustered-indexer/replay/overlay/indexer.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/indexer.py",
+          "ro"
+        ]
+      ]
+    },
+    "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-36/upstreams.lock.json",
+    "environment": {
+      "VLLM_DS41_PAGE_SHORTLIST": "0"
+    },
+    "deployment": {
+      "path": "{home}/spark-lab/checkouts/clustered-serving",
+      "ready_url": "http://127.0.0.1:8001/v1/models"
+    }
+  },
+  "serve_options": {
+    "--port": "8001"
+  },
+  "notes": "Actual native C36 control with original 68-byte/key cache layout and the shared live-list scratch guard. Final acceptance comparisons count the candidate full summary storage and construction costs; no common padded cache is imposed on native."
+}

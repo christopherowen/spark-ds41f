@@ -1,0 +1,229 @@
+# Upstream base: C36 vLLM 6d4e49d1cdbb6513819e47145e0e52fdab327b6b.
+# Requires the ordered native scratch guard, four LSA, block summary and query reuse patches.
+# Rationale: fuse mean construction with native MXFP4 encoding and use native
+# blockscaled coarse scoring without duplicate query expansion or metadata launches.
+# Quality: quantized summaries may alter selection; native fine arithmetic and
+# budgets stay unchanged. Independent completed-answer no-loss gates are required.
+# Tests: exact encoder bytes, decoded quantized-mean oracle, native fine-score bits,
+# strict initialization, cache/graph/recycling, two processes and full model gates.
+# Upstream status: unpromoted local experiment, not submitted upstream.
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 0509bf8abcb2cdf8c79161efd45ba6e99030aec6..5ec7e71afae385de92315ed23e9d0516df4a6f9a 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -109,7 +109,8 @@ class _Cache(nn.Module, AttentionLayerBase):
+             head_size=512 if self.kind == "swa" else 68,
+             # Experiment storage is part of each admitted physical cache page.
+             state_content_bytes=(528 if self.kind == "swa" else
+-                                 (100 if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8" else 73)
++                                 (80 if os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8" else
++                                  100 if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8" else 73)
+                                  if "VLLM_DS41_PAGE_SHORTLIST" in os.environ else 68),
+             dtype=torch.uint8,
+             tokens_per_state=self.ratio,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index d3b7be8ebc5da48b3084aa6dd9b2f9b14b0012be..0ccc0bc8a0f94f2fe87330a11fe69e43104f1d61 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -30,11 +30,16 @@ from .paged_shortlist import PageShortlistPlan, summarize_pages, STATE_BYTES
+ from .direct_shortlist import DirectPageShortlistPlan
+ from .block_shortlist import summarize_blocks, STATE_BYTES as BLOCK_STATE_BYTES
+ from .query_reuse import QueryReusePlan as BlockMeanShortlistPlan
++from .compact_shortlist import CompactShortlistPlan, summarize_compact, STATE_BYTES as COMPACT_STATE_BYTES
+ 
+ if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8":
+     STATE_BYTES = BLOCK_STATE_BYTES
++elif os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8":
++    STATE_BYTES = COMPACT_STATE_BYTES
+ 
+ def _summary_kernel():
++    if os.environ.get("VLLM_DS41_PAGE_MODE") == "compact8":
++        return summarize_compact
+     return summarize_blocks if os.environ.get("VLLM_DS41_PAGE_MODE") == "block8" else summarize_pages
+ from .indexer import (
+     CANDIDATE_BLOCK,
+@@ -95,6 +100,8 @@ def _shortlist_options(width, candidates, candidate_blocks):
+ 
+ def _shortlist_class():
+     mode = os.environ.get("VLLM_DS41_PAGE_MODE", "")
++    if mode == "compact8":
++        return CompactShortlistPlan
+     if mode == "block8":
+         return BlockMeanShortlistPlan
+     if mode:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compact_shortlist.py b/vllm/models/deepseek_v4_1/tilelang/compact_shortlist.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe1970b691609e5dc678b0efd6163bd2543e49bd
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/compact_shortlist.py
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Page-owned MXFP4 block means and native coarse/fine scoring."""
++import math
++
++import tilelang
++import tilelang.language as T
++import torch
++
++from . import prepare
++from .block_shortlist import BlockMeanShortlistPlan, block_candidates
++from .indexer import (
++    CANDIDATE_BLOCK, CANDIDATE_BLOCKS, IndexerTopK, IndexerV41Plan,
++    _mxfp4_byte, indexer_score_v41,
++)
++from .shortlist_indexer import decode, remap_blocks
++
++STATE_BYTES = 80
++
++
++@tilelang.jit
++def summarize_compact(page: int, slot_dtype: str = 'int64'):
++    rows, pool_pages, stride = T.dynamic('rows, pool_pages, stride')
++    small = page // 8
++    assert page in (128, 256)
++
++    @T.prim_func
++    def update(Pool: T.StridedTensor([pool_pages, page*STATE_BYTES], [stride, 1], T.uint8),
++               Half: T.StridedTensor([pool_pages, page*STATE_BYTES//2], [stride//2, 1], T.bfloat16),
++               Slots: T.Tensor([rows], slot_dtype)):
++        with T.Kernel(rows, threads=128) as row:
++            tx = T.get_thread_binding()
++            slot = Slots[row]
++            vals = T.alloc_local([32], T.bfloat16)
++            sums = T.alloc_local([32], T.float32)
++            amax = T.alloc_var(T.float32)
++            if (slot >= 0) & (slot % page == page-1) & (slot // page < pool_pages):
++                physical = slot // page
++                for group in T.serial(T.ceildiv(small*4, 128)):
++                    g = group*128+tx
++                    block, part = g//4, g%4
++                    if g < small*4:
++                        T.fill(sums, 0.)
++                        for k in T.serial(8):
++                            for i in T.serial(32):
++                                d = part*32+i
++                                token = block*8+k
++                                sums[i] += decode(Pool[physical, token*64+d//2],
++                                    Pool[physical, page*64+token*4+part], d)*.125
++                        amax = 6.0 * 2.0**-126
++                        for i in T.serial(32):
++                            vals[i] = T.cast(sums[i], T.bfloat16)
++                            amax = T.max(amax, T.abs(T.cast(vals[i], T.float32)))
++                        bits = T.reinterpret(T.fmul(amax, T.float32(1.0/6.0)), T.uint32)
++                        sf = T.cast(T.shift_right(bits, 23) & 0xFF, T.int32) + T.cast(
++                            (bits & 0x7FFFFF) != 0, T.int32)
++                        scale = T.reinterpret(T.cast(T.shift_left(254-sf, 23), T.uint32), T.float32)
++                        for i in T.serial(16):
++                            Pool[physical, page*68+block*64+part*16+i] = _mxfp4_byte(vals, 2*i, scale)
++                        Pool[physical, page*68+small*64+block*4+part] = T.cast(sf, T.uint8)
++    return update
++
++
++class CompactShortlistPlan(BlockMeanShortlistPlan):
++    def __init__(self, width, page, *, candidate_blocks=False, budget=None, row_cap=256):
++        self.width, self.page, self.source, self.row_cap = width, page, candidate_blocks, row_cap
++        self.budget = budget or (512 if candidate_blocks else 64)
++        self.block_budget = self.budget*8
++        self.capacity = (self.budget+8)*64
++        self.score = indexer_score_v41(width//8, page//8, block_P=page//8,
++                                      summary_page=page, summary_budget=self.block_budget)
++        self.coarse = IndexerTopK(width//8, self.block_budget)
++        self.assemble = block_candidates(width, page, self.block_budget)
++        self.final = IndexerV41Plan(self.capacity, page, candidates=True)
++        if self.source:
++            self.select_blocks = IndexerTopK(self.capacity, CANDIDATE_BLOCKS, CANDIDATE_BLOCK)
++            self.remap = remap_blocks(self.capacity)
++
++    @staticmethod
++    def calls(width, page, *, candidate_blocks=False, budget=None, row_cap=256):
++        b = budget or (512 if candidate_blocks else 64)
++        parent = BlockMeanShortlistPlan.calls(width, page, candidate_blocks=candidate_blocks,
++                                             budget=budget, row_cap=row_cap)
++        return [prepare.call(indexer_score_v41, width//8, page//8, block_P=page//8,
++                             summary_page=page, summary_budget=b*8), *parent[1:]]
++
++    def run(self, q, scales, weights, pool, table, lengths, active, candidates=None, candidate_lengths=None,
++            *, out=None, candidate_out=None, candidate_out_lengths=None, scratch=None):
++        if candidates is not None or candidate_lengths is not None:
++            raise ValueError('compact summaries cannot consume reindex candidates')
++        if out is None or scratch is None:
++            raise ValueError('outputs and scratch must be admitted')
++        if self.source and (candidate_out is None or candidate_out_lengths is None):
++            raise ValueError('source handoff outputs are required')
++        rows = len(q)
++        specs = self._specs(rows)
++        if len(scratch) != len(specs):
++            raise ValueError('workspace differs from admission')
++        full = dict(zip(specs, scratch))
++        means = pool[:, self.page*68:self.page*68+(self.page//8)*68]
++        def buffers(name, plan, b):
++            return [b[f'{name}_{i}'] for i in range(len(plan.scratch_specs(1)))]
++        for start in range(0, rows, self.row_cap):
++            end = min(start+self.row_cap, rows)
++            r = end-start
++            current = self._specs(r)
++            b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0])
++                 for name, t in full.items()}
++            qr, sr, wr, tr, lr = q[start:end], scales[start:end], weights[start:end], table[start:end], lengths[start:end]
++            self.score(qr.view(torch.int8), sr.view(torch.uint32).reshape(r, 32), wr,
++                       means.view(torch.int8), means.view(torch.uint32), tr, lr, active, b['scores'], b['counts'])
++            self.coarse.run(b['scores'], b['counts'], active, b['selected'], b['values'],
++                            scratch=buffers('coarse', self.coarse, b))
++            self.assemble(b['selected'], lr, active, b['candidates'], b['candidate_lengths'])
++            _, scores = self.final.run(qr, sr, wr, pool, tr, lr, active, b['candidates'], b['candidate_lengths'],
++                                      out=out[start:end], scratch=buffers('final', self.final, b))
++            if self.source:
++                self.select_blocks.run(scores, b['candidate_lengths'], active, b['compact'], b['block_values'],
++                                       counts=candidate_out_lengths[start:end], scratch=buffers('blocks', self.select_blocks, b))
++                self.remap(b['compact'], b['candidates'], candidate_out[start:end])
++        return out, None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index cf0b4d7adbb9bcf2602665565eb01dc3297ba0bb..406f80344228928d6ebe42e37adffe8db70e8828 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -152,6 +152,8 @@ def indexer_score_v41(
+     block_P: int = 64,
+     threads: int = 128,
+     max_ctas: int = 128,
++    summary_page: int = 0,
++    summary_budget: int = 0,
+ ):
+     """Build the score kernel. Inputs:
+ 
+@@ -334,6 +336,35 @@ def indexer_score_v41(
+                             -T.infinity(T.bfloat16),
+                         )
+ 
++    if summary_page:
++        assert not candidates and summary_page == page_size * 8
++        assert summary_budget > 0
++
++        @T.prim_func
++        def summary_score(
++            Q: T.Tensor([rows, heads, D], fp4),
++            QScale: T.Tensor([rows, heads], T.uint32),
++            Weights: T.Tensor([rows, heads], T.bfloat16),
++            KPool: T.StridedTensor([pool_pages, page_words * 8], [pool_stride, 1], fp4),
++            KScale: T.StridedTensor([pool_pages, page_words], [scale_stride, 1], T.uint32),
++            PageTable: T.Tensor([rows, table_width], T.int32),
++            Lengths: T.Tensor([rows], T.int32),
++            Active: T.Tensor([1], T.int32),
++            Scores: T.Tensor([rows, width], T.bfloat16),
++            Counts: T.Tensor([rows], T.int32),
++        ):
++            with T.Kernel(ctas, rows, threads=threads) as (cta, row):
++                pdl.chain()
++                raw = _row_extent(Lengths, Active, row, width * 8)
++                full = raw // summary_page * page_size
++                extent = T.if_then_else(full <= summary_budget, 0, full)
++                if (cta == 0) & (T.get_thread_binding() == 0):
++                    Counts[row] = extent
++                score_row(Q, QScale, Weights, KPool, KScale, PageTable, row, cta,
++                          extent, lambda p0, p: p0 + p, lambda p0, p: True,
++                          lambda p0, p: p0 + p < extent, None, None, Scores)
++        return summary_score
++
+     if not candidates:
+ 
+         @T.prim_func

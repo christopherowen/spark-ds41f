@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "/tmp/validate_retention.py", line 95, in <module>
+    if __name__ == '__main__':main()
+                              ^^^^^^
+  File "/tmp/validate_retention.py", line 88, in main
+    result['cases'].append(one(data,metric.bfloat16().cuda()))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/validate_retention.py", line 55, in one
+    plan.run(*args,out=output,candidate_out=blocks,candidate_out_lengths=counts,scratch=scratch)
+  File "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/direct_shortlist.py", line 169, in run
+    self.score(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),wr,
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 222, in __call__
+2026-11-05 12:24:14  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `score` with `out_idx=None`
+2026-11-05 12:24:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `score`
+2026-11-05 12:24:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `compact` with `out_idx=None`
+2026-11-05 12:24:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `compact`
+    return self.torch_function(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/tvm_ffi.py", line 339, in func
+    executable(*tensor_list)
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/runtime/executable.py", line 46, in __call__
+    return self.jit().main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 968, in tvm_ffi.core.Function.__call__
+RuntimeError: kernel score input Table shape[1] violates packed ABI constraint; expected: 263, got: 4096
