@@ -1,43 +1,10 @@
-"""Small fixed-shape workloads for attributing profiled engine costs."""
+#!/usr/bin/env python3
+"""CED's routed FFN cost in a profiler trace: the DeepSeek V4.1 decoder's MoE work, by kernel.
 
-import json
-import urllib.request
-import uuid
-
-from . import engine, prom
-
-
-def one_row(base_url: str, *, requests: int = 32, prompt_token: int = 1) -> dict:
-    """Profile cold single-token target forwards, without chat-template padding.
-
-    A fresh cache salt per request ensures the token is computed, even with prefix
-    caching. This is a cost probe, not a real-text throughput benchmark.
-    """
-    if requests < 24:
-        raise ValueError("one-row profiling needs at least 24 engine iterations")
-    base = base_url.rstrip("/")
-    prom.require_idle(base, "one-row profiling")
-    with urllib.request.urlopen(base + "/v1/models", timeout=60) as response:
-        model = json.load(response)["data"][0]["id"]
-
-    def forward():
-        result = engine._post(base + "/v1/completions", {
-            "model": model, "prompt": [prompt_token], "max_tokens": 1,
-            "temperature": 0, "cache_salt": uuid.uuid4().hex,
-        }, 120)
-        if result["usage"]["prompt_tokens"] != 1:
-            raise RuntimeError("one-row profile received a padded prompt")
-        return result
-
-    for _ in range(2):
-        forward()
-    engine._post(base + "/start_profile", None, 120)
-    try:
-        for _ in range(requests):
-            forward()
-    finally:
-        engine._post(base + "/stop_profile", None, 120)
-    return {"requests": requests, "prompt_tokens_per_request": 1}
+A library for analysis scripts (it reads Chrome-trace events and prints nothing). The cost
+probe that makes such traces is Sonar's (``sonar.profile.one_row``); the attribution below
+knows this deployment's kernels and geometry, so it stays here.
+"""
 
 
 def ced_moe_costs(events: list[dict], *, rows: int, decoder_layers: int = 20) -> list[dict]:

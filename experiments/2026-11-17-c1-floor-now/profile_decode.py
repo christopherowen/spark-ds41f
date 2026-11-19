@@ -22,8 +22,10 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from servebench import prom  # noqa: E402
-from servebench.prompts import default_prompts  # noqa: E402
+from spark_ds41f import sonar  # noqa: E402
+
+prom = sonar.module("prom")
+default_prompts = sonar.module("prompts").default_prompts
 
 
 def option(name, default):

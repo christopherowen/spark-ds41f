@@ -18,7 +18,9 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from servebench import engine  # noqa: E402
+from spark_ds41f import sonar  # noqa: E402
+
+engine = sonar.module("engine")
 
 
 def option(name, default):

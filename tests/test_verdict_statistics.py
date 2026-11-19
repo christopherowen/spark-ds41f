@@ -1,5 +1,6 @@
-"""Verdict statistics: averaging both boots on each side, the boot term, recorded floors by
-testbed and suite, the startup-memory summary's start, and first boots (CPU only)."""
+"""Verdict statistics here: recorded floors by testbed and suite, the reference repeat's names,
+the lab's table steps, the startup-memory summary's start, and first boots (CPU only). The
+boot term and the averaging themselves are Sonar's, and its tests cover them."""
 
 import contextlib
 import importlib.util
@@ -15,127 +16,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from servebench import __main__ as cli  # noqa: E402
-from servebench import suite  # noqa: E402
-from spark_ds41f import candidate, lab  # noqa: E402
+from spark_ds41f import candidate, lab, sonar  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location("servebench_suite_table", ROOT / "scripts/servebench_suite_table.py")
+cli = sonar.module("sonar.__main__")
+suite = sonar.module("suite")
+
+_spec = importlib.util.spec_from_file_location("sonar_table", ROOT / "scripts/sonar_table.py")
 table = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(table)
 
 
-def paired(change: float, half: float = 0.05) -> dict:
-    return {"metric": "decode tok/s, paired", "change_pct": change, "ci95_pct": half,
-            "low_pct": change - half, "high_pct": change + half, "higher_is_better": True}
-
-
-def outcome(grid: float, tps: float, pair: float | None = None, grid_ci: float = 0.15) -> dict:
-    rows = [{"metric": "output tok/s", "change_pct": tps, "ci95_pct": 0.9}]
-    if pair is not None:
-        rows.append(paired(pair))
-    return {"steps": {"grid": ("servebench-engine/1", {"rows": [
-                {"metric": "decode geometric mean (20)", "change_pct": grid, "ci95_pct": grid_ci}]}),
-            "c16": ("servebench/1", {"rows": rows})}}
-
-
-class BootTermTest(unittest.TestCase):
-    def test_one_bound_for_both_sides(self):
-        self.assertAlmostEqual(suite.boot_term(0.4, None, 1, 1), 0.4)
-        self.assertAlmostEqual(suite.boot_term(0.4, None, 2, 1), 0.4 * math.sqrt(0.75))
-        self.assertAlmostEqual(suite.boot_term(0.4, 0.4, 2, 2), 0.4 * math.sqrt(0.5))
-        self.assertAlmostEqual(suite.boot_term(0.4, None, 2, 2), 0.4 * math.sqrt(0.5))
-
-    def test_each_side_its_own_bound(self):
-        self.assertAlmostEqual(suite.boot_term(0.4, 0.2, 2, 2), math.sqrt(0.4 ** 2 / 4 + 0.2 ** 2 / 4))
-        self.assertAlmostEqual(suite.boot_term(0.4, 0.2, 1, 2), math.sqrt(0.4 ** 2 / 2 + 0.2 ** 2 / 4))
-
-
-class AveragingTest(unittest.TestCase):
-    floors = {"c16": 0.43, "grid": 0.43}
-
-    def rows(self, **extra):
-        return {(r["step"], r["metric"]): r for r in suite.with_floor(
-            outcome(-1.0, 1.0, 0.40), outcome(0.10, -0.10, 0.10), floors=self.floors,
-            reference_to_repeat=outcome(-0.9, 1.2, 0.30), **extra)}
-
-    def test_without_a_reference_repeat_nothing_changes(self):
-        rows = self.rows()
-        pair = rows[("c16", "decode tok/s, paired")]
-        self.assertEqual((pair["boots"], pair["reference_boots"]), (2, 1))
-        self.assertAlmostEqual(pair["change_pct"], 0.35)
-        self.assertAlmostEqual(pair["floor_pct"], 0.43 * math.sqrt(0.75))
-        self.assertIsNone(pair["reference_repeat_pct"])
-        # A window row keeps the first pairing and interval + |repeat|.
-        window = rows[("c16", "output tok/s")]
-        self.assertEqual((window["boots"], window["reference_boots"], window["change_pct"]), (1, 1, 1.0))
-        self.assertAlmostEqual(window["margin_pct"], 0.9 + 0.10)
-        # The grid's geometric mean takes its recorded floor over both candidate boots.
-        grid = rows[("grid", "decode geometric mean (20)")]
-        self.assertEqual(grid["boots"], 2)
-        self.assertAlmostEqual(grid["change_pct"], -0.95)
-        self.assertAlmostEqual(grid["floor_pct"], 0.43 * math.sqrt(0.75))
-        self.assertAlmostEqual(grid["margin_pct"], math.hypot(0.15, 0.43 * math.sqrt(0.75)))
-        self.assertEqual(grid["verdict"], "better")  # step times fell
-
-    def test_a_grid_without_a_floor_keeps_interval_plus_repeat(self):
-        rows = {(r["step"], r["metric"]): r for r in suite.with_floor(outcome(-0.3, 1.0), outcome(0.2, 0.1))}
-        grid = rows[("grid", "decode geometric mean (20)")]
-        self.assertIsNone(grid["floor_pct"])
-        self.assertAlmostEqual(grid["margin_pct"], 0.15 + 0.2)
-        self.assertEqual(grid["verdict"], "same")
-
-    def test_both_boots_of_each(self):
-        rows = self.rows(reference_repeat=outcome(0.05, 0.2, -0.1),
-                         reference_again_to_candidate=outcome(-1.1, 0.8, 0.50),
-                         reference_again_to_repeat=outcome(-1.0, 1.0, 0.40))
-        pair = rows[("c16", "decode tok/s, paired")]
-        self.assertEqual((pair["boots"], pair["reference_boots"]), (2, 2))
-        self.assertAlmostEqual(pair["change_pct"], (0.40 + 0.30 + 0.50 + 0.40) / 4)
-        self.assertAlmostEqual(pair["reference_repeat_pct"], -0.1)
-        self.assertAlmostEqual(pair["floor_pct"], 0.43 * math.sqrt(0.5))
-        self.assertAlmostEqual(pair["margin_pct"], math.hypot(0.05, 0.43 * math.sqrt(0.5)))
-        window = rows[("c16", "output tok/s")]
-        self.assertAlmostEqual(window["change_pct"], (1.0 + 0.8 + 1.2 + 1.0) / 4)
-        # Window rows: interval + the repeats' boot term over two boots of each.
-        self.assertAlmostEqual(window["boot_pct"], math.sqrt(0.10 ** 2 / 4 + 0.2 ** 2 / 4))
-        self.assertAlmostEqual(window["margin_pct"], 0.9 + window["boot_pct"])
-        grid = rows[("grid", "decode geometric mean (20)")]
-        self.assertAlmostEqual(grid["change_pct"], (-1.0 - 0.9 - 1.1 - 1.0) / 4)
-        self.assertAlmostEqual(grid["floor_pct"], 0.43 * math.sqrt(0.5))
-
-    def test_a_noisy_repeat_on_either_side_widens_its_bound(self):
-        rows = self.rows(reference_repeat=outcome(0.9, 0.2, -0.8),
-                         reference_again_to_candidate=outcome(-1.1, 0.8, 0.50),
-                         reference_again_to_repeat=outcome(-1.0, 1.0, 0.40))
-        self.assertAlmostEqual(rows[("c16", "decode tok/s, paired")]["floor_pct"], math.sqrt(0.43 ** 2 / 4 + 0.8 ** 2 / 4))
-        self.assertAlmostEqual(rows[("grid", "decode geometric mean (20)")]["floor_pct"],
-                               math.sqrt(0.43 ** 2 / 4 + 0.9 ** 2 / 4))
-
-    def test_a_missing_pairing_counts_only_the_boots_used(self):
-        rows = self.rows(reference_repeat=outcome(0.05, 0.2, -0.1), reference_again_to_candidate=outcome(-1.1, 0.8, 0.5))
-        pair = rows[("c16", "decode tok/s, paired")]
-        self.assertEqual((pair["boots"], pair["reference_boots"]), (2, 2))
-        self.assertAlmostEqual(pair["change_pct"], (0.40 + 0.50 + 0.30) / 3)
-
-    def test_the_table_says_which_boots_were_averaged(self):
-        rows = suite.with_floor(outcome(-1.0, 1.0, 0.4), outcome(0.1, -0.1, 0.1), floors=self.floors,
-                                reference_to_repeat=outcome(-0.9, 1.2, 0.3), reference_repeat=outcome(0.05, 0.2, -0.1),
-                                reference_again_to_candidate=outcome(-1.1, 0.8, 0.5),
-                                reference_again_to_repeat=outcome(-1.0, 1.0, 0.4))
-        text = suite.format_floor(rows, "ref", "cand", "cand-again", reference_repeat="ref-again",
-                                  floors_note="floors (tp4-ring, screen): grid 0.37% (6 pairs)")
-        head = text.splitlines()[0]
-        self.assertTrue(head.startswith("verdicts: ref -> cand, against the run's own repeat (cand -> cand-again)"))
-        self.assertIn("and the reference's (ref-again); each change is the mean over both boots of each "
-                      "(cand, cand-again; ref, ref-again)", head)
-        self.assertIn("(both boots of each, reference repeat -0.10%; window tok/s", text)
-        self.assertIn("floors (tp4-ring, screen)", text)
-        self.assertTrue(text.splitlines()[-1].startswith("paired rows: margin"))
-        self.assertIn("in quadrature", text)
-        # Without a reference repeat the header is the old one.
-        plain = suite.format_floor(suite.with_floor(outcome(-1.0, 1.0, 0.4), outcome(0.1, -0.1, 0.1), floors=self.floors),
-                                   "ref", "cand", "cand-again")
-        self.assertEqual(plain.splitlines()[0], "verdicts: ref -> cand, against the run's own repeat (cand -> cand-again)")
+def sonar_fakes():
+    """Sonar's own fake server and tiny suite (its tests/test_sonar.py in the pinned checkout)."""
+    spec = importlib.util.spec_from_file_location("sonar_fakes", sonar.checkout() / "tests/test_sonar.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def index(name: str, transport: str | None, nodes: int, steps: list[dict], digest: str = "d" * 64) -> dict:
@@ -260,7 +156,8 @@ class TableEndToEndTest(unittest.TestCase):
     """Four arms of a tiny suite on a fake server: the reference's repeat is averaged."""
 
     def test_reference_repeat_arm_is_averaged(self):
-        from tests.test_servebench import FakeServer, SuiteTest
+        fakes = sonar_fakes()
+        FakeServer, SuiteTest = fakes.FakeServer, fakes.SuiteTest
 
         server = FakeServer()
         try:
@@ -326,18 +223,18 @@ class SuiteJobReferenceRepeatTest(unittest.TestCase):
                "reference_repeat": "refs/c54-screen-second", "arms": [{"config": "a.json", "label": "c"},
                                                                       {"config": "a.json", "label": "c-again"}]}
         tables = [s for s in lab.suite_steps(spec, job, job["arms"]) if s["kind"] == "table"]
-        self.assertEqual(tables[0]["argv"], ["scripts/servebench_suite_table.py", "--reference-repeat",
+        self.assertEqual(tables[0]["argv"], ["scripts/sonar_table.py", "--reference-repeat",
                                              "refs/c54-screen-second", "r", "c", "refs/c54-screen", "c-again"])
         self.assertEqual(tables[1]["argv"][1:3], ["--reference-repeat", "refs/c54-screen-second-single-stream"])
         self.assertEqual(tables[1]["reference_repeat"], "refs/c54-screen-second-single-stream")
         job.pop("reference_repeat")
         plain = [s for s in lab.suite_steps(spec, job, job["arms"]) if s["kind"] == "table"]
-        self.assertEqual(plain[0]["argv"], ["scripts/servebench_suite_table.py", "r", "c", "refs/c54-screen", "c-again"])
+        self.assertEqual(plain[0]["argv"], ["scripts/sonar_table.py", "r", "c", "refs/c54-screen", "c-again"])
 
     def test_reference_problems_check_a_named_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for name, digest in (("ref", suite.digest(suite.load("screen"))), ("ref-other", "e" * 64)):
+            for name, digest in (("ref", suite.digest(sonar.load_suite("screen"))), ("ref-other", "e" * 64)):
                 (root / name).mkdir()
                 (root / name / "suite.json").write_text(json.dumps({"suite_sha256": digest}))
             step = {"unresolved": None, "arms": 2, "reference": "ref", "suite": "screen", "reference_repeat": "ref-other"}

@@ -38,7 +38,11 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from servebench import engine, prefill, prom  # noqa: E402
+from spark_ds41f import sonar  # noqa: E402
+
+engine = sonar.module("engine")
+prefill = sonar.module("prefill")
+prom = sonar.module("prom")
 
 LEAD = 12  # output chunks before the decode span starts: the uncached tail's prefill is over
 
