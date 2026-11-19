@@ -1,0 +1,228 @@
+From 8538c3a0a410507129e903de1c60ff69f363642d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:51:53 +0000
+Subject: [PATCH 827/827] fix(dsv41): rename quantization-ignored layers into
+ the VL wrapper before layers are built
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-62's series applied through 0826.
+
+Rationale: configure_quant_config renames the modules a quantization config
+lists (Fp8Config.ignored_layers) with the model class's hf_to_vllm_mapper,
+before the first instance exists. The V4.1 VL wrapper sets its mapper only on
+the instance, after its language model has chosen every layer's quantization
+method, so the class has none: the list keeps the checkpoint's names
+(layers.1.engram.wkv) while the layers are built under the wrapper
+(language_model.model.layers.1.engram.wkv). DeepseekV41FP8Config matches
+ignored layers exactly, so a projection the checkpoint lists as unquantized is
+built block32 FP8. The text-only class already carries a class mapper. Give the
+wrapper one holding its module renames only (the five prefixes and the shared
+expert's down_proj), from the same tables as the instance mapper; it carries no
+tensor, scale or drop rule and needs no model import. The GB10 wrapper
+(vllm/models/deepseek_v4_1/nvidia/vl_model.py) inherits it.
+
+Quality implications: none on the served checkpoints. DeepSeek-V4.1-Flash
+(dba1be0a) and DeepSeek-V4.1-Flash-1017 (1bae0e10) list no ignored layers and
+store both Engram projections as E4M3 weights with E8M0 scales, so the list is
+empty before and after: every layer's method, the kernels and the outputs are
+unchanged. A checkpoint that lists ignored layers now gets them unquantized, as
+it states, instead of silently quantized.
+
+Tests: tests/models/test_deepseek_v4_1_quant_ignore.py in the candidate-61-r2
+image on one GB10, with the two files mounted over it: 6 passed. Without the
+change to the wrapper, 5 of the 6 fail (the ignored Engram projection gets the
+block32 FP8 method); the served-checkpoint case passes both ways.
+
+Upstream status: local; a candidate for vllm-project/vllm, whose wrapper has
+the same gap.
+---
+ .../models/test_deepseek_v4_1_quant_ignore.py | 107 ++++++++++++++++++
+ vllm/models/deepseek_v41/nvidia/vl_model.py   |  36 ++++--
+ 2 files changed, 134 insertions(+), 9 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_quant_ignore.py
+
+diff --git a/tests/models/test_deepseek_v4_1_quant_ignore.py b/tests/models/test_deepseek_v4_1_quant_ignore.py
+new file mode 100644
+index 000000000..b4e2e3336
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_quant_ignore.py
+@@ -0,0 +1,107 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 on GB10: a quantization config's ignored layers take the
++wrapper's module names before any layer is built."""
++
++import pytest
++
++from vllm.model_executor.layers.linear import LinearBase
++from vllm.model_executor.model_loader.utils import configure_quant_config
++from vllm.models.deepseek_v4_1 import kernels
++from vllm.models.deepseek_v4_1.nvidia.vl_model import (
++    DeepseekV41ForCausalLM,
++    _make_deepseek_v4_vl_weights_mapper,
++)
++from vllm.models.deepseek_v4_1.quant_config import (
++    Block32FP8LinearMethod,
++    DeepseekV41FP8Config,
++)
++
++# DeepSeek-V4.1-Flash-1017's quantization_config (revision 1bae0e10).
++CHECKPOINT_QUANT = {
++    "quant_method": "fp8",
++    "activation_scheme": "dynamic",
++    "weight_block_size": [32, 32],
++    "scale_fmt": "ue8m0",
++    "expert_dtype": "fp4",
++}
++# Checkpoint names and the modules the wrapper builds for them.
++MODULES = {
++    "layers.1.engram.wkv": "language_model.model.layers.1.engram.wkv",
++    "layers.14.engram.wkv": "language_model.model.layers.14.engram.wkv",
++    "layers.0.attn.wq_b": "language_model.model.layers.0.attn.wq_b",
++    "layers.0.ffn.shared_experts.w2": (
++        "language_model.model.layers.0.ffn.shared_experts.down_proj"
++    ),
++    "embed.proj": "language_model.model.embed.proj",
++    "norm.proj": "language_model.model.norm.proj",
++    "hc_head_fn": "language_model.model.hc_head_fn",
++    "mtp.0.head": "language_model.model.mtp.0.head",
++    # A name already in the wrapper's namespace stays: mapping twice is safe.
++    "language_model.model.layers.1.engram.wkv": (
++        "language_model.model.layers.1.engram.wkv"
++    ),
++}
++
++
++def _configured(ignored_layers=None):
++    config = dict(CHECKPOINT_QUANT)
++    if ignored_layers is not None:
++        config["ignored_layers"] = list(ignored_layers)
++    quant = DeepseekV41FP8Config.from_config(config)
++    # The engine's hook, before the first instance of the model class exists.
++    configure_quant_config(quant, DeepseekV41ForCausalLM)
++    return quant
++
++
++def test_served_checkpoint_lists_no_ignored_layers() -> None:
++    """The served checkpoint ignores nothing: every linear stays block32 FP8."""
++    quant = _configured()
++
++    assert quant.ignored_layers == []
++    method = quant.get_quant_method(
++        LinearBase.__new__(LinearBase), "language_model.model.layers.1.engram.wkv"
++    )
++    assert isinstance(method, Block32FP8LinearMethod)
++
++
++def test_ignored_layers_take_the_wrapper_module_names() -> None:
++    quant = _configured(MODULES)
++
++    assert quant.ignored_layers == list(MODULES.values())
++    # A second model class of the same engine (a reload) changes nothing.
++    configure_quant_config(quant, DeepseekV41ForCausalLM)
++    assert quant.ignored_layers == list(MODULES.values())
++
++
++@pytest.mark.parametrize("layer_id", [1, 14])
++def test_ignored_engram_projection_is_not_quantized(layer_id) -> None:
++    """An ignored Engram projection gets the plain linear method at the prefix
++    the wrapper builds it with; its neighbour stays block32 FP8."""
++    quant = _configured([f"layers.{layer_id}.engram.wkv"])
++    layer = LinearBase.__new__(LinearBase)
++    prefix = f"language_model.model.layers.{layer_id}.engram.wkv"
++
++    ignored = quant.get_quant_method(layer, prefix)
++    assert type(ignored) is type(kernels.linear_method())
++    assert not isinstance(ignored, Block32FP8LinearMethod)
++    kept = quant.get_quant_method(
++        layer, f"language_model.model.layers.{layer_id}.attn.wq_b"
++    )
++    assert isinstance(kept, Block32FP8LinearMethod)
++
++
++@pytest.mark.parametrize("expert_dtype", ["fp4", "fp8"])
++def test_class_mapper_renames_modules_as_the_instance_mapper(expert_dtype) -> None:
++    """The class mapper carries the instance mapper's module renames and none of
++    its tensor, scale or drop rules."""
++    mapper = DeepseekV41ForCausalLM.hf_to_vllm_mapper
++    instance = _make_deepseek_v4_vl_weights_mapper(expert_dtype, "weight_scale_inv")
++
++    assert mapper.orig_to_new_prefix == instance.orig_to_new_prefix
++    assert not mapper.orig_to_new_regex
++    assert not mapper.orig_to_new_suffix
++    assert None not in mapper.orig_to_new_substr.values()
++    names = list(MODULES)
++    assert mapper.apply_list(names) == list(MODULES.values())
++    assert mapper.apply_list(names) == instance.get_rename_mapper().apply_list(names)
+diff --git a/vllm/models/deepseek_v41/nvidia/vl_model.py b/vllm/models/deepseek_v41/nvidia/vl_model.py
+index da235d264..f3efacd19 100644
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
+@@ -86,6 +86,21 @@ class DeepseekV4VLImagePixelInputs(TensorSchema):
+     types: Annotated[torch.Tensor, TensorShape("ns", dynamic_dims={"ns"})]
+ 
+ 
++# The checkpoint's module names under this wrapper. They rename modules, not
++# tensors, so they hold for every list that names modules: the checkpoint's
++# weights and a quantization config's ignored layers.
++_VL_MODULE_PREFIXES: dict[str, str | None] = {
++    "layers.": "language_model.model.layers.",
++    "embed.": "language_model.model.embed.",
++    "norm.": "language_model.model.norm.",
++    "hc_head": "language_model.model.hc_head",
++    "mtp.": "language_model.model.mtp.",
++}
++_VL_MODULE_SUBSTRS: dict[str, str | None] = {
++    ".shared_experts.w2": ".shared_experts.down_proj",
++}
++
++
+ def _make_deepseek_v4_vl_weights_mapper(
+     expert_dtype: str, linear_scale_name: str
+ ) -> WeightsMapper:
+@@ -93,15 +108,8 @@ def _make_deepseek_v4_vl_weights_mapper(
+     from .model import _make_deepseek_v4_weights_mapper
+ 
+     base = _make_deepseek_v4_weights_mapper(expert_dtype, linear_scale_name)
+-    orig_to_new_prefix: dict[str, str | None] = {
+-        "layers.": "language_model.model.layers.",
+-        "embed.": "language_model.model.embed.",
+-        "norm.": "language_model.model.norm.",
+-        "hc_head": "language_model.model.hc_head",
+-        "mtp.": "language_model.model.mtp.",
+-    }
+     return WeightsMapper(
+-        orig_to_new_prefix=orig_to_new_prefix,
++        orig_to_new_prefix=dict(_VL_MODULE_PREFIXES),
+         orig_to_new_regex=base.orig_to_new_regex,
+         orig_to_new_suffix={
+             "head.weight": "language_model.lm_head.weight",
+@@ -109,7 +117,7 @@ def _make_deepseek_v4_vl_weights_mapper(
+             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+         },
+         orig_to_new_substr={
+-            ".shared_experts.w2": ".shared_experts.down_proj",
++            **_VL_MODULE_SUBSTRS,
+             # The MTP/DSpark draft heads are not supported for the vision
+             # variant; drop their weights.
+             "mtp.": None,
+@@ -136,6 +144,16 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
+     # bias_vl.
+     requires_raw_input_tokens = True
+ 
++    # configure_quant_config reads the class's mapper before any layer is built,
++    # to rename the modules a quantization config lists (its ignored layers) into
++    # this wrapper's namespace. __init__ installs the instance mapper, with the
++    # checkpoint's tensor and scale rules, only after the language model has
++    # chosen every layer's quantization method: too late for that list.
++    hf_to_vllm_mapper = WeightsMapper(
++        orig_to_new_prefix=dict(_VL_MODULE_PREFIXES),
++        orig_to_new_substr=dict(_VL_MODULE_SUBSTRS),
++    )
++
+     @classmethod
+     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+         if modality == "image":
+-- 
+2.43.0
+
