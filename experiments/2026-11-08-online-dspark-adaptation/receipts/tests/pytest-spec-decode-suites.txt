@@ -1,0 +1,122 @@
+...................................................s............................................................ [ 44%]
+..................FF............................................................................................ [ 89%]
+..........................                                                                                       [100%]
+======================================================= FAILURES =======================================================
+_________________________________ test_dspark_revisited_position_uses_step_seed[False] _________________________________
+
+use_fp64 = False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize("use_fp64", [False, True])
+    def test_dspark_revisited_position_uses_step_seed(use_fp64):
+        """A cached draft at a revisited position must use its current step."""
+        device = torch.device("cuda")
+        batch = 4096
+        spec = DSparkSpeculator.__new__(DSparkSpeculator)
+        spec.acceptance_estimator = None
+        spec._d2t_scatter_index = None
+        spec.draft_watermarker = None
+        spec.use_fp64_gumbel = use_fp64
+        spec.temperature = torch.ones(batch, device=device)
+        spec.seeds = torch.arange(batch, dtype=torch.int64, device=device)
+        spec._step_cols = torch.arange(2, dtype=torch.int32, device=device)
+        spec.draft_logits = torch.empty(batch, 2, 2, device=device)
+        logits = torch.tensor([0.7, 0.3], device=device).log().expand(batch, -1)
+        mapping = torch.arange(batch, device=device)
+        positions = torch.full((batch,), 22, dtype=torch.int64, device=device)
+    
+>       first = spec._sample_logits(logits, mapping, positions, 1)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/spec_decode/test_dspark_topk.py:265: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator object at 0xf5f5ad0abc20>
+logits = tensor([[-0.3567, -1.2040],
+        [-0.3567, -1.2040],
+        [-0.3567, -1.2040],
+        ...,
+        [-0.3567, -1.2040],
+        [-0.3567, -1.2040],
+        [-0.3567, -1.2040]], device='cuda:0')
+idx_map = tensor([   0,    1,    2,  ..., 4093, 4094, 4095], device='cuda:0')
+sample_pos = tensor([22, 22, 22,  ..., 22, 22, 22], device='cuda:0'), step = 1
+
+    def _sample_logits(
+        self,
+        logits: torch.Tensor,
+        idx_map: torch.Tensor,
+        sample_pos: torch.Tensor,
+        step: int,
+    ) -> torch.Tensor:
+>       if not self.use_confidence_head:
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'DSparkSpeculator' object has no attribute 'use_confidence_head'
+
+vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:427: AttributeError
+_________________________________ test_dspark_revisited_position_uses_step_seed[True] __________________________________
+
+use_fp64 = True
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize("use_fp64", [False, True])
+    def test_dspark_revisited_position_uses_step_seed(use_fp64):
+        """A cached draft at a revisited position must use its current step."""
+        device = torch.device("cuda")
+        batch = 4096
+        spec = DSparkSpeculator.__new__(DSparkSpeculator)
+        spec.acceptance_estimator = None
+        spec._d2t_scatter_index = None
+        spec.draft_watermarker = None
+        spec.use_fp64_gumbel = use_fp64
+        spec.temperature = torch.ones(batch, device=device)
+        spec.seeds = torch.arange(batch, dtype=torch.int64, device=device)
+        spec._step_cols = torch.arange(2, dtype=torch.int32, device=device)
+        spec.draft_logits = torch.empty(batch, 2, 2, device=device)
+        logits = torch.tensor([0.7, 0.3], device=device).log().expand(batch, -1)
+        mapping = torch.arange(batch, device=device)
+        positions = torch.full((batch,), 22, dtype=torch.int64, device=device)
+    
+>       first = spec._sample_logits(logits, mapping, positions, 1)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/spec_decode/test_dspark_topk.py:265: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator object at 0xf5f5ad0a74d0>
+logits = tensor([[-0.3567, -1.2040],
+        [-0.3567, -1.2040],
+        [-0.3567, -1.2040],
+        ...,
+        [-0.3567, -1.2040],
+        [-0.3567, -1.2040],
+        [-0.3567, -1.2040]], device='cuda:0')
+idx_map = tensor([   0,    1,    2,  ..., 4093, 4094, 4095], device='cuda:0')
+sample_pos = tensor([22, 22, 22,  ..., 22, 22, 22], device='cuda:0'), step = 1
+
+    def _sample_logits(
+        self,
+        logits: torch.Tensor,
+        idx_map: torch.Tensor,
+        sample_pos: torch.Tensor,
+        step: int,
+    ) -> torch.Tensor:
+>       if not self.use_confidence_head:
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'DSparkSpeculator' object has no attribute 'use_confidence_head'
+
+vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:427: AttributeError
+=================================================== warnings summary ===================================================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/spec_decode/test_adaptive_verification.py::test_sampler_hands_configured_seed_to_sampling_states
+  /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=============================================== short test summary info ================================================
+SKIPPED [1] tests/v1/spec_decode/test_adaptive_verification.py:615: requires two CUDA devices
+2 failed, 247 passed, 1 skipped, 15 warnings in 65.45s (0:01:05)
+exit 1

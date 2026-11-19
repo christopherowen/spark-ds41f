@@ -703,7 +703,13 @@ Don't repeat these without a new reason:
   ~3.7× at `c1` (`PR #1003` sunk-cost rule, `c61-r1-2`: pushed low-survival tail
   rows into 384-expert MoE, adding `+1.78 ms/step` and regressing `c1` `-3.25%`);
   cohort-atomic budgeting + `COALESCED_ROW_COST_SCALE=0.28` (`PR #953`/`#986`,
-  `c61-r3`: pushed `c16` `sched/step` to `40.05` and regressed `c16` `-3.3 tok/s`).
+  `c61-r3`: pushed `c16` `sched/step` to `40.05` and regressed `c16` `-3.3 tok/s`);
+  online verification-driven DSpark adaptation, per-position calibration plus W1
+  and confidence-head updates after every step
+  (`experiments/2026-11-08-online-dspark-adaptation`, #1002: c1 decode −3.8% coding
+  and −5.5% held-out at `tp4-switched`; shorter `0504` budgets and ~0.8 ms a step;
+  end-of-turn shadow learner `experiments/2026-11-17-dspark-turn-learning`: `+0.37%..+1.06%`
+  target-forward overhead with learner idle).
 - **Decode kernels:** 1-launch atomic last-CTA `mHC project_and_finalize_streams`
   for `M <= 16` (`experiments/2026-11-06-mhc-project-finalize`, #946: 12–34%
   slower than 2-launch PDL due to atomic/fence serialization and register
