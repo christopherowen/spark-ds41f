@@ -55,10 +55,14 @@ HISTORICAL_PROFILES = {
     "experiments/2026-11-05-selector-fitting/capture.json",
     "experiments/2026-11-06-optional-lsa/tp4-default-off.json",
     "experiments/2026-11-06-optional-lsa/tp4.json",
+    # Ran on pre-r2 c61-decode (tree 42332c66ca46) before c61-r2 updated c61-decode/tp4-dev.json to db2b19659c29.
+    "experiments/2026-11-18-ffn-prefetch-pace/tp4-pace-ref-dev.json",
+    "experiments/2026-11-18-ffn-prefetch-pace/tp4-pace0-dev.json",
+    "experiments/2026-11-18-ffn-prefetch-pace/tp4-pace50-dev.json",
+    "experiments/2026-11-18-ffn-prefetch-pace/tp4-pace100-dev.json",
 }
 
-# Early TileLang experiments whose locks pointed at the mutable root series
-# (patches/vllm/series, patches/b12x/series) before per-experiment series existed.
+# Experiments whose locks pointed at a mutable series before per-experiment or later edits.
 HISTORICAL_ROLLING_SERIES_LOCKS = {
     "experiments/2026-10-03-packed-bf16-head/tilelang-tp4/upstreams.lock.json",
     "experiments/2026-10-04-tilelang-gate-router/upstreams.lock.json",
@@ -66,6 +70,7 @@ HISTORICAL_ROLLING_SERIES_LOCKS = {
     "experiments/2026-10-04-tilelang-router/upstreams.lock.json",
     "experiments/2026-10-04-tilelang-sparknet/upstreams.lock.json",
     "experiments/2026-10-04-tilelang-vocab-heads/upstreams.lock.json",
+    "experiments/2026-11-18-ffn-prefetch-pace/upstreams.lock.json",
 }
 
 
