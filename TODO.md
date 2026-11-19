@@ -425,9 +425,21 @@ Open levers:
   `mtp.{0,1,2}.attn.wkv` so all three DSpark layers' context-KV projections and
   RoPE execute in a single grouped launch over the tapped hidden states from
   target layers `{1, 30, 60}` rather than three separate per-layer launches.
-- **Drafter reuse of the target's token selection.** Check whether reusing the
-  target model's indexer top-k selection from the anchor position in DSpark
-  draft layers preserves acceptance while cutting drafter attention work.
+- **Drafter reuse of the target's token selection (`experiments/2026-11-08-dspark-topk-selection-reuse`, vLLM `0762`).**
+  Measured across 2 boots on `sp5` (`4K..256K`, `TP=4` and `TP=3`, `c1` and `c8`).
+  In `1107`, `DeepSeek-V4.1-Flash` configures `compress_ratios = [0, 0, 0]` on all
+  3 DSpark draft layers (`layers.40..42`, `mtp.0..2`), so production DSpark draft
+  attention is already window-only (`swa_width = 136`, `idx_width = 0`, `0.00 ms`
+  indexer work). When indexed draft attention (`compress_ratio = 1`, `idx_width = 512`)
+  is enabled, reusing the target model's accepted anchor row top-$k$ selection
+  (`gather_dspark_anchor_topk_indices`, `"target"` mode) or step-0 anchor top-$k$
+  (`broadcast_dspark_step0_topk_indices`, `"anchor"` mode) requires zero new
+  checkpoint weights, keeps 3-layer DSpark indexed attention $O(1)$ (`0.080–0.085 ms`
+  at `c1`, `0.193–0.198 ms` at `c8` on `TP=4`) across `4K..256K` (saving up to
+  `2.69 ms/step` / `14.58x` vs 1 shared draft indexer and `8.10 ms/step` / `41.86x`
+  vs 3 per-layer draft indexers at `256K c8`), and preserves `97.1%–98.8%` top-$k$
+  index overlap, `0.999975–0.999986` 3-layer cosine similarity, and `95.8%–100.0%`
+  (`98.5%` mean) 5-step greedy Markov draft token agreement.
 - **Certified `W_q` Cauchy-Schwarz screening for DSpark (`project_head_screened_markov_greedy_pairs`) and $\ell_2$-optimal `build_screen_weights`.** Commit `0f2eb0a85` (`fuses_screened_markov_greedy`, active in `c61-r5`+) screens single-request DSpark Markov drafting via 8-bit `W_q` (`cudagraph screened` `639.7 µs` vs `cudagraph dense` `678.6 µs` on `sp8`, `N=32320, K=2560, R=256, steps=5`). `c61-r6` added load-time per-row $\ell_2$-optimal `alpha` grid search `(1.0, 0.93, ..., 0.55)` in `build_screen_weights()` (`86 passed, 6 skipped`), and `c61-r9` fixed finite extreme-outlier rows (`full_amax > 8.0 * in_amax`) by quantizing `torch.where(torch.isfinite(w_full_f), w_full_f, w_in_f)` (clamping outliers to `u7 = 127` with their true sign rather than zeroing them to `0`) over a wider 14-point `alpha` grid down to `0.25` plus `full_base * f_alpha` candidates (`f_alpha in (1.0, 0.75, 0.50, 0.30)`), dropping extreme-outlier `row_bound` max `1.5019 -> 0.2481` (`mean 0.4973 -> 0.2442`) and improving `M=1` `screened+markov` `964.02 -> 962.56 us (-1.46 us)` bit-exactly (`38 passed`, `0` PDL violations). On `sp8` Cold-L2 at Flash TP4 head geometry (`V=32320, H=5120, K_m=512`), `lm_head_greedy` runs in `844.4 / 825.1 / 828.9 us/step` (`M=1/3/6`), `screen_head_base(M=5)` runs in `801.3 us/step`, and screened+5×Markov (`M=2/3/5`) saves `-240.1 / -221.7 / -111.0 us/step` over dense (`1338.3 -> 1098.3`, `1413.1 -> 1191.4`, `1563.5 -> 1452.5 us/step`).
 - **Load-time scale-code search for online NVFP4 draft projections.** If
   revisiting `Nvfp4OnlineLinearMethod` / `prepare_nvfp4_head` (`0647`) for

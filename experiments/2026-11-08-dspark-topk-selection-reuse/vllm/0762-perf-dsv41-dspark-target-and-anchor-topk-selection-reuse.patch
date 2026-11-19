@@ -1,0 +1,1563 @@
+From 9cbd4fe2882f4b78a5dcc338b292b6bc64aeec65 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 20:30:00 +0000
+Subject: [PATCH] perf(dsv41): reuse target and step-0 anchor indexer top-k
+ selection in DSpark
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (patch 0761 head 2756478b60b9)
+Rationale: When DSpark draft layers run with indexed attention (compress_ratio > 0, idx_width = 512), scoring the full KPool across all 5 draft query positions per request scales linearly with context length (reaching 2.89 ms/step for 1 shared indexer and 8.30 ms/step for 3 per-layer indexers at 256K c8 on TP=4). Because the target model already scores the accepted anchor position at layer 36 during verification and DSpark sliding-window attention (swa_width = 136) covers all 5 newly drafted tail positions, gathering the target anchor top-k row (or broadcasting step-0 anchor top-k across steps 1..4) eliminates 80%..100% of draft indexer work and keeps indexed draft attention O(1) across 4K..256K.
+Quality implications: Lossless target output (KL = 0) because every drafted token is verified by the target model on the next verification step; 97.1%..98.8% top-k index overlap, 0.999975..0.999986 3-layer DSpark output cosine similarity, and 95.8%..100.0% (98.5% mean) greedy Markov top-1 draft token agreement across 4K..256K.
+Tests: pytest tests/models/test_deepseek_v4_1_dspark_topk_reuse.py tests/models/test_deepseek_v4_1_attention.py
+Upstream status: Local optimization for DeepSeek-V4.1-Flash DSpark speculative decoding.
+---
+ .../test_deepseek_v4_1_dspark_topk_reuse.py   | 658 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        | 537 ++++++++++++--
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  85 ++-
+ .../deepseek_v4_1/tilelang/attention.py       |   8 +-
+ 4 files changed, 1229 insertions(+), 59 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_dspark_topk_reuse.py
+
+diff --git a/tests/models/test_deepseek_v4_1_dspark_topk_reuse.py b/tests/models/test_deepseek_v4_1_dspark_topk_reuse.py
+new file mode 100644
+index 0000000000..c56e51c7a2
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_dspark_topk_reuse.py
+@@ -0,0 +1,658 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for DSpark target-to-drafter and intra-draft step-0 top-k selection reuse."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.forward_context import set_forward_context
++from vllm.models.deepseek_v4_1.attention import (
++    DeepseekV4Attention,
++    broadcast_dspark_step0_topk_indices,
++    gather_dspark_anchor_topk_indices,
++)
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
++
++
++def test_broadcast_dspark_step0_topk_when_seq_len_le_topk():
++    topk = 512
++    q_per_req = 5
++    # Req 0: visible=64 (well below topk), Req 1: visible=510 (straddles topk=512 across steps 0..4),
++    # Req 2: visible=512 (exact boundary), Req 3: inactive padding (visible=0).
++    visible = torch.tensor([64, 510, 512, 0], dtype=torch.int32)
++    step0 = torch.full((4, topk), -1, dtype=torch.int32)
++    # Include some out-of-bounds/rejected indices >= visible in step0 to verify masking + compaction.
++    step0[0, :64] = torch.arange(64, dtype=torch.int32)
++    step0[0, 64:70] = torch.arange(64, 70, dtype=torch.int32)  # >= 64 -> must be masked out
++    step0[1, :510] = torch.arange(510, dtype=torch.int32)
++    step0[1, 510:] = torch.tensor([510, 515], dtype=torch.int32)  # >= 510 -> must be masked out
++    step0[2, :512] = torch.arange(512, dtype=torch.int32)
++    step0[3, :10] = torch.arange(10, dtype=torch.int32)
++
++    out_no_tail = broadcast_dspark_step0_topk_indices(
++        step0, visible, q_per_req, num_reqs=3, append_tail=False
++    )
++    assert out_no_tail.shape == (20, topk)
++    for s in range(q_per_req):
++        # Req 0: exactly 0..63 valid, rest -1
++        assert torch.equal(out_no_tail[0 * 5 + s, :64], torch.arange(64, dtype=torch.int32))
++        assert torch.all(out_no_tail[0 * 5 + s, 64:] == -1)
++        # Req 1: exactly 0..509 valid, rest -1
++        assert torch.equal(out_no_tail[1 * 5 + s, :510], torch.arange(510, dtype=torch.int32))
++        assert torch.all(out_no_tail[1 * 5 + s, 510:] == -1)
++        # Req 2: 0..511 valid
++        assert torch.equal(out_no_tail[2 * 5 + s], torch.arange(512, dtype=torch.int32))
++        # Req 3 (inactive): all -1
++        assert torch.all(out_no_tail[3 * 5 + s] == -1)
++
++    out_tail = broadcast_dspark_step0_topk_indices(
++        step0, visible, q_per_req, num_reqs=3, append_tail=True
++    )
++    for s in range(q_per_req):
++        # Req 0 (visible=64): step s appends s tail tokens [64 .. 64+s-1] into unused -1 slots
++        expected_r0 = torch.arange(64 + s, dtype=torch.int32)
++        assert torch.equal(out_tail[0 * 5 + s, : 64 + s], expected_r0)
++        assert torch.all(out_tail[0 * 5 + s, 64 + s :] == -1)
++
++        # Req 1 (visible=510):
++        # s=0 -> 510 valid, 2 -1s
++        # s=1 -> 511 valid (0..510), 1 -1
++        # s=2 -> 512 valid (0..511), 0 -1s
++        # s=3 -> 509 historical (0..508) + 3 tail (510, 511, 512)
++        # s=4 -> 508 historical (0..507) + 4 tail (510, 511, 512, 513)
++        row_r1 = out_tail[1 * 5 + s]
++        if 510 + s <= topk:
++            assert torch.equal(row_r1[: 510 + s], torch.arange(510 + s, dtype=torch.int32))
++            assert torch.all(row_r1[510 + s :] == -1)
++        else:
++            keep = topk - s
++            assert torch.equal(row_r1[:keep], torch.arange(keep, dtype=torch.int32))
++            assert torch.equal(
++                row_r1[keep:], torch.arange(510, 510 + s, dtype=torch.int32)
++            )
++
++
++def test_broadcast_dspark_step0_topk_when_seq_len_gt_topk():
++    topk = 512
++    q_per_req = 5
++    visible = torch.tensor([4096, 131072], dtype=torch.int32)
++    step0 = torch.stack(
++        [
++            torch.arange(1000, 1000 + topk, dtype=torch.int32),
++            torch.arange(50000, 50000 + topk, dtype=torch.int32),
++        ],
++        dim=0,
++    )
++
++    out_no_tail = broadcast_dspark_step0_topk_indices(
++        step0, visible, q_per_req, append_tail=False
++    )
++    for r in range(2):
++        for s in range(q_per_req):
++            assert torch.equal(out_no_tail[r * q_per_req + s], step0[r])
++
++    out_tail = broadcast_dspark_step0_topk_indices(
++        step0, visible, q_per_req, append_tail=True
++    )
++    for r in range(2):
++        vis = int(visible[r].item())
++        for s in range(q_per_req):
++            row = out_tail[r * q_per_req + s]
++            keep = topk - s
++            assert torch.equal(row[:keep], step0[r, :keep])
++            if s > 0:
++                assert torch.equal(
++                    row[keep:], torch.arange(vis, vis + s, dtype=torch.int32)
++                )
++
++
++def test_gather_dspark_anchor_topk_rejected_slots_overwritten_next_step():
++    topk = 512
++    q_per_req = 5
++    # 3 active requests + 1 padded request; each active request verified 6 target tokens.
++    target_qsl = torch.tensor([0, 6, 12, 18, 18], dtype=torch.int32)
++    # Give every target row a distinct signature and include future positions that must be masked
++    # if a previous token in the verification window is chosen as anchor.
++    target_topk = torch.full((24, topk), -1, dtype=torch.int32)
++    for t_row in range(18):
++        req = t_row // 6
++        local_step = t_row % 6
++        base_vis = (req + 1) * 100 + local_step
++        # Fill first 80 slots with valid historical [0..79], and slots 80..85 with [base_vis - 2 .. base_vis + 3]
++        target_topk[t_row, :80] = torch.arange(80, dtype=torch.int32)
++        target_topk[t_row, 80:86] = torch.arange(
++            base_vis - 2, base_vis + 4, dtype=torch.int32
++        )
++
++    # Step 1: num_rejected = [0, 2, 5, 0]
++    # Req 0: anchor_row = 6 - 0 - 1 = 5, visible = 105
++    # Req 1: anchor_row = 12 - 2 - 1 = 9, visible = 203
++    # Req 2: anchor_row = 18 - 5 - 1 = 12, visible = 300
++    num_rejected_step1 = torch.tensor([0, 2, 5, 0], dtype=torch.int32)
++    visible_step1 = torch.tensor([105, 203, 300, 0], dtype=torch.int32)
++    out_buf = torch.full((20, topk), 999999, dtype=torch.int32)
++
++    gather_dspark_anchor_topk_indices(
++        target_topk,
++        target_qsl,
++        num_rejected_step1,
++        visible_step1,
++        num_reqs=3,
++        num_query_per_req=q_per_req,
++        append_tail=True,
++        out=out_buf,
++    )
++
++    for r, expected_vis in enumerate([105, 203, 300]):
++        for s in range(q_per_req):
++            row = out_buf[r * q_per_req + s]
++            # Valid historical entries at anchor are < expected_vis: 80 + 2 = 82 entries,
++            # plus s tail entries [expected_vis .. expected_vis + s - 1].
++            valid_entries = row[row >= 0]
++            assert valid_entries.numel() == 82 + s
++            assert int(valid_entries.max().item()) < expected_vis + s
++            if s > 0:
++                assert torch.equal(
++                    valid_entries[-s:],
++                    torch.arange(expected_vis, expected_vis + s, dtype=torch.int32),
++                )
++    # Padded request 3 is all -1
++    assert torch.all(out_buf[15:20] == -1)
++
++    # Verify position-offset path (num_rejected=None) produces bit-identical output
++    target_req_pos = torch.tensor([100, 200, 300, -1], dtype=torch.int64)
++    draft_req_pos = torch.tensor([105, 203, 300, -1], dtype=torch.int64)
++    out_pos_path = gather_dspark_anchor_topk_indices(
++        target_topk,
++        target_qsl,
++        None,
++        visible_step1,
++        num_reqs=3,
++        num_query_per_req=q_per_req,
++        target_request_positions=target_req_pos,
++        draft_request_positions=draft_req_pos,
++        append_tail=True,
++    )
++    assert torch.equal(out_buf, out_pos_path)
++
++    # Step 2: Suppose draft tokens from Step 1 were rejected on the next step, so
++    # Req 0 only advanced to visible=106 (rejecting positions 106..109 that were written into out_buf!),
++    # and Req 2 had all 6 tokens rejected (edge case clamping to q_start).
++    num_rejected_step2 = torch.tensor([4, 3, 6, 0], dtype=torch.int32)
++    visible_step2 = torch.tensor([106, 204, 300, 0], dtype=torch.int32)
++    # Contaminate target_topk at anchor rows with rejected draft positions >= visible_step2
++    target_topk[1, 90:95] = torch.tensor([106, 107, 108, 109, 110], dtype=torch.int32)
++
++    gather_dspark_anchor_topk_indices(
++        target_topk,
++        target_qsl,
++        num_rejected_step2,
++        visible_step2,
++        num_reqs=3,
++        num_query_per_req=q_per_req,
++        append_tail=False,
++        out=out_buf,
++    )
++    for r, expected_vis in enumerate([106, 204, 300]):
++        for s in range(q_per_req):
++            row = out_buf[r * q_per_req + s]
++            valid = row[row >= 0]
++            assert torch.all(valid < expected_vis), (
++                f"Rejected slot >= {expected_vis} survived in req {r} step {s}"
++            )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for CUDAGraph test")
++def test_dspark_topk_reuse_cudagraph_capture_and_replay():
++    device = torch.device("cuda")
++    topk = 512
++    max_reqs = 4
++    q_per_req = 5
++    target_topk = torch.full((max_reqs * 6, topk), -1, dtype=torch.int32, device=device)
++    target_qsl = torch.tensor([0, 6, 12, 18, 24], dtype=torch.int32, device=device)
++    num_rejected = torch.zeros(max_reqs, dtype=torch.int32, device=device)
++    visible_anchor = torch.tensor([128, 1024, 510, 4096], dtype=torch.int32, device=device)
++    num_reqs_t = torch.tensor(4, dtype=torch.int32, device=device)
++    out_graph = torch.empty((max_reqs * q_per_req, topk), dtype=torch.int32, device=device)
++
++    stream = torch.cuda.Stream(device=device)
++    with torch.cuda.stream(stream):
++        for _ in range(3):
++            gather_dspark_anchor_topk_indices(
++                target_topk,
++                target_qsl,
++                num_rejected,
++                visible_anchor,
++                num_reqs_t,
++                q_per_req,
++                append_tail=True,
++                out=out_graph,
++            )
++    torch.cuda.synchronize(device)
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=stream):
++        gather_dspark_anchor_topk_indices(
++            target_topk,
++            target_qsl,
++            num_rejected,
++            visible_anchor,
++            num_reqs_t,
++            q_per_req,
++            append_tail=True,
++            out=out_graph,
++        )
++
++    # Replay 1: mixed seq_len <= topk and seq_len > topk, 3 active requests
++    for row in range(24):
++        target_topk[row] = torch.arange(row * 10, row * 10 + topk, dtype=torch.int32, device=device)
++    num_rejected.copy_(torch.tensor([1, 2, 4, 0], dtype=torch.int32, device=device))
++    visible_anchor.copy_(torch.tensor([200, 510, 4096, 8192], dtype=torch.int32, device=device))
++    num_reqs_t.fill_(3)
++    graph.replay()
++    torch.cuda.synchronize(device)
++
++    expected_1 = gather_dspark_anchor_topk_indices(
++        target_topk,
++        target_qsl,
++        num_rejected,
++        visible_anchor,
++        num_reqs_t,
++        q_per_req,
++        append_tail=True,
++    )
++    assert torch.equal(out_graph, expected_1)
++
++    # Replay 2: next step after rejection, overwriting rejected draft slots
++    num_rejected.copy_(torch.tensor([5, 0, 3, 2], dtype=torch.int32, device=device))
++    visible_anchor.copy_(torch.tensor([150, 2048, 300, 1024], dtype=torch.int32, device=device))
++    num_reqs_t.fill_(4)
++    graph.replay()
++    torch.cuda.synchronize(device)
++
++    expected_2 = gather_dspark_anchor_topk_indices(
++        target_topk,
++        target_qsl,
++        num_rejected,
++        visible_anchor,
++        num_reqs_t,
++        q_per_req,
++        append_tail=True,
++    )
++    assert torch.equal(out_graph, expected_2)
++
++
++def _make_dspark_layer(
++    context: dict,
++    *,
++    prefix: str,
++    layer_id: int,
++    is_draft: bool,
++    is_kv_source: bool,
++    is_index_source: bool,
++    kv_source_layer_id: int,
++    index_source_layer_id: int,
++    reuse_mode: str,
++    topk_indices_buffer: torch.Tensor | None,
++    device: torch.device,
++) -> DeepseekV4Attention:
++    from vllm.models.deepseek_v4_1.tilelang.attention import (
++        DeepseekV41TileLangAttention,
++    )
++
++    module = DeepseekV41TileLangAttention.__new__(DeepseekV41TileLangAttention)
++    torch.nn.Module.__init__(module)
++    module.prefix = prefix
++    module.layer_id = layer_id
++    module.is_draft = is_draft
++    module.is_ced_decoder = False
++    module._draft_replays = False
++    module._draft_replay_start = None
++    module.window_size = 128
++    module.swa_width = 136 if is_draft else 128
++    module.capacity = 64
++    module.max_model_len = 8192
++    module.compress_ratio = 1
++    module._main_page = module._index_page = 64
++    module._main_width = module._index_width = 128
++    module.is_kv_source = is_kv_source
++    module.is_index_source = is_index_source
++    module.kv_source_layer_id = kv_source_layer_id
++    module.index_source_layer_id = index_source_layer_id
++    module.candidate_source_layer = 0
++    module.n_local_heads = 16
++    module.head_dim = 512
++    module.q_lora_rank = 128
++    module._context = context
++    context[prefix] = module
++    module._dspark_num_query_tokens = 5 if is_draft else 1
++    module._dspark_topk_reuse = reuse_mode
++    module._dspark_append_tail = True
++    module._is_draft_topk_leader = True
++    module._target_topk_prepared = False
++    module._target_num_rejected = None
++    module.topk_indices_buffer = topk_indices_buffer
++    module.compressor = None
++    module.swa_cache_layer = SimpleNamespace(
++        prefix=f"{prefix}.swa_cache",
++        block_size=64,
++        kv_cache=torch.zeros((16, 64 * 528), dtype=torch.uint8, device=device),
++    )
++    if is_index_source:
++        k_cache = (
++            SimpleNamespace(
++                prefix=f"{prefix}.indexer.k_cache",
++                kv_cache=torch.zeros((16, 64 * 68), dtype=torch.uint8, device=device),
++            )
++            if is_kv_source
++            else module._resolve_layer(kv_source_layer_id).indexer.k_cache
++        )
++        module.indexer = SimpleNamespace(heads=32, owns_k=is_kv_source, k_cache=k_cache)
++    else:
++        module.indexer = None
++    module.config = SimpleNamespace(
++        scheduler_config=SimpleNamespace(max_num_seqs=8),
++        speculative_config=SimpleNamespace(
++            num_speculative_tokens=5,
++            parallel_drafting=True,
++            num_verification_tokens=5,
++        ),
++        compilation_config=SimpleNamespace(max_cudagraph_capture_size=64),
++    )
++    module.rotary_emb = SimpleNamespace(
++        cos_sin_cache=torch.zeros((8192, 64), dtype=torch.float32, device=device)
++    )
++    module._ready = False
++    return module
++
++
++def _stub_layer_kernels(
++    layer: DeepseekV4Attention, index_calls: list, attend_calls: list
++):
++    layer._check_attention_rows = lambda mode, rows: None
++    layer._attention_scratch_specs = lambda mode, rows: ()
++
++    def _index_chunk(mode, rows, *, output_indices, cache_lengths, **kwargs):
++        index_calls.append((layer.layer_id, mode, rows, cache_lengths.clone()))
++        for r in range(rows):
++            vis = min(int(cache_lengths[r].item()), 512)
++            output_indices[r].fill_(-1)
++            if vis > 0:
++                output_indices[r, :vis] = torch.arange(
++                    vis, device=output_indices.device, dtype=torch.int32
++                )
++
++    def _attend(mode, q, output, *, scratch, positions, **indices):
++        attend_calls.append(
++            (
++                layer.layer_id,
++                mode,
++                q.shape[0],
++                indices["indexed_indices"].clone()
++                if "indexed_indices" in indices
++                else None,
++            )
++        )
++        output.zero_()
++
++    layer._index_chunk = _index_chunk
++    layer._attend = _attend
++
++
++@pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="CUDA required for TileLang metadata"
++)
++def test_deepseek_v4_attention_dspark_target_and_step0_topk_reuse(monkeypatch):
++    from vllm.models.deepseek_v4_1 import attention as attn_mod
++    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++    device = torch.device("cuda")
++    monkeypatch.setattr(
++        tl_metadata,
++        "pages",
++        lambda reqs, lengths, table, out, offset, count, read_width, *, page: out[
++            :count
++        ].zero_(),
++    )
++
++    def _fake_decode_metadata(
++        positions,
++        reqs,
++        table,
++        swa_indices,
++        swa_lengths,
++        top_lengths,
++        visible,
++        starts,
++        req_pos,
++         main_reqs,
++        main_table,
++        main_pages,
++        offset,
++        rows,
++        main_width,
++        *,
++        main_page,
++        **window,
++    ):
++        swa_indices[:rows].zero_()
++        swa_lengths[:rows].fill_(128)
++        top_lengths[:rows].copy_(torch.clamp(visible[:rows], min=0, max=512))
++        main_pages[:rows].zero_()
++
++    monkeypatch.setattr(tl_metadata, "decode_metadata", _fake_decode_metadata)
++
++    for reuse_mode in ("target", "anchor", "full"):
++        context: dict = {}
++        target_l0 = _make_dspark_layer(
++            context,
++            prefix="language_model.model.layers.0.attn",
++            layer_id=0,
++            is_draft=False,
++            is_kv_source=True,
++            is_index_source=True,
++            kv_source_layer_id=0,
++            index_source_layer_id=0,
++            reuse_mode=reuse_mode,
++            topk_indices_buffer=None,
++            device=device,
++        )
++        target_l1 = _make_dspark_layer(
++            context,
++            prefix="language_model.model.layers.1.attn",
++            layer_id=1,
++            is_draft=False,
++            is_kv_source=False,
++            is_index_source=True,
++            kv_source_layer_id=0,
++            index_source_layer_id=1,
++            reuse_mode=reuse_mode,
++            topk_indices_buffer=None,
++            device=device,
++        )
++        draft_buf = torch.full((64, 512), -1, dtype=torch.int32, device=device)
++        draft_idx_src = 1 if reuse_mode == "target" else 2
++        draft_l2 = _make_dspark_layer(
++            context,
++            prefix="model.layers.2.attn",
++            layer_id=2,
++            is_draft=True,
++            is_kv_source=False,
++            is_index_source=(reuse_mode != "target"),
++            kv_source_layer_id=0,
++            index_source_layer_id=draft_idx_src,
++            reuse_mode=reuse_mode,
++            topk_indices_buffer=draft_buf,
++            device=device,
++        )
++        draft_l3 = _make_dspark_layer(
++            context,
++            prefix="model.layers.3.attn",
++            layer_id=3,
++            is_draft=True,
++            is_kv_source=False,
++            is_index_source=False,
++            kv_source_layer_id=0,
++            index_source_layer_id=draft_idx_src,
++            reuse_mode=reuse_mode,
++            topk_indices_buffer=draft_buf,
++            device=device,
++        )
++        draft_l2._is_draft_topk_leader = True
++        draft_l3._is_draft_topk_leader = False
++
++        assert draft_l2._owner() is target_l0
++        assert draft_l3._owner() is target_l0
++        assert draft_l3._index_owner() is (
++            target_l1 if reuse_mode == "target" else draft_l2
++        )
++
++        index_calls: list = []
++        attend_calls: list = []
++        for layer in (target_l0, target_l1, draft_l2, draft_l3):
++            layer._attention_geometry()
++            layer._prepare(device)
++            _stub_layer_kernels(layer, index_calls, attend_calls)
++        target_l0.kv_cache = torch.zeros(
++            (16, 64 * 288), dtype=torch.uint8, device=device
++        )
++
++        # Populate target_l1.topk_indices_buffer as if target verification ran on 2 requests (6 tokens each, 12 total)
++        # Req 0: anchor at row 4 (1 rejected, visible=100)
++        # Req 1: anchor at row 11 (0 rejected, visible=600)
++        target_l1.topk_indices_buffer.fill_(-1)
++        target_l1.topk_indices_buffer[4, :100] = torch.arange(
++            100, device=device, dtype=torch.int32
++        )
++        target_l1.topk_indices_buffer[11] = torch.arange(
++            600 - 512, 600, device=device, dtype=torch.int32
++        )
++
++        target_meta = DeepseekV41B12xMetadata(
++            num_actual_tokens=12,
++            num_reqs=2,
++            max_query_len=6,
++            block_size=64,
++            block_table=torch.arange(1, 17, dtype=torch.int32, device=device).view(2, 8),
++            query_start_loc=torch.tensor([0, 6, 12], dtype=torch.int32, device=device),
++            request_positions=torch.tensor([95, 594], dtype=torch.int64, device=device),
++            live_counts=torch.tensor([12, 2], dtype=torch.int32, device=device),
++            positions=torch.arange(12, dtype=torch.int64, device=device),
++            req_id_per_token=torch.tensor(
++                [0] * 6 + [1] * 6, dtype=torch.int32, device=device
++            ),
++            slot_mapping=torch.arange(12, dtype=torch.int64, device=device),
++            cache_lengths=torch.tensor(
++                [96, 97, 98, 99, 100, 101, 595, 596, 597, 598, 599, 600],
++                dtype=torch.int32,
++                device=device,
++            ),
++            is_decode=True,
++            max_seq_len=600,
++        )
++        target_l0._last_main_metadata = target_meta
++        target_l0._last_index_metadata = target_meta
++        target_l1._last_index_metadata = target_meta
++
++        draft_swa_meta = DeepseekV41B12xMetadata(
++            num_actual_tokens=10,
++            num_reqs=2,
++            max_query_len=5,
++            block_size=64,
++            block_table=torch.arange(1, 17, dtype=torch.int32, device=device).view(2, 8),
++            query_start_loc=torch.tensor([0, 5, 10], dtype=torch.int32, device=device),
++            request_positions=torch.tensor([99, 599], dtype=torch.int64, device=device),
++            live_counts=torch.tensor([10, 2], dtype=torch.int32, device=device),
++            positions=torch.tensor(
++                [99, 100, 101, 102, 103, 599, 600, 601, 602, 603],
++                dtype=torch.int64,
++                device=device,
++            ),
++            req_id_per_token=torch.tensor(
++                [0] * 5 + [1] * 5, dtype=torch.int32, device=device
++            ),
++            slot_mapping=torch.arange(10, dtype=torch.int64, device=device),
++            cache_lengths=torch.tensor(
++                [100, 101, 102, 103, 104, 600, 601, 602, 603, 604],
++                dtype=torch.int32,
++                device=device,
++            ),
++            is_decode=True,
++            max_seq_len=604,
++        )
++        attn_metadata = {
++            draft_l2.swa_cache_layer.prefix: draft_swa_meta,
++            draft_l3.swa_cache_layer.prefix: draft_swa_meta,
++        }
++        monkeypatch.setattr(
++            attn_mod,
++            "get_forward_context",
++            lambda: SimpleNamespace(attn_metadata=attn_metadata),
++        )
++        monkeypatch.setattr(
++            attn_mod,
++            "current_workspace_manager",
++            lambda: SimpleNamespace(get_simultaneous=lambda *specs: ()),
++        )
++        monkeypatch.setattr(
++            attn_mod, "retain_cuda_graph_capture_resource", lambda *args: None
++        )
++        q = torch.zeros((10, 16, 512), dtype=torch.bfloat16, device=device)
++        kv = torch.zeros((10, 512), dtype=torch.bfloat16, device=device)
++        out = torch.zeros_like(q)
++
++        if reuse_mode == "target":
++            draft_l2.forward_mqa(q, kv, draft_swa_meta.positions, out, index_query=None)
++            draft_l3.forward_mqa(q, kv, draft_swa_meta.positions, out, index_query=None)
++            assert len(index_calls) == 0
++        elif reuse_mode == "anchor":
++            iq_d = torch.zeros((2, 32, 64), dtype=torch.uint8, device=device)
++            iq_s = torch.full((2, 32, 4), 127, dtype=torch.uint8, device=device)
++            iw = torch.ones((2, 32), dtype=torch.bfloat16, device=device)
++            draft_l2.forward_mqa(
++                q,
++                kv,
++                draft_swa_meta.positions,
++                out,
++                index_query=(iq_d, iq_s, iw, None, None),
++            )
++            draft_l3.forward_mqa(q, kv, draft_swa_meta.positions, out, index_query=None)
++            assert len(index_calls) == 1
++            assert index_calls[0][2] == 2  # Only 2 step-0 rows indexed instead of 10!
++        else:
++            iq_d = torch.zeros((10, 32, 64), dtype=torch.uint8, device=device)
++            iq_s = torch.full((10, 32, 4), 127, dtype=torch.uint8, device=device)
++            iw = torch.ones((10, 32), dtype=torch.bfloat16, device=device)
++            draft_l2.forward_mqa(
++                q,
++                kv,
++                draft_swa_meta.positions,
++                out,
++                index_query=(iq_d, iq_s, iw, None, None),
++            )
++            draft_l3.forward_mqa(q, kv, draft_swa_meta.positions, out, index_query=None)
++            assert len(index_calls) == 1
++            assert index_calls[0][2] == 10
++
++        assert len(attend_calls) == 2
++        idx_used = attend_calls[0][3]
++        assert idx_used is not None and idx_used.shape == (10, 512)
++        assert torch.equal(idx_used, attend_calls[1][3])
++        if reuse_mode in ("target", "anchor"):
++            # Req 0 (visible=100 <= 512): step s has 100 + s valid indices
++            for s in range(5):
++                assert torch.equal(
++                    idx_used[s, : 100 + s],
++                    torch.arange(100 + s, device=device, dtype=torch.int32),
++                )
++                assert torch.all(idx_used[s, 100 + s :] == -1)
++            # Req 1 (visible=600 > 512): step s keeps 512 - s historical and appends s tail [600 .. 600+s-1]
++            for s in range(5):
++                keep = 512 - s
++                if s > 0:
++                    assert torch.equal(
++                        idx_used[5 + s, keep:],
++                        torch.arange(600, 600 + s, device=device, dtype=torch.int32),
++                    )
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index cf600a6752..660e7a6189 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -60,12 +60,156 @@ logger = init_logger(__name__)
+ # Validation only: under a sequence-parallel indexer split, every rank also runs
+ # the full-row indexer twice and compares its own rows with the split result.
+ _INDEX_SPLIT_CHECK = os.environ.get("SPARK_DS41F_INDEXER_SPLIT_CHECK") == "1"
++_DSPARK_TOPK_REUSE_MODES = ("auto", "target", "anchor", "full")
++_DSPARK_TOPK_REUSE_ENV = (
++    os.environ.get("VLLM_DS41_DSPARK_TOPK_REUSE", "auto").strip().lower()
++)
+ 
+ 
+ def _source(prefix, layer):
+     return re.sub(r"(layers\.)\d+", rf"\g<1>{layer}", prefix)
+ 
+ 
++def broadcast_dspark_step0_topk_indices(
++    step0_topk_indices: torch.Tensor,
++    visible_anchor: torch.Tensor,
++    num_query_per_req: int,
++    *,
++    num_reqs: int | torch.Tensor | None = None,
++    append_tail: bool = False,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Broadcast per-request anchor/step-0 top-k KV indices across DSpark draft rows.
++
++    Each request's step-0 row holds historical KV positions selected at the
++    accepted anchor position. Any invalid or rejected position (>= visible_anchor
++    or < 0) is masked to -1 and valid entries are compacted to the left so
++    sparse MLA's top_lengths prefix reads every kept index. When ``append_tail``
++    is True, draft step ``s`` (``0 <= s < num_query_per_req``) appends the ``s``
++    newly drafted causal positions ``visible_anchor .. visible_anchor + s - 1``.
++    """
++    max_reqs, topk = step0_topk_indices.shape
++    if (
++        visible_anchor.ndim == 1
++        and num_query_per_req > 1
++        and visible_anchor.shape[0] == max_reqs * num_query_per_req
++    ):
++        visible_req = visible_anchor[0::num_query_per_req]
++    else:
++        visible_req = visible_anchor[:max_reqs]
++    device = step0_topk_indices.device
++    req_ids = torch.arange(max_reqs, device=device, dtype=torch.int32)
++    active_req = visible_req > 0
++    if num_reqs is not None:
++        limit = (
++            num_reqs.to(device=device, dtype=torch.int32)
++            if isinstance(num_reqs, torch.Tensor)
++            else int(num_reqs)
++        )
++        active_req = active_req & (req_ids < limit)
++    vis_col = visible_req.to(dtype=torch.int32).unsqueeze(1)
++    valid_mask = (
++        active_req.unsqueeze(1)
++        & (step0_topk_indices >= 0)
++        & (step0_topk_indices < vis_col)
++    )
++    masked = torch.where(valid_mask, step0_topk_indices, -1)
++    valid_int = valid_mask.to(dtype=torch.int64)
++    valid_rank = valid_int.cumsum(dim=-1) - 1
++    invalid_rank = (
++        valid_int.sum(dim=-1, keepdim=True) + (1 - valid_int).cumsum(dim=-1) - 1
++    )
++    dst_col = torch.where(valid_mask, valid_rank, invalid_rank)
++    compacted = torch.empty_like(masked)
++    compacted.scatter_(1, dst_col, masked)
++    expanded = compacted.unsqueeze(1).expand(max_reqs, num_query_per_req, topk)
++    if append_tail and num_query_per_req > 1:
++        valid_count = valid_mask.sum(dim=-1, dtype=torch.int32).view(max_reqs, 1, 1)
++        step_ids = torch.arange(
++            num_query_per_req, device=device, dtype=torch.int32
++        ).view(1, num_query_per_req, 1)
++        base_slot = torch.minimum(valid_count, topk - step_ids).clamp(min=0)
++        col_ids = torch.arange(topk, device=device, dtype=torch.int32).view(
++            1, 1, topk
++        )
++        tail_offset = col_ids - base_slot
++        in_tail = (
++            active_req.view(max_reqs, 1, 1)
++            & (tail_offset >= 0)
++            & (tail_offset < step_ids)
++        )
++        tail_vals = visible_req.to(dtype=torch.int32).view(max_reqs, 1, 1) + tail_offset
++        expanded = torch.where(in_tail, tail_vals, expanded)
++    flat = expanded.reshape(max_reqs * num_query_per_req, topk)
++    if out is None:
++        return flat.contiguous()
++    out[: max_reqs * num_query_per_req].copy_(flat)
++    return out[: max_reqs * num_query_per_req]
++
++
++def gather_dspark_anchor_topk_indices(
++    target_topk_indices: torch.Tensor,
++    target_query_start_loc: torch.Tensor,
++    num_rejected: torch.Tensor | None,
++    visible_anchor: torch.Tensor,
++    num_reqs: int | torch.Tensor,
++    num_query_per_req: int,
++    *,
++    target_request_positions: torch.Tensor | None = None,
++    draft_request_positions: torch.Tensor | None = None,
++    append_tail: bool = False,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Gather each request's accepted anchor row from the target model's top-k
++    buffer and broadcast it across that request's DSpark draft query rows."""
++    if (
++        visible_anchor.ndim == 1
++        and num_query_per_req > 1
++        and visible_anchor.shape[0] > target_query_start_loc.shape[0] - 1
++        and visible_anchor.shape[0] % num_query_per_req == 0
++    ):
++        visible_req = visible_anchor[0::num_query_per_req]
++    else:
++        visible_req = visible_anchor
++    max_reqs = min(visible_req.shape[0], target_query_start_loc.shape[0] - 1)
++    visible_req = visible_req[:max_reqs]
++    device = target_topk_indices.device
++    req_ids = torch.arange(max_reqs, device=device, dtype=torch.int32)
++    limit = (
++        num_reqs.to(device=device, dtype=torch.int32)
++        if isinstance(num_reqs, torch.Tensor)
++        else int(num_reqs)
++    )
++    active_req = (req_ids < limit) & (visible_req > 0)
++    q_start = target_query_start_loc[:max_reqs].to(dtype=torch.int64)
++    q_end = target_query_start_loc[1 : max_reqs + 1].to(dtype=torch.int64)
++    if num_rejected is not None:
++        rej = num_rejected[:max_reqs].to(dtype=torch.int64)
++        anchor_row = torch.maximum(q_end - rej - 1, q_start)
++    elif target_request_positions is not None and draft_request_positions is not None:
++        offset = draft_request_positions[:max_reqs].to(
++            dtype=torch.int64
++        ) - target_request_positions[:max_reqs].to(dtype=torch.int64)
++        anchor_row = torch.clamp(
++            q_start + offset, min=q_start, max=torch.maximum(q_end - 1, q_start)
++        )
++    else:
++        anchor_row = torch.maximum(q_end - 1, q_start)
++    max_target_row = max(target_topk_indices.shape[0] - 1, 0)
++    safe_anchor_row = torch.where(active_req, anchor_row, 0).clamp(
++        min=0, max=max_target_row
++    )
++    anchor_topk = target_topk_indices.index_select(0, safe_anchor_row)
++    return broadcast_dspark_step0_topk_indices(
++        anchor_topk,
++        visible_req,
++        num_query_per_req,
++        num_reqs=num_reqs,
++        append_tail=append_tail,
++        out=out,
++    )
++
++
+ def _native_linear(layer):
+     method = layer.quant_method
+     if kernels.is_native_linear_method(method):
+@@ -430,6 +574,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     ``_attend``."""
+ 
+     backend_cls = DeepseekV41B12xBackend
++    is_draft: bool = False
++    _dspark_num_query_tokens: int = 1
++    _dspark_topk_reuse: str = "auto"
++    _dspark_append_tail: bool = False
++    _is_draft_topk_leader: bool = True
++    _target_topk_prepared: bool = False
++    _target_num_rejected: torch.Tensor | None = None
+     # Index scores need bounded row scratch; attention handles the whole batch.
+     INDEX_CHUNK = 256
+     DECODE_CHUNK = 64
+@@ -477,6 +628,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self._draft_replays = self.is_draft and boundary is not None
+         self._draft_replay_start: torch.Tensor | None = None
+         self.swa_width = self.window_size
++        self._dspark_num_query_tokens = 1
++        self._dspark_topk_reuse = str(
++            getattr(hf, "dspark_topk_reuse", _DSPARK_TOPK_REUSE_ENV)
++        ).lower()
++        if self._dspark_topk_reuse not in _DSPARK_TOPK_REUSE_MODES:
++            raise ValueError(
++                f"Unsupported dspark_topk_reuse mode {self._dspark_topk_reuse!r}"
++            )
++        self._dspark_append_tail = bool(getattr(hf, "dspark_topk_append_tail", False))
++        self._is_draft_topk_leader = True
++        self._target_topk_prepared = False
++        self._target_num_rejected: torch.Tensor | None = None
+         if self.is_draft:
+             from vllm.v1.attention.backends.mla.compressor_utils import (
+                 get_dspark_swa_index_width,
+@@ -485,6 +648,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self.swa_width = get_dspark_swa_index_width(
+                 self.window_size, spec.num_speculative_tokens
+             )
++            self._dspark_num_query_tokens = spec.num_speculative_tokens + (
++                0 if getattr(hf, "sample_from_anchor", True) else 1
++            )
+         self.capacity = vllm_config.scheduler_config.max_num_batched_tokens
+         self.max_model_len = vllm_config.model_config.max_model_len
+         self.compress_ratio = (
+@@ -623,9 +789,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     ratio=self.compress_ratio,
+                 )
+             else:
+-                k_cache = self._context[
++                k_cache_key = (
+                     f"{_source(prefix, self.kv_source_layer_id)}.indexer.k_cache"
+-                ]
++                )
++                k_cache = (
++                    self._context[k_cache_key]
++                    if k_cache_key in self._context
++                    else self._resolve_layer(self.kv_source_layer_id).indexer.k_cache
++                )
+             self.indexer = DeepseekV4Indexer(
+                 vllm_config,
+                 f"{prefix}.indexer",
+@@ -657,8 +828,42 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     def bind_kv_cache(self, cache):
+         self.kv_cache = cache.view(cache.shape[0], -1)
+ 
++    def _resolve_layer(self, layer_id):
++        target = _source(self.prefix, layer_id)
++        if target in self._context:
++            return self._context[target]
++        suffix = f".layers.{layer_id}.attn"
++        for key, layer in self._context.items():
++            if key == f"layers.{layer_id}.attn" or key.endswith(suffix):
++                return layer
++        raise KeyError(target)
++
+     def _owner(self):
+-        return self._context[_source(self.prefix, self.kv_source_layer_id)]
++        return self._resolve_layer(self.kv_source_layer_id)
++
++    def _index_owner(self):
++        return self._resolve_layer(self.index_source_layer_id)
++
++    def _uses_draft_indexer(self) -> bool:
++        if self.indexer is None:
++            return False
++        if self.is_draft and self._dspark_topk_reuse == "target":
++            return False
++        return True
++
++    def _dspark_step0_stride(self, swa, rows: int, sp_rows=None) -> int:
++        if (
++            not self.is_draft
++            or self._dspark_topk_reuse not in ("auto", "anchor")
++            or sp_rows is not None
++        ):
++            return 1
++        q_per_req = int(
++            getattr(swa, "max_query_len", 0) or self._dspark_num_query_tokens
++        )
++        if q_per_req > 1 and rows >= q_per_req and rows % q_per_req == 0:
++            return q_per_req
++        return 1
+ 
+     def _attention_geometry(self) -> None:
+         """The metadata arena of each attention mode and the staging this layer
+@@ -702,8 +907,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 metadata_specs += (((capacity, self._main_width), torch.int32),)
+             self._attention_workspace_specs[mode] = metadata_specs
+         if not hasattr(self, "_owns_topk_indices"):
+-            self._owns_topk_indices = (
+-                self.topk_indices_buffer is None and self.is_index_source
++            self._owns_topk_indices = self.topk_indices_buffer is None and (
++                self.is_index_source or (self.is_draft and bool(self.compress_ratio))
+             )
+         specs: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+         if self._owns_topk_indices:
+@@ -719,7 +924,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     ("_active", (1,), torch.int32),
+                 )
+             )
+-            if self.layer_id == self.candidate_source_layer:
++            if self.is_draft:
++                specs.append(
++                    (
++                        "_dspark_step0_topk",
++                        (self.capacity, 512),
++                        torch.int32,
++                    )
++                )
++            if not self.is_draft and self.layer_id == self.candidate_source_layer:
+                 specs.extend(
+                     (
+                         # The block ids the candidate source publishes, a row.
+@@ -731,6 +944,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         if (
+             self.indexer is not None
+             and not self.is_ced_decoder
++            and not self.is_draft
+             and self.capacity > self.INDEX_CHUNK
+             and self.layer_id < self.candidate_source_layer
+         ):
+@@ -890,6 +1104,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             tensor = getattr(self, name, None)
+             if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                 setattr(self, name, torch.empty(shape, dtype=dtype, device=device))
++        if (
++            self.topk_indices_buffer is not None
++            and self.topk_indices_buffer.device != torch.device(device)
++        ):
++            self.topk_indices_buffer = self.topk_indices_buffer.to(device=device)
+         if self.indexer is not None:
+             self._active.fill_(self._index_width * self._index_page)
+         self._ready = True
+@@ -1195,10 +1414,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 qr, kv = self.q_norm(qr), self.kv_norm(kv)
+             else:
+                 del qr_kv
++        uses_indexer = self._uses_draft_indexer()
+         if front is None:
+             q_cast = (
+                 kernels.cast_mxfp8(qr)
+-                if self.n_local_heads > 0 or self.indexer is not None
++                if self.n_local_heads > 0 or uses_indexer
+                 else None
+             )
+             front_wrote_kv = False
+@@ -1211,7 +1431,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+         else:
+             q = torch.empty((rows, 0, 512), dtype=qr.dtype, device=qr.device)
+-        if self.indexer is None:
++        if not uses_indexer:
+             del q_cast
+         self._issue_wo_prefetch(rows, after="q-b")
+         if self.n_local_heads > 0:
+@@ -1234,37 +1454,67 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if swa is original_swa and hidden_states is not None:
+                 self._prepare_global_kv(positions, hidden_states)
+             index_query = None
+-            if self.indexer is not None:
+-                # Sequence-parallel prefill: the indexer is replicated, so each
+-                # rank scores and selects only its own rows, and forward_mqa
+-                # gathers the selected positions. Every row is independent.
+-                split = sp_rows if sp_rows is not None and not swa.is_decode else None
+-                first = split.start if split is not None else 0
+-                last = first + split.real_rows if split is not None else rows
+-                query = self._index_query(
+-                    qr,
+-                    positions,
+-                    hidden_states,
+-                    index_weights,
+-                    first,
+-                    last,
+-                    swa,
+-                    q_cast,
+-                )
+-                reference = None
+-                if split is not None and _INDEX_SPLIT_CHECK:
+-                    reference = self._index_query(
++            if uses_indexer:
++                step0_stride = self._dspark_step0_stride(swa, rows, sp_rows)
++                if step0_stride > 1:
++                    del q_cast
++                    step0_rows = rows // step0_stride
++                    qr_step0 = qr[0:rows:step0_stride].contiguous()
++                    pos_step0 = positions[0:rows:step0_stride].contiguous()
++                    hs_step0 = (
++                        hidden_states[0:rows:step0_stride].contiguous()
++                        if hidden_states is not None
++                        else None
++                    )
++                    iw_step0 = (
++                        index_weights[0:rows:step0_stride].contiguous()
++                        if index_weights is not None
++                        else None
++                    )
++                    query = self._index_query(
++                        qr_step0,
++                        pos_step0,
++                        hs_step0,
++                        iw_step0,
++                        0,
++                        step0_rows,
++                        swa,
++                        None,
++                    )
++                    index_query = (*query, None, None)
++                else:
++                    # Sequence-parallel prefill: the indexer is replicated, so each
++                    # rank scores and selects only its own rows, and forward_mqa
++                    # gathers the selected positions. Every row is independent.
++                    split = (
++                        sp_rows if sp_rows is not None and not swa.is_decode else None
++                    )
++                    first = split.start if split is not None else 0
++                    last = first + split.real_rows if split is not None else rows
++                    query = self._index_query(
+                         qr,
+                         positions,
+                         hidden_states,
+                         index_weights,
+-                        0,
+-                        rows,
++                        first,
++                        last,
+                         swa,
+                         q_cast,
+                     )
+-                del q_cast
+-                index_query = (*query, split, reference)
++                    reference = None
++                    if split is not None and _INDEX_SPLIT_CHECK:
++                        reference = self._index_query(
++                            qr,
++                            positions,
++                            hidden_states,
++                            index_weights,
++                            0,
++                            rows,
++                            swa,
++                            q_cast,
++                        )
++                    del q_cast
++                    index_query = (*query, split, reference)
+             del qr, hidden_states, index_weights
+             output = torch.empty_like(q)
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
+@@ -1430,14 +1680,67 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+         # Only the score matrix needs row chunking. All selected positions
+         # survive in the source-owned buffer until their reuse interval ends.
+-        if self.indexer is not None:
++        if self._uses_draft_indexer():
+             index_mode = "decode" if mode == "decode" else "prefill"
+             *query, split, reference = index_query
+-            im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
++            k_prefix = self.indexer.k_cache.prefix
++            if k_prefix in metadata:
++                im = self._query_metadata(metadata[k_prefix])
++            elif self.is_draft:
++                im = getattr(self._owner(), "_last_index_metadata", None) or getattr(
++                    self._index_owner(), "_last_index_metadata", None
++                )
++                if im is None:
++                    raise KeyError(k_prefix)
++            else:
++                raise KeyError(k_prefix)
++            if not self.is_draft:
++                self._last_index_metadata = im
++            step0_stride = (
++                self._dspark_step0_stride(swa, rows)
++                if split is None and query[0].shape[0] < rows
++                else 1
++            )
++            im_matches_swa = (
++                not self.is_draft
++                or (
++                    im.num_actual_tokens == swa.num_actual_tokens
++                    and im.max_query_len == swa.max_query_len
++                )
++            )
++            if step0_stride > 1:
++                im_reqs = swa.req_id_per_token[0:rows:step0_stride].contiguous()
++                base_lens = (
++                    im.cache_lengths[0:rows:step0_stride]
++                    if im_matches_swa
++                    else swa.cache_lengths[0:rows:step0_stride]
++                    if self.compress_ratio <= 1
++                    else torch.div(
++                        swa.cache_lengths[0:rows:step0_stride],
++                        self.compress_ratio,
++                        rounding_mode="floor",
++                    )
++                )
++                im_lengths = base_lens.contiguous()
++            elif im_matches_swa:
++                im_reqs = im.req_id_per_token
++                im_lengths = im.cache_lengths
++            else:
++                im_reqs = swa.req_id_per_token
++                im_lengths = (
++                    swa.cache_lengths
++                    if self.compress_ratio <= 1
++                    else torch.div(
++                        swa.cache_lengths,
++                        self.compress_ratio,
++                        rounding_mode="floor",
++                    )
++                )
+             lsa_enabled = os.environ.get("VLLM_DS41_LSA") == "1"
+             score_width = None
+             if (
+                 (mode == "extend" or lsa_enabled)
++                and not self.is_draft
+                 and self.layer_id <= self.candidate_source_layer
+                 and not torch.cuda.is_current_stream_capturing()
+             ):
+@@ -1520,7 +1823,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     )
+ 
+                     page_table = None
+-                    cacheable = split is None and index_rows <= chunk_rows
++                    cacheable = (
++                        split is None
++                        and step0_stride == 1
++                        and im_matches_swa
++                        and index_rows <= chunk_rows
++                    )
+                     if cacheable:
+                         key = (id(im), row, count, index_width, self._index_page)
+                         shared = get_forward_context().__dict__.setdefault(
+@@ -1531,8 +1839,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                             page_table = entry[1]
+                     if page_table is None:
+                         tl_metadata.pages(
+-                            im.req_id_per_token,
+-                            im.cache_lengths,
++                            im_reqs,
++                            im_lengths,
+                             im.block_table,
+                             buf,
+                             row,
+@@ -1544,15 +1852,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         if cacheable and keep:
+                             shared[key] = (im, page_table)
+                     candidate_args = {}
+-                    if self.layer_id == self.candidate_source_layer:
++                    if not self.is_draft and self.layer_id == self.candidate_source_layer:
+                         candidate_args = dict(
+                             candidate_output=self._candidates[row:row_end],
+                             candidate_output_lengths=self._candidate_lens[row:row_end],
+                         )
+-                    elif self.layer_id > self.candidate_source_layer:
+-                        source = self._context[
+-                            _source(self.prefix, self.candidate_source_layer)
+-                        ]
++                    elif (
++                        not self.is_draft
++                        and self.candidate_source_layer is not None
++                        and self.layer_id > self.candidate_source_layer
++                    ):
++                        source = self._resolve_layer(self.candidate_source_layer)
+                         candidate_args = dict(
+                             candidate_indices=source._candidates[row:row_end],
+                             candidate_lengths=source._candidate_lens[row:row_end],
+@@ -1564,14 +1874,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         q_scales=iq_scale[offset:end],
+                         query_weights=iw[offset:end],
+                         page_table=page_table,
+-                        cache_lengths=im.cache_lengths[row:row_end],
++                        cache_lengths=im_lengths[row:row_end],
+                         score_width=score_width,
+                         output_indices=selected[offset:end],
+                         **candidate_args,
+                     )
+ 
+             if split is None:
+-                select(query, 0, self.topk_indices_buffer)
++                if step0_stride > 1:
++                    step0_rows = query[0].shape[0]
++                    select(query, 0, self._dspark_step0_topk[:step0_rows])
++                    live_reqs = (
++                        swa.live_counts[1]
++                        if hasattr(swa, "live_counts") and swa.live_counts.numel() >= 2
++                        else step0_rows
++                    )
++                    broadcast_dspark_step0_topk_indices(
++                        self._dspark_step0_topk[:step0_rows],
++                        im_lengths,
++                        step0_stride,
++                        num_reqs=live_reqs,
++                        append_tail=self._dspark_append_tail,
++                        out=self.topk_indices_buffer[:rows],
++                    )
++                else:
++                    select(query, 0, self.topk_indices_buffer)
+             else:
+                 real = split.real_rows
+                 local = slice(split.start, split.start + real)
+@@ -1609,16 +1936,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         split, selected, expected, repeat, expected_candidates
+                     )
+                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
++        elif self.is_draft and self.compress_ratio:
++            self._maybe_gather_target_topk(metadata, swa, rows, q.device)
+ 
+         if getattr(self, "n_local_heads", 1) == 0:
+             return
+-        main = (
+-            self._query_metadata(metadata[self._owner().prefix])
+-            if self.compress_ratio
+-            else None
+-        )
++        if self.compress_ratio:
++            owner_layer = self._owner()
++            if owner_layer.prefix in metadata:
++                main = self._query_metadata(metadata[owner_layer.prefix])
++            elif self.is_draft:
++                main = getattr(owner_layer, "_last_main_metadata", None)
++                if main is None:
++                    raise KeyError(owner_layer.prefix)
++            else:
++                raise KeyError(owner_layer.prefix)
++            if not self.is_draft and self.is_kv_source:
++                self._last_main_metadata = main
++        else:
++            main = None
+         owner = (
+-            self._context[_source(self.prefix, self.index_source_layer_id)]
++            self
++            if (self.is_draft and self.topk_indices_buffer is not None)
++            else self._index_owner()
+             if self.compress_ratio
+             else self
+         )
+@@ -1794,11 +2134,101 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             return self._draft_replay_start
+         return None
+ 
++    def _maybe_gather_target_topk(self, metadata, swa, rows: int, device) -> None:
++        if (
++            not self._is_draft_topk_leader
++            or self._target_topk_prepared
++            or self.topk_indices_buffer is None
++        ):
++            return
++        index_owner = self._index_owner()
++        if index_owner is self or index_owner.topk_indices_buffer is None:
++            return
++        q_per_req = int(
++            getattr(swa, "max_query_len", 0) or self._dspark_num_query_tokens
++        )
++        q_per_req = max(q_per_req, 1)
++        if rows < q_per_req or rows % q_per_req != 0:
++            return
++        num_reqs_padded = rows // q_per_req
++        vis_anchor = (
++            swa.cache_lengths[0:rows:q_per_req]
++            if self.compress_ratio <= 1
++            else torch.div(
++                swa.cache_lengths[0:rows:q_per_req],
++                self.compress_ratio,
++                rounding_mode="floor",
++            )
++        )
++        req_valid = swa.req_id_per_token[0:rows:q_per_req] >= 0
++        vis_anchor = torch.where(req_valid, vis_anchor, 0)
++        owner_layer = self._owner()
++        target_meta = None
++        if index_owner.indexer is not None and index_owner.indexer.k_cache.prefix in metadata:
++            target_meta = self._query_metadata(
++                metadata[index_owner.indexer.k_cache.prefix]
++            )
++        elif owner_layer.prefix in metadata:
++            target_meta = self._query_metadata(metadata[owner_layer.prefix])
++        else:
++            target_meta = getattr(index_owner, "_last_index_metadata", None) or getattr(
++                owner_layer, "_last_main_metadata", None
++            )
++        if (
++            target_meta is not None
++            and (
++                target_meta.num_actual_tokens != swa.num_actual_tokens
++                or target_meta.max_query_len != swa.max_query_len
++            )
++        ):
++            target_qsl = target_meta.query_start_loc
++            target_req_pos = target_meta.request_positions
++            draft_req_pos = swa.request_positions
++        else:
++            target_qsl = torch.arange(
++                num_reqs_padded + 1, device=device, dtype=torch.int32
++            )
++            target_req_pos = None
++            draft_req_pos = None
++        live_reqs = (
++            swa.live_counts[1]
++            if hasattr(swa, "live_counts") and swa.live_counts.numel() >= 2
++            else num_reqs_padded
++        )
++        gather_dspark_anchor_topk_indices(
++            index_owner.topk_indices_buffer,
++            target_qsl,
++            self._target_num_rejected,
++            vis_anchor,
++            live_reqs,
++            q_per_req,
++            target_request_positions=target_req_pos,
++            draft_request_positions=draft_req_pos,
++            append_tail=self._dspark_append_tail,
++            out=self.topk_indices_buffer[:rows],
++        )
++
+     def _write_decode_metadata(self, buffers, swa, main, rows):
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+ 
+         swa_indices, swa_lengths, top_lengths = buffers[:3]
+-        visible = main.cache_lengths if main is not None else swa.cache_lengths
++        main_matches_swa = main is not None and (
++            not self.is_draft
++            or (
++                main.num_actual_tokens == swa.num_actual_tokens
++                and main.max_query_len == swa.max_query_len
++            )
++        )
++        if main is None:
++            visible = swa.cache_lengths
++        elif main_matches_swa:
++            visible = main.cache_lengths
++        elif self.compress_ratio <= 1:
++            visible = swa.cache_lengths
++        else:
++            visible = torch.div(
++                swa.cache_lengths, self.compress_ratio, rounding_mode="floor"
++            )
+         window = dict(
+             page=self.swa_cache_layer.block_size,
+             window=self.window_size,
+@@ -1819,10 +2249,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         if main is None:
+             tl_metadata.chunk(*common, 0, rows, **window)
+         else:
++            main_reqs = (
++                main.req_id_per_token if main_matches_swa else swa.req_id_per_token
++            )
+             # The window metadata and the main page table in one launch.
+             tl_metadata.decode_metadata(
+                 *common,
+-                main.req_id_per_token,
++                main_reqs,
+                 main.block_table,
+                 buffers[3],
+                 0,
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 7ac9d3e937..a286c4db06 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -317,12 +317,27 @@ class DSparkDeepseekV4Model(nn.Module):
+                 for i in range(self.num_dspark_layers)
+             ]
+         )
+-        # The drafter's layers attend to their window only (compress ratio 0): no
+-        # indexed attention reads a top-k buffer, so none is allocated for them.
+-        if any(layer.attn.compress_ratio for layer in self.layers):
+-            raise ValueError(
+-                "DSpark draft layers must be window-only (compress ratio 0)"
++        has_compressed_draft = any(layer.attn.compress_ratio for layer in self.layers)
++        self.topk_indices_buffer: torch.Tensor | None = None
++        if has_compressed_draft:
++            buf_device = self.layers[0].attn.rotary_emb.cos_sin_cache.device
++            self.topk_indices_buffer = torch.empty(
++                vllm_config.scheduler_config.max_num_batched_tokens,
++                config.index_topk,
++                dtype=torch.int32,
++                device=buf_device,
+             )
++            for layer in self.layers:
++                layer.attn.topk_indices_buffer = self.topk_indices_buffer
++                layer.attn._owns_topk_indices = False
++        first_target_reuse_seen = False
++        for layer in self.layers:
++            if layer.attn.compress_ratio and not layer.attn._uses_draft_indexer():
++                layer.attn._is_draft_topk_leader = not first_target_reuse_seen
++                first_target_reuse_seen = True
++            else:
++                layer.attn._is_draft_topk_leader = False
++        self.uses_target_topk_reuse = first_target_reuse_seen
+         # A draft forward routes one query block per request, as DSparkSpeculator
+         # lays it out: the speculative tokens, plus the anchor unless the drafter
+         # predicts from it.
+@@ -393,6 +408,54 @@ class DSparkDeepseekV4Model(nn.Module):
+                 self.main_norm.with_cast = True
+             prepare.declare(warm=lambda: _warm_casts(self.hidden_size))
+ 
++    def prepare_target_topk_reuse(
++        self,
++        target_query_start_loc: torch.Tensor,
++        num_rejected: torch.Tensor | None,
++        visible_anchor: torch.Tensor,
++        num_reqs: int | torch.Tensor,
++        num_query_per_req: int,
++        *,
++        target_topk_indices: torch.Tensor | None = None,
++        target_request_positions: torch.Tensor | None = None,
++        draft_request_positions: torch.Tensor | None = None,
++        append_tail: bool | None = None,
++    ) -> torch.Tensor | None:
++        if self.topk_indices_buffer is None:
++            return None
++        from ..attention import gather_dspark_anchor_topk_indices
++
++        leader = next(
++            (layer.attn for layer in self.layers if layer.attn.compress_ratio),
++            None,
++        )
++        if leader is None:
++            return None
++        if target_topk_indices is None:
++            owner = leader._index_owner()
++            target_topk_indices = owner.topk_indices_buffer
++        if target_topk_indices is None:
++            return None
++        use_append_tail = (
++            leader._dspark_append_tail if append_tail is None else append_tail
++        )
++        out = gather_dspark_anchor_topk_indices(
++            target_topk_indices,
++            target_query_start_loc,
++            num_rejected,
++            visible_anchor,
++            num_reqs,
++            num_query_per_req,
++            target_request_positions=target_request_positions,
++            draft_request_positions=draft_request_positions,
++            append_tail=use_append_tail,
++            out=self.topk_indices_buffer,
++        )
++        for layer in self.layers:
++            if layer.attn.compress_ratio:
++                layer.attn._target_topk_prepared = True
++        return out
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         assert self.embed_tokens is not None
+         return self.embed_tokens(input_ids)
+@@ -517,6 +580,9 @@ class DSparkDeepseekV4Model(nn.Module):
+                 res_mix,
+                 residual,
+             )
++        for layer in self.layers:
++            if getattr(layer.attn, "_target_topk_prepared", False):
++                layer.attn._target_topk_prepared = False
+         l2_prefetch.join()
+         assert pre_mix is not None
+         if hasattr(layer.mhc, "post_collapse"):
+@@ -584,6 +650,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+ 
+     # --- Hooks used by the speculator -------------------------------------
+ 
++    @property
++    def uses_target_topk_reuse(self) -> bool:
++        return bool(getattr(self.model, "uses_target_topk_reuse", False))
++
++    def prepare_target_topk_reuse(
++        self, *args, **kwargs
++    ) -> torch.Tensor | None:
++        return self.model.prepare_target_topk_reuse(*args, **kwargs)
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index bc87e341bc..655150efe8 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -161,7 +161,11 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         )
+         index, chunks = {}, {}
+         if self.indexer is not None:
+-            reindex = self.layer_id > self.candidate_source_layer
++            reindex = (
++                not self.is_draft
++                and self.candidate_source_layer is not None
++                and self.layer_id > self.candidate_source_layer
++            )
+             width = (
+                 CANDIDATE_BLOCKS * CANDIDATE_BLOCK
+                 if reindex
+@@ -171,7 +175,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                 width,
+                 self._index_page,
+                 reindex,
+-                self.layer_id == self.candidate_source_layer,
++                not self.is_draft and self.layer_id == self.candidate_source_layer,
+             )
+             index = {"decode": full, "prefill": full}
+             chunks = {"decode": self.DECODE_CHUNK, "prefill": self.INDEX_CHUNK}
+-- 
+2.43.0
+
