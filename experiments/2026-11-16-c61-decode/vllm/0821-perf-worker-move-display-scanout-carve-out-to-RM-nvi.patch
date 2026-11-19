@@ -1,4 +1,4 @@
-From 1edfcbb01de3d2f5763860330570955d732c15ed Mon Sep 17 00:00:00 2001
+From a90835e62654d5c388530e9a1b755c6235121e76 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:50:35 +0100
 Subject: [PATCH 821/822] perf(worker): move display scanout carve-out to RM
@@ -26,9 +26,9 @@ Upstream status: local candidate-61 patch
  vllm/utils/mem_utils.py                       | 150 +++-
  vllm/utils/torch_utils.py                     |   6 +-
  vllm/v1/executor/multiproc_executor.py        |  11 +-
- vllm/v1/worker/display_carveout.py            | 708 ++++++++++++++----
+ vllm/v1/worker/display_carveout.py            | 738 ++++++++++++++----
  vllm/v1/worker/gpu_worker.py                  |  68 +-
- 11 files changed, 1014 insertions(+), 264 deletions(-)
+ 11 files changed, 1035 insertions(+), 273 deletions(-)
 
 diff --git a/tests/model_executor/model_loader/test_direct_loader_cuda.py b/tests/model_executor/model_loader/test_direct_loader_cuda.py
 index 28c1882a4..d2e24e65b 100644
@@ -954,7 +954,7 @@ index 562a34326..3ec9ec7bc 100644
  
  def _check_response(rank: int, status: Any, result: Any) -> Any:
 diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
-index a5e09f665..b1685069b 100644
+index a5e09f665..3feb7de78 100644
 --- a/vllm/v1/worker/display_carveout.py
 +++ b/vllm/v1/worker/display_carveout.py
 @@ -1,58 +1,63 @@
@@ -1081,7 +1081,7 @@ index a5e09f665..b1685069b 100644
  # Leave 64 MiB of the 2,032 MiB scanout reserve free for the console framebuffer.
  _MAX_TOTAL_BYTES = 1968 << 20
 -_CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD = 9
- 
++
 +# NVIDIA Resource Manager escape codes (nv_escape.h), class IDs (cl0000.h /
 +# cl0080.h / cl003e.h), and control commands (ctrl0000gpu.h / ctrl0000unix.h).
 +_NV_ESC_RM_FREE = 0x29
@@ -1166,8 +1166,10 @@ index a5e09f665..b1685069b 100644
 +        ("paramsSize", ctypes.c_uint32),
 +        ("status", ctypes.c_uint32),
 +    ]
-+
-+
+ 
+ 
+-class _Win32Handle(ctypes.Structure):
+-    _fields_ = [("handle", ctypes.c_void_p), ("name", ctypes.c_void_p)]
 +class _Nv0000AllocParams(ctypes.Structure):
 +    _fields_ = [
 +        ("hClient", ctypes.c_uint32),
@@ -1175,10 +1177,14 @@ index a5e09f665..b1685069b 100644
 +        ("processName", ctypes.c_char * 100),
 +        ("pOsPidInfo", ctypes.c_uint64),
 +    ]
-+
-+
+ 
+ 
+-class _HandleUnion(ctypes.Union):
 +class _Nv0080AllocParams(ctypes.Structure):
-+    _fields_ = [
+     _fields_ = [
+-        ("fd", ctypes.c_int),
+-        ("win32", _Win32Handle),
+-        ("nvSciBufObject", ctypes.c_void_p),
 +        ("deviceId", ctypes.c_uint32),
 +        ("hClientShare", ctypes.c_uint32),
 +        ("hTargetClient", ctypes.c_uint32),
@@ -1188,11 +1194,17 @@ index a5e09f665..b1685069b 100644
 +        ("vaStartInternal", ctypes.c_uint64),
 +        ("vaLimitInternal", ctypes.c_uint64),
 +        ("vaMode", ctypes.c_uint32),
-+    ]
-+
-+
+     ]
+ 
+ 
+-class _ExternalMemoryHandleDesc(ctypes.Structure):
 +class _NvMemoryAllocationParams(ctypes.Structure):
-+    _fields_ = [
+     _fields_ = [
+-        ("type", ctypes.c_int),
+-        ("handle", _HandleUnion),
+-        ("size", ctypes.c_ulonglong),
+-        ("flags", ctypes.c_uint),
+-        ("reserved", ctypes.c_uint * 16),
 +        ("owner", ctypes.c_uint32),
 +        ("type", ctypes.c_uint32),
 +        ("flags", ctypes.c_uint32),
@@ -1216,28 +1228,27 @@ index a5e09f665..b1685069b 100644
 +        ("internalflags", ctypes.c_uint32),
 +        ("tag", ctypes.c_uint32),
 +        ("numaNode", ctypes.c_int32),
-+    ]
-+
-+
+     ]
+ 
+ 
+-class _ExternalMemoryBufferDesc(ctypes.Structure):
 +class _Nv0000AttachIdsParams(ctypes.Structure):
-+    _fields_ = [
+     _fields_ = [
+-        ("offset", ctypes.c_ulonglong),
+-        ("size", ctypes.c_ulonglong),
+-        ("flags", ctypes.c_uint),
+-        ("reserved", ctypes.c_uint * 16),
 +        ("gpuIds", ctypes.c_uint32 * _NV_MAX_DEVICES),
 +        ("failedId", ctypes.c_uint32),
-+    ]
+     ]
  
--class _Win32Handle(ctypes.Structure):
--    _fields_ = [("handle", ctypes.c_void_p), ("name", ctypes.c_void_p)]
  
 +class _Nv0000AttachedIdsParams(ctypes.Structure):
 +    _fields_ = [("gpuIds", ctypes.c_uint32 * _NV_MAX_DEVICES)]
- 
--class _HandleUnion(ctypes.Union):
++
 +
 +class _Nv0000GpuIdInfoV2Params(ctypes.Structure):
-     _fields_ = [
--        ("fd", ctypes.c_int),
--        ("win32", _Win32Handle),
--        ("nvSciBufObject", ctypes.c_void_p),
++    _fields_ = [
 +        ("gpuId", ctypes.c_uint32),
 +        ("gpuFlags", ctypes.c_uint32),
 +        ("deviceInstance", ctypes.c_uint32),
@@ -1246,40 +1257,29 @@ index a5e09f665..b1685069b 100644
 +        ("boardId", ctypes.c_uint32),
 +        ("gpuInstance", ctypes.c_uint32),
 +        ("numaId", ctypes.c_int32),
-     ]
- 
- 
--class _ExternalMemoryHandleDesc(ctypes.Structure):
++    ]
++
++
 +class _Nv0000UuidFromGpuIdParams(ctypes.Structure):
-     _fields_ = [
--        ("type", ctypes.c_int),
--        ("handle", _HandleUnion),
--        ("size", ctypes.c_ulonglong),
--        ("flags", ctypes.c_uint),
--        ("reserved", ctypes.c_uint * 16),
++    _fields_ = [
 +        ("gpuId", ctypes.c_uint32),
 +        ("flags", ctypes.c_uint32),
 +        ("gpuUuid", ctypes.c_uint8 * _NV0000_GPU_MAX_GID_LENGTH),
 +        ("uuidStrLen", ctypes.c_uint32),
-     ]
- 
- 
--class _ExternalMemoryBufferDesc(ctypes.Structure):
++    ]
++
++
 +class _Nv0000CtrlOsUnixExportObjectToFdParams(ctypes.Structure):
-     _fields_ = [
--        ("offset", ctypes.c_ulonglong),
--        ("size", ctypes.c_ulonglong),
--        ("flags", ctypes.c_uint),
--        ("reserved", ctypes.c_uint * 16),
++    _fields_ = [
 +        ("type", ctypes.c_uint32),
 +        ("hDevice", ctypes.c_uint32),
 +        ("hParent", ctypes.c_uint32),
 +        ("hObject", ctypes.c_uint32),
 +        ("fd", ctypes.c_int32),
 +        ("flags", ctypes.c_uint32),
-     ]
- 
- 
++    ]
++
++
 +class _CUmemLocation(ctypes.Structure):
 +    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
 +
@@ -1781,7 +1781,7 @@ index a5e09f665..b1685069b 100644
      except OSError:
          return tensor
      _carveouts.append(carveout)
-@@ -462,11 +855,11 @@ def _is_mandatory_vocab_module(module: torch.nn.Module) -> bool:
+@@ -462,28 +855,40 @@ def _is_mandatory_vocab_module(module: torch.nn.Module) -> bool:
  def streamed_weights(
      model: torch.nn.Module, *extra_models: torch.nn.Module | None
  ) -> list[tuple[str, torch.nn.Parameter]]:
@@ -1797,7 +1797,45 @@ index a5e09f665..b1685069b 100644
      modules shares their parameters, so each tensor appears once.
      """
      roots = [model, *(m for m in extra_models if m is not None)]
-@@ -502,11 +895,18 @@ def confirm_streamed_weights(
+     found: dict[int, tuple[str, torch.nn.Parameter]] = {}
+     for root in roots:
+         for name, module in root.named_modules():
+-            if not _is_mandatory_vocab_module(module):
+-                continue
+-            weight = getattr(module, "weight", None)
++            if _is_mandatory_vocab_module(module):
++                weight = getattr(module, "weight", None)
++                if (
++                    isinstance(weight, torch.nn.Parameter)
++                    and weight.is_cuda
++                    and weight.is_contiguous()
++                    and _nbytes(weight) >= _MIN_WEIGHT_BYTES
++                ):
++                    label = f"{name}.weight" if name else "weight"
++                    found.setdefault(weight.data_ptr(), (label, weight))
++            screen_wq = getattr(module, "_carveout_screen_wq", None)
+             if (
+-                isinstance(weight, torch.nn.Parameter)
+-                and weight.is_cuda
+-                and weight.is_contiguous()
+-                and _nbytes(weight) >= _MIN_WEIGHT_BYTES
++                isinstance(screen_wq, torch.Tensor)
++                and screen_wq.is_cuda
++                and screen_wq.is_contiguous()
++                and any(_holds(carveout, screen_wq) for carveout in _carveouts)
+             ):
+-                label = f"{name}.weight" if name else "weight"
+-                found.setdefault(weight.data_ptr(), (label, weight))
++                label = (
++                    f"{name}._carveout_screen_wq"
++                    if name
++                    else "_carveout_screen_wq"
++                )
++                found.setdefault(screen_wq.data_ptr(), (label, screen_wq))
+         for name, param in root.named_parameters():
+             if (
+                 param.is_cuda
+@@ -502,11 +907,18 @@ def confirm_streamed_weights(
      """Confirm the streamed weights loaded into the display carve-out.
  
      Every vocabulary-sized weight of the served model (and any drafter) must

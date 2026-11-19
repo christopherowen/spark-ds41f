@@ -1,4 +1,4 @@
-From b82d414bd17b83c8ebf0d39561590a44736a95be Mon Sep 17 00:00:00 2001
+From 0936b2bd302727f1c47b4a25522fd711b6a366c5 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 01:50:34 +0100
 Subject: [PATCH 819/822] perf(dsv41): tune vocab head grid width and packed
@@ -16,13 +16,13 @@ Tests: pytest -q -p deepseek_models tests/kernels/quantization/test_deepseek_v41
 
 Upstream status: local candidate-61 patch
 ---
- .../test_deepseek_v41_tilelang_vocab.py       |  191 +-
- .../layers/quantization/online/packed_bf16.py |   22 +-
+ .../test_deepseek_v41_tilelang_vocab.py       |  255 ++-
+ .../layers/quantization/online/packed_bf16.py |   44 +-
  vllm/models/deepseek_v4_1/tilelang/vocab.py   | 1634 ++++++++++++++---
- 3 files changed, 1614 insertions(+), 233 deletions(-)
+ 3 files changed, 1652 insertions(+), 281 deletions(-)
 
 diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
-index e7d44eca9..e1c81ceea 100644
+index e7d44eca9..714497c29 100644
 --- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
 +++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
 @@ -29,6 +29,9 @@ from vllm.models.deepseek_v4_1.tilelang.vocab import (  # noqa: E402
@@ -74,7 +74,78 @@ index e7d44eca9..e1c81ceea 100644
  
      class _HeadLayer(torch.nn.Module):
          pass
-@@ -949,3 +973,166 @@ def test_packed_head_greedy_pairs_sink_tp4_and_cudagraph(monkeypatch):
+@@ -693,34 +717,42 @@ def test_packed_bf16_lm_head_carveout_shares_single_buffer_with_screen_wq(monkey
+ 
+     n, k = 16384, 4096
+     config = VllmConfig(kernel_config=KernelConfig(linear_backend="tilelang"))
+-    with set_current_vllm_config(config):
+-        method = PackedBf16LmHeadMethod()
+-        layer = _HeadLayer()
+-        with torch.device(DEVICE):
+-            method.create_weights(layer, k, [n], k, n, torch.bfloat16)
+-        original = _head(n, k, seed=42)
+-        layer.weight.data.copy_(original)
+-        method.process_weights_after_loading(layer)
+-        method.declare_layer_kernels(layer)
+-
+-        assert len(display_carveout._carveouts) == 1
+-        carveout = display_carveout._carveouts[0]
+-        w_q = layer._tilelang_vocab_screen[0]
+-        assert display_carveout._holds(carveout, layer.weight.data)
+-        assert display_carveout._holds(carveout, w_q)
+-
+-        model = torch.nn.Module()
+-        model.lm_head = layer
+-        display_carveout.confirm_streamed_weights(model, torch.device(DEVICE))
+-        assert display_carveout._integrity is not None
+-        display_carveout._integrity.check()
+-        assert display_carveout._integrity.failure is None
+-
+-        x = (torch.randn(6, k, device=DEVICE) * 0.5).bfloat16()
+-        logits = project_head(layer, x)
+-        expected = vocab_parallel_pairs(logits, n, 0, tp_size=1)
+-        actual = project_head_greedy_pairs(layer, x, vocab=n, vocab_start=0)
+-        assert torch.equal(actual[:, :2], expected[:, :2])
++    try:
++        with set_current_vllm_config(config):
++            method = PackedBf16LmHeadMethod()
++            layer = _HeadLayer()
++            with torch.device(DEVICE):
++                method.create_weights(layer, k, [n], k, n, torch.bfloat16)
++            original = _head(n, k, seed=42)
++            layer.weight.data.copy_(original)
++            method.process_weights_after_loading(layer)
++            method.declare_layer_kernels(layer)
++
++            assert len(display_carveout._carveouts) == 2
++            head_carveout, wq_carveout = display_carveout._carveouts
++            w_q = layer._tilelang_vocab_screen[0]
++            assert head_carveout.cacheable is True
++            assert head_carveout.nbytes == 96 << 20
++            assert display_carveout._holds(head_carveout, layer.weight.data)
++            assert wq_carveout.cacheable is False
++            assert wq_carveout.nbytes == 64 << 20
++            assert display_carveout._holds(wq_carveout, w_q)
++
++            model = torch.nn.Module()
++            model.lm_head = layer
++            display_carveout.confirm_streamed_weights(model, torch.device(DEVICE))
++            assert display_carveout._integrity is not None
++            display_carveout._integrity.check()
++            assert display_carveout._integrity.failure is None
++
++            x = (torch.randn(6, k, device=DEVICE) * 0.5).bfloat16()
++            logits = project_head(layer, x)
++            expected = vocab_parallel_pairs(logits, n, 0, tp_size=1)
++            actual = project_head_greedy_pairs(layer, x, vocab=n, vocab_start=0)
++            assert torch.equal(actual[:, :2], expected[:, :2])
++    finally:
++        for carveout in list(display_carveout._carveouts):
++            carveout.close()
+ 
+ 
+ def test_tile_config_128_uses_matched_two_stage_pipeline():
+@@ -949,3 +981,166 @@ def test_packed_head_greedy_pairs_sink_tp4_and_cudagraph(monkeypatch):
          n_tok = int(g_n[req_idx])
          assert torch.equal(g_sampled[req_idx, :n_tok], exp_sampled[req_idx, :n_tok])
      assert torch.equal(g_alts, exp_alts)
@@ -242,7 +313,7 @@ index e7d44eca9..e1c81ceea 100644
 +    assert torch.equal(act_pv[:, :check_tiles], ref_pv[:, :check_tiles])
 +    assert torch.equal(act_pi[:, :check_tiles], ref_pi[:, :check_tiles])
 diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
-index bcc96fe2c..e79588037 100644
+index bcc96fe2c..ff312b9a0 100644
 --- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
 +++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
 @@ -15,6 +15,7 @@ or TileLang's with the TileLang linear backend.
@@ -253,42 +324,71 @@ index bcc96fe2c..e79588037 100644
  
  import torch
  from torch.nn import Parameter
-@@ -77,8 +78,14 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
-         # head (1.5 * n * k bytes) and its 8-bit screening table (1.0 * n * k
-         # bytes) share one carve-out mapping without allocating host memory.
-         alloc_shape = (n, k + k // 4) if self.tilelang else shape
-+        # TileLang decode shares this buffer with the single-pass 8-bit W_q
-+        # screening table, where GPU_CACHEABLE_NO avoids L2 line allocation
-+        # overhead; packed-only carve-outs keep GPU_CACHEABLE_YES.
-         raw = display_carveout.allocate(
+@@ -71,25 +72,16 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         k = input_size_per_partition
+         shape = (n, k)
+         # In the GB10 display carve-out when it is required: the checkpoint
+-        # streams straight in and the head is then packed where it lies.
+-        # With the TileLang backend, reserve 2.5 * n * k bytes (1.25 * n * k
+-        # BF16 elements) in that single carve-out buffer so the packed 12-bit
+-        # head (1.5 * n * k bytes) and its 8-bit screening table (1.0 * n * k
+-        # bytes) share one carve-out mapping without allocating host memory.
+-        alloc_shape = (n, k + k // 4) if self.tilelang else shape
+-        raw = display_carveout.allocate(
 -            alloc_shape, params_dtype, torch.get_default_device()
-+            alloc_shape,
++        # streams straight in and the head is then packed where it lies with
++        # GPU_CACHEABLE_YES so repeat refinement passes keep L2 reuse. The
++        # single-pass 8-bit screening table W_q is allocated separately as
++        # GPU_CACHEABLE_NO once compaction reclaims the packed slack.
++        data = display_carveout.allocate(
++            shape,
 +            params_dtype,
 +            torch.get_default_device(),
-+            cacheable=not self.tilelang,
++            cacheable=True,
          )
-         if raw is not None and self.tilelang:
-             data = raw.view(-1)[: n * k].view(shape)
-@@ -90,6 +97,19 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
-             )
-         else:
-             data = raw
+-        if raw is not None and self.tilelang:
+-            data = raw.view(-1)[: n * k].view(shape)
+-            row_bytes = k + k // 2
+-            layer._carveout_screen_wq = (
+-                raw.view(torch.uint8)
+-                .view(-1)[n * row_bytes : n * (row_bytes + k)]
+-                .view(shape)
+-            )
+-        else:
+-            data = raw
+         weight = Parameter(
+             data if data is not None else torch.empty(*shape, dtype=params_dtype),
+             requires_grad=False,
+@@ -123,9 +115,6 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+ 
+         del weight
+         values = packed.values
+-        # The TileLang head's carve-out buffer also holds its 8-bit screening
+-        # table, right after the packed rows (``_carveout_screen_wq``), so it has
+-        # no slack to give back: compacting it would free the table's storage.
+         if getattr(layer, "_carveout_screen_wq", None) is None:
+             values = display_carveout.compact(values)
+         replace_parameter(layer, "weight", values)
+@@ -139,6 +128,19 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         if self.tilelang:
+             from vllm.models.deepseek_v4_1.tilelang.vocab import _ensure_screen_weights
+ 
 +            if (
-+                self.tilelang
++                getattr(layer, "_carveout_screen_wq", None) is None
 +                and os.getenv("VLLM_DS41_CARVEOUT_SCREEN_WQ", "1") != "0"
 +            ):
 +                wq = display_carveout.allocate(
-+                    shape,
++                    (int(values.shape[0]), in_features),
 +                    torch.uint8,
-+                    torch.get_default_device(),
++                    values.device,
 +                    optional=True,
 +                    cacheable=False,
 +                )
 +                if wq is not None:
 +                    layer._carveout_screen_wq = wq
-         weight = Parameter(
-             data if data is not None else torch.empty(*shape, dtype=params_dtype),
-             requires_grad=False,
+             _ensure_screen_weights(layer)
+             # The model's head dtype: FP32 logits as DeepSeek's reference head, or
+             # the model dtype. The projection is declared with it when the worker
 diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
 index 840927396..788f6252d 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
@@ -2322,5 +2422,5 @@ index 840927396..788f6252d 100644
      "shared_memory_bytes",
      "tile_config",
 -- 
-2.54.0 (Apple Git-157)
+2.43.0
 

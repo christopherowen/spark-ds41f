@@ -100,6 +100,18 @@ class ParsingTest(unittest.TestCase):
             self.assertNotIn("min_tokens", payloads[0][1])
         self.assertEqual(spark.DECODE_CASES["code-nothink"].template_kwargs, {"thinking": False})
 
+    def test_distinct_decode_cases_vary_by_stream_without_changing_reference_prompts(self) -> None:
+        self.assertEqual(spark.DECODE_CASE_GROUPS["distinct"], ["prose-distinct", "code-distinct"])
+        self.assertEqual(set(spark.DECODE_PROMPTS), {"prose", "code"})
+        for case in spark.DECODE_CASE_GROUPS["distinct"]:
+            payloads = [payload for _, payload in spark.decode_payloads("m", case, 16)]
+            self.assertEqual(len({payload["messages"][0]["content"] for payload in payloads}), 16, case)
+            for payload in payloads:
+                self.assertEqual(payload["temperature"], 0)
+                self.assertEqual(payload["seed"], 42)
+                self.assertNotIn("min_tokens", payload)
+                self.assertNotIn("chat_template_kwargs", payload)
+
     def test_portable_cases_fix_the_length_and_vary_by_stream(self) -> None:
         self.assertEqual(
             spark.DECODE_CASE_GROUPS["portable"],

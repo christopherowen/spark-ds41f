@@ -122,6 +122,44 @@ DECODE_CASES = {
     ),
 }
 DECODE_CASES.update((case, DecodeCase(prompt)) for case, prompt in DECODE_PROMPTS.items())
+DISTINCT_PROSE_PROMPTS: tuple[str, ...] = (
+    "Explain, in precise technical prose, how speculative decoding increases language-model serving throughput while preserving the target output distribution. Cover acceptance rate, verification cost, batching, and latency.",
+    "Explain, in precise technical prose, how continuous iteration-level batching interacts with paged KV-cache management in large transformer servers. Discuss memory fragmentation, preemption, and tail latency.",
+    "Explain, in precise technical prose, how rotary positional embeddings scale to million-token contexts. Cover base frequency adjustment, YaRN interpolation, attention entropy, and extrapolation limits.",
+    "Explain, in precise technical prose, how Multi-Head Latent Attention reduces KV-cache footprint during long-context inference. Discuss low-rank key-value compression, matrix absorption, and arithmetic intensity.",
+    "Explain, in precise technical prose, how tensor parallelism partitions linear layers and self-attention across GPUs. Discuss Megatron column-row sharding, all-reduce synchronization, and communication hiding.",
+    "Explain, in precise technical prose, why unified-memory GPU architectures behave differently from discrete-VRAM servers during small-batch decode. Cover L2 cache pollution, DMA prefetching, and memory bandwidth saturation.",
+    "Explain, in precise technical prose, how Sparse Mixture-of-Experts routing affects decoding efficiency across nodes. Discuss top-k gating, expert load balance, irregular GEMM shapes, and all-to-all traffic.",
+    "Explain, in precise technical prose, how block-wise FP8 weight and activation quantization preserves accuracy while accelerating GEMMs. Cover per-block scaling exponents, accumulator precision, and outlier handling.",
+    "Explain, in precise technical prose, how CUDA Graphs reduce host launch overhead for latency-sensitive decode loops. Cover graph capture invariants, static buffer aliasing, shape bucketing, and replay dispatch.",
+    "Explain, in precise technical prose, how sliding-window attention and recurrent state layers bound per-token state growth. Discuss fixed-size ring buffers, eviction semantics, and hybrid full-attention interleaved layers.",
+    "Explain, in precise technical prose, how prefix caching reuses computed key-value blocks across multi-turn prompts. Cover block content hashing, reference counting, copy-on-write, and LRU eviction.",
+    "Explain, in precise technical prose, how disaggregated prefill and decode workers avoid compute-versus-memory interference. Discuss KV-cache transfer over RDMA, time-to-first-token isolation, and queue scheduling.",
+    "Explain, in precise technical prose, why vocabulary projection dominates single-stream speculative verification cost on wide vocabularies. Cover logit all-gather volume, top-k screening, and BF16 versus INT8 fidelity.",
+    "Explain, in precise technical prose, how adaptive speculative verification budgets draft tokens dynamically under concurrency. Cover marginal step cost, token survival probability, and Tensor Core tile knees.",
+    "Explain, in precise technical prose, how RDMA GPUDirect over convergent RoCE fabrics cuts collective latency on multi-node clusters. Cover queue-pair posting, inline headers, zero-copy registration, and ring versus direct topologies.",
+    "Explain, in precise technical prose, how thermal throttling silently distorts long-context prefill benchmarks. Cover clock-frequency droop, inter-run cooling floors, sample variance, and sustained power limits.",
+)
+DISTINCT_CODE_PROMPTS: tuple[str, ...] = (
+    "Write a complete Python implementation of an LRU cache using only the standard library. Include type hints, O(1) get and put methods, capacity validation, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a fixed-capacity ring buffer queue using only the standard library. Include type hints, push, pop, peek, overwrite-oldest handling, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a prefix trie supporting insert, search, starts_with, and delete using only the standard library. Include type hints and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of an LFU cache using only the standard library. Include type hints, O(1) get and put methods, capacity validation, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a disjoint-set (Union-Find) structure with path compression and union by rank using only the standard library. Include type hints and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a token-bucket rate limiter using only the standard library. Include type hints, monotonic clock refills, thread safety, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a segment tree supporting range sum queries and point updates using only the standard library. Include type hints, bounds checking, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a consistent hashing ring with virtual nodes using only the standard library. Include type hints, node add/remove, key lookup, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of an indexed binary min-heap supporting decrease_key and remove_key in O(log n) using only the standard library. Include type hints and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a directed graph topological sort with cycle detection (Kahn's algorithm) using only the standard library. Include type hints and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of an interval tree or sorted disjoint-interval merger supporting insert and overlap queries using only the standard library. Include type hints and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a Fenwick (Binary Indexed) tree supporting prefix sums and point updates using only the standard library. Include type hints, validation, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a thread-safe bounded blocking queue using only the standard library. Include type hints, optional timeouts on put and get, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of an adaptive Huffman or streaming run-length codec using only the standard library. Include type hints, round-trip checks, and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a skip-list ordered map supporting get, put, and delete using only the standard library. Include type hints and a short executable example. Explain the complexity after the code.",
+    "Write a complete Python implementation of a deterministic Bloom filter with configurable bit size and hash count using only the standard library. Include type hints, validation, and a short executable example. Explain the complexity after the code.",
+)
+DECODE_CASES["prose-distinct"] = DecodeCase(DISTINCT_PROSE_PROMPTS, per_stream=True)
+DECODE_CASES["code-distinct"] = DecodeCase(DISTINCT_CODE_PROMPTS, per_stream=True)
 # Portable cases follow the protocol public DGX Spark benchmarks use, so
 # figures line up with theirs: reasoning off, exactly 256 tokens, a distinct
 # prompt per stream, and workloads from highly predictable (a count) to
@@ -190,7 +228,10 @@ DECODE_CASES["chat-sampled"] = DecodeCase(
     temperature=0.7, top_p=0.95,
 )
 # Names --decode-cases expands.
-DECODE_CASE_GROUPS = {"portable": [*PORTABLE_CASES, "chat-sampled"]}
+DECODE_CASE_GROUPS = {
+    "portable": [*PORTABLE_CASES, "chat-sampled"],
+    "distinct": ["prose-distinct", "code-distinct"],
+}
 # The internal precision set resolves small differences between arms. It keeps
 # the portable protocol's settings (reasoning off, temperature 0) but gives
 # every sample four times the decode steps, uses prompts whose natural answer
