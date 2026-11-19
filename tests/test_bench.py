@@ -1098,6 +1098,31 @@ class ReferenceShapeTest(unittest.TestCase):
             ["step:model", "cool", "step:engine", "step:prefill", "cool", "cool"],
         )
 
+    def test_take_fan_control_retries_transient_floor_failure(self) -> None:
+        nodes = {"nodes": [{"name": "dgx3"}]}
+        node = nodes["nodes"][0]
+        outcomes = iter([0, 0, 1, 1, 0])
+        seen: list[tuple[str, ...]] = []
+
+        def fake_ssh(_nodes, _node, *command):
+            seen.append(command)
+            return mock.Mock(returncode=next(outcomes))
+
+        with mock.patch.object(spark, "run_ssh", side_effect=fake_ssh):
+            result = spark.take_fan_control(nodes, node, attempts=3, retry_delay_s=0)
+
+        self.assertEqual(result, {"service": True, "floor": True})
+        self.assertEqual(
+            seen,
+            [
+                ("systemctl", "is-active", "--quiet", spark.FAN_SERVICE),
+                ("sudo", "-n", "systemctl", "stop", spark.FAN_SERVICE),
+                ("sudo", "-n", "dgx-fan-control", "set-state", "12"),
+                ("systemctl", "is-active", "--quiet", spark.FAN_SERVICE),
+                ("sudo", "-n", "dgx-fan-control", "set-state", "12"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

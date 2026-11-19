@@ -79,6 +79,9 @@ agentx = importlib.util.module_from_spec(importlib.util.spec_from_loader("agentx
 _agentx_loader.exec_module(agentx)
 
 HOLD = Path.home() / "spark-hold.json"
+HOLD_LOCK = Path.home() / "spark-hold.lock"
+_DEFAULT_HOLD = HOLD
+_DEFAULT_HOLD_LOCK = HOLD_LOCK
 LAB_HOME = Path.home() / "spark-lab"
 REQUEST = Path.home() / "spark-request.json"
 # The names before the project was renamed from spark3: a hold or request an
@@ -223,6 +226,27 @@ def step_argv(step: dict) -> list[str]:
 
 # ---------------------------------------------------------------- hold file and guards
 
+def _hold_lock_path() -> Path:
+    if HOLD_LOCK != _DEFAULT_HOLD_LOCK:
+        return HOLD_LOCK
+    if HOLD != _DEFAULT_HOLD:
+        return HOLD.with_suffix(".lock")
+    return HOLD_LOCK
+
+
+@contextlib.contextmanager
+def hold_lock():
+    """Serialize hold-file updates and window_close() across runner, closer and watchdog processes."""
+    lock_path = _hold_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def read_hold(path: Path | None = None) -> dict | None:
     for candidate in (path,) if path else (HOLD, LEGACY_HOLD):
         try:
@@ -278,14 +302,19 @@ def heartbeat_age(hold: dict, at: float | None = None) -> float:
     return at - parse_time(hold["heartbeat"])
 
 
-def beat(note: str | None = None) -> None:
-    hold = read_hold()
-    if not hold_is_ours(hold):
-        raise SystemExit("the hold file is not ours; refusing to continue")
-    hold["heartbeat"] = now()
-    if note:
-        hold["current"] = note
-    write_json_atomic(HOLD, hold)
+def beat(note: str | None = None, *, expected_window: str | None = None) -> None:
+    with hold_lock():
+        hold = read_hold()
+        if not hold_is_ours(hold):
+            raise SystemExit("the hold file is not ours; refusing to continue")
+        if expected_window is not None and hold.get("window") != expected_window:
+            raise SystemExit("the hold file moved to another window; refusing to continue")
+        if hold.get("closing"):
+            raise SystemExit("the window is closing; refusing to continue")
+        hold["heartbeat"] = now()
+        if note:
+            hold["current"] = note
+        write_json_atomic(HOLD, hold)
 
 
 def window_should_close(hold: dict, at: float | None = None) -> str | None:
@@ -1005,18 +1034,97 @@ def window_open(minutes: int, note: str, dry: bool = False) -> None:
                          start_new_session=True)
 
 
-def window_close(reason: str, dry: bool = False) -> bool:
-    hold = read_hold()
-    if hold and not hold_is_ours(hold):
-        log(f"hold belongs to {hold.get('holder')!r}; leaving the cluster alone")
-        return False
-    log(f"closing window ({reason})")
-    ok = restore_production(dry=dry)
-    if not dry and ok and hold_is_ours(read_hold()):
-        HOLD.unlink()
-        log("window closed; hold removed")
-    elif not ok:
-        log("restore FAILED; hold kept so nobody assumes production is up")
+def _close_window(
+    reason: str,
+    dry: bool = False,
+    *,
+    expected_window: str | None = None,
+    stale_heartbeat: str | None = None,
+    beat_interval: float = 60.0,
+) -> tuple[bool, str]:
+    if dry:
+        hold = read_hold()
+        if hold and not hold_is_ours(hold):
+            log(f"hold belongs to {hold.get('holder')!r}; leaving the cluster alone")
+            return False, "foreign"
+        log(f"closing window ({reason})")
+        ok = restore_production(dry=True)
+        if not ok:
+            log("restore FAILED; hold kept so nobody assumes production is up")
+        return ok, "dry" if ok else "failed"
+
+    with hold_lock():
+        hold = read_hold()
+        if hold and not hold_is_ours(hold):
+            log(f"hold belongs to {hold.get('holder')!r}; leaving the cluster alone")
+            return False, "foreign"
+        if expected_window is not None and (not hold or hold.get("window") != expected_window):
+            log(f"window {expected_window} is already gone; leaving the cluster alone")
+            return True, "gone"
+        if stale_heartbeat is not None and (not hold or hold.get("heartbeat") != stale_heartbeat):
+            log("heartbeat was refreshed before close; leaving the window open")
+            return True, "refreshed"
+        window_id = hold.get("window") if hold else None
+        log(f"closing window ({reason})")
+        stop_close_beat = threading.Event()
+        close_beater: threading.Thread | None = None
+        if hold_is_ours(hold):
+            hold["closing"] = reason
+            hold["heartbeat"] = now()
+            write_json_atomic(HOLD, hold)
+
+            def close_heartbeat() -> None:
+                while not stop_close_beat.wait(beat_interval):
+                    # This thread runs only while the owning call holds hold_lock(), so it
+                    # must not re-acquire the flock; atomic replace keeps readers consistent.
+                    latest_in_close = read_hold()
+                    if hold_is_ours(latest_in_close) and (
+                        window_id is None or latest_in_close.get("window") == window_id
+                    ):
+                        latest_in_close["heartbeat"] = now()
+                        write_json_atomic(HOLD, latest_in_close)
+
+            close_beater = threading.Thread(target=close_heartbeat, daemon=True)
+            close_beater.start()
+        try:
+            ok = restore_production(dry=False)
+        finally:
+            stop_close_beat.set()
+            if close_beater is not None:
+                close_beater.join()
+
+        latest = read_hold()
+        if ok and hold_is_ours(latest) and (window_id is None or latest.get("window") == window_id):
+            HOLD.unlink(missing_ok=True)
+            log("window closed; hold removed")
+            return True, "closed"
+        if not ok:
+            if hold_is_ours(latest) and (window_id is None or latest.get("window") == window_id):
+                latest.pop("closing", None)
+                write_json_atomic(HOLD, latest)
+            log("restore FAILED; hold kept so nobody assumes production is up")
+            return False, "failed"
+        return ok, "closed"
+
+
+def window_close(
+    reason: str,
+    dry: bool = False,
+    *,
+    expected_window: str | None = None,
+    stale_heartbeat: str | None = None,
+    beat_interval: float = 60.0,
+    _outcome: dict | None = None,
+) -> bool:
+    ok, status = _close_window(
+        reason,
+        dry=dry,
+        expected_window=expected_window,
+        stale_heartbeat=stale_heartbeat,
+        beat_interval=beat_interval,
+    )
+    if _outcome is not None:
+        _outcome["status"] = status
     return ok
 
 
@@ -1030,7 +1138,16 @@ def watchdog(max_age: int, once: bool) -> None:
         age = heartbeat_age(hold)
         if age > max_age:
             log(f"watchdog: heartbeat {age:.0f} s old; closing the window")
-            window_close("watchdog: stale heartbeat")
+            outcome: dict[str, str] = {}
+            window_close(
+                "watchdog: stale heartbeat",
+                expected_window=hold.get("window"),
+                stale_heartbeat=hold.get("heartbeat"),
+                _outcome=outcome,
+            )
+            if outcome.get("status") == "refreshed" and not once:
+                time.sleep(60)
+                continue
             return
         if once:
             return
@@ -2123,6 +2240,8 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
     hold = read_hold()
     if not hold_is_ours(hold):
         window_open(spec.get("minutes", DEFAULT_MINUTES), f"run {spec['run']}")
+        hold = read_hold()
+    window_id = hold.get("window") if hold_is_ours(hold) else None
     checked = set()
     failed = None
     window_ending = None  # a reason the window itself must close, not just this run
@@ -2134,11 +2253,15 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
         # catches a dead runner; a hung step is for whoever watches the run (or a cap).
         while not stop_beating.wait(60):
             try:
-                beat(current["note"])
+                if window_id is None:
+                    beat(current["note"])
+                else:
+                    beat(current["note"], expected_window=window_id)
             except SystemExit:
                 return
 
-    threading.Thread(target=heartbeat, daemon=True).start()
+    beater = threading.Thread(target=heartbeat, daemon=True)
+    beater.start()
     validated = False
     restart = False
     booted = None  # the arm serving now: its container is the one sampled and whose logs are kept
@@ -2153,7 +2276,10 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             failed = window_ending = reason
             break
         current["note"] = describe_step(step)
-        beat(current["note"])
+        if window_id is None:
+            beat(current["note"])
+        else:
+            beat(current["note"], expected_window=window_id)
         if step["kind"] != "sync" and not validated:
             # After any sync, before the first boot: every file and servebench argument
             # the run needs, so a mistake costs seconds rather than a boot.
@@ -2316,6 +2442,7 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             failed = f"{describe_step(step)} raised {type(error).__name__}: {error}"
             break
     stop_beating.set()
+    beater.join()
     if failed_points and not failed:
         failed = f"agentx points failed: {', '.join(failed_points)}"
     if restart:

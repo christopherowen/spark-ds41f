@@ -1129,15 +1129,29 @@ def hottest_zone_c(nodes: dict, node: dict) -> float | None:
         return None
 
 
-def take_fan_control(nodes: dict, node: dict) -> dict:
+def take_fan_control(
+    nodes: dict,
+    node: dict,
+    *,
+    attempts: int = 3,
+    retry_delay_s: float = 0.5,
+) -> dict:
     """Pause the dgx-fan-control service and select the maximum fan floor."""
     service = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0
-    if service:
-        stopped = run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
-        if stopped.returncode:
-            return {"service": service, "floor": False}
-    floor = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "set-state", "12").returncode == 0
-    return {"service": service, "floor": floor}
+    active = service
+    for attempt in range(attempts):
+        if attempt > 0:
+            active = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0
+            service = service or active
+        stopped_ok = (
+            not active
+            or run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE).returncode == 0
+        )
+        if stopped_ok and run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "set-state", "12").returncode == 0:
+            return {"service": service, "floor": True}
+        if attempt + 1 < attempts and retry_delay_s > 0:
+            time.sleep(retry_delay_s)
+    return {"service": service, "floor": False}
 
 
 def restore_fan_control(nodes: dict, node: dict, control: dict) -> str | None:
