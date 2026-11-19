@@ -1,0 +1,328 @@
+From 3b3aa7fc4467907964757ca869dbdd906cac6bdc Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 10:51:57 +0000
+Subject: [PATCH] perf(dsv41): upgrade VLLM_DS41_LSA to FP8 group32 dominance
+ summaries and long-context r=1 shortlist
+
+Replace the 32-byte BF16 arithmetic-mean block-8 summary in opt-in VLLM_DS41_LSA=1 (STATE_BYTES=100) with a 16-byte float8_e4m3fn Group-32 dominance-blended summary (0.85 * mean + 0.15 * k*, where k* is the key in the 8-token block with maximum squared L2 deviation from the block mean in each 32-dim MXFP4 scale group; STATE_BYTES=84), and enable the shortlist plan at r=1 decode when score_width >= 262144.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Cutting per-slot summary storage from +32 B to +16 B (STATE_BYTES 100 -> 84) halves VLLM_DS41_LSA KV cache overhead (333.57 -> 312.26 B/token, freeing +21.31 B/token across 4 indexer layers) and keeps the 1M Layer-20 summary pool (16 MB vs 32 MB) resident in GB10 L2 cache, accelerating 1M Layer-20 coarse scoring by 2.70x-2.90x and 4-layer 1M indexing to 6.10x over native while improving top-512 recall across all context lengths and needle-in-a-block regimes. Routing r=1 decode through the shortlist plan at score_width >= 262144 accelerates long-context single-row decode by up to 2.58x over native.
+Quality: Default-off path (VLLM_DS41_LSA=0/unset) is 100% unchanged native indexing (68-byte keys). Under opt-in VLLM_DS41_LSA=1, FP8 Group-32 dominance summaries improve Dense b64 mean top-512 recall (87.74% vs 87.25%), Source b512 recall (95.35% vs 93.44%), Source b1024 recall (98.85% vs 97.92%; 90.7% vs 78.8% at 1M), and single-needle-in-8-token-block recall (+13.87 pp uncorrelated, +28.98 pp canceling).
+Tests: pytest -v -p tblib_stub -p no:cacheprovider -p tests.kernels.deepseek_v41_pdl_sources tests/models/test_deepseek_v4_1_lsa.py tests/models/test_deepseek_v4_1_attention.py across 2 container boots (73 passed, 0 PDL violations) and 2-boot 32K-1M GPU recall and latency benchmark matrix on GB10 (sp5).
+Upstream-status: local
+---
+ tests/models/test_deepseek_v4_1_lsa.py        | 47 ++++++++++++++-----
+ vllm/models/deepseek_v4_1/attention.py        |  4 +-
+ .../deepseek_v4_1/tilelang/attention.py       |  9 +++-
+ .../deepseek_v4_1/tilelang/block_shortlist.py | 41 ++++++++++++----
+ .../deepseek_v4_1/tilelang/query_reuse.py     |  8 ++--
+ 5 files changed, 80 insertions(+), 29 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_lsa.py b/tests/models/test_deepseek_v4_1_lsa.py
+index f78607017..f46b05de9 100644
+--- a/tests/models/test_deepseek_v4_1_lsa.py
++++ b/tests/models/test_deepseek_v4_1_lsa.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Unit and GPU tests for opt-in VLLM_DS41_LSA BF16 block8 shortlist indexing."""
++"""Unit and GPU tests for opt-in VLLM_DS41_LSA FP8 group32 dominance block8 shortlist indexing."""
+ 
+ import ast
+ from pathlib import Path
+@@ -210,7 +210,7 @@ def test_lsa_opt_in_kv_cache_spec_and_plan_registration(monkeypatch):
+     tl_attn._source_short_plan.cache_clear()
+ 
+     assert tl_attn._lsa_enabled()
+-    assert STATE_BYTES == 100
++    assert STATE_BYTES == 84
+     assert issubclass(QueryReusePlan, PageShortlistPlan)
+ 
+     dummy_index_cache = SimpleNamespace(
+@@ -224,7 +224,7 @@ def test_lsa_opt_in_kv_cache_spec_and_plan_registration(monkeypatch):
+     index_spec = _Cache.get_kv_cache_spec(
+         dummy_index_cache, SimpleNamespace(model_config=None)
+     )
+-    assert index_spec.state_content_bytes == 100
++    assert index_spec.state_content_bytes == 84
+ 
+     assert tl_attn._shortlist_options(4096, False, False) is None
+     assert tl_attn._shortlist_options(16384, False, False) == {
+@@ -287,7 +287,7 @@ def test_lsa_opt_in_kv_cache_spec_and_plan_registration(monkeypatch):
+     layer.indexer = SimpleNamespace(
+         k_norm=SimpleNamespace(weight=torch.ones(128), variance_epsilon=1e-6),
+         k_cache=SimpleNamespace(
+-            kv_cache=torch.zeros(4, 128 * 100, dtype=torch.uint8)
++            kv_cache=torch.zeros(4, 128 * 84, dtype=torch.uint8)
+         ),
+     )
+     layer._check_cache_pages()
+@@ -324,7 +324,7 @@ def test_lsa_opt_in_kv_cache_spec_and_plan_registration(monkeypatch):
+     assert writes == [("norm_rope", 9), ("direct", 4)]
+     assert len(summaries) == 2
+     assert all(
+-        dtype == torch.bfloat16 and s == (127, 255) for _, dtype, s in summaries
++        dtype == torch.float8_e4m3fn and s == (127, 255) for _, dtype, s in summaries
+     )
+     assert summarize_blocks is not None
+ 
+@@ -416,7 +416,7 @@ def test_lsa_opt_in_32k_to_1m_routing_and_metadata_wiring(monkeypatch):
+         layer.indexer = SimpleNamespace(
+             heads=32,
+             k_cache=SimpleNamespace(
+-                kv_cache=torch.zeros(4, layer._index_page * 100, dtype=torch.uint8)
++                kv_cache=torch.zeros(4, layer._index_page * 84, dtype=torch.uint8)
+             ),
+         )
+         layer._active = torch.tensor(
+@@ -519,6 +519,11 @@ def test_lsa_opt_in_32k_to_1m_routing_and_metadata_wiring(monkeypatch):
+             64,
+             "IndexerTopK",
+         )
++        assert dispatch(dense_layer, "decode", 1, sw) == (
++            ("shortlist", 524288, 64, "IndexerTopK")
++            if sw >= 262144
++            else ("native", 524288, None, None)
++        )
+ 
+     # Source layer (layer 20) routing across 32K..1M
+     assert dispatch(source_layer, "prefill", 64, 32768) == (
+@@ -564,6 +569,11 @@ def test_lsa_opt_in_32k_to_1m_routing_and_metadata_wiring(monkeypatch):
+             1024,
+             "RawWideCoarseTopK",
+         )
++        assert dispatch(source_layer, "decode", 1, tokens) == (
++            ("shortlist", 1048576, 1024, "RawWideCoarseTopK")
++            if tokens >= 262144
++            else ("native", 1048576, None, None)
++        )
+ 
+     # During CUDA stream capture (score_width=None), decode r=1 uses native_index and r=8 uses shortlist
+     assert dispatch(dense_layer, "decode", 1, None) == ("native", 524288, None, None)
+@@ -685,8 +695,17 @@ def _decode_mxfp4_pages_reference(pool: torch.Tensor, page: int) -> torch.Tensor
+     sign = torch.where((codes & 8) != 0, -1.0, 1.0)
+     scale_f32 = torch.bitwise_left_shift(scales, 23).view(torch.float32)
+     scale_expanded = scale_f32.repeat_interleave(32, dim=-1)
+-    decoded = sign * lut[mag] * scale_expanded
+-    return decoded.view(pages, page // 8, 8, 128).mean(dim=2).to(torch.bfloat16)
++    decoded = (sign * lut[mag] * scale_expanded).view(pages, page // 8, 8, 4, 32)
++    mean = decoded.mean(dim=2)
++    dev_sq = (decoded - mean.unsqueeze(2)).square().sum(dim=-1)
++    max_idx = (
++        dev_sq.argmax(dim=2, keepdim=True)
++        .unsqueeze(-1)
++        .expand(-1, -1, 1, -1, 32)
++    )
++    dom = torch.gather(decoded, 2, max_idx).squeeze(2)
++    blended = 0.85 * mean + 0.15 * dom
++    return blended.reshape(pages, page // 8, 128).to(torch.float8_e4m3fn)
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@@ -740,15 +759,17 @@ def test_lsa_gpu_summarize_blocks_and_freeze_registration():
+             dtype=torch.int64,
+             device="cuda",
+         )
+-        summarize_blocks(page)(pool, pool.view(torch.bfloat16), slots)
++        summarize_blocks(page)(pool, pool.view(torch.float8_e4m3fn), slots)
+         ref = _decode_mxfp4_pages_reference(pool, page)
+-        actual = pool.view(torch.bfloat16)[:, page * 68 // 2 : page * 100 // 2].view(
++        actual = pool.view(torch.float8_e4m3fn)[:, page * 68 : page * STATE_BYTES].view(
+             num_pages, page // 8, 128
+         )
+         for p_idx in (0, 2, 4):
+-            assert torch.equal(actual[p_idx], ref[p_idx])
++            assert torch.equal(
++                actual[p_idx].view(torch.uint8), ref[p_idx].view(torch.uint8)
++            )
+         for p_idx in (1, 3, 5):
+-            assert torch.count_nonzero(actual[p_idx]) == 0
++            assert torch.count_nonzero(actual[p_idx].to(torch.float32)) == 0
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@@ -796,7 +817,7 @@ def test_lsa_gpu_index_chunk_and_cudagraph_replay(
+     complete_slots = (
+         torch.arange(active_pages, dtype=torch.int64, device="cuda") * page + page - 1
+     )
+-    summarize_blocks(page)(pool, pool.view(torch.bfloat16), complete_slots)
++    summarize_blocks(page)(pool, pool.view(torch.float8_e4m3fn), complete_slots)
+ 
+     native = IndexerV41Plan(width, page, candidate_blocks=source)
+     shortlist = QueryReusePlan(
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index cf600a675..dac174997 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -107,11 +107,11 @@ class _Cache(nn.Module, AttentionLayerBase):
+             block_size=self.block_size,
+             num_kv_heads=1,
+             head_size=512 if self.kind == "swa" else 68,
+-            # Optional BF16 block-mean shortlist storage is admitted only when enabled.
++            # Optional FP8 block-8 shortlist storage is admitted only when enabled.
+             state_content_bytes=(
+                 528
+                 if self.kind == "swa"
+-                else (100 if os.environ.get("VLLM_DS41_LSA") == "1" else 68)
++                else (84 if os.environ.get("VLLM_DS41_LSA") == "1" else 68)
+             ),
+             dtype=torch.uint8,
+             tokens_per_state=self.ratio,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index bc87e341b..c6a48f3fc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -390,7 +390,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         page_summary = getattr(self, "_page_summary", None)
+         if page_summary is not None:
+             pool = self.indexer.k_cache.kv_cache
+-            page_summary(pool, pool.view(torch.bfloat16), slot_mapping)
++            page_summary(pool, pool.view(torch.float8_e4m3fn), slot_mapping)
+ 
+     def _index_chunk(
+         self,
+@@ -411,7 +411,12 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+     ):
+         plans = self._tilelang()
+         plan = plans.index[mode]
+-        if mode == "decode" and isinstance(plan, PageShortlistPlan) and rows < 2:
++        if (
++            mode == "decode"
++            and isinstance(plan, PageShortlistPlan)
++            and rows < 2
++            and (score_width is None or score_width < 262144)
++        ):
+             plan = plans.native_index[mode]
+         # Outside graph capture, the existing conservative extent can
+         # prove that every key would be kept. Avoid the entire coarse pipeline.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
+index 9e65f0ff8..7a3b4b04c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
++++ b/vllm/models/deepseek_v4_1/tilelang/block_shortlist.py
+@@ -14,10 +14,10 @@ from .paged_shortlist import PageShortlistPlan
+ from .raw_wide_coarse import RawWideCoarseTopK
+ from .shortlist_indexer import decode, remap_blocks
+ 
+-STATE_BYTES = 100
++STATE_BYTES = 84
+ 
+ 
+-@tilelang.jit
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True})
+ def summarize_blocks(page: int, slot_dtype: str = 'int64'):
+     rows,pool_pages,stride = T.dynamic('rows, pool_pages, stride')
+     groups = (page//8)*4
+@@ -25,11 +25,12 @@ def summarize_blocks(page: int, slot_dtype: str = 'int64'):
+ 
+     @T.prim_func
+     def update(Pool: T.StridedTensor([pool_pages,page*STATE_BYTES],[stride,1],T.uint8),
+-               Half: T.StridedTensor([pool_pages,page*STATE_BYTES//2],[stride//2,1],T.bfloat16),
++               Fp8: T.StridedTensor([pool_pages,page*STATE_BYTES],[stride,1],T.float8_e4m3fn),
+                Slots: T.Tensor([rows],slot_dtype)):
+         with T.Kernel(rows,threads=512) as row:
+             pdl.chain()
+             means = T.alloc_fragment([groups,32],T.float32)
++            dev_sq = T.alloc_shared([groups,8],T.float32)
+             slot = Slots[row]
+             if (slot >= 0) & (slot%page == page-1) & (slot//page < pool_pages):
+                 physical = slot//page
+@@ -40,8 +41,32 @@ def summarize_blocks(page: int, slot_dtype: str = 'int64'):
+                         token = (g//4)*8+k
+                         means[g,i] += decode(Pool[physical,token*64+d//2],
+                             Pool[physical,page*64+token*4+g%4],d)*.125
++                for g,k in T.Parallel(groups,8):
++                    dev_sq[g,k] = 0.
++                T.sync_threads()
++                for k in T.serial(8):
++                    for g,i in T.Parallel(groups,32):
++                        d = (g%4)*32+i
++                        token = (g//4)*8+k
++                        v = decode(Pool[physical,token*64+d//2],
++                            Pool[physical,page*64+token*4+g%4],d)
++                        diff = v - means[g,i]
++                        T.atomic_add(dev_sq[g,k], diff * diff)
++                T.sync_threads()
+                 for g,i in T.Parallel(groups,32):
+-                    Half[physical,page*68//2+g*32+i] = T.cast(means[g,i],T.bfloat16)
++                    best_k = T.alloc_var(T.int32)
++                    best_d = T.alloc_var(T.float32)
++                    best_k = 0
++                    best_d = dev_sq[g,0]
++                    for k in T.serial(1,8):
++                        if dev_sq[g,k] > best_d:
++                            best_d = dev_sq[g,k]
++                            best_k = k
++                    d = (g%4)*32+i
++                    dom_token = (g//4)*8+best_k
++                    dom_v = decode(Pool[physical,dom_token*64+d//2],
++                        Pool[physical,page*64+dom_token*4+g%4],d)
++                    Fp8[physical,page*68+g*32+i] = T.cast(means[g,i]*0.85 + dom_v*0.15, T.float8_e4m3fn)
+     return update
+ 
+ 
+@@ -54,7 +79,7 @@ def block_scores(width: int, page: int, budget: int, block_c: int = 64):
+     @T.prim_func
+     def score(Q: T.Tensor([rows,32,64],T.uint8), Scale: T.Tensor([rows,32,4],T.uint8),
+               Weight: T.Tensor([rows,32],T.bfloat16),
+-              Pool: T.StridedTensor([pool_pages,page*STATE_BYTES//2],[stride,1],T.bfloat16),
++              Pool: T.StridedTensor([pool_pages,page*STATE_BYTES],[stride,1],T.float8_e4m3fn),
+               Table: T.Tensor([rows,width//page],T.int32), Length: T.Tensor([rows],T.int32),
+               Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
+               Count: T.Tensor([rows],T.int32)):
+@@ -78,8 +103,8 @@ def block_scores(width: int, page: int, budget: int, block_c: int = 64):
+                     for c,d in T.Parallel(block_c,128):
+                         a[c,d] = 0
+                         if start+c < count:
+-                            a[c,d] = Pool[Table[row,(start+c)//(page//8)],
+-                                page*68//2+((start+c)%(page//8))*128+d]
++                            a[c,d] = T.cast(Pool[Table[row,(start+c)//(page//8)],
++                                page*68+((start+c)%(page//8))*128+d],T.bfloat16)
+                     T.gemm(a,b,acc,transpose_B=True,clear_accum=True)
+                     for c,h in T.Parallel(block_c,32):
+                         dot = T.max(T.cast(T.cast(acc[c,h],T.bfloat16),T.float32),0.)
+@@ -198,7 +223,7 @@ class BlockMeanShortlistPlan(PageShortlistPlan):
+             b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0]) for name,t in full.items()}
+             qr,sr,wr,tr,lr = q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
+             self.score(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),wr,
+-                       pool.view(torch.bfloat16),tr,lr,active,b['scores'],b['counts'])
++                       pool.view(torch.float8_e4m3fn),tr,lr,active,b['scores'],b['counts'])
+             self.coarse.run(b['scores'],b['counts'],active,b['selected'],b['values'],scratch=buffers('coarse',self.coarse,b))
+             self.assemble(b['selected'],lr,active,b['candidates'],b['candidate_lengths'])
+             _,scores = self.final.run(qr,sr,wr,pool,tr,lr,active,b['candidates'],b['candidate_lengths'],
+diff --git a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py b/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
+index 930569278..2efe4b468 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
++++ b/vllm/models/deepseek_v4_1/tilelang/query_reuse.py
+@@ -33,7 +33,7 @@ def prepared_scores(width: int, page: int, budget: int, block_c: int = 64):
+     @T.prim_func
+     def score(Q: T.Tensor([rows,32,128],T.bfloat16), Scale: T.Tensor([rows,32,4],T.uint8),
+               Weight: T.Tensor([rows,32],T.bfloat16),
+-              Pool: T.StridedTensor([pool_pages,page//8,128],[stride,128,1],T.bfloat16),
++              Pool: T.StridedTensor([pool_pages,page//8,128],[stride,128,1],T.float8_e4m3fn),
+               Table: T.Tensor([rows,width//page],T.int32), Length: T.Tensor([rows],T.int32),
+               Active: T.Tensor([1],T.int32), Score: T.Tensor([rows,n],T.bfloat16),
+               Count: T.Tensor([rows],T.int32)):
+@@ -57,8 +57,8 @@ def prepared_scores(width: int, page: int, budget: int, block_c: int = 64):
+                         first = start+part*(page//8)
+                         if first < count:
+                             physical = Table[row,first//(page//8)]
+-                            T.copy(Pool[physical,0:page//8,0:128],
+-                                   a[part*(page//8):(part+1)*(page//8),0:128])
++                            for c,d in T.Parallel(page//8,128):
++                                a[part*(page//8)+c,d] = T.cast(Pool[physical,c,d],T.bfloat16)
+                         else:
+                             for c,d in T.Parallel(page//8,128):
+                                 a[part*(page//8)+c,d] = 0
+@@ -139,7 +139,7 @@ class QueryReusePlan(BlockMeanShortlistPlan):
+             b = {name:t.view(-1)[:math.prod(current[name][0])].view(current[name][0]) for name,t in full.items()}
+             qr,sr,wr,tr,lr = q[start:end],scales[start:end],weights[start:end],table[start:end],lengths[start:end]
+             self.unpack(qr.view(torch.uint8),sr.view(torch.uint8).reshape(r,32,4),lr,active,b['prepared_q'])
+-            means = pool.view(torch.bfloat16)[:,self.page*68//2:self.page*100//2].view(len(pool),self.page//8,128)
++            means = pool.view(torch.float8_e4m3fn)[:,self.page*68:self.page*STATE_BYTES].view(len(pool),self.page//8,128)
+             self.prepared_score(b['prepared_q'],sr.view(torch.uint8).reshape(r,32,4),wr,
+                                 means,tr,lr,active,b['scores'],b['counts'])
+             self.coarse.run(b['scores'],b['counts'],active,b['selected'],b['values'],scratch=buffers('coarse',self.coarse,b))
+-- 
+2.43.0
+
