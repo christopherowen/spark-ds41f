@@ -1,0 +1,183 @@
+From 94e9a5f343a88afd50869aa7e7313b8d89e3456c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:11:43 +0000
+Subject: [PATCH] fix(dsv41): hold back an unfinished next parameter tag in the
+ structural DSML text path
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-62's series applied through 0828.
+
+Rationale: 0824 replaced the text-path argument converter and open-value
+extender of the V4.1 parser with structural versions. Both lost a rule the
+previous ones had (deepseek_v4._match_open_param): while a value is still
+open, the start of a next parameter tag that has not reached its '>' is held
+back. Without it, when the model leaves out a parameter closer, the next head
+is streamed as argument text from the moment its tag start arrives until
+name=" completes it; the value then ends where the tag began, but the text
+already sent cannot be taken back, and the extender goes on appending deltas
+to the wrong value. Streamed by characters with no token ids, a call whose
+first value holds a '>' and has no closer came out as one argument holding the
+whole next parameter. Add _open_value_end, the previous rule over the raw
+arguments, and use it in both: the converter cuts the open value there and
+the extender declines while a tag is held. The token-provenance path already
+treats an unfinished genuine head as a boundary and is unchanged.
+
+Quality implications: Tool-call arguments on the text path only (no token
+ids, or a tokenizer without the DSML token), and only while a next parameter
+tag is unfinished after the value's last '>'. There the streamed value is
+again what the previous parser produced. Complete arguments, the
+token-provenance path, 0824's closer rules, reasoning and content are
+unchanged. VLLM_DSV41_STRUCTURAL_DSML=0 is unaffected.
+
+Tests: tests/parser/test_deepseek_v41_structural_closers.py gains the held
+back tag at every cut point of the next head, after a plain value and after a
+literal closer kept as text (14 of these 48 fail without the change), the
+extender still offered for an open value with no unfinished tag, and a
+character-streamed call with a missing closer at six chunk sizes (all six
+fail without the change, and pass on the previous parser with the switch
+off). tests/parser/engine/test_deepseek_v41.py::
+test_partial_tag_after_gt_is_held_back, in the release gate since 0643 and
+failing since 0824, passes again. Run in the candidate-62 image, CPU only.
+
+Upstream status: local patch.
+---
+ .../test_deepseek_v41_structural_closers.py   | 79 +++++++++++++++++++
+ vllm/parser/deepseek_v41.py                   | 18 ++++-
+ 2 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/tests/parser/test_deepseek_v41_structural_closers.py b/tests/parser/test_deepseek_v41_structural_closers.py
+index d656b77e0..17c3463b6 100644
+--- a/tests/parser/test_deepseek_v41_structural_closers.py
++++ b/tests/parser/test_deepseek_v41_structural_closers.py
+@@ -275,6 +275,85 @@ def test_structural_closer_matrix_case(tokenizer, case_name: str) -> None:
+         assert _calls_of(ns) == [("write_file", {"path": "x.md", "content": f"the tag is {PE}"})]
+ 
+ 
++NEXT_HEAD = f'{PS} name="j" string="true">'
++OPEN_VALUES = {
++    "plain": "a > b",
++    "after_literal_closer": f"see {PE} and a > b",
++}
++
++
++@pytest.mark.parametrize("value_name", sorted(OPEN_VALUES))
++@pytest.mark.parametrize("cut", range(len(PS), len(NEXT_HEAD)))
++def test_unfinished_next_tag_is_held_back(value_name: str, cut: int) -> None:
++    # The model left out the parameter closer and the next head is still arriving.
++    # Its text must not be streamed as part of the open value, at any cut point.
++    value = OPEN_VALUES[value_name]
++    raw = f'{PS} name="k" string="true">{value}{NEXT_HEAD[:cut]}'
++    assert json.loads(v41mod._structural_dsml_arg_converter(raw, True)) == {"k": value}
++    assert v41mod._structural_open_value_extender(raw) is None
++
++
++@pytest.mark.parametrize("value_name", sorted(OPEN_VALUES))
++def test_open_value_without_unfinished_tag_still_extends(value_name: str) -> None:
++    value = OPEN_VALUES[value_name]
++    raw = f'{PS} name="k" string="true">{value}'
++    assert json.loads(v41mod._structural_dsml_arg_converter(raw, True)) == {"k": value}
++    assert v41mod._structural_open_value_extender(raw) is not None
++
++
++def _run_text_stream(tok, text: str, chunk: int) -> dict:
++    """Stream by characters with no token ids: the text path of the parser."""
++    r = _req(stream=True)
++    tp = DeepSeekV41EngineToolParser(
++        tok, r.tools, chat_template_kwargs={"thinking": False}
++    )
++    prev_text, calls = "", {}
++
++    def absorb(d):
++        for tc in (d.tool_calls if d is not None else None) or []:
++            c = calls.setdefault(tc.index, {"name": None, "args": ""})
++            if tc.function and tc.function.name:
++                c["name"] = tc.function.name
++            if tc.function and tc.function.arguments:
++                c["args"] += tc.function.arguments
++
++    for i in range(0, len(text), chunk):
++        cur_text = text[: i + chunk]
++        absorb(
++            tp.extract_tool_calls_streaming(
++                prev_text, cur_text, cur_text[len(prev_text) :], [], [], [], r
++            )
++        )
++        prev_text = cur_text
++    if hasattr(tp, "finish_streaming"):
++        absorb(tp.finish_streaming())
++    out = []
++    for k in sorted(calls):
++        a, ok = _parsed(calls[k]["args"])
++        out.append({"name": calls[k]["name"], "args": a, "json_ok": ok})
++    return {"calls": out}
++
++
++@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 7, 11])
++def test_text_stream_holds_back_next_head_after_missing_closer(
++    tokenizer, chunk: int
++) -> None:
++    # The first value holds a ">" and its closer is missing, so the next head is
++    # the only thing that ends it. No chunking may leak that head into the value.
++    text = (
++        f'{S}\n{IS}write_file">\n{PS} name="path" string="true">a > b.txt\n'
++        f'{_p("content", "hi")}{IE}\n{E}'
++    )
++    st = _run_text_stream(tokenizer, text, chunk)
++    assert st["calls"] == [
++        {
++            "name": "write_file",
++            "args": {"path": "a > b.txt\n", "content": "hi"},
++            "json_ok": True,
++        }
++    ]
++
++
+ @pytest.mark.parametrize("case_name", sorted(REASONING_CASES))
+ def test_reasoning_unchanged_with_dsml_closers(tokenizer, case_name: str) -> None:
+     text = REASONING_CASES[case_name]
+diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
+index 3dbdecf21..474aeb607 100644
+--- a/vllm/parser/deepseek_v41.py
++++ b/vllm/parser/deepseek_v41.py
+@@ -118,6 +118,18 @@ def _find_value_end(raw: str, vstart: int, partial: bool) -> tuple[int, int] | N
+         pos = after  # literal closer inside the value; keep scanning
+ 
+ 
++def _open_value_end(raw: str, vstart: int) -> int:
++    """End of the open value that starts at vstart.
++
++    An unfinished next parameter tag (the tag's start with no ``>`` after it) is
++    held back, as stock's ``_match_open_param`` does. Once that head completes, the
++    value ends where the tag began, and argument text already streamed cannot be
++    taken back.
++    """
++    cut = raw.find(DSML_PARAM_START, max(vstart, raw.rfind(">") + 1))
++    return len(raw) if cut < 0 else cut
++
++
+ def _store(params: dict, name: str, is_str: str | None, value: str, partial: bool):
+     if is_str == "true":
+         params[name] = value
+@@ -142,7 +154,7 @@ def _structural_dsml_arg_converter(raw_args: str, partial: bool) -> str:
+         found = _find_value_end(raw_args, m.end(), partial)
+         if found is None:
+             if partial:
+-                value = raw_args[m.end():]
++                value = raw_args[m.end():_open_value_end(raw_args, m.end())]
+                 if is_str == "true":
+                     params[name] = value
+                 else:
+@@ -181,6 +193,10 @@ def _structural_open_value_extender(raw_args: str) -> ArgValueExtender | None:
+         return None
+     if head.group(2) != "true" or head.group(1) in names:
+         return None
++    if _open_value_end(raw_args, head.end()) < len(raw_args):
++        # The converter is holding back an unfinished tag: appending the next
++        # delta to the streamed value would skip the held text.
++        return None
+     return _dsml_open_value_extender(raw_args, DSML_PARAM_START, DSML_PARAM_CLOSE)
+ 
+ 
+-- 
+2.43.0
+

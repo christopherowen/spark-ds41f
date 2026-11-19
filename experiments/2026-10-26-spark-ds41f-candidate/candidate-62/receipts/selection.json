@@ -14,11 +14,11 @@
   "tp7-switched",
   "tp8-switched"
  ],
- "purpose": "candidate carrying over candidate-61-r2's all-shape hardware qualification benchmarks while integrating host Python PRs, five Python-only vLLM fixes (0823..0827), and the strictly default-off opt-in VLLM_DS41_LSA=1 FP8 group32 dominance upgrade (0828)",
+ "purpose": "candidate carrying over candidate-61-r2's all-shape hardware qualification benchmarks while integrating host Python PRs, five Python-only vLLM fixes (0823..0827), and the strictly default-off opt-in VLLM_DS41_LSA=1 FP8 group32 dominance upgrade (0828), and a streaming fix to 0824's tool-argument parser (0829)",
  "base": "candidate-61-r2",
  "base_experiment": "experiments/2026-11-16-c61-decode",
- "stack_tree": "b6acfcc12b3a23fde43d28dab1c9f57dc5bcfe01",
- "stack_head": "45ec62399b1e9265564b075cdc614f5e3e404dee",
+ "stack_tree": "8fc99ca7546c5c538f0fe64e7c82954f1d2d7ae0",
+ "stack_head": "9b251a1860e7e9e123aaf718d15f499a2beb6738",
  "host_python_prs": [
   {
    "pr": 1224,
@@ -98,6 +98,16 @@
    "opt_in_env": "VLLM_DS41_LSA=1",
    "declared_output_change": "none when VLLM_DS41_LSA is unset or 0 (default across all cluster shapes): 68-byte index KV cache, no summarize_blocks or QueryReusePlan declaration/JIT compilation (jit_new_files = 0), no summary writes, IndexerV41Plan path unchanged",
    "acts_on_deployment": "inert when VLLM_DS41_LSA is unset (all candidate-62 profiles). When VLLM_DS41_LSA=1 is explicitly enabled, replaces BF16 block-8 mean summaries (STATE_BYTES=100) with FP8 E4M3 group-32 dominance summaries (0.85 * mean + 0.15 * k*, STATE_BYTES=84) and routes r=1 decode at score_width >= 262144 through PageShortlistPlan; backed by #954, #1014, #1017, and #976"
+  },
+  {
+   "patch": "0829-fix-dsv41-hold-back-an-unfinished-next-parameter-tag.patch",
+   "pr": 1236,
+   "sha256": "d9f468da7b6ab9338e069ad2befe2012fee7764e06fe9a5fa9063a39266a41c4",
+   "kind": "fix",
+   "jit_new_files": 0,
+   "kernel_change": false,
+   "declared_output_change": "streamed tool-call arguments on the text path (no token ids) while a next parameter tag is unfinished: the tag is held back again, as before 0824; complete arguments and the token-provenance path are unchanged",
+   "acts_on_deployment": "acts on DS4.1 tool calls: fixes a gate failure 0824 introduced (tests/parser/engine/test_deepseek_v41.py::test_partial_tag_after_gt_is_held_back), found by candidate-62's release tests on 2026-11-19"
   }
  ],
  "benchmark_carry_over": {
