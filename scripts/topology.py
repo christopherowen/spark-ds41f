@@ -46,8 +46,9 @@ def transport(cluster: dict) -> str | None:
 
 # sparknet's one-shot transports and their one-shot topology. They are always
 # on (no enable switch).
+LOCAL = "local"
 ONE_SHOT = {"oneshot-direct": "direct", "oneshot-ring4": "ring4", "oneshot-switched": "direct"}
-TRANSPORTS = (*ONE_SHOT, "nccl-ring", "nccl-switched")
+TRANSPORTS = (*ONE_SHOT, "nccl-ring", "nccl-switched", LOCAL)
 
 def switched(mode: str | None) -> bool:
     return mode in ("oneshot-switched", "nccl-switched")
@@ -106,7 +107,7 @@ def fabric_map(nodes: dict, *, strip_gid_index: bool = False) -> dict:
 def node_environment(cluster: dict, node: dict) -> dict[str, str]:
     base = {key: str(value) for key, value in cluster["environment"].items()}
     mode = transport(cluster)
-    if mode in TRANSPORTS:
+    if mode in TRANSPORTS and mode != LOCAL:
         sparknet = fabric(cluster)
         pinned = gid_pinned(cluster)
         clean_node = fabric_node(node, strip_gid_index=True)
@@ -146,6 +147,8 @@ def control_ip(node: dict) -> str:
 
 def hcas(cluster: dict, node: dict) -> list[str]:
     """The node's RDMA devices for the configured transport."""
+    if transport(cluster) == LOCAL:
+        return []
     return fabric(cluster).nodes.nccl_hcas(fabric_node(node), transport(cluster))
 
 
@@ -170,7 +173,10 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 errors.append(f"{node.get('name')}: roce_gid_index must be a nonnegative integer")
     count = len(entries)
     mode = transport(cluster)
-    if switched(mode):
+    if mode == LOCAL:
+        if count != 1:
+            errors.append(f"local deployment requires 1 node, got {count}")
+    elif switched(mode):
         if not 2 <= count <= 8:
             errors.append(f"switched deployment requires 2 to 8 nodes, got {count}")
     elif count not in (2, 3, 4):
@@ -181,6 +187,15 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                       "rocenante-direct, which is retired (docs/switchless-topology.md)")
     elif mode not in TRANSPORTS:
         errors.append(f"unknown fabric transport {mode!r}")
+    elif mode == LOCAL:
+        if count == 1:
+            head_node = entries[0]
+            if not head_node.get("head"):
+                errors.append("single-node deployment requires head=true on rank 0")
+            if head_node.get("rank") != 0:
+                errors.append("single-node deployment requires rank=0")
+            if not head_node.get("name") or not head_node.get("management_ip"):
+                errors.append("single-node deployment requires name and management_ip")
     else:
         sparknet = fabric(cluster)
         errors.extend(sparknet.nodes.problems(fabric_map(nodes, strip_gid_index=True), mode))

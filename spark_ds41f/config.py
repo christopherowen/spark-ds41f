@@ -78,6 +78,7 @@ NODE_MAP_EXAMPLES = {
     "config/nodes-switched6.local.json": "config/examples/nodes-switched6.json",
     "config/nodes-switched7.local.json": "config/examples/nodes-switched7.json",
     "config/nodes-switched8.local.json": "config/examples/nodes-switched8.json",
+    "config/nodes-tp1.local.json": "config/examples/nodes-tp1.json",
 }
 
 

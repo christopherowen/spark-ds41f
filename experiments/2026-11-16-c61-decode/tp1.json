@@ -1,0 +1,98 @@
+{
+  "notes": "candidate-61-r2 at tp1-local: vLLM 0001..0822 (tree db2b19659c29), RM nvidiactl carve-out, Sparknet/PyNCCL/split-group NCCL disabled, uni executor, zero-copy io_uring expert slots (104/48, protect 24), 8.00 GiB KV, 256K ctx",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tp3.json"
+  },
+  "set": {
+    "nodes": 1,
+    "nodes_config": "config/nodes-tp1.local.json",
+    "fabric": {
+      "transport": "local"
+    },
+    "container": {
+      "image": "spark-ds41f:candidate-61-r2",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "db2b19659c29473706613e51c14b604f6b766064",
+        "local.spark-ds41f.tilelang.tree": "741806c7357102130a149cdcae2a5f22678eab67",
+        "local.spark-ds41f.sparknet.tree": "e06f6a0675cb66638231d2c68948a2b315b69b07"
+      },
+      "docker_run_args": [
+        "--network=host",
+        "--ipc=host",
+        "--gpus=all",
+        "--cap-add=IPC_LOCK",
+        "--ulimit=memlock=-1:-1",
+        "--ulimit=stack=67108864:67108864",
+        "--ulimit=core=0",
+        "--security-opt=seccomp=unconfined",
+        "--security-opt=label=disable",
+        "--shm-size=16g",
+        "--memory=112g",
+        "--memory-swap=112g",
+        "--cpuset-cpus=5-9,15-19"
+      ]
+    },
+    "upstreams_config": "experiments/2026-11-16-c61-decode/upstreams.lock.json",
+    "environment": {
+      "NCCL_IB_DISABLE": "1",
+      "NCCL_P2P_DISABLE": "1",
+      "NCCL_SHM_DISABLE": "1",
+      "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS": "1",
+      "VLLM_DISABLE_PYNCCL": "1",
+      "VLLM_DISTRIBUTED_USE_SPLIT_GROUP": "0",
+      "VLLM_DS41_EXPERT_SLOTS": "104",
+      "VLLM_DS41_EXPERT_DYNAMIC_SLOTS": "48",
+      "VLLM_DS41_EXPERT_CACHE_DIR": "/cache/ds41_expert_slots",
+      "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": "24",
+      "VLLM_MAX_IMAGE_PIXELS": "16777216"
+    }
+  },
+  "unset": [
+    "environment.NCCL_ALGO",
+    "environment.NCCL_BUFFSIZE",
+    "environment.NCCL_CROSS_NIC",
+    "environment.NCCL_CUMEM_ENABLE",
+    "environment.NCCL_DEBUG",
+    "environment.NCCL_DEBUG_SUBSYS",
+    "environment.NCCL_IB_ADDR_FAMILY",
+    "environment.NCCL_IB_GID_INDEX",
+    "environment.NCCL_IB_MERGE_NICS",
+    "environment.NCCL_IB_ROCE_VERSION_NUM",
+    "environment.NCCL_IB_SUBNET_AWARE_ROUTING",
+    "environment.NCCL_IGNORE_CPU_AFFINITY",
+    "environment.NCCL_LL128_BUFFSIZE",
+    "environment.NCCL_MAX_NCHANNELS",
+    "environment.NCCL_MIN_NCHANNELS",
+    "environment.NCCL_MIN_TRAFFIC_PER_CHANNEL",
+    "environment.NCCL_NET",
+    "environment.NCCL_NET_PLUGIN",
+    "environment.NCCL_NVLS_ENABLE",
+    "environment.NCCL_P2P_NET_CHUNKSIZE",
+    "environment.NCCL_PROTO",
+    "environment.NCCL_SOCKET_IFNAME",
+    "environment.NCCL_SWITCHLESS_BIDIRECTIONAL",
+    "environment.NCCL_THREAD_THRESHOLDS",
+    "environment.SPARKNET_ROCE_ALLGATHER_MAX_BYTES",
+    "environment.SPARKNET_ROCE_ALLREDUCE_CAPACITY_BYTES",
+    "environment.SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES",
+    "environment.SPARKNET_ROCE_MAX_COLLECTIVE_BYTES",
+    "environment.SPARKNET_ROCE_PROXY_CPU",
+    "environment.SPARKNET_ROCE_TIMEOUT_MS"
+  ],
+  "serve_options": {
+    "--tensor-parallel-size": "1",
+    "--nnodes": "1",
+    "--distributed-executor-backend": "uni",
+    "--max-model-len": "262144",
+    "--max-num-seqs": "4",
+    "--max-num-batched-tokens": "4096",
+    "--kv-cache-memory-bytes": "8589934592",
+    "--max-cudagraph-capture-size": "24",
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":1,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}",
+    "--compilation-config": "{\"cudagraph_mode\":\"PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24]}",
+    "--prefix-cache-retention-interval": "8192",
+    "--long-prefill-token-threshold": "4072",
+    "--mm-processor-cache-gb": "0",
+    "--limit-mm-per-prompt": "{\"image\":67}"
+  }
+}

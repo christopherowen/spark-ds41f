@@ -1279,6 +1279,25 @@ class NewUserOnboardingTest(unittest.TestCase):
         self.assertTrue(any("ssh_host is no longer used because name is now the SSH target" in e for e in errors))
         self.assertFalse(any("unknown fields" in e for e in errors))
 
+    def test_local_tp1_topology_problems(self) -> None:
+        import copy
+
+        cluster = spark.read_cluster("experiments/2026-11-16-c61-decode/tp1.json")
+        nodes = spark.read_json("config/examples/nodes-tp1.json")
+        cluster["distributed"]["master_addr"] = nodes["nodes"][0]["management_ip"]
+        self.assertEqual(spark.topology.problems(cluster, nodes), [])
+        self.assertEqual(spark.topology.hcas(cluster, nodes["nodes"][0]), [])
+
+        two_nodes = copy.deepcopy(nodes)
+        two_nodes["nodes"].append({"name": "spark-2", "rank": 1, "management_ip": "192.0.2.2", "head": False})
+        errors = spark.topology.problems(cluster, two_nodes)
+        self.assertTrue(any("local deployment requires 1 node, got 2" in e for e in errors))
+
+        with_sparknet = copy.deepcopy(cluster)
+        with_sparknet["environment"]["SPARKNET_ROCE_TIMEOUT_MS"] = "10000"
+        errors = spark.topology.problems(with_sparknet, nodes)
+        self.assertTrue(any("local does not run sparknet; SPARKNET_ROCE_* settings do not apply" in e for e in errors))
+
     def test_docker_permission_denied_points_to_docker_group(self) -> None:
         stderr = (
             "permission denied while trying to connect to the Docker daemon socket at "
