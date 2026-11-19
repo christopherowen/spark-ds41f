@@ -706,7 +706,7 @@ On the triangle (qualified 2026-10-30, 6,144-token budget): decode 2.3-3.8% fast
 tok/s at one stream, 158.6 output tok/s at eight), prefill 4.1-7.0% faster from 32K to 500K;
 a 131K prefill beside 3 or 6 streams with short requests waiting is 3.7-4.6% slower, while
 those requests' first token comes 2-8x sooner; greedy 256/256 identical. The recipe and lock are frozen in
-[releases/spark-ds41f-1030](releases/spark-ds41f-1030/); spark-ds41f-1025's, the rollback, in
+[releases/spark-ds41f-1030](releases/spark-ds41f-1030/); spark-ds41f-1025's, its rollback, in
 [releases/spark-ds41f-1025](releases/spark-ds41f-1025/).
 
 Before spark-ds41f-1030, production was **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the

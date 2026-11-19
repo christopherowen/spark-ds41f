@@ -1,8 +1,45 @@
 # Current state
 
-Production is **spark-ds41f-1030** ([config/cluster.json](../config/cluster.json), frozen in
+Production is **spark-ds41f-1107** ([config/cluster.json](../config/cluster.json), frozen in
+[releases/spark-ds41f-1107](../releases/spark-ds41f-1107/)), serving DeepSeek-V4.1-Flash-1017 at
+1,048,576 tokens on the `tp4-ring` shape (dgx1-dgx4). It was promoted 2026-11-07 as
+[`2026-11-07-spark-ds41f-1107`](../manifests/baselines/2026-11-07-spark-ds41f-1107.json)
+([release record](../experiments/2026-10-26-spark-ds41f-candidate/README.md),
+[release notes](../experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)): image
+`spark-ds41f:1107` (`sha256:3f32a962ce04`, built on sp1 and copied to sp2-sp8 and dgx1-dgx4, one
+image ID on all 12 nodes), spark-ds41f-1030's sources with vLLM 0568-0761 (641 active patches,
+series [1107/vllm/series](../experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series)),
+TileLang `2123e412ce22` with 13 SM120/SM121 patches, and sparknet `1fd6a1fbd8dc` (single-slot
+one-shot RoCE all-reduce cap). It is the first release qualified on all eight supported shapes:
+`tp4-ring` and `tp3-triangle` on dgx1-dgx4, and `tp3-switched` through `tp8-switched` on sp1-sp8.
+Among its changes: the TileLang runtime closure and serving contract; per-type L2 prefetch;
+a context-aware chunk step-down at 256K and up and a decode interleave after a 1 s prefill stall;
+loop detection on by default in every phase, including requests with thinking off (0656, 0674,
+0679); CopyDrafter drafts beside DSpark by default (0688) with caller-stream continuation and
+expected-yield pruning (0744-0745); DSpark online confidence calibration with margin and depth
+pruning; the indexer's `wq_b` RoPE and MXFP4 epilogue fused; selective 12-bit packing of the KV
+compressor's BF16 weights; multi-CTA packed and cached disk Engram rows; a row-parallel vision
+tower with multi-image packing; TP2-TP8 uneven-shard padding and cross-topology parity; TP3's
+6-channel bidirectional NCCL ring; and allocator and heap flushes during startup and graph
+capture (0761). Against spark-ds41f-1030 on the ring: paired decode +5.30% at c16 (272.86 tok/s),
++4.04% at c8 (207.45 tok/s), +4.92% at one stream (82.62 tok/s); engine decode grid -14.36%
+geometric mean (21.48 vs 25.09 ms, 20/20 shapes faster); prefill +8.34% to +17.05% from 32K to 1M
+(8,508 / 8,657 / 8,261 / 7,460 / 6,012 tok/s); sampled decode +4.56% to +6.40%; a short request's
+first token p50 during a 131K prefill beside 3 and 11 streams 3.30 to 1.02 s and 3.59 to 1.44 s;
+greedy 256/256 identical. `tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-11-07-spark-ds41f-1107-tp4](../manifests/suites/2026-11-07-spark-ds41f-1107-tp4/).
+On the triangle: paired decode +1.70% at c8, +2.04% at c4, +2.59% at one stream (64.28 tok/s);
+engine decode grid -15.36% (21.29 vs 25.15 ms, 15/15 shapes faster); prefill +2.99% to +10.55%
+from 32K to 1M; sampled decode +1.92% to +2.28%; the same first token beside 3 and 6 streams 2.03
+to 1.07 s and 9.59 to 1.18 s; greedy 256/256 identical. `tp3-triangle`'s `benchmark_reference` is
+[manifests/suites/2026-11-07-spark-ds41f-1107-tp3](../manifests/suites/2026-11-07-spark-ds41f-1107-tp3/);
+each switched shape's is its `manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched*.json`
+run. spark-ds41f-1030's recipe and lock, the rollback, are frozen in
+[releases/spark-ds41f-1030](../releases/spark-ds41f-1030/) (image `spark-ds41f:1030`).
+
+Before spark-ds41f-1107 production was **spark-ds41f-1030** (frozen in
 [releases/spark-ds41f-1030](../releases/spark-ds41f-1030/)), serving DeepSeek-V4.1-Flash-1017 at
-1,048,576 tokens on the `tp4-ring` shape (dgx1-dgx4). It was promoted 2026-10-30 as
+1,048,576 tokens on the `tp4-ring` shape (dgx1-dgx4) from 2026-10-30 until 2026-11-07. It was promoted 2026-10-30 as
 [`2026-10-30-spark-ds41f-1030`](../manifests/baselines/2026-10-30-spark-ds41f-1030.json)
 ([release record](../experiments/2026-10-26-spark-ds41f-candidate/README.md),
 [release notes](../experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)): image
@@ -36,9 +73,9 @@ and the 6,144 budget; those requests' first token p50 16.6 to 2.0 s and 18.3 to 
 c16 +2.76%, c8 +2.41%, c1 +2.94%; greedy 256/256 identical, KL 4.2e-8. `tp3-triangle`'s
 `benchmark_reference` is
 [manifests/suites/2026-10-30-spark-ds41f-1030-tp3](../manifests/suites/2026-10-30-spark-ds41f-1030-tp3/).
-spark-ds41f-1025's recipe and lock, the rollback, are frozen in
+spark-ds41f-1025's recipe and lock, its rollback, are frozen in
 [releases/spark-ds41f-1025](../releases/spark-ds41f-1025/) (image
-`spark-ds41f:19f2c20ed4d6-next-6`, still on every node).
+`spark-ds41f:19f2c20ed4d6-next-6`).
 
 Before spark-ds41f-1030 production was **spark-ds41f-1025**, serving
 DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens. From 2026-10-26 21:46 CET it ran the
