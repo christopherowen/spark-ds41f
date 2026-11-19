@@ -1,0 +1,906 @@
+From 335b88012dcb800b534824934b98356db750e0ef Mon Sep 17 00:00:00 2001
+From: James Meadlock <jmeadlock@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:19:25 -0600
+Subject: [PATCH 824/826] fix(dsv41): keep DSML closers inside tool arguments
+ unless structure follows
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-60's series applied through 0816.
+
+Rationale: DSML has no escaping. Candidate-60's token-provenance rule (0643,
+#948/#949) keeps a quoted closer spelled in ordinary pieces as text, but when
+the model emits the quoted closer as the genuine DSML token (as reported on
+#876), a string argument that contains </｜DSML｜ parameter>, invoke> or
+calls> is still cut there: the argument is dropped or truncated and streaming
+can end with unterminated JSON. Add a structural lookahead in the TOOL_ARGS
+state: a parameter closer ends a value only when whitespace and a new
+parameter head, or the end of the call's arguments, follow; an invoke/calls
+closer ends a call only once its arguments are closed, and is otherwise held
+until the next tokens show whether it was structure (end of stream resolves it
+as structure). The provenance rule is kept unchanged and runs first.
+Reasoning and content parsing are unchanged. Every closer kept as text is
+logged. VLLM_DSV41_STRUCTURAL_DSML=0 restores the previous behaviour; if the
+engine hooks it relies on change shape it logs an error and stays off.
+Rule after an idea by Hector Isaza (ecohash-co's report); this is an
+independent implementation, no code copied.
+
+Quality implications: Tool-call arguments only. Six cases that previously cut
+or dropped an argument are now exact (B, C, D, E, E2, J in the matrix).
+Documented changes: a value whose parameter closer the model omitted before
+</｜DSML｜ invoke> is kept rather than dropped (N, N2); a value ending with a
+literal parameter closer is kept whole (R). A value that contains a parameter
+closer followed by whitespace and a parameter head is still read as two
+arguments; nothing can tell that apart from real structure. All other cases
+match the previous parser byte for byte, streamed and non-streamed.
+
+Tests: 25-case matrix x (non-streaming, four chunkings, two reasoning modes)
+against the real DeepSeek-V4.1-Flash-1017 tokenizer, run inside the
+candidate-60 image (CPU only): stream equals non-stream, streamed JSON always
+valid, kill switch byte-identical to the previous parser, and the previous
+parser fails the six target cases (instrument check). ALL GATES PASS. Live:
+served on a 4x GB10 TP4 lane with the candidate-60 image; tool-call probe
+(plain and DSML-quoting arguments, streamed and not) passes.
+
+Upstream status: local patch proposal.
+---
+ .../test_deepseek_v41_structural_closers.py   | 325 ++++++++++++++
+ vllm/parser/deepseek_v41.py                   | 423 +++++++++++++++++-
+ 2 files changed, 729 insertions(+), 19 deletions(-)
+ create mode 100644 tests/parser/test_deepseek_v41_structural_closers.py
+
+diff --git a/tests/parser/test_deepseek_v41_structural_closers.py b/tests/parser/test_deepseek_v41_structural_closers.py
+new file mode 100644
+index 000000000..d656b77e0
+--- /dev/null
++++ b/tests/parser/test_deepseek_v41_structural_closers.py
+@@ -0,0 +1,325 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Structural DSML closer lookahead for DeepSeek V4.1 tool arguments."""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++import vllm.parser.deepseek_v41 as v41mod
++from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++from vllm.parser.engine.registered_adapters import (
++    DeepSeekV41ParserReasoningAdapter,
++)
++from vllm.tokenizers import get_tokenizer
++from vllm.tool_parsers.deepseekv41_engine_tool_parser import (
++    DeepSeekV41EngineToolParser,
++)
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
++TOOLS = [
++    {
++        "type": "function",
++        "function": {
++            "name": "write_file",
++            "description": "write a file",
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "path": {"type": "string"},
++                    "content": {"type": "string"},
++                },
++                "required": ["path", "content"],
++            },
++        },
++    },
++    {
++        "type": "function",
++        "function": {
++            "name": "set_cfg",
++            "description": "set config",
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "n": {"type": "integer"},
++                    "cfg": {"type": "object"},
++                    "tag": {"type": "string"},
++                },
++                "required": ["n"],
++            },
++        },
++    },
++]
++
++S, E = "<｜DSML｜ calls>", "</｜DSML｜ calls>"
++IS, IE = '<｜DSML｜ invoke name="', "</｜DSML｜ invoke>"
++PS, PE = "<｜DSML｜ parameter", "</｜DSML｜ parameter>"
++
++
++def _p(name: str, val: str, s: str | None = "true") -> str:
++    attr = f' string="{s}"' if s is not None else ""
++    return f'{PS} name="{name}"{attr}>{val}{PE}\n'
++
++
++def _wf(path: str, content: str) -> str:
++    return f'{IS}write_file">\n{_p("path", path)}{_p("content", content)}{IE}\n'
++
++
++CASES = {
++    "A_control": f"Writing it.\n\n{S}\n{_wf('a.txt', 'hello world')}{E}",
++    "B_value_holds_calls_closer": f"Writing it.\n\n{S}\n{_wf('dsml.md', 'The block ends with ' + E + ' on its own line.')}{E}",
++    "C_value_holds_param_closer": f"Writing it.\n\n{S}\n{_wf('dsml.md', 'A param ends with ' + PE + ' then more.')}{E}",
++    "D_value_holds_invoke_closer": f"Writing it.\n\n{S}\n{_wf('dsml.md', 'An invoke ends with ' + IE + ' then more.')}{E}",
++    "E_two_calls_first_holds_closer": f"{S}\n{_wf('one.md', 'see ' + E + ' here')}{_wf('two.txt', 'second')}{E}",
++    "E2_all_three_closers_multiline": f"{S}\n{_wf('doc.md', 'line1 ' + PE + chr(10) + 'line2 ' + IE + chr(10) + 'line3 ' + E + chr(10) + 'end')}{E}",
++    "F_orphan_closers_only": f"{IE}\n{E}",
++    "G_json_answer_with_tools": '{"city": "Paris", "temp_c": 21}',
++    "H_parallel_calls": f"{S}\n{_wf('a.txt', 'one')}{_wf('b.txt', 'two')}{E}",
++    "I_string_false_values": f'{S}\n{IS}set_cfg">\n{_p("n", "5", "false")}{_p("cfg", json.dumps({"a": [1, 2], "b": None}), "false")}{IE}\n{E}',
++    "J_string_false_json_holding_invoke_closer": f'{S}\n{IS}set_cfg">\n{_p("n", "7", "false")}{_p("cfg", json.dumps({"note": "a " + IE + " b"}, ensure_ascii=False), "false")}{IE}\n{E}',
++    "K_missing_string_attr": f'{S}\n{IS}set_cfg">\n{_p("n", "3", None)}{_p("tag", "plain", None)}{IE}\n{E}',
++    "L_omit_invoke_end": f'{S}\n{IS}write_file">\n{_p("path", "a.txt")}{_p("content", "hi")}{E}',
++    "M_omit_param_close_before_next_head": f'{S}\n{IS}write_file">\n{PS} name="path" string="true">a.txt\n{_p("content", "hi")}{IE}\n{E}',
++    "N_omit_param_close_then_invoke_end": f'{S}\n{IS}write_file">\n{_p("path", "a.txt")}{PS} name="content" string="true">hello\n{IE}\n{E}',
++    "N2_omit_param_close_then_invoke_end_eos": f'{S}\n{IS}write_file">\n{_p("path", "a.txt")}{PS} name="content" string="true">hello\n{IE}',
++    "O_truncated_mid_value": f'{S}\n{IS}write_file">\n{_p("path", "a.txt")}{PS} name="content" string="true">partial tex',
++    "O2_truncated_after_literal_closer": f'{S}\n{IS}write_file">\n{_p("path", "a.txt")}{PS} name="content" string="true">see {E} and then tru',
++    "Q_ambiguous_value_holds_closer_plus_head": f"{S}\n{_wf('x.md', 'a' + PE + chr(10) + PS + ' name=' + chr(34) + 'z' + chr(34) + ' string=' + chr(34) + 'true' + chr(34) + '>b')}{E}",
++    "R_value_ends_with_literal_param_closer": f"{S}\n{_wf('x.md', 'the tag is ' + PE)}{E}",
++    "T_text_after_block": f"{S}\n{_wf('a.txt', 'x')}{E}\ntrailing words",
++    "U_json_body": f'{S}\n{IS}write_file">\n{json.dumps({"path": "j.txt", "content": "json body"})}\n{IE}\n{E}',
++    "U2_json_body_holds_invoke_closer": f'{S}\n{IS}write_file">\n{json.dumps({"path": "j.txt", "content": "has " + IE + " inside"}, ensure_ascii=False)}\n{IE}\n{E}',
++}
++
++REASONING_CASES = {
++    "P_reasoning_mentions_closers": f"<think>I could write {E} or {IE} in prose here.</think>Plain answer, no tools.",
++    "P2_reasoning_then_call": f"<think>plan: use {PE} maybe</think>{S}\n{_wf('a.txt', 'ok')}{E}",
++}
++
++UNCHANGED = {
++    "A_control",
++    "F_orphan_closers_only",
++    "G_json_answer_with_tools",
++    "H_parallel_calls",
++    "I_string_false_values",
++    "K_missing_string_attr",
++    "L_omit_invoke_end",
++    "M_omit_param_close_before_next_head",
++    "O_truncated_mid_value",
++    "T_text_after_block",
++    "U_json_body",
++}
++TRUNCATION = {"O_truncated_mid_value", "O2_truncated_after_literal_closer"}
++FIXED = {
++    "B_value_holds_calls_closer": [
++        ("write_file", {"path": "dsml.md", "content": f"The block ends with {E} on its own line."})
++    ],
++    "C_value_holds_param_closer": [
++        ("write_file", {"path": "dsml.md", "content": f"A param ends with {PE} then more."})
++    ],
++    "D_value_holds_invoke_closer": [
++        ("write_file", {"path": "dsml.md", "content": f"An invoke ends with {IE} then more."})
++    ],
++    "E_two_calls_first_holds_closer": [
++        ("write_file", {"path": "one.md", "content": f"see {E} here"}),
++        ("write_file", {"path": "two.txt", "content": "second"}),
++    ],
++    "E2_all_three_closers_multiline": [
++        ("write_file", {"path": "doc.md", "content": f"line1 {PE}\nline2 {IE}\nline3 {E}\nend"})
++    ],
++    "J_string_false_json_holding_invoke_closer": [
++        ("set_cfg", {"n": 7, "cfg": {"note": f"a {IE} b"}})
++    ],
++}
++
++
++def _resolve_tokenizer_path() -> str | None:
++    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
++    snapshots = sorted(
++        hub.glob("models--deepseek-ai--DeepSeek-V4.1-Flash*/snapshots/*")
++    )
++    for candidate in (
++        *(["/models"] if Path("/models/tokenizer.json").is_file() else []),
++        *(str(s) for s in snapshots),
++        MODEL,
++    ):
++        try:
++            get_tokenizer(candidate, tokenizer_mode="deepseek_v41")
++            return candidate
++        except Exception:
++            if candidate == MODEL:
++                if os.environ.get("HF_HUB_OFFLINE") or os.environ.get(
++                    "TRANSFORMERS_OFFLINE"
++                ):
++                    return None
++                raise
++    return None
++
++
++@pytest.fixture(scope="module")
++def tokenizer():
++    path = _resolve_tokenizer_path()
++    if path is None:
++        pytest.skip(f"needs Hugging Face {MODEL} (offline)")
++    return get_tokenizer(path, tokenizer_mode="deepseek_v41")
++
++
++@pytest.fixture(scope="module")
++def tokenizer_path() -> str:
++    path = _resolve_tokenizer_path()
++    if path is None:
++        pytest.skip(f"needs Hugging Face {MODEL} (offline)")
++    return path
++
++
++def _req(stream: bool = False) -> ChatCompletionRequest:
++    return ChatCompletionRequest(
++        model="m",
++        messages=[{"role": "user", "content": "x"}],
++        tools=TOOLS,
++        stream=stream,
++    )
++
++
++def _parsed(args: str):
++    try:
++        return (json.loads(args) if args else None), True
++    except Exception:
++        return args, False
++
++
++def _run_nonstream(tok, text: str) -> dict:
++    r = _req()
++    tp = DeepSeekV41EngineToolParser(tok, r.tools, chat_template_kwargs={"thinking": False})
++    out = tp.extract_tool_calls(text, r)
++    calls = []
++    for c in out.tool_calls:
++        a, ok = _parsed(c.function.arguments)
++        calls.append({"name": c.function.name, "args": a, "json_ok": ok})
++    return {"tools_called": out.tools_called, "calls": calls, "content": out.content}
++
++
++def _run_stream(tok, text: str, chunk: int) -> dict:
++    r = _req(stream=True)
++    tp = DeepSeekV41EngineToolParser(tok, r.tools, chat_template_kwargs={"thinking": False})
++    ids = tok.encode(text, add_special_tokens=False)
++    prev_text, prev_ids, content, calls = "", [], "", {}
++
++    def absorb(d):
++        nonlocal content
++        if d is None:
++            return
++        if d.content:
++            content += d.content
++        for tc in d.tool_calls or []:
++            c = calls.setdefault(tc.index, {"name": None, "args": ""})
++            if tc.function and tc.function.name:
++                c["name"] = tc.function.name
++            if tc.function and tc.function.arguments:
++                c["args"] += tc.function.arguments
++
++    for i in range(0, len(ids), chunk):
++        cur_ids = ids[: i + chunk]
++        cur_text = tok.decode(cur_ids)
++        delta = cur_text[len(prev_text) :]
++        absorb(
++            tp.extract_tool_calls_streaming(
++                prev_text, cur_text, delta, prev_ids, cur_ids, ids[i : i + chunk], r
++            )
++        )
++        prev_text, prev_ids = cur_text, cur_ids
++    if hasattr(tp, "finish_streaming"):
++        absorb(tp.finish_streaming())
++    out = []
++    for k in sorted(calls):
++        a, ok = _parsed(calls[k]["args"])
++        out.append({"name": calls[k]["name"], "args": a, "json_ok": ok})
++    return {"calls": out, "content": content}
++
++
++def _calls_of(block: dict) -> list[tuple]:
++    return [(c["name"], c["args"]) for c in block.get("calls", [])]
++
++
++def test_structural_dsml_active_by_default() -> None:
++    assert v41mod._STRUCTURAL_ACTIVE is True
++
++
++@pytest.mark.parametrize("case_name", sorted(CASES))
++def test_structural_closer_matrix_case(tokenizer, case_name: str) -> None:
++    text = CASES[case_name]
++    ns = _run_nonstream(tokenizer, text)
++    for chunk in (1, 3, 7, 10**6):
++        st = _run_stream(tokenizer, text, chunk)
++        for call in st["calls"]:
++            if case_name in TRUNCATION:
++                continue
++            assert call["json_ok"], f"G1 {case_name} chunk={chunk}: {call['args']!r}"
++        if case_name not in TRUNCATION:
++            assert _calls_of(st) == _calls_of(ns), (
++                f"G2 {case_name} chunk={chunk}: stream {_calls_of(st)} != nonstream {_calls_of(ns)}"
++            )
++    if case_name in FIXED:
++        assert _calls_of(ns) == FIXED[case_name]
++    if case_name in ("N_omit_param_close_then_invoke_end", "N2_omit_param_close_then_invoke_end_eos"):
++        assert _calls_of(ns) == [("write_file", {"path": "a.txt", "content": "hello\n"})]
++    if case_name == "R_value_ends_with_literal_param_closer":
++        assert _calls_of(ns) == [("write_file", {"path": "x.md", "content": f"the tag is {PE}"})]
++
++
++@pytest.mark.parametrize("case_name", sorted(REASONING_CASES))
++def test_reasoning_unchanged_with_dsml_closers(tokenizer, case_name: str) -> None:
++    text = REASONING_CASES[case_name]
++    rp = DeepSeekV41ParserReasoningAdapter(
++        tokenizer, chat_template_kwargs={"thinking": True}
++    )
++    reasoning, content = rp.extract_reasoning(text, _req())
++    assert reasoning is not None
++    ns = _run_nonstream(tokenizer, text.split("</think>", 1)[1])
++    if case_name == "P_reasoning_mentions_closers":
++        assert "Plain answer" in (content or "")
++        assert _calls_of(ns) == []
++    else:
++        assert _calls_of(ns) == [("write_file", {"path": "a.txt", "content": "ok"})]
++
++
++def test_kill_switch_restores_previous_parser_and_fails_fixed(
++    tokenizer, tokenizer_path: str
++) -> None:
++    probe = f"""
++import json
++from vllm.tokenizers import get_tokenizer
++from tests.parser.test_deepseek_v41_structural_closers import (
++    CASES, UNCHANGED, FIXED, _run_nonstream, _run_stream, _calls_of,
++)
++tok = get_tokenizer({tokenizer_path!r}, tokenizer_mode="deepseek_v41")
++out = {{}}
++for k in sorted(UNCHANGED | set(FIXED)):
++    out[k] = {{
++        "ns": _run_nonstream(tok, CASES[k]),
++        "s1": _run_stream(tok, CASES[k], 1),
++    }}
++print(json.dumps(out))
++"""
++    env = dict(os.environ, VLLM_DSV41_STRUCTURAL_DSML="0")
++    proc = subprocess.run(
++        [sys.executable, "-c", probe],
++        env=env,
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++    kill = json.loads(proc.stdout)
++    for k in UNCHANGED:
++        assert kill[k]["ns"] == _run_nonstream(tokenizer, CASES[k])
++        assert kill[k]["s1"] == _run_stream(tokenizer, CASES[k], 1)
++    for k, expected in FIXED.items():
++        assert _calls_of(kill[k]["ns"]) != expected, f"instrument check failed on {k}"
+diff --git a/vllm/parser/deepseek_v41.py b/vllm/parser/deepseek_v41.py
+index 8ef0091bb..3dbdecf21 100644
+--- a/vllm/parser/deepseek_v41.py
++++ b/vllm/parser/deepseek_v41.py
+@@ -1,16 +1,43 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek V4.1 reasoning and spaced DSML tool calls."""
++"""DeepSeek V4.1 reasoning and spaced DSML tool calls.
++
++DSML has no escaping, so a tool argument that contains a DSML closer (a file *about*
++DSML) used to be cut at that closer: the argument was dropped or truncated, text after
++it vanished, and the streaming path emitted unterminated JSON.
++
++Rules (TOOL_ARGS state only; reasoning and content parsing are unchanged):
++  * a parameter closer ends a value only when what follows is whitespace and then a new
++    parameter head, or the end of the call's arguments.
++  * an invoke closer / calls closer ends a call only when its arguments are closed (they
++    end with a parameter closer, or hold no parameter). Otherwise the closer is held: it
++    becomes structure if the next thing is a calls closer, a new invoke head, or the end
++    of the stream (the open parameter is then closed, not dropped), and literal text
++    otherwise.
++  * candidate-60's token-provenance rule is kept unchanged: markup spelled in ordinary
++    pieces is text before the lookahead is asked, and only markup carrying the DSML token
++    is a candidate boundary at all. The lookahead additionally rejects a *genuine* closer
++    that is not followed by structure (the model can emit a quoted closer as the DSML
++    token itself, so provenance alone does not cover it).
++  * Every closer kept as text is logged.
++
++Kill switch: ``VLLM_DSV41_STRUCTURAL_DSML=0`` restores the previous behaviour. If the
++engine hooks this relies on change shape, the structural rule logs an error and stays
++off.
++"""
+ 
+ from __future__ import annotations
+ 
+ import functools
++import inspect
+ import json
++import os
+ from collections.abc import Iterable, Sequence
+ from dataclasses import replace
+ 
+ import regex as re
+ 
++from vllm.logger import init_logger
+ from vllm.parser.abstract_parser import DelegatingParser
+ from vllm.parser.deepseek_v4 import (
+     DeepSeekV4Parser,
+@@ -25,9 +52,11 @@ from vllm.parser.engine.adapters import (
+     ParserEngineReasoningAdapter,
+     ParserEngineToolAdapter,
+ )
+-from vllm.parser.engine.parser_engine_config import ParserEngineConfig
++from vllm.parser.engine.parser_engine_config import ArgValueExtender, ParserEngineConfig
+ from vllm.parser.metrics import record_tool_parser_invocation
+ 
++logger = init_logger(__name__)
++
+ DSML_ATOM = "｜DSML｜"
+ 
+ DSML_TOOL_START = "<｜DSML｜ calls>"
+@@ -42,6 +71,121 @@ _PARAM_HEAD_RE = re.compile(
+     re.escape(DSML_PARAM_START) + r'\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+ )
+ 
++OVERLAY_ID = "dsv41-structural-dsml-v1"
++
++# ── structural closers ──────────────────────────────────────
++
++# A complete next-parameter head start, as stock's missing-closer lookahead uses.
++_NEXT_HEAD_RE = re.compile(rf"{re.escape(DSML_PARAM_START)}\s+name=\"")
++# A parameter head still being written (partial mode only): starts with the tag and
++# has not reached its closing '>' yet.
++_HEAD_IN_PROGRESS_RE = re.compile(rf"{re.escape(DSML_PARAM_START)}(?:\s[^>]*)?$")
++# Offset of the DSML atom inside a parameter closer, for the synthetic closer below.
++_PARAM_CLOSE_ATOM = DSML_PARAM_CLOSE.find(DSML_ATOM)
++
++
++def _closer_is_structural(raw: str, after: int, partial: bool) -> bool:
++    follower = raw[after:].lstrip()
++    if not follower:
++        return True
++    if _NEXT_HEAD_RE.match(follower):
++        return True
++    if partial and (
++        DSML_PARAM_START.startswith(follower) or _HEAD_IN_PROGRESS_RE.match(follower)
++    ):
++        # Multi-token deltas can end a streaming tick inside the next head. Treat the
++        # closer as structure for this tick; if literal text follows later the value
++        # only grows, which keeps the streamed JSON prefix-stable.
++        return True
++    return False
++
++
++def _find_value_end(raw: str, vstart: int, partial: bool) -> tuple[int, int] | None:
++    """Return (value_end, resume_pos) for the value starting at vstart, or None
++    when the value is still open (no structural closer and no next head)."""
++    pos = vstart
++    head = _NEXT_HEAD_RE.search(raw, vstart)
++    while True:
++        c = raw.find(DSML_PARAM_CLOSE, pos)
++        if head is not None and (c < 0 or head.start() < c):
++            # Stock recovery: a value whose closer is missing ends at the next head.
++            return head.start(), head.start()
++        if c < 0:
++            return None
++        after = c + len(DSML_PARAM_CLOSE)
++        if _closer_is_structural(raw, after, partial):
++            return c, after
++        pos = after  # literal closer inside the value; keep scanning
++
++
++def _store(params: dict, name: str, is_str: str | None, value: str, partial: bool):
++    if is_str == "true":
++        params[name] = value
++        return
++    try:
++        params[name] = json.loads(value)
++    except (json.JSONDecodeError, ValueError):
++        if not partial:
++            params[name] = value
++        # Partial non-string values that do not parse yet are left out, as stock does.
++
++
++def _structural_dsml_arg_converter(raw_args: str, partial: bool) -> str:
++    """Stock's text-path converter, with the structural rule for closers."""
++    params: dict[str, object] = {}
++    pos = 0
++    while True:
++        m = _PARAM_HEAD_RE.search(raw_args, pos)
++        if not m:
++            break
++        name, is_str = m.group(1), m.group(2)
++        found = _find_value_end(raw_args, m.end(), partial)
++        if found is None:
++            if partial:
++                value = raw_args[m.end():]
++                if is_str == "true":
++                    params[name] = value
++                else:
++                    try:
++                        params[name] = json.loads(value)
++                    except (json.JSONDecodeError, ValueError):
++                        pass
++            break
++        vend, pos = found
++        _store(params, name, is_str, raw_args[m.end():vend], partial=False)
++    return json.dumps(params, ensure_ascii=False)
++
++
++def _structural_scan(raw_args: str) -> tuple[set[str], int]:
++    """Names of structurally complete parameters, and the end of the last one."""
++    names: set[str] = set()
++    last_end = 0
++    pos = 0
++    while True:
++        m = _PARAM_HEAD_RE.search(raw_args, pos)
++        if not m:
++            return names, last_end
++        found = _find_value_end(raw_args, m.end(), partial=False)
++        if found is None:
++            return names, last_end
++        _vend, pos = found
++        names.add(m.group(1))
++        last_end = pos
++
++
++def _structural_open_value_extender(raw_args: str) -> ArgValueExtender | None:
++    """Stock's text-path extender rule, decided with the structural rule."""
++    names, last_end = _structural_scan(raw_args)
++    head = _PARAM_HEAD_RE.search(raw_args, last_end)
++    if head is None or _find_value_end(raw_args, head.end(), partial=False) is not None:
++        return None
++    if head.group(2) != "true" or head.group(1) in names:
++        return None
++    return _dsml_open_value_extender(raw_args, DSML_PARAM_START, DSML_PARAM_CLOSE)
++
++
++# ── token provenance (candidate-60) ────────────────────────────────────────
++
+ 
+ def _token_origin_boundaries(
+     raw_args: str, spans: Iterable[tuple[int, int]]
+@@ -67,11 +211,12 @@ def _token_origin_boundaries(
+     return boundaries
+ 
+ 
+-def _token_origin_args(
+-    raw_args: str, partial: bool, spans: Iterable[tuple[int, int]]
++def _args_from_boundaries(
++    raw_args: str,
++    partial: bool,
++    boundaries: Sequence[tuple[int, int, re.Match | None]],
+ ) -> str:
+-    """Parse only parameter boundaries carrying a genuine DSML token atom."""
+-    boundaries = _token_origin_boundaries(raw_args, spans)
++    """Parse raw arguments from a boundary list (candidate-60's body)."""
+     params = {}
+     for index, (_, end, head) in enumerate(boundaries):
+         if head is None:
+@@ -93,6 +238,222 @@ def _token_origin_args(
+     return json.dumps(params, ensure_ascii=False)
+ 
+ 
++def _token_origin_args(
++    raw_args: str, partial: bool, spans: Iterable[tuple[int, int]]
++) -> str:
++    """Parse only parameter boundaries carrying a genuine DSML token atom."""
++    return _args_from_boundaries(
++        raw_args, partial, _token_origin_boundaries(raw_args, spans)
++    )
++
++
++def _structural_token_origin_boundaries(
++    raw_args: str, spans: Iterable[tuple[int, int]], partial: bool
++) -> list[tuple[int, int, re.Match | None]]:
++    """Token-origin boundaries, keeping a closer only when it is structural.
++
++    A closer whose DSML atom is genuine is still literal text when what follows
++    it is not whitespace + a new head and not the end of the call's arguments.
++    """
++    return [
++        entry
++        for entry in _token_origin_boundaries(raw_args, spans)
++        if entry[2] is not None or _closer_is_structural(raw_args, entry[1], partial)
++    ]
++
++
++def _open_extender_for_boundaries(
++    raw_args: str, boundaries: Sequence[tuple[int, int, re.Match | None]]
++):
++    """candidate-60's open-value test over a boundary list."""
++    if not boundaries or (head := boundaries[-1][2]) is None:
++        return None
++    names = {entry[2].group(1) for entry in boundaries[:-1] if entry[2]}
++    if head.group(2) != "true" or head.group(1) in names:
++        return None
++    return _dsml_open_value_extender(raw_args, DSML_PARAM_START, DSML_PARAM_CLOSE)
++
++
++# ── engine guard ───────────────────────────────────────────────────────────
++
++_ENABLED = os.environ.get("VLLM_DSV41_STRUCTURAL_DSML", "1") != "0"
++_V41Engine = None
++
++try:
++    from vllm.parser.engine.parser_engine_config import ParserState
++    from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
++
++    _REQUIRED = (
++        "_on_terminal",
++        "_emit_for_state",
++        "finish",
++        "reset",
++        "_process_scanner_items",
++        "_process_lex_tokens",
++        "_record_reasoning_tokens",
++    )
++    _missing = [a for a in _REQUIRED if not hasattr(StreamingParserEngine, a)]
++    if _missing:
++        raise AttributeError(f"StreamingParserEngine lacks {_missing}")
++    for _hook in ("_on_terminal", "_emit_for_state"):
++        if "token_id_spans" not in inspect.signature(
++            getattr(StreamingParserEngine, _hook)
++        ).parameters:
++            raise AttributeError(f"StreamingParserEngine.{_hook} lacks token_id_spans")
++
++    class _V41StructuralEngine(StreamingParserEngine):
++        """Keeps DSML closers that sit inside an open parameter value as text."""
++
++        _v41_args = ""
++        _v41_held = None
++        _v41_held_ws = ""
++
++        def reset(self, initial_state=None) -> None:
++            super().reset(initial_state)
++            self._v41_args = ""
++            self._v41_held = None  # (terminal, value, token_count, token_id_spans)
++            self._v41_held_ws = ""
++
++        def _v41_token_origin(self) -> bool:
++            return bool(self._ever_had_token_ids and self._has_composite_ids)
++
++        def _v41_args_closed(self) -> bool:
++            s = self._v41_args.rstrip()
++            return (not s) or (DSML_PARAM_START not in s) or s.endswith(DSML_PARAM_CLOSE)
++
++        def _v41_args_open_param(self) -> bool:
++            """An opened parameter head with no structural closer after it."""
++            s = self._v41_args
++            i = s.rfind(DSML_PARAM_START)
++            if i < 0:
++                return False
++            m = _PARAM_HEAD_RE.match(s, i)
++            if not m:
++                return False
++            return _find_value_end(s, m.end(), partial=False) is None
++
++        def _emit_for_state(self, text: str, token_count: int = 0, token_id_spans=()):
++            if self.state != ParserState.TOOL_ARGS:
++                return super()._emit_for_state(text, token_count, token_id_spans)
++            events = []
++            if self._v41_held is not None:
++                if not text.strip():
++                    self._v41_held_ws += text
++                    return events
++                events.extend(self._v41_release_literal())
++            self._v41_args += text
++            events.extend(
++                super()._emit_for_state(text, token_count, token_id_spans)
++            )
++            return events
++
++        def _v41_release_literal(self):
++            terminal, value, _, _ = self._v41_held
++            text = value + self._v41_held_ws
++            self._v41_held = None
++            self._v41_held_ws = ""
++            logger.info(
++                "%s: DSML %s inside a parameter value kept as text (call %d)",
++                OVERLAY_ID,
++                terminal,
++                self.tool_index,
++            )
++            self._v41_args += text
++            return StreamingParserEngine._emit_for_state(self, text, 0)
++
++        def _v41_resolve_structural(self):
++            terminal, value, token_count, token_id_spans = self._v41_held
++            ws = self._v41_held_ws
++            self._v41_held = None
++            self._v41_held_ws = ""
++            events = []
++            if self._v41_args_open_param():
++                # Model omitted the parameter closer: close it so the value is kept.
++                # Under token provenance the synthetic closer must carry the atom's
++                # span, or the token-origin converter would read it as text and drop
++                # the value; the structural decision is what marks it as structure.
++                spans = (
++                    ((_PARAM_CLOSE_ATOM, _PARAM_CLOSE_ATOM + len(DSML_ATOM)),)
++                    if self._v41_token_origin()
++                    else ()
++                )
++                self._v41_args += DSML_PARAM_CLOSE
++                events.extend(
++                    StreamingParserEngine._emit_for_state(
++                        self, DSML_PARAM_CLOSE, 0, spans
++                    )
++                )
++            events.extend(
++                super()._on_terminal(terminal, value, token_count, token_id_spans)
++            )
++            if ws:
++                events.extend(self._emit_for_state(ws, 0))
++            return events
++
++        def _on_terminal(
++            self, terminal: str, value: str, token_count: int = 0, token_id_spans=()
++        ):
++            if self.state == ParserState.TOOL_ARGS:
++                events = []
++                if self._v41_held is not None:
++                    if terminal in ("TOOL_END", "INVOKE_PREFIX"):
++                        events.extend(self._v41_resolve_structural())
++                        events.extend(
++                            self._on_terminal(
++                                terminal, value, token_count, token_id_spans
++                            )
++                        )
++                        return events
++                    events.extend(self._v41_release_literal())
++                if terminal in (
++                    "INVOKE_END",
++                    "TOOL_END",
++                ) and not self._v41_args_closed():
++                    self._v41_held = (terminal, value, token_count, token_id_spans)
++                    self._v41_held_ws = ""
++                    return events
++                events.extend(
++                    self._v41_on_terminal_tracked(
++                        terminal, value, token_count, token_id_spans
++                    )
++                )
++                return events
++            return self._v41_on_terminal_tracked(
++                terminal, value, token_count, token_id_spans
++            )
++
++        def _v41_on_terminal_tracked(
++            self, terminal, value, token_count, token_id_spans
++        ):
++            before = self.state
++            events = super()._on_terminal(
++                terminal, value, token_count, token_id_spans
++            )
++            if before != ParserState.TOOL_ARGS and self.state == ParserState.TOOL_ARGS:
++                self._v41_args = ""
++                self._v41_held = None
++                self._v41_held_ws = ""
++            return events
++
++        def finish(self):
++            if self._v41_held is None:
++                return super().finish()
++            events = self._process_scanner_items(self._scanner.flush_pending())
++            events.extend(self._process_lex_tokens(self._lexer.flush()))
++            if self._v41_held is not None and self.state == ParserState.TOOL_ARGS:
++                events.extend(self._v41_resolve_structural())
++            self._record_reasoning_tokens(events)
++            events.extend(super().finish())
++            return events
++
++    _V41Engine = _V41StructuralEngine
++except Exception as e:  # noqa: BLE001
++    logger.error("%s: structural DSML overlay disabled (stock behaviour): %s", OVERLAY_ID, e)
++    _V41Engine = None
++
++_STRUCTURAL_ACTIVE = _ENABLED and _V41Engine is not None
++
++
+ @functools.cache
+ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+     config = deepseek_v4_config(thinking=thinking)
+@@ -104,6 +465,15 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+         "PARAM_START": DSML_PARAM_START,
+         "PARAM_CLOSE": DSML_PARAM_CLOSE,
+     }
++    if _STRUCTURAL_ACTIVE:
++        converter = _structural_dsml_arg_converter
++    else:
++        converter = functools.partial(
++            _dsml_arg_converter,
++            param_re=_PARAM_RE,
++            partial_param_re=_PARTIAL_PARAM_RE,
++            param_start=DSML_PARAM_START,
++        )
+     return replace(
+         config,
+         name="deepseek_v41",
+@@ -119,12 +489,7 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
+             "DSML_ATOM": DSML_ATOM,
+         },
+         composite_token_id_terminals=dict.fromkeys(terminal_overrides, "DSML_ATOM"),
+-        arg_converter=functools.partial(
+-            _dsml_arg_converter,
+-            param_re=_PARAM_RE,
+-            partial_param_re=_PARTIAL_PARAM_RE,
+-            param_start=DSML_PARAM_START,
+-        ),
++        arg_converter=converter,
+         arg_value_extender=functools.partial(
+             _dsml_arg_value_extender,
+             param_re=_PARAM_RE,
+@@ -141,6 +506,10 @@ class DeepSeekV41Parser(DeepSeekV4Parser):
+     def __init__(self, tokenizer, tools=None, **kwargs) -> None:
+         super().__init__(tokenizer, tools, **kwargs)
+         self._arg_value_extender = self._extend_open_value
++        if _STRUCTURAL_ACTIVE:
++            self._engine = _V41Engine(
++                self.parser_engine_config, tokenizer, vocab=self.vocab
++            )
+ 
+     @property
+     def _token_origin(self) -> bool:
+@@ -156,7 +525,14 @@ class DeepSeekV41Parser(DeepSeekV4Parser):
+             return super()._convert_args(raw_args, partial)
+         slot = self._arg_slot(raw_args)
+         spans = slot.arg_token_id_spans if slot is not None else ()
+-        result = _token_origin_args(raw_args, partial, spans or ())
++        if _STRUCTURAL_ACTIVE:
++            result = _args_from_boundaries(
++                raw_args,
++                partial,
++                _structural_token_origin_boundaries(raw_args, spans or (), partial),
++            )
++        else:
++            result = _token_origin_args(raw_args, partial, spans or ())
+         return _unwrap_wrapper_args(
+             result, self._tools, slot.name if slot is not None else None
+         )
+@@ -164,18 +540,23 @@ class DeepSeekV41Parser(DeepSeekV4Parser):
+     def _extend_open_value(self, raw_args: str):
+         extender = self.parser_engine_config.arg_value_extender
+         assert extender is not None
++        if _STRUCTURAL_ACTIVE:
++            return self._structural_extend_open_value(raw_args)
+         if not self._token_origin:
+             return extender(raw_args)
+         # The text-based extender would trust parameter tags spelled in text.
+         slot = self._arg_slot(raw_args)
+         spans = slot.arg_token_id_spans if slot is not None else ()
+         boundaries = _token_origin_boundaries(raw_args, spans or ())
+-        if not boundaries or (head := boundaries[-1][2]) is None:
+-            return None
+-        names = {entry[2].group(1) for entry in boundaries[:-1] if entry[2]}
+-        if head.group(2) != "true" or head.group(1) in names:
+-            return None
+-        return _dsml_open_value_extender(raw_args, DSML_PARAM_START, DSML_PARAM_CLOSE)
++        return _open_extender_for_boundaries(raw_args, boundaries)
++
++    def _structural_extend_open_value(self, raw_args: str):
++        if not self._token_origin:
++            return _structural_open_value_extender(raw_args)
++        slot = self._arg_slot(raw_args)
++        spans = slot.arg_token_id_spans if slot is not None else ()
++        boundaries = _structural_token_origin_boundaries(raw_args, spans or (), True)
++        return _open_extender_for_boundaries(raw_args, boundaries)
+ 
+     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
+         self.set_prompt_token_ids(prompt_token_ids)
+@@ -317,3 +698,7 @@ class DeepSeekV41ServingParser(DelegatingParser):
+                 record_tool_parser_invocation(
+                     is_tool_called=is_tool_called, is_streaming=True, request=request
+                 )
++
++
++if _STRUCTURAL_ACTIVE:
++    logger.info("%s: structural DSML closers active", OVERLAY_ID)
+-- 
+2.43.0
+

@@ -1,0 +1,215 @@
+From 29b6f5b5f0ae19881063fba71eb8cfd6dd5267f9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:01:20 +0000
+Subject: [PATCH 825/826] fix(serve): bind SSE keep-alive done callback per
+ wait to prevent InvalidStateError
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-61-r2's series applied through 0824.
+
+Rationale: Under long idle streams in _keep_alive_stream (vllm/entrypoints/serve/utils/sse_keep_alive.py),
+when the keep-alive timer fires and resolves current_waiter to False in the same
+event-loop turn that next_task finishes, asyncio queues the shared _on_task_done
+callback onto loop._ready before remove_done_callback runs. After synchronously
+yielding the keep-alive comment and chunk and creating task_2 with a new
+current_waiter, loop._ready invokes the stale callback from task_1, resolving
+task_2's waiter to True while task_2 is still pending so next_task.result() raises
+asyncio.InvalidStateError: Result is not set. (#1210). Bind each wait's done
+callback to its own (waiter, watched_task) pair, guard the wait with
+while not next_task.done(), and always detach the callback in finally.
+
+Quality implications: None on model outputs or hot-path token latency. Preserves
+the single rolling call_at timer design for fast decode streaming and shields
+upstream generator cleanup on client disconnect.
+
+Tests: CPU pytest tests/entrypoints/serve/utils/test_sse_keep_alive_race.py in
+the candidate-61-r2 container covering the deterministic same-turn timer/completion
+race, fast-stream pass-through, and ASGI StreamingResponse disconnect cleanup.
+
+Upstream status: local fix for #1210.
+---
+ .../serve/utils/test_sse_keep_alive_race.py   | 114 ++++++++++++++++++
+ .../entrypoints/serve/utils/sse_keep_alive.py |  33 +++--
+ 2 files changed, 135 insertions(+), 12 deletions(-)
+ create mode 100644 tests/entrypoints/serve/utils/test_sse_keep_alive_race.py
+
+diff --git a/tests/entrypoints/serve/utils/test_sse_keep_alive_race.py b/tests/entrypoints/serve/utils/test_sse_keep_alive_race.py
+new file mode 100644
+index 000000000..e8d8859ba
+--- /dev/null
++++ b/tests/entrypoints/serve/utils/test_sse_keep_alive_race.py
+@@ -0,0 +1,114 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Regression tests for SSE keep-alive waiter binding and cleanup."""
++
++from __future__ import annotations
++
++import asyncio
++
++from starlette.responses import StreamingResponse
++
++from vllm.entrypoints.serve.utils.sse_keep_alive import (
++    SSE_KEEP_ALIVE_COMMENT,
++    with_sse_keep_alive,
++)
++
++
++def test_same_turn_timer_and_completion_does_not_resolve_next_waiter() -> None:
++    """Reproduce #1210 deterministically via same-turn timer expiry and task completion.
++
++    When _on_timer fires on the same turn that task_1 finishes, _on_timer sets
++    waiter_1 to False and task_1 queues its done callback on loop._ready before
++    remove_done_callback runs. Synchronous iteration through keep-alive and
++    chunk-1 creates task_2 and awaits waiter_2 before loop._ready drains. The
++    queued callback must remain bound to waiter_1 so waiter_2 is never resolved
++    prematurely.
++    """
++
++    async def scenario() -> None:
++        loop = asyncio.get_running_loop()
++        orig_call_at = loop.call_at
++        fut1: asyncio.Future[str] = loop.create_future()
++        fut2: asyncio.Future[str] = loop.create_future()
++        intercepted = False
++
++        def wrapped_call_at(when, callback, *args, **kwargs):
++            nonlocal intercepted
++            if not intercepted and getattr(callback, "__name__", "") == "_on_timer":
++                intercepted = True
++
++                def racer(*cb_args):
++                    callback(*cb_args)
++                    if not fut1.done():
++                        fut1.set_result("chunk-1")
++
++                return orig_call_at(when, racer, *args, **kwargs)
++            return orig_call_at(when, callback, *args, **kwargs)
++
++        async def gen():
++            yield await fut1
++            loop.call_later(0.01, fut2.set_result, "chunk-2")
++            yield await fut2
++
++        loop.call_at = wrapped_call_at  # type: ignore[method-assign]
++        try:
++            chunks = [chunk async for chunk in with_sse_keep_alive(gen(), 0.01)]
++        finally:
++            loop.call_at = orig_call_at  # type: ignore[method-assign]
++
++        assert intercepted
++        assert SSE_KEEP_ALIVE_COMMENT in chunks
++        assert [c for c in chunks if c != SSE_KEEP_ALIVE_COMMENT] == [
++            "chunk-1",
++            "chunk-2",
++        ]
++
++    asyncio.run(scenario())
++
++
++def test_streaming_response_disconnect_and_fast_stream() -> None:
++    async def scenario() -> None:
++        async def fast():
++            for i in range(4):
++                yield f"data: {i}\n\n"
++
++        out = [chunk async for chunk in with_sse_keep_alive(fast(), 1.0)]
++        assert out == [f"data: {i}\n\n" for i in range(4)]
++
++        finalized = asyncio.Event()
++        started = asyncio.Event()
++
++        async def slow():
++            try:
++                await asyncio.Event().wait()
++                yield "never"
++            finally:
++                finalized.set()
++
++        response = StreamingResponse(
++            content=with_sse_keep_alive(slow(), 10.0),
++            media_type="text/event-stream",
++        )
++
++        async def receive():
++            await started.wait()
++            return {"type": "http.disconnect"}
++
++        async def send(message):
++            if message["type"] == "http.response.start":
++                started.set()
++
++        await response(
++            {"type": "http", "asgi": {"spec_version": "2.3"}},
++            receive,
++            send,
++        )
++        assert finalized.is_set()
++        pending = [
++            t
++            for t in asyncio.all_tasks()
++            if t is not asyncio.current_task() and not t.done()
++        ]
++        assert pending == []
++
++    asyncio.run(scenario())
+diff --git a/vllm/entrypoints/serve/utils/sse_keep_alive.py b/vllm/entrypoints/serve/utils/sse_keep_alive.py
+index 600062423..3c3bc8085 100644
+--- a/vllm/entrypoints/serve/utils/sse_keep_alive.py
++++ b/vllm/entrypoints/serve/utils/sse_keep_alive.py
+@@ -125,10 +125,6 @@ async def _keep_alive_stream(
+         if current_waiter is not None and not current_waiter.done():
+             current_waiter.set_result(False)
+ 
+-    def _on_task_done(_: asyncio.Task[str]) -> None:
+-        if current_waiter is not None and not current_waiter.done():
+-            current_waiter.set_result(True)
+-
+     async def _run_cleanup() -> None:
+         if next_task is not None:
+             await _shield_wait(next_task)
+@@ -155,20 +151,33 @@ async def _keep_alive_stream(
+ 
+     try:
+         while True:
+-            if not next_task.done():
+-                current_waiter = loop.create_future()
+-                next_task.add_done_callback(_on_task_done)
+-                if next_task.done():
+-                    if not current_waiter.done():
+-                        current_waiter.set_result(True)
++            while not next_task.done():
++                watched_task = next_task
++                waiter = loop.create_future()
++
++                def _on_task_done(
++                    done_task: asyncio.Task[str],
++                    w: asyncio.Future[bool] = waiter,
++                    expected: asyncio.Task[str] = watched_task,
++                ) -> None:
++                    # Bind callback state per wait so an already-queued callback
++                    # from a prior task can never resolve a newer wait future.
++                    if done_task is expected and not w.done():
++                        w.set_result(True)
++
++                watched_task.add_done_callback(_on_task_done)
++                current_waiter = waiter
++                if watched_task.done():
++                    if not waiter.done():
++                        waiter.set_result(True)
+                 elif timer_handle is None:
+                     timer_handle = loop.call_at(last_activity + interval, _on_timer)
+                 try:
+-                    ready = await current_waiter
++                    ready = await waiter
+                 finally:
+                     current_waiter = None
++                    watched_task.remove_done_callback(_on_task_done)
+                 if not ready:
+-                    next_task.remove_done_callback(_on_task_done)
+                     last_activity = loop.time()
+                     yield SSE_KEEP_ALIVE_COMMENT
+                     if consumer_task is not None and consumer_task.cancelling():
+-- 
+2.43.0
+

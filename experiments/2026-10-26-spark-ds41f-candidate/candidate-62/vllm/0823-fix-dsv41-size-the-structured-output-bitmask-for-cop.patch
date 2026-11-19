@@ -1,0 +1,161 @@
+From 8b2e7fc1f2e29dcd0526f471859de750fa6db128 Mon Sep 17 00:00:00 2001
+From: Zee-B33 <202631651+Zee-B33@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:18:29 -0600
+Subject: [PATCH 823/826] fix(dsv41): size the structured-output bitmask for
+ copy-draft verify rows
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-60's series applied through 0816.
+
+Rationale: StructuredOutputManager sizes the grammar bitmask by
+num_speculative_tokens (5), but DSpark copy drafts verify up to
+num_verification_tokens (16) rows per request. Roughly 6-16 concurrent
+response_format requests whose answers copy long prompt spans overrun the
+bitmask; xgrammar's bounds check then raises inside grammar_bitmask() and the
+engine exits, failing every in-flight request (#1194). Size the bitmask by the
+larger of the two. Diagnosis and fix by Zee-B33 in #1194.
+
+Quality implications: None on outputs. The bitmask grows from 96 to 272 rows
+at 16 seats (about 1.6 MB to 4.4 MB at the 129,280-token vocabulary); the row
+layout and the slice sent to workers are unchanged. backend_outlines.py and
+backend_lm_format_enforcer.py also read num_speculative_tokens and are not
+changed.
+
+Tests: JSON-burst probe (two waves of 32 concurrent json_object/json_schema
+requests whose answers copy 40 records from the prompt): 64/64 HTTP 200,
+valid JSON, exact counts, engine alive, on three candidate-60 boots carrying
+this change as a file mount (4x GB10, switched, TP4, 32 seats), and 32/32 on
+a fourth. The crash itself was not
+reproduced here; reproductions are in #1194.
+
+Upstream status: local patch proposal; vllm-project/vllm has no
+num_verification_tokens.
+---
+ .../test_copy_draft_bitmask_rows.py           | 96 +++++++++++++++++++
+ vllm/v1/structured_output/__init__.py         |  7 ++
+ 2 files changed, 103 insertions(+)
+ create mode 100644 tests/v1/structured_output/test_copy_draft_bitmask_rows.py
+
+diff --git a/tests/v1/structured_output/test_copy_draft_bitmask_rows.py b/tests/v1/structured_output/test_copy_draft_bitmask_rows.py
+new file mode 100644
+index 000000000..ea656997f
+--- /dev/null
++++ b/tests/v1/structured_output/test_copy_draft_bitmask_rows.py
+@@ -0,0 +1,96 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from vllm.config import (
++    DeviceConfig,
++    SchedulerConfig,
++    StructuredOutputsConfig,
++    VllmConfig,
++)
++from vllm.config.model import ModelConfig
++from vllm.config.speculative import CopyDraftsConfig, SpeculativeConfig
++from vllm.sampling_params import SamplingParams, StructuredOutputsParams
++from vllm.v1.request import Request
++from vllm.v1.structured_output import StructuredOutputManager
++
++
++@pytest.mark.parametrize(
++    ("num_speculative_tokens", "copy_max_drafts", "expected_rows"),
++    [
++        (5, 16, 16 * (1 + 16)),
++        (5, None, 16 * (1 + 5)),
++        (8, 4, 16 * (1 + 8)),
++        (None, None, 16),
++    ],
++)
++def test_grammar_bitmask_sizes_for_verification_tokens(
++    num_speculative_tokens: int | None,
++    copy_max_drafts: int | None,
++    expected_rows: int,
++) -> None:
++    """Copy-drafting can verify more tokens than num_speculative_tokens."""
++    spec_config = (
++        None
++        if num_speculative_tokens is None
++        else SpeculativeConfig(
++            model="[ngram]",
++            num_speculative_tokens=num_speculative_tokens,
++        )
++    )
++    vllm_config = VllmConfig(
++        model_config=ModelConfig(tokenizer="gpt2"),
++        device_config=DeviceConfig(device="cpu"),
++        scheduler_config=SchedulerConfig(
++            max_num_seqs=16,
++            max_model_len=1024,
++            is_encoder_decoder=False,
++        ),
++        structured_outputs_config=StructuredOutputsConfig(backend="xgrammar"),
++        speculative_config=spec_config,
++    )
++    if (
++        vllm_config.speculative_config is not None
++        and copy_max_drafts is not None
++    ):
++        # Assign after VllmConfig.__post_init__ so CPU-only test config keeps CopyDraftsConfig.
++        vllm_config.speculative_config.copy_drafts = CopyDraftsConfig(
++            max_drafts=copy_max_drafts
++        )
++
++    manager = StructuredOutputManager(vllm_config)
++    backend = MagicMock()
++    backend.allocate_token_bitmask.side_effect = lambda n: torch.zeros(
++        (n, 4), dtype=torch.int32
++    )
++    backend.vocab_size = 128
++    manager.backend = backend
++
++    grammar = MagicMock()
++    grammar.is_terminated.return_value = False
++    structured_req = MagicMock()
++    structured_req._check_grammar_completion.return_value = True
++    structured_req.grammar = grammar
++    structured_req.reasoning_ended = True
++
++    request = Request(
++        request_id="req-copy-draft",
++        prompt_token_ids=[1, 2],
++        sampling_params=SamplingParams(
++            structured_outputs=StructuredOutputsParams(json='{"type": "object"}')
++        ),
++        pooling_params=None,
++    )
++    request.structured_output_request = structured_req
++
++    bitmask = manager.grammar_bitmask(
++        requests={request.request_id: request},
++        structured_output_request_ids=[request.request_id],
++        scheduled_spec_decode_tokens={request.request_id: []},
++    )
++    assert bitmask is not None
++    backend.allocate_token_bitmask.assert_called_once_with(expected_rows)
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index c1ac615cb..777da2ede 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -347,6 +347,13 @@ class StructuredOutputManager:
+ 
+         # Covers both speculative decoding and diffusion LLMs (canvas_length).
+         max_num_spec_tokens = self.vllm_config.num_speculative_tokens
++        spec_config = self.vllm_config.speculative_config
++        if spec_config is not None and getattr(
++            spec_config, "num_verification_tokens", None
++        ):
++            max_num_spec_tokens = max(
++                max_num_spec_tokens, spec_config.num_verification_tokens
++            )
+ 
+         if self._grammar_bitmask is None:
+             assert self.backend is not None
+-- 
+2.43.0
+

@@ -76,6 +76,7 @@ class RunningImageTest(unittest.TestCase):
                 "splash_problems", "idle_service_warnings", "nvme_coalescing_warnings",
                 "nvme_apst_warnings", "wireless_warnings", "fan_control_problems",
                 "roce_gid_findings", "node_glp_problems", "clock_latch_problems",
+                "memory_block_warnings",
             ):
                 stack.enter_context(mock.patch.object(spark, name, return_value=[]))
             stack.enter_context(mock.patch.object(spark, "kernel_policy_path",

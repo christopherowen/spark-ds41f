@@ -1,0 +1,1319 @@
+From d828d052f4efa2b952309a12a693f76bdace49fb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:03:32 +0000
+Subject: [PATCH 826/826] feat(responses): support CustomTool and OpenResponses
+ input normalization
+
+Upstream base: local-inference-lab/vllm 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate-61-r2's series applied through 0825.
+
+Rationale: Codex CLI and OpenResponses clients send Responses API requests with
+{"type": "custom", "name": "apply_patch"} tools, custom_tool_call /
+custom_tool_call_output history items across context compaction, and typeless or
+id-less assistant/reasoning input items (#1206). Port the non-Harmony Responses
+API custom-tool shim (upstream vllm-project/vllm@83773ecdf3ce) and OpenResponses
+input normalization (upstream vllm-project/vllm@945d0a268bc6) so free-form text
+custom tools are schema-shimmed as single-string {"input": ...} functions for
+chat templates, decoded back into custom_tool_call output items and
+response.custom_tool_call_input.{delta,done} SSE events, and reconstructed cleanly
+on multi-turn history replay (including empty ResponseOutputMessage content and
+dict-form reasoning/assistant inputs). Grammar-formatted custom tools are
+explicitly rejected with a 400 validation error.
+
+Quality implications: Responses API frontend and tool schema helpers only; no
+impact on chat completions, inference kernels, CUDA graphs, memory layout, or
+serving benchmarks.
+
+Tests: CPU pytest tests/entrypoints/openai/test_responses_custom_tools.py in
+the candidate-61-r2 container covering CustomTool validation, Codex apply_patch
+compaction history replay, custom tool streaming deltas/done events, schema and
+xgrammar helpers, and OpenResponses input normalization.
+
+Upstream status: adapted from upstream vllm-project/vllm commits 83773ecdf3ce
+(#57322) and 945d0a268bc6 (#35508) for the 19f2c20ed4d6 non-Harmony stack.
+---
+ .../openai/test_responses_custom_tools.py     | 353 ++++++++++++++++++
+ vllm/entrypoints/openai/responses/protocol.py | 136 +++++--
+ .../openai/responses/streaming_events.py      | 131 +++++--
+ vllm/entrypoints/openai/responses/utils.py    | 161 ++++++--
+ vllm/parser/abstract_parser.py                |  12 +-
+ vllm/tool_parsers/structural_tag_registry.py  |  10 +-
+ vllm/tool_parsers/utils.py                    |  46 ++-
+ 7 files changed, 753 insertions(+), 96 deletions(-)
+ create mode 100644 tests/entrypoints/openai/test_responses_custom_tools.py
+
+diff --git a/tests/entrypoints/openai/test_responses_custom_tools.py b/tests/entrypoints/openai/test_responses_custom_tools.py
+new file mode 100644
+index 000000000..0b55a3bb9
+--- /dev/null
++++ b/tests/entrypoints/openai/test_responses_custom_tools.py
+@@ -0,0 +1,353 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Regression tests for Responses API CustomTool and OpenResponses normalization."""
++
++from __future__ import annotations
++
++import pytest
++from openai.types.responses import (
++    CustomTool,
++    FunctionTool,
++    ResponseCustomToolCall,
++    ResponseFunctionToolCall,
++    ToolChoiceCustom,
++)
++from openai.types.responses.response_output_message import ResponseOutputMessage
++from pydantic import ValidationError
++
++from vllm.entrypoints.generate.base.protocol import (
++    DeltaFunctionCall,
++    DeltaMessage,
++    DeltaToolCall,
++    FunctionCall,
++)
++from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++from vllm.entrypoints.openai.responses.streaming_events import (
++    SimpleStreamingEventProcessor,
++    _StateType,
++    split_delta,
++)
++from vllm.entrypoints.openai.responses.utils import (
++    _construct_message_from_response_item,
++    build_response_output_items,
++    construct_chat_messages_with_tool_call,
++    decode_custom_tool_input,
++    decode_custom_tool_input_prefix,
++    extract_function_tool_names,
++)
++from vllm.exceptions import VLLMValidationError
++from vllm.tool_parsers.structural_tag_registry import (
++    _dump_tool_choice_for_xgrammar,
++    _dump_tool_for_xgrammar,
++)
++from vllm.tool_parsers.utils import (
++    custom_tool_parameters,
++    find_tool_name,
++    find_tool_properties,
++    get_json_schema_from_tools,
++    iter_response_function_tool_dicts,
++)
++
++
++def _make_tool_call(
++    index: int,
++    name: str | None = None,
++    arguments: str | None = None,
++    call_id: str | None = None,
++) -> DeltaToolCall:
++    return DeltaToolCall(
++        id=call_id,
++        index=index,
++        function=DeltaFunctionCall(name=name, arguments=arguments),
++    )
++
++
++def _run_processor(
++    processor: SimpleStreamingEventProcessor, delta_message: DeltaMessage
++) -> list:
++    events = []
++    for dm in split_delta(delta_message):
++        target_state, tool_call = processor.resolve_target_state(dm)
++        if target_state == _StateType.NONE:
++            continue
++        if processor.needs_transition(target_state, tool_call):
++            events.extend(processor.close_current())
++            events.extend(processor.open(target_state, tool_call))
++        events.extend(processor.emit_delta(dm, None))
++    return events
++
++
++def test_custom_tool_grammar_format_rejected_and_text_accepted() -> None:
++    grammar = {"type": "grammar", "syntax": "lark", "definition": 'start: "pwd"'}
++    with pytest.raises(VLLMValidationError) as exc_info:
++        ResponsesRequest(
++            input="hi",
++            tools=[{"type": "custom", "name": "emit", "format": grammar}],
++        )
++    assert exc_info.value.parameter == "tools"
++
++    request = ResponsesRequest(
++        input="hi",
++        tools=[{"type": "custom", "name": "emit", "format": {"type": "text"}}],
++        tool_choice={"type": "custom", "name": "emit"},
++    )
++    assert request.tools is not None and request.tools[0].type == "custom"
++    assert extract_function_tool_names(request.tools) == frozenset({"emit"})
++
++    with pytest.raises(VLLMValidationError):
++        ResponsesRequest(
++            input="hi",
++            tools=[{"type": "custom", "name": "emit"}],
++            tool_choice={"type": "custom", "name": "missing"},
++        )
++
++
++@pytest.mark.parametrize(
++    "tools",
++    [
++        "abc",
++        {"type": "custom"},
++        [None],
++        [{"type": "custom", "name": "x", "format": "text"}],
++    ],
++)
++def test_malformed_tools_rejected_by_field_validation(tools) -> None:
++    with pytest.raises(ValidationError):
++        ResponsesRequest(input="hi", tools=tools)
++
++
++def test_custom_tool_output_and_codex_compaction_replay() -> None:
++    tools = [
++        CustomTool(type="custom", name="apply_patch", format={"type": "text"}),
++        FunctionTool(
++            type="function", name="get_weather", parameters={}, strict=None
++        ),
++    ]
++    custom, function = build_response_output_items(
++        reasoning=None,
++        content=None,
++        tool_calls=[
++            FunctionCall(
++                id="call_1",
++                name="apply_patch",
++                arguments='{"input": "*** Begin Patch\\n*** End Patch"}',
++            ),
++            FunctionCall(
++                id="call_2", name="get_weather", arguments='{"city": "Paris"}'
++            ),
++        ],
++        tools=tools,
++    )
++    assert isinstance(custom, ResponseCustomToolCall)
++    assert (custom.call_id, custom.input) == (
++        "call_1",
++        "*** Begin Patch\n*** End Patch",
++    )
++    assert custom.id.startswith("ctc_")
++    assert isinstance(function, ResponseFunctionToolCall)
++    assert function.arguments == '{"city": "Paris"}'
++
++    # Exact #1206 Codex multi-turn custom_tool_call + custom_tool_call_output history
++    req = ResponsesRequest.model_validate(
++        {
++            "model": "deepseek-v41",
++            "tools": [{"type": "custom", "name": "apply_patch"}],
++            "input": [
++                {"role": "user", "content": "Patch the file"},
++                {
++                    "type": "reasoning",
++                    "summary": [],
++                    "encrypted_content": None,
++                },
++                {
++                    "type": "custom_tool_call",
++                    "call_id": "call_patch_1",
++                    "name": "apply_patch",
++                    "input": "*** Begin Patch\n*** End Patch",
++                },
++                {
++                    "type": "custom_tool_call_output",
++                    "call_id": "call_patch_1",
++                    "output": "Success. Updated 1 file.",
++                },
++                {
++                    "type": "message",
++                    "role": "assistant",
++                    "content": [{"type": "output_text", "text": "Done."}],
++                },
++                {"role": "user", "content": "Next step"},
++            ],
++        }
++    )
++    assert isinstance(req.input, list)
++    messages = construct_chat_messages_with_tool_call(req.input)
++    assert messages == [
++        {"role": "user", "content": "Patch the file"},
++        {
++            "role": "assistant",
++            "reasoning": "",
++            "tool_calls": [
++                {
++                    "id": "call_patch_1",
++                    "type": "function",
++                    "function": {
++                        "name": "apply_patch",
++                        "arguments": '{"input": "*** Begin Patch\\n*** End Patch"}',
++                    },
++                }
++            ],
++        },
++        {
++            "role": "tool",
++            "content": "Success. Updated 1 file.",
++            "tool_call_id": "call_patch_1",
++        },
++        {"role": "assistant", "content": "Done."},
++        {"role": "user", "content": "Next step"},
++    ]
++
++
++def test_decode_custom_tool_input_and_prefix() -> None:
++    assert decode_custom_tool_input('{"input": "pwd"}') == "pwd"
++    assert decode_custom_tool_input('{"cmd": "pwd"}') == '{"cmd": "pwd"}'
++    assert decode_custom_tool_input('{"input": 7}') == '{"input": 7}'
++    assert decode_custom_tool_input("pwd") == "pwd"
++
++    assert decode_custom_tool_input_prefix('{"inp') == ""
++    assert decode_custom_tool_input_prefix('{"input": "ls \\"dir') == 'ls "dir'
++    assert decode_custom_tool_input_prefix('{"input": "a\\') == "a"
++    assert decode_custom_tool_input_prefix('{"input": "\\ud83d') == ""
++    assert (
++        decode_custom_tool_input_prefix('{"input": "\\ud83d\\ude00!"}')
++        == "\U0001f600!"
++    )
++
++
++def test_custom_tool_streaming_events_and_function_call_invariance() -> None:
++    # Custom tool streams response.custom_tool_call_input.{delta,done}
++    processor = SimpleStreamingEventProcessor(
++        tools=[CustomTool(type="custom", name="emit_command")]
++    )
++    events = _run_processor(
++        processor,
++        DeltaMessage(
++            tool_calls=[
++                _make_tool_call(0, name="emit_command", arguments='{"input": "ls ')
++            ]
++        ),
++    )
++    events += _run_processor(
++        processor,
++        DeltaMessage(tool_calls=[_make_tool_call(0, arguments='-la \\"x\\""}')]),
++    )
++    events += processor.close_current()
++    assert [e.type for e in events] == [
++        "response.output_item.added",
++        "response.custom_tool_call_input.delta",
++        "response.custom_tool_call_input.delta",
++        "response.custom_tool_call_input.done",
++        "response.output_item.done",
++    ]
++    done = events[-1].item
++    assert isinstance(done, ResponseCustomToolCall)
++    assert done.input == 'ls -la "x"'
++    assert "".join(e.delta for e in events[1:3]) == done.input
++    assert events[3].input == done.input
++    assert done.id.startswith("ctc_")
++
++    # Unrelated keys before "input" do not leak into deltas.
++    p2 = SimpleStreamingEventProcessor(
++        tools=[CustomTool(type="custom", name="emit_command")]
++    )
++    e2 = _run_processor(
++        p2,
++        DeltaMessage(
++            tool_calls=[_make_tool_call(0, name="emit_command", arguments='{"a": "xy"')]
++        ),
++    )
++    e2 += _run_processor(
++        p2,
++        DeltaMessage(tool_calls=[_make_tool_call(0, arguments=', "input": "hello"}')]),
++    )
++    e2 += p2.close_current()
++    assert "".join(
++        e.delta for e in e2 if e.type == "response.custom_tool_call_input.delta"
++    ) == "hello"
++
++    # Non-extension final payload resends authoritative payload on close.
++    p3 = SimpleStreamingEventProcessor(
++        tools=[CustomTool(type="custom", name="emit_command")]
++    )
++    p3.state.current_state = _StateType.TOOL_CALL
++    p3.state.tool_call_is_custom = True
++    p3.state.tool_call_payload = "xy"
++    p3.state.accumulated_text = '{"a": "xy", "input": "hello"}'
++    e3 = p3.close_current()
++    assert [
++        e.delta for e in e3 if e.type == "response.custom_tool_call_input.delta"
++    ] == ["hello"]
++    assert e3[-1].item.input == "hello"
++
++    # Regular function tool without deltas keeps 19f2c20ed4d6 shape (no empty arguments.done).
++    p4 = SimpleStreamingEventProcessor()
++    e4 = _run_processor(
++        p4, DeltaMessage(tool_calls=[_make_tool_call(0, name="noop")])
++    )
++    e4 += p4.close_current()
++    assert [e.type for e in e4] == [
++        "response.output_item.added",
++        "response.output_item.done",
++    ]
++
++
++def test_tool_schema_helpers_and_openresponses_normalization() -> None:
++    tool = CustomTool(type="custom", name="emit_command", description="Emit")
++    [tool_dict] = iter_response_function_tool_dicts([tool])
++    assert tool_dict == {
++        "type": "function",
++        "name": "emit_command",
++        "description": "Emit",
++        "parameters": custom_tool_parameters(),
++    }
++    assert find_tool_name([tool], "emit_command") is True
++    assert find_tool_properties([tool], "emit_command") == custom_tool_parameters()["properties"]
++    assert (
++        get_json_schema_from_tools(
++            ToolChoiceCustom(type="custom", name="emit_command"), [tool]
++        )
++        == custom_tool_parameters()
++    )
++    dumped_tool = _dump_tool_for_xgrammar(tool)
++    assert dumped_tool["type"] == "function"
++    assert dumped_tool["function"]["name"] == "emit_command"
++    assert _dump_tool_choice_for_xgrammar(
++        ToolChoiceCustom(type="custom", name="emit_command")
++    ) == {"type": "function", "function": {"name": "emit_command"}}
++
++    # Typeless assistant message without id/status survives OpenResponses normalization.
++    req = ResponsesRequest.model_validate(
++        {
++            "input": [
++                {
++                    "role": "assistant",
++                    "content": [{"type": "output_text", "text": "hi"}],
++                }
++            ]
++        }
++    )
++    assert isinstance(req.input, list) and len(req.input) == 1
++    assert isinstance(req.input[0], ResponseOutputMessage)
++    assert req.input[0].content[0].text == "hi"
++
++    # Empty ResponseOutputMessage.content does not crash message construction.
++    empty_msg = ResponseOutputMessage(
++        id="msg_empty",
++        content=[],
++        role="assistant",
++        status="completed",
++        type="message",
++    )
++    assert _construct_message_from_response_item(empty_msg) == {
++        "role": "assistant",
++        "content": "",
++    }
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index 3d6041d80..9c91a39d8 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -14,6 +14,8 @@ from openai.types.responses import (
+     ResponseCodeInterpreterCallInterpretingEvent,
+     ResponseContentPartAddedEvent,
+     ResponseContentPartDoneEvent,
++    ResponseCustomToolCallInputDeltaEvent,
++    ResponseCustomToolCallInputDoneEvent,
+     ResponseFunctionToolCall,
+     ResponseInputItemParam,
+     ResponseMcpCallArgumentsDeltaEvent,
+@@ -538,74 +540,136 @@ class ResponsesRequest(OpenAIBaseModel):
+ 
+         processed_input = []
+         for item in input_data:
+-            if not isinstance(item, dict):
+-                processed_input.append(item)
++            normalized_item = cls._normalize_openresponses_input_item(item)
++
++            if not isinstance(normalized_item, dict):
++                processed_input.append(normalized_item)
+                 continue
+ 
+-            item_type = item.get("type")
++            item_type = normalized_item.get("type")
+ 
+             if item_type == "function_call":
+                 try:
+-                    processed_input.append(ResponseFunctionToolCall(**item))
++                    processed_input.append(
++                        ResponseFunctionToolCall(**normalized_item)
++                    )
+                 except ValidationError:
+                     logger.debug(
+                         "Failed to parse function_call to ResponseFunctionToolCall, "
+                         "leaving for Pydantic validation"
+                     )
+-                    processed_input.append(item)
++                    processed_input.append(normalized_item)
+ 
+             elif item_type == "reasoning":
+-                if "id" not in item:
+-                    item = {**item, "id": f"rs_{random_uuid()}"}
+                 try:
+-                    processed_input.append(ResponseReasoningItem(**item))
++                    processed_input.append(ResponseReasoningItem(**normalized_item))
+                 except ValidationError:
+                     logger.debug(
+                         "Failed to parse reasoning to ResponseReasoningItem, "
+                         "leaving for Pydantic validation"
+                     )
+-                    processed_input.append(item)
++                    processed_input.append(normalized_item)
+ 
+-            elif item_type == "message" and item.get("role") == "assistant":
+-                content = item.get("content")
+-                if not isinstance(content, list):
++            elif item_type == "message" and normalized_item.get("role") == "assistant":
++                if not isinstance(normalized_item.get("content"), list):
+                     # String content is a valid EasyInputMessageParam,
+                     # do not coerce it to ResponseOutputMessage
+                     processed_input.append(item)
+                     continue
+ 
+-                original_item = item
+-                item = dict(item)
+-                if "id" not in item:
+-                    item["id"] = f"msg_{random_uuid()}"
+-                if "status" not in item:
+-                    item["status"] = "completed"
+-                # ResponseOutputText requires annotations
+-                new_content = []
+-                for c in content:
+-                    if (
+-                        isinstance(c, dict)
+-                        and c.get("type") == "output_text"
+-                        and "annotations" not in c
+-                    ):
+-                        c = {**c, "annotations": []}
+-                    new_content.append(c)
+-                item["content"] = new_content
+                 try:
+-                    processed_input.append(ResponseOutputMessage(**item))
++                    processed_input.append(ResponseOutputMessage(**normalized_item))
+                 except ValidationError:
+                     logger.debug(
+                         "Failed to parse assistant message to ResponseOutputMessage, "
+                         "leaving for Pydantic validation"
+                     )
+-                    processed_input.append(original_item)
++                    processed_input.append(item)
+ 
+             else:
+-                processed_input.append(item)
++                processed_input.append(normalized_item)
+ 
+         data["input"] = processed_input
+         return data
+ 
++    @staticmethod
++    def _normalize_openresponses_input_item(item: Any) -> Any:
++        """Normalize input items to bridge OpenResponses schema and openai-python.
++
++        The OpenResponses specification treats several fields as optional
++        (``id``, ``status`` on assistant/reasoning items; ``annotations``
++        on output_text content) that the openai-python SDK marks as
++        required. Fill sensible defaults so payloads conforming to the
++        OpenResponses spec pass SDK validation.
++        """
++        if not isinstance(item, dict):
++            return item
++
++        item_type = item.get("type", "message")
++        should_fill = item_type == "reasoning" or (
++            item_type == "message" and item.get("role") == "assistant"
++        )
++        if not should_fill:
++            return item
++
++        normalized_item = item.copy()
++        # ``type`` is optional in the OpenResponses schema but load-bearing for
++        # SDK validation: without it a filled-in assistant item matches
++        # ``ItemReference`` in the input union and collapses to ``{"id": ...}``,
++        # silently dropping role/content. Stamp back the type we keyed off.
++        normalized_item["type"] = item_type
++        if normalized_item.get("id") in (None, ""):
++            prefix = "rs" if item_type == "reasoning" else "msg"
++            normalized_item["id"] = f"{prefix}_{random_uuid()}"
++        if normalized_item.get("status") in (None, ""):
++            normalized_item["status"] = "completed"
++        if item_type == "reasoning" and normalized_item.get("summary") is None:
++            normalized_item["summary"] = []
++
++        if item_type == "message" and isinstance(
++            normalized_item.get("content"), list
++        ):
++            normalized_content = []
++            for content_item in normalized_item["content"]:
++                if (
++                    isinstance(content_item, dict)
++                    and content_item.get("type") == "output_text"
++                    and "annotations" not in content_item
++                ):
++                    content_item = {**content_item, "annotations": []}
++                normalized_content.append(content_item)
++            normalized_item["content"] = normalized_content
++
++        return normalized_item
++
++    @model_validator(mode="before")
++    @classmethod
++    def check_custom_tool_format(cls, data):
++        if not isinstance(data, dict):
++            return data
++        tools = data.get("tools")
++        if not isinstance(tools, list):
++            return data
++        for tool in tools:
++            if isinstance(tool, dict):
++                tool_dict = tool
++            elif hasattr(tool, "model_dump"):
++                tool_dict = tool.model_dump()
++            else:
++                continue
++            tool_format = tool_dict.get("format")
++            if (
++                tool_dict.get("type") == "custom"
++                and isinstance(tool_format, dict)
++                and tool_format.get("type") == "grammar"
++            ):
++                raise VLLMValidationError(
++                    "Custom tools with a grammar format are not supported; "
++                    "only free-form text custom tools are accepted.",
++                    parameter="tools",
++                )
++        return data
++
+     @model_validator(mode="before")
+     @classmethod
+     def check_tool_usage(cls, data):
+@@ -615,9 +679,9 @@ class ResponsesRequest(OpenAIBaseModel):
+         tools = data.get("tools")
+         tool_choice = data.get("tool_choice", "auto")
+         has_tools = tools is not None and len(tools) > 0
+-        is_named_tool_choice = (
+-            isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
+-        )
++        is_named_tool_choice = isinstance(
++            tool_choice, dict
++        ) and tool_choice.get("type") in ("function", "custom")
+ 
+         if not has_tools:
+             if tool_choice in ("auto", "none"):
+@@ -874,6 +938,8 @@ StreamingResponsesResponse: TypeAlias = (
+     | ResponseOutputItemDoneEvent
+     | ResponseContentPartAddedEvent
+     | ResponseContentPartDoneEvent
++    | ResponseCustomToolCallInputDeltaEvent
++    | ResponseCustomToolCallInputDoneEvent
+     | ResponseReasoningTextDeltaEvent
+     | ResponseReasoningTextDoneEvent
+     | ResponseReasoningPartAddedEvent
+diff --git a/vllm/entrypoints/openai/responses/streaming_events.py b/vllm/entrypoints/openai/responses/streaming_events.py
+index 40abc45b4..bc9141097 100644
+--- a/vllm/entrypoints/openai/responses/streaming_events.py
++++ b/vllm/entrypoints/openai/responses/streaming_events.py
+@@ -30,6 +30,9 @@ from openai.types.responses import (
+     ResponseCodeInterpreterToolCallParam,
+     ResponseContentPartAddedEvent,
+     ResponseContentPartDoneEvent,
++    ResponseCustomToolCall,
++    ResponseCustomToolCallInputDeltaEvent,
++    ResponseCustomToolCallInputDoneEvent,
+     ResponseFunctionCallArgumentsDeltaEvent,
+     ResponseFunctionCallArgumentsDoneEvent,
+     ResponseFunctionToolCall,
+@@ -74,6 +77,9 @@ from vllm.entrypoints.openai.responses.protocol import (
+ )
+ from vllm.entrypoints.openai.responses.utils import (
+     build_responses_tool_call_name_map,
++    custom_tool_names,
++    decode_custom_tool_input,
++    decode_custom_tool_input_prefix,
+     resolve_responses_tool_call_name,
+ )
+ from vllm.outputs import CompletionOutput
+@@ -822,6 +828,8 @@ class SimpleStreamingState:
+     tool_call_name: str = ""
+     tool_call_namespace: str | None = None
+     tool_call_index: int | None = None
++    tool_call_is_custom: bool = False
++    tool_call_payload: str = ""
+     has_emitted_tool_call_delta: bool = False
+     current_state: _StateType = field(default_factory=lambda: _StateType.NONE)
+ 
+@@ -1023,39 +1031,82 @@ def emit_simple_tool_call_open(
+     name: str,
+     index: int | None,
+     namespace: str | None = None,
++    is_custom: bool = False,
++    call_id: str | None = None,
+ ) -> list[StreamingResponsesResponse]:
+     state.current_state = _StateType.TOOL_CALL
+-    state.current_item_id = random_uuid()
+-    state.tool_call_id = f"call_{random_uuid()}"
++    state.current_item_id = (
++        f"ctc_{random_uuid()}" if is_custom else random_uuid()
++    )
++    state.tool_call_id = call_id or f"call_{random_uuid()}"
+     state.tool_call_name = name
+     state.tool_call_namespace = namespace
+     state.tool_call_index = index
++    state.tool_call_is_custom = is_custom
++    state.tool_call_payload = ""
+     state.accumulated_text = ""
+     state.has_emitted_tool_call_delta = False
++    item: ResponseOutputItem
++    if is_custom:
++        item = ResponseCustomToolCall(
++            type="custom_tool_call",
++            id=state.current_item_id,
++            call_id=state.tool_call_id,
++            name=name,
++            input="",
++        )
++    else:
++        item = ResponseFunctionToolCallItem(
++            type="function_call",
++            id=state.current_item_id,
++            call_id=state.tool_call_id,
++            name=name,
++            namespace=namespace,
++            arguments="",
++            status="in_progress",
++        )
+     return [
+         ResponseOutputItemAddedEvent(
+             type="response.output_item.added",
+             sequence_number=-1,
+             output_index=state.output_index,
+-            item=ResponseFunctionToolCallItem(
+-                type="function_call",
+-                id=state.current_item_id,
+-                call_id=state.tool_call_id,
+-                name=name,
+-                namespace=namespace,
+-                arguments="",
+-                status="in_progress",
+-            ),
++            item=item,
+         ),
+     ]
+ 
+ 
++def _emit_custom_tool_input_delta(
++    state: SimpleStreamingState,
++    payload: str,
++) -> list[StreamingResponsesResponse]:
++    streamed = state.tool_call_payload
++    if payload == streamed:
++        return []
++    state.tool_call_payload = payload
++    # A payload that is not an extension of what was streamed cannot be
++    # retracted, so the authoritative value is resent in full.
++    delta = payload[len(streamed) :] if payload.startswith(streamed) else payload
++    return [
++        ResponseCustomToolCallInputDeltaEvent(
++            type="response.custom_tool_call_input.delta",
++            sequence_number=-1,
++            output_index=state.output_index,
++            item_id=state.current_item_id,
++            delta=delta,
++        )
++    ]
++
++
+ def emit_simple_tool_call_delta(
+     state: SimpleStreamingState,
+     delta: str,
+ ) -> list[StreamingResponsesResponse]:
+     state.accumulated_text += delta
+     state.has_emitted_tool_call_delta = True
++    if state.tool_call_is_custom:
++        return _emit_custom_tool_input_delta(
++            state, decode_custom_tool_input_prefix(state.accumulated_text)
++        )
+     return [
+         ResponseFunctionCallArgumentsDeltaEvent(
+             type="response.function_call_arguments.delta",
+@@ -1070,36 +1121,61 @@ def emit_simple_tool_call_delta(
+ def emit_simple_tool_call_done(
+     state: SimpleStreamingState,
+ ) -> list[StreamingResponsesResponse]:
+-    events: list[StreamingResponsesResponse] = []
+-    if state.has_emitted_tool_call_delta:
++    events: list[StreamingResponsesResponse]
++    item: ResponseOutputItem
++    if state.tool_call_is_custom:
++        payload = decode_custom_tool_input(state.accumulated_text)
++        events = _emit_custom_tool_input_delta(state, payload)
+         events.append(
+-            ResponseFunctionCallArgumentsDoneEvent(
+-                type="response.function_call_arguments.done",
++            ResponseCustomToolCallInputDoneEvent(
++                type="response.custom_tool_call_input.done",
+                 sequence_number=-1,
+                 output_index=state.output_index,
+                 item_id=state.current_item_id,
+-                arguments=state.accumulated_text,
+-                name=state.tool_call_name,
++                input=payload,
+             )
+         )
++        item = ResponseCustomToolCall(
++            type="custom_tool_call",
++            id=state.current_item_id,
++            call_id=state.tool_call_id,
++            name=state.tool_call_name,
++            input=payload,
++        )
++    else:
++        events = []
++        if state.has_emitted_tool_call_delta:
++            events.append(
++                ResponseFunctionCallArgumentsDoneEvent(
++                    type="response.function_call_arguments.done",
++                    sequence_number=-1,
++                    output_index=state.output_index,
++                    item_id=state.current_item_id,
++                    arguments=state.accumulated_text,
++                    name=state.tool_call_name,
++                )
++            )
++        item = ResponseFunctionToolCall(
++            type="function_call",
++            name=state.tool_call_name,
++            namespace=state.tool_call_namespace,
++            arguments=state.accumulated_text,
++            status="completed",
++            id=state.current_item_id,
++            call_id=state.tool_call_id,
++        )
+     events.append(
+         ResponseOutputItemDoneEvent(
+             type="response.output_item.done",
+             sequence_number=-1,
+             output_index=state.output_index,
+-            item=ResponseFunctionToolCall(
+-                type="function_call",
+-                name=state.tool_call_name,
+-                namespace=state.tool_call_namespace,
+-                arguments=state.accumulated_text,
+-                status="completed",
+-                id=state.current_item_id,
+-                call_id=state.tool_call_id,
+-            ),
++            item=item,
+         ),
+     )
+     state.output_index += 1
+     state.tool_call_namespace = None
++    state.tool_call_is_custom = False
++    state.tool_call_payload = ""
+     state.current_state = _StateType.NONE
+     return events
+ 
+@@ -1184,6 +1260,7 @@ class SimpleStreamingEventProcessor:
+     ) -> None:
+         self.state = state or SimpleStreamingState()
+         self.tool_call_name_map = build_responses_tool_call_name_map(tools)
++        self.custom_tool_names = custom_tool_names(tools)
+ 
+     def resolve_target_state(
+         self, delta_message: DeltaMessage
+@@ -1249,6 +1326,8 @@ class SimpleStreamingEventProcessor:
+                 call_name.name,
+                 tool_call.index,
+                 call_name.namespace,
++                call_name.name in self.custom_tool_names,
++                getattr(tool_call, "id", None),
+             )
+         return handlers.open_fn(self.state)
+ 
+diff --git a/vllm/entrypoints/openai/responses/utils.py b/vllm/entrypoints/openai/responses/utils.py
+index 82ab75f75..3afaab3cf 100644
+--- a/vllm/entrypoints/openai/responses/utils.py
++++ b/vllm/entrypoints/openai/responses/utils.py
+@@ -1,9 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import json
+ from collections.abc import Iterable
+ from typing import Any
+ 
++import partial_json_parser
++
+ from openai.types.chat import (
+     ChatCompletionAssistantMessageParam,
+     ChatCompletionMessageToolCallParam,
+@@ -13,6 +16,7 @@ from openai.types.chat.chat_completion_message_tool_call_param import (
+     Function as FunctionCallTool,
+ )
+ from openai.types.responses import (
++    ResponseCustomToolCall,
+     ResponseFunctionToolCall,
+     ResponseOutputItem,
+     ResponseOutputMessage,
+@@ -28,6 +32,7 @@ from openai.types.responses.response_reasoning_item import (
+     Content as ResponseReasoningTextContent,
+ )
+ from openai.types.responses.tool import Tool
++from partial_json_parser.core.options import Allow
+ 
+ from vllm import envs
+ from vllm.entrypoints.chat_utils import make_tool_call_id
+@@ -40,6 +45,7 @@ from vllm.entrypoints.openai.responses.protocol import ResponseInputOutputItem
+ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.tool_parsers.utils import (
++    CUSTOM_TOOL_INPUT_KEY,
+     build_responses_tool_call_name_map,
+     flat_namespace_tool_name,
+     iter_response_function_tool_dicts,
+@@ -50,6 +56,51 @@ from vllm.utils import random_uuid
+ logger = init_logger(__name__)
+ 
+ 
++def custom_tool_names(tools: list[Tool] | None) -> frozenset[str]:
++    return frozenset(tool.name for tool in tools or [] if tool.type == "custom")
++
++
++def encode_custom_tool_input(payload: str) -> str:
++    return json.dumps({CUSTOM_TOOL_INPUT_KEY: payload}, ensure_ascii=False)
++
++
++def _custom_tool_payload(parsed: Any) -> str | None:
++    if not isinstance(parsed, dict):
++        return None
++    value = parsed.get(CUSTOM_TOOL_INPUT_KEY)
++    return value if isinstance(value, str) else None
++
++
++def decode_custom_tool_input(arguments: str) -> str:
++    """Payload of a completed shim call; bare text is passed through."""
++    try:
++        payload = _custom_tool_payload(json.loads(arguments))
++    except ValueError:
++        return arguments
++    return arguments if payload is None else payload
++
++
++def decode_custom_tool_input_prefix(arguments: str) -> str:
++    """Longest decodable payload prefix of partial shim arguments, so that
++    streamed ``custom_tool_call_input`` deltas stay a prefix of the final input."""
++    try:
++        parsed = partial_json_parser.loads(arguments, Allow.STR | Allow.OBJ)
++    except (ValueError, IndexError, AssertionError):
++        return ""
++    payload = _custom_tool_payload(parsed) or ""
++    if payload and "\ud800" <= payload[-1] <= "\udbff":
++        payload = payload[:-1]
++    return payload
++
++
++def _item_type(item: ResponseInputOutputItem) -> str | None:
++    return item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
++
++
++def _item_dict(item: ResponseInputOutputItem) -> dict[str, Any]:
++    return item if isinstance(item, dict) else item.model_dump()
++
++
+ def build_response_output_items(
+     reasoning: str | None,
+     content: str | None,
+@@ -59,6 +110,7 @@ def build_response_output_items(
+ ) -> list[ResponseOutputItem]:
+     outputs: list[ResponseOutputItem] = []
+     tool_call_name_map = build_responses_tool_call_name_map(tools)
++    custom_names = custom_tool_names(tools)
+ 
+     if reasoning:
+         outputs.append(
+@@ -93,14 +145,27 @@ def build_response_output_items(
+ 
+     if tool_calls:
+         for idx, tool_call in enumerate(tool_calls):
++            call_id = tool_call.id or make_tool_call_id(
++                func_name=tool_call.name, idx=idx
++            )
++            if tool_call.name in custom_names:
++                outputs.append(
++                    ResponseCustomToolCall(
++                        id=f"ctc_{random_uuid()}",
++                        call_id=call_id,
++                        type="custom_tool_call",
++                        name=tool_call.name,
++                        input=decode_custom_tool_input(tool_call.arguments),
++                    )
++                )
++                continue
+             call_name = resolve_responses_tool_call_name(
+                 tool_call.name, tool_call_name_map=tool_call_name_map
+             )
+             outputs.append(
+                 ResponseFunctionToolCall(
+                     id=f"fc_{random_uuid()}",
+-                    call_id=tool_call.id
+-                    or make_tool_call_id(func_name=tool_call.name, idx=idx),
++                    call_id=call_id,
+                     type="function_call",
+                     status="completed",
+                     name=call_name.name,
+@@ -234,6 +299,7 @@ def _construct_message_from_response_item(
+         prev_msg if prev_msg and prev_msg.get("role") == "assistant" else None
+     )
+ 
++    tool_call: ChatCompletionMessageToolCallParam | None = None
+     if isinstance(item, ResponseFunctionToolCall):
+         tool_name = item.name
+         if item.namespace:
+@@ -246,6 +312,17 @@ def _construct_message_from_response_item(
+             ),
+             type="function",
+         )
++    elif _item_type(item) == "custom_tool_call":
++        call = _item_dict(item)
++        tool_call = ChatCompletionMessageToolCallParam(
++            id=call["call_id"],
++            function=FunctionCallTool(
++                name=call["name"],
++                arguments=encode_custom_tool_input(call.get("input") or ""),
++            ),
++            type="function",
++        )
++    if tool_call is not None:
+         if prev_assistant_msg:
+             tool_calls = prev_assistant_msg.get("tool_calls")
+             if tool_calls is None:
+@@ -264,14 +341,14 @@ def _construct_message_from_response_item(
+             logger.warning(
+                 "Previous assistant message has unknown tool_calls format. "
+                 "Tool call merging is skipped and a new assistant message is created. "
+-                "Item %s",
+-                item.id,
++                "Call %s",
++                tool_call["id"],
+             )
+         return ChatCompletionAssistantMessageParam(
+             role="assistant",
+             tool_calls=[tool_call],
+         )
+-    elif isinstance(item, ResponseReasoningItem):
++    if isinstance(item, ResponseReasoningItem):
+         reasoning = ""
+         if item.encrypted_content:
+             raise VLLMValidationError(
+@@ -299,7 +376,10 @@ def _construct_message_from_response_item(
+             "reasoning": reasoning,
+         }
+     elif isinstance(item, ResponseOutputMessage):
+-        output_text = item.content[0].text
++        # Assistant messages may legitimately have empty content (e.g. when the
++        # assistant emitted only a tool call). Fall back to empty string instead
++        # of crashing on item.content[0].text.
++        output_text = item.content[0].text if item.content else ""
+         if prev_assistant_msg:
+             previous_content = prev_assistant_msg.get("content")
+             if previous_content is None:
+@@ -315,27 +395,64 @@ def _construct_message_from_response_item(
+             content=item.output,
+             tool_call_id=item.call_id,
+         )
+-    elif isinstance(item, dict) and item.get("type") == "function_call_output":
+-        # Append the function call output as a tool message.
++    elif _item_type(item) in ("function_call_output", "custom_tool_call_output"):
++        output = _item_dict(item)
+         return ChatCompletionToolMessageParam(
+             role="tool",
+-            content=item.get("output"),
+-            tool_call_id=item.get("call_id"),
++            content=output.get("output"),
++            tool_call_id=output.get("call_id"),
+         )
++    elif isinstance(item, dict) and item.get("type") == "reasoning":
++        # Dict-form reasoning item (e.g. from TypedDict union parsing).
++        # Pydantic may leave Iterable fields as ValidatorIterator objects,
++        # so materialise them with list() before indexing.
++        reasoning_content = ""
++        content = item.get("content")
++        summary = item.get("summary")
++        if content:
++            content = list(content)
++            if len(content) >= 1:
++                text = content[0]
++                reasoning_content = (
++                    text.get("text", "") if isinstance(text, dict) else text
++                )
++        elif summary:
++            summary = list(summary)
++            if len(summary) >= 1:
++                s = summary[0]
++                reasoning_content = s.get("text", "") if isinstance(s, dict) else s
++        if prev_assistant_msg:
++            previous_reasoning = prev_assistant_msg.get("reasoning")
++            if previous_reasoning is None:
++                prev_assistant_msg["reasoning"] = reasoning_content
++                return None
++        return {
++            "role": "assistant",
++            "reasoning": reasoning_content,
++        }
+     elif isinstance(item, dict) and item.get("role") == "assistant":
++        # Dict-form assistant message (e.g. from TypedDict union parsing).
+         content = item.get("content")
+-        text: str | None = None
+-        if isinstance(content, str):
++        if content and not isinstance(content, str):
++            content = list(content)
++            if len(content) >= 1:
++                first = content[0]
++                text = first.get("text", "") if isinstance(first, dict) else first
++            else:
++                text = ""
++        elif isinstance(content, str):
+             text = content
+-        elif isinstance(content, list) and content:
+-            text = content[0].get("text")
+-        if text is not None:
+-            if prev_assistant_msg:
+-                previous_content = prev_assistant_msg.get("content")
+-                if previous_content is None:
+-                    prev_assistant_msg["content"] = text
+-                    return None
+-            return {"role": "assistant", "content": text}
++        else:
++            text = ""
++        if prev_assistant_msg:
++            previous_content = prev_assistant_msg.get("content")
++            if previous_content is None:
++                prev_assistant_msg["content"] = text
++                return None
++        return {
++            "role": "assistant",
++            "content": text,
++        }
+     if isinstance(item, dict) and "role" in item:
+         return item  # type: ignore[return-value]
+     item_type = item.get("type") if isinstance(item, dict) else item.type
+@@ -348,7 +465,7 @@ def _construct_message_from_response_item(
+ def extract_function_tool_names(tools: list[Tool]) -> frozenset[str]:
+     names = []
+     for tool in tools:
+-        if tool.type == "function":
++        if tool.type in ("function", "custom"):
+             names.append(tool.name)
+         elif tool.type == "namespace":
+             names.extend(
+diff --git a/vllm/parser/abstract_parser.py b/vllm/parser/abstract_parser.py
+index c631d823a..8cc6d379e 100644
+--- a/vllm/parser/abstract_parser.py
++++ b/vllm/parser/abstract_parser.py
+@@ -8,7 +8,7 @@ from collections.abc import Sequence
+ from dataclasses import dataclass, field
+ from functools import cached_property
+ 
+-from openai.types.responses import ToolChoiceFunction
++from openai.types.responses import ToolChoiceCustom, ToolChoiceFunction
+ from pydantic import TypeAdapter, ValidationError
+ 
+ from vllm.entrypoints.chat_utils import (
+@@ -428,7 +428,9 @@ class DelegatingParser(Parser):
+     def _get_function_name(
+         self, request: ChatCompletionRequest | ResponsesRequest
+     ) -> str:
+-        if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
++        if request.tool_choice and isinstance(
++            request.tool_choice, (ToolChoiceFunction, ToolChoiceCustom)
++        ):
+             return request.tool_choice.name
+         if request.tool_choice and isinstance(
+             request.tool_choice, ChatCompletionNamedToolChoiceParam
+@@ -467,7 +469,7 @@ class DelegatingParser(Parser):
+         supports_required_and_named = tool_parser.supports_required_and_named
+         is_named_tool_choice = request.tool_choice and isinstance(
+             request.tool_choice,
+-            (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
++            (ToolChoiceFunction, ToolChoiceCustom, ChatCompletionNamedToolChoiceParam),
+         )
+         is_required_tool_choice = request.tool_choice == "required"
+         is_auto_tool_choice = enable_auto_tools and (
+@@ -580,7 +582,7 @@ class DelegatingParser(Parser):
+             or request.tool_choice == "required"
+             or isinstance(
+                 request.tool_choice,
+-                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
++                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction, ToolChoiceCustom),
+             )
+         )
+         if not need_tool_calling:
+@@ -729,7 +731,7 @@ class DelegatingParser(Parser):
+             and request.tool_choice
+             and isinstance(
+                 request.tool_choice,
+-                (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
++                (ToolChoiceFunction, ToolChoiceCustom, ChatCompletionNamedToolChoiceParam),
+             )
+         ):
+             delta_message, function_name_returned = extract_named_tool_call_streaming(
+diff --git a/vllm/tool_parsers/structural_tag_registry.py b/vllm/tool_parsers/structural_tag_registry.py
+index e8d1c4aed..886620f9b 100644
+--- a/vllm/tool_parsers/structural_tag_registry.py
++++ b/vllm/tool_parsers/structural_tag_registry.py
+@@ -4,7 +4,7 @@
+ from collections.abc import Callable, Sequence
+ from typing import Any, Literal, TypeAlias
+ 
+-from openai.types.responses import FunctionTool
++from openai.types.responses import CustomTool, FunctionTool, ToolChoiceCustom
+ from openai.types.responses.response import ToolChoice as ResponsesToolChoice
+ from openai.types.responses.tool import Tool as ResponsesTool
+ from openai.types.responses.tool_choice_allowed import ToolChoiceAllowed
+@@ -35,6 +35,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionNamedToolChoiceParam,
+     ChatCompletionToolsParam,
+ )
++from vllm.tool_parsers.utils import custom_tool_parameters
+ 
+ ToolChoice: TypeAlias = (
+     Literal["none", "auto", "required"]
+@@ -168,6 +169,11 @@ def _dump_tool_for_xgrammar(
+         if tool.strict is not None:
+             function["strict"] = tool.strict
+         return {"type": "function", "function": function}
++    if isinstance(tool, CustomTool):
++        function = {"name": tool.name, "parameters": custom_tool_parameters()}
++        if tool.description is not None:
++            function["description"] = tool.description
++        return {"type": "function", "function": function}
+     dumped_tool = tool.model_dump(mode="json", exclude_none=True)
+     if isinstance(tool, ChatCompletionToolsParam):
+         return dumped_tool
+@@ -188,7 +194,7 @@ def _dump_tool_choice_for_xgrammar(
+     if isinstance(tool_choice, ChatCompletionNamedToolChoiceParam):
+         return tool_choice.model_dump(mode="json", exclude_none=True)
+ 
+-    if isinstance(tool_choice, ToolChoiceFunction):
++    if isinstance(tool_choice, (ToolChoiceFunction, ToolChoiceCustom)):
+         return {
+             "type": "function",
+             "function": {"name": tool_choice.name},
+diff --git a/vllm/tool_parsers/utils.py b/vllm/tool_parsers/utils.py
+index d39c83969..ff548c263 100644
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -12,8 +12,10 @@ from typing import Any, TypeAlias
+ 
+ import partial_json_parser
+ from openai.types.responses import (
++    CustomTool,
+     FunctionTool,
+     NamespaceTool,
++    ToolChoiceCustom,
+     ToolChoiceFunction,
+ )
+ from openai.types.responses.tool import Tool as ResponsesTool
+@@ -35,6 +37,32 @@ Tool: TypeAlias = ChatCompletionToolsParam | ResponsesTool
+ 
+ logger = init_logger(__name__)
+ 
++CUSTOM_TOOL_INPUT_KEY = "input"
++
++
++def custom_tool_parameters() -> dict[str, Any]:
++    """Schema of the single-string function shim a ``custom`` tool is shown as."""
++    return {
++        "type": "object",
++        "properties": {
++            CUSTOM_TOOL_INPUT_KEY: {
++                "type": "string",
++                "description": "The freeform text payload for this tool.",
++            }
++        },
++        "required": [CUSTOM_TOOL_INPUT_KEY],
++        "additionalProperties": False,
++    }
++
++
++def custom_tool_as_function_dict(tool: CustomTool) -> dict[str, Any]:
++    return {
++        "type": "function",
++        "name": tool.name,
++        "description": tool.description,
++        "parameters": custom_tool_parameters(),
++    }
++
+ 
+ def safe_literal_eval(text: str):
+     with warnings.catch_warnings():
+@@ -187,6 +215,8 @@ def iter_response_function_tool_info(
+ ) -> list[tuple[str, dict[str, Any] | None]]:
+     if isinstance(tool, FunctionTool):
+         return [(tool.name, tool.parameters)]
++    if isinstance(tool, CustomTool):
++        return [(tool.name, custom_tool_parameters())]
+     if not isinstance(tool, NamespaceTool):
+         return []
+ 
+@@ -216,6 +246,8 @@ def iter_response_function_tool_dicts(
+                     namespace, namespaced_tool.name
+                 )
+                 function_tools.append(tool_dict)
++        elif isinstance(tool, CustomTool):
++            function_tools.append(custom_tool_as_function_dict(tool))
+         elif isinstance(tool, FunctionTool):
+             function_tools.append(tool.model_dump())
+     return function_tools
+@@ -277,7 +309,7 @@ def find_tool_properties(
+     if not tools:
+         return {}
+     for tool in tools:
+-        if isinstance(tool, (FunctionTool, NamespaceTool)):
++        if isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
+             for name, params in iter_response_function_tool_info(tool):
+                 if name == tool_name:
+                     return (params or {}).get("properties", {})
+@@ -298,7 +330,7 @@ def find_tool_name(
+     if not tools:
+         return False
+     for tool in tools:
+-        if isinstance(tool, (FunctionTool, NamespaceTool)):
++        if isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
+             for name, _ in iter_response_function_tool_info(tool):
+                 if name == tool_name:
+                     return True
+@@ -354,7 +386,7 @@ def _get_json_schema_from_tools(
+     fn_tool_schemas: list[dict[str, Any]] = []
+     fn_tools: list[Tool] = []
+     for tool in tools:
+-        if isinstance(tool, (FunctionTool, NamespaceTool)):
++        if isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
+             fn_tool_schemas.extend(
+                 _get_tool_schema_from_name_and_params(name, params)
+                 for name, params in iter_response_function_tool_info(tool)
+@@ -379,7 +411,9 @@ def _get_json_schema_from_tools(
+ 
+ 
+ def get_json_schema_from_tools(
+-    tool_choice: str | ToolChoiceFunction | ChatCompletionNamedToolChoiceParam,
++    tool_choice: (
++        str | ToolChoiceFunction | ToolChoiceCustom | ChatCompletionNamedToolChoiceParam
++    ),
+     tools: list[Tool] | None,
+ ) -> str | dict | None:
+     # tool_choice: "none"
+@@ -387,12 +421,12 @@ def get_json_schema_from_tools(
+         return None
+     # tool_choice: Forced Function (Responses)
+     if (not isinstance(tool_choice, str)) and isinstance(
+-        tool_choice, ToolChoiceFunction
++        tool_choice, (ToolChoiceFunction, ToolChoiceCustom)
+     ):
+         tool_name = tool_choice.name
+         responses_tool_map: dict[str, dict[str, Any] | None] = {}
+         for tool in tools:
+-            if not isinstance(tool, (FunctionTool, NamespaceTool)):
++            if not isinstance(tool, (FunctionTool, NamespaceTool, CustomTool)):
+                 continue
+             for name, params in iter_response_function_tool_info(tool):
+                 responses_tool_map[name] = params
+-- 
+2.43.0
+
