@@ -9,7 +9,21 @@
 - **vLLM patch head**: `2a758e3c08b031ad0b09d3625df5acb4515e0a92`
 - **vLLM expected tree**: `6aec3edca6da865e7e095ab0b87eafff552310a3`
 - **Patchset SHA-256**: `0deda9cdf21001992e6a3bd88c4e1e36609af5708792292969e8cb5491a74795`
-- **TileLang / TileKernels / SparkNet / NCCL / Model weights / Serve options**: Identical to `experiments/2026-11-16-c61-decode/` (`upstreams.lock.json` differs only in `vllm`).
+- **TileLang / TileKernels / SparkNet / NCCL / Model weights**: Identical to `experiments/2026-11-16-c61-decode/` (`upstreams.lock.json` differs only in `vllm`).
+- **32-sequence concurrency on `TP4+` (`tp4`..`tp8-switched`)**: Adopts `--max-num-seqs 32` (`--max-cudagraph-capture-size 192`) across all `TP4..TP8` profiles (`TP1..TP3` unchanged at `4`/`8` seats), backed by `#1230` (`+37%` aggregate decode scaling at `c32`, `+19%` mixed-load tasks/h), single-slot 2 MiB RoCE compatibility (`192 × 10,240 B = 1.875 MiB <= 2.0 MiB`), patch `0823` (`544`-row structured-output bitmask), and `0783`/`0784` (`128`-row decode tiles and `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16`).
+
+## `TP4..TP8` 32-Sequence Configuration (`max_num_seqs = 32`, `max_cudagraph_capture_size = 192`)
+
+| Shape | `--max-num-seqs` | `max_cg` | `--max-num-batched-tokens` | `--long-prefill-token-threshold` | `--kv-cache-memory-bytes` | Full `1M` Contexts | 32-Seq Simultaneous Context |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `tp4` (`tp4-ring`) | `32` | `192` | `16,384` | `16,192` | `17,716,740,096` (`16.50 GiB`) | `17.86x` | `579,840` tokens |
+| `tp4-switched` | `32` | `192` | `16,384` | `16,192` | `17,716,740,096` (`16.50 GiB`) | `17.86x` | `579,840` tokens |
+| `tp5-switched` | `32` | `192` | `32,768` | `32,576` | `25,769,803,776` (`24.00 GiB`) | `25.46x` | `831,744` tokens |
+| `tp6-switched` | `32` | `192` | `24,576` | `24,384` | `13,958,643,712` (`13.00 GiB`) | `13.41x` | `432,384` tokens |
+| `tp7-switched` | `32` | `192` | `32,768` | `32,576` | `17,179,869,184` (`16.00 GiB`) | `16.36x` | `530,176` tokens |
+| `tp8-switched` | `32` | `192` | `32,768` | `32,576` | `27,380,416,512` (`25.50 GiB`) | `27.17x` | `888,320` tokens |
+
+`tp6-switched` (`14.00 -> 13.00 GiB`, `+23.8%` over `1107`'s `10.50 GiB`) and `tp8-switched` (`26.00 -> 25.50 GiB`, `+142.9%` over `1107`'s `10.50 GiB`) reserve extra host headroom for the `192`-row CUDA graph pool (`~0.35 GiB/rank`) to maintain the `>= 5.5 GiB` startup `MemAvailable` floor on the head node (`sp1`, in-memory Engram). All `TP4..TP8` shapes keep the 2-to-192 CUDA graph capture ladder (`capture_sizes(192)`).
 
 ## Included Host-Python & Tooling PRs
 
@@ -27,15 +41,12 @@
 | [`0825`](vllm/0825-fix-serve-bind-SSE-keep-alive-done-callback-per-wait.patch) | `#1210` | `vllm/entrypoints/serve/utils/sse_keep_alive.py` binds per-wait done callbacks (`watched_task`, `waiter`), guards `while not next_task.done():`, and removes callbacks in `finally:` so stale queued callbacks cannot resolve a later chunk's waiter (`InvalidStateError`). | Async SSE transport wrapper only; zero engine/worker/kernel changes. | `tests/entrypoints/serve/utils/test_sse_keep_alive_race.py` |
 | [`0826`](vllm/0826-feat-responses-support-CustomTool-and-OpenResponses-.patch) | `#1206` | Non-Harmony Responses API support for `CustomTool` (`"type": "custom"`), `custom_tool_call` / `custom_tool_call_output` history replay, custom-tool streaming events, tool schema/xgrammar helpers, and OpenResponses input normalization (grammar-format custom tools rejected with `400`). | Responses API frontend & schema helpers only; zero chat-completion, kernel, weight, graph, or collective changes. | `tests/entrypoints/openai/test_responses_custom_tools.py` |
 
-## Benchmark Carry-Over Contract (`rc12 -> rc13 -> rc14` Precedent)
+## Benchmark Carry-Over & Qualification Scope
 
-Per the `rc12 -> rc13 -> rc14` carry-over precedent recorded in [`manifests/baselines/2026-10-30-spark-ds41f-1030.json`](../../../manifests/baselines/2026-10-30-spark-ds41f-1030.json), because `candidate-62` preserves `candidate-61-r2`'s exact:
-- TileLang/TileKernels/NCCL/SparkNet bits (`jit_new_files = 0`),
-- Model weights, packing, KV budgets, and CUDA graph capture shapes,
-- Collective policies and speculative decoding parameters, and
-- Unconstrained `/v1/chat/completions` greedy/sampled serving hot paths,
+Per the `rc12 -> rc13 -> rc14` carry-over precedent recorded in [`manifests/baselines/2026-10-30-spark-ds41f-1030.json`](../../../manifests/baselines/2026-10-30-spark-ds41f-1030.json), because `candidate-62` preserves `candidate-61-r2`'s exact TileLang/TileKernels/NCCL/SparkNet bits (`jit_new_files = 0`), weights, and unconstrained `/v1/chat/completions` hot paths:
 
-all hardware benchmark suites recorded on `candidate-61` and `candidate-61-r2` (`experiments/2026-11-16-c61-decode/`) stand directly for `candidate-62` across all 12 shape profiles (`tp1-local`, `tp2-direct`, `tp2-switched`, `tp3-triangle`, `tp3-triangle-4k`, `tp3-switched`, `tp4-ring`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`). Every `candidate-62/<shape>.json` resolves via `tests/test_releases.py:serving()` to the exact same runtime configuration as its parent profile in `experiments/2026-11-16-c61-decode/` apart from container image tag (`spark-ds41f:candidate-62`), `local.spark-ds41f.vllm.tree`, and `upstreams_config`.
+- **`TP1–TP3` (`tp1`, `tp2-direct`, `tp2-switched`, `tp3`, `tp3-switched`, `tp3-triangle-4k`)**: Carry over `candidate-61` and `candidate-61-r2` hardware benchmarks directly (`serving()` configuration is unchanged aside from container image tag, `local.spark-ds41f.vllm.tree`, and `upstreams_config`).
+- **`TP4–TP8` (`tp4`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`)**: Raise `--max-num-seqs` to `32`, `--max-cudagraph-capture-size` to `192`, and shift `--long-prefill-token-threshold` by `-96` (`-96` tokens on multi-chunk prefill boundaries), plus KV headroom adjustments on `tp6-switched` (`13.00 GiB`) and `tp8-switched` (`25.50 GiB`). Once active `candidate-61-r2` waves conclude, record 2-boot 32-seat startup-memory, determinism, `release`/`bench`, and `--suite c32` ([`config/suites/c32.json`](../../../config/suites/c32.json)) receipts across `TP4..TP8`.
 
 Before promoting or shipping an image built from `candidate-62`, execute:
 - [`bundles/release-tests`](bundles/release-tests) (in-image gate suite) and [`build.json`](build.json) / [`fix-tp4.json`](fix-tp4.json) (two-boot determinism + startup memory verification).

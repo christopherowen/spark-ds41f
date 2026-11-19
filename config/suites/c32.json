@@ -1,0 +1,109 @@
+{
+ "name": "c32",
+ "version": 1,
+ "description": "32-seat saturation measurement for TP4+ cluster shapes: 32 and 24 greedy closed loops, 32-stream sampled decode, Poisson arrivals at 1.0 requests/s with goodput under a 2 s time to first token and 100 ms per output token, and decode stalls while a cold 131K prompt prefills at 23 streams (with short TTFT probes 2-14 s into it) and 31 streams (filling all 32 slots).",
+ "steps": [
+  {
+   "id": "c32",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 32,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c24",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 24,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c32-sampled",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 32,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "temperature": 1.0,
+     "top_p": 1.0,
+     "seed": 0,
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "poisson-c32",
+   "command": "run",
+   "args": {
+    "mode": "poisson",
+    "rate": 1.0,
+    "warmup": 60,
+    "duration": 300,
+    "slo_ttft": 2,
+    "slo_tpot": 100,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "stall-23",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 23,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3,
+    "probes": [
+     2,
+     5,
+     8,
+     11,
+     14
+    ],
+    "probe_tokens": 500,
+    "probe_max_tokens": 16
+   }
+  },
+  {
+   "id": "stall-31",
+   "command": "stall",
+   "args": {
+    "sizes": [
+     131072
+    ],
+    "streams": 31,
+    "max_tokens": 16384,
+    "warmup": 20,
+    "tail": 2,
+    "repeats": 3
+   }
+  }
+ ]
+}
