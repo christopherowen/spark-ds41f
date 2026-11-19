@@ -2,13 +2,13 @@
 
 ## Summary
 
-`candidate-62` layers five pure-Python vLLM fixes (`0823..0827`) plus the strictly opt-in `VLLM_DS41_LSA=1` FP8 group-32 dominance upgrade (`0828`, PR `#954`) onto `candidate-61-r2` (`experiments/2026-11-16-c61-decode/`, vLLM `0001..0822`) alongside the merged host-Python PRs (`#1224`, `#1049`, `#1232`, `#958`) and LSA evidence/watchlist PRs (`#976`, `#1014`, `#1017`). With `VLLM_DS41_LSA` unset (the default across every `candidate-62` shape), default serving keeps the 68-byte index cache, declares zero LSA kernels (`jit_new_files = 0`), and executes the exact `candidate-61-r2` hot paths.
+`candidate-62` layers five pure-Python vLLM fixes (`0823..0827`) plus the strictly opt-in `VLLM_DS41_LSA=1` FP8 group-32 dominance upgrade (`0828`, PR `#954`) and a streaming fix to `0824`'s tool-argument parser (`0829`) onto `candidate-61-r2` (`experiments/2026-11-16-c61-decode/`, vLLM `0001..0822`) alongside the merged host-Python PRs (`#1224`, `#1049`, `#1232`, `#958`) and LSA evidence/watchlist PRs (`#976`, `#1014`, `#1017`). With `VLLM_DS41_LSA` unset (the default across every `candidate-62` shape), default serving keeps the 68-byte index cache, declares zero LSA kernels (`jit_new_files = 0`), and executes the exact `candidate-61-r2` hot paths.
 
 - **vLLM base revision**: `19f2c20ed4d64ae22bd009ceacadd85e2a81e354`
-- **vLLM patch series**: [`vllm/series`](vllm/series) (`701` active patches, ending at `0828`)
-- **vLLM patch head**: `45ec62399b1e9265564b075cdc614f5e3e404dee`
-- **vLLM expected tree**: `b6acfcc12b3a23fde43d28dab1c9f57dc5bcfe01`
-- **Patchset SHA-256**: `93a85c59539360ad7774b4e8040fe7423c5069eac971607aa58b88fe3bf3bcf4`
+- **vLLM patch series**: [`vllm/series`](vllm/series) (`702` active patches, ending at `0829`)
+- **vLLM patch head**: `9b251a1860e7e9e123aaf718d15f499a2beb6738`
+- **vLLM expected tree**: `8fc99ca7546c5c538f0fe64e7c82954f1d2d7ae0`
+- **Patchset SHA-256**: `800e726dc8e772596e3e4cce20e264e92921510264cf628c7bdc4bd4fcb8d906`
 - **TileLang / TileKernels / SparkNet / NCCL / Model weights**: Identical to `experiments/2026-11-16-c61-decode/` (`upstreams.lock.json` differs only in `vllm`).
 - **32-sequence concurrency on `TP4+` (`tp4`..`tp8-switched`)**: Adopts `--max-num-seqs 32` (`--max-cudagraph-capture-size 192`) across all `TP4..TP8` profiles (`TP1..TP3` unchanged at `4`/`8` seats), backed by `#1230` (`+37%` aggregate decode scaling at `c32`, `+19%` mixed-load tasks/h), single-slot 2 MiB RoCE compatibility (`192 × 10,240 B = 1.875 MiB <= 2.0 MiB`), patch `0823` (`544`-row structured-output bitmask), and `0783`/`0784` (`128`-row decode tiles and `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16`).
 
@@ -32,7 +32,7 @@
 3. **PR `#1232`**: `doctor`: free memory by block size and `--stream-rate` per idle node (`23b24a022`).
 4. **PR `#958`**: Verify TP3 6-channel bidirectional Ring NCCL profile and align topology checks (`d99dd9514`).
 
-## Included vLLM Patches (`0823..0828`)
+## Included vLLM Patches (`0823..0829`)
 
 | Patch | Issue / PR | Scope | Memory & Kernel Impact | Gate Test Added |
 |---|---|---|---|---|
@@ -42,6 +42,7 @@
 | [`0826`](vllm/0826-feat-responses-support-CustomTool-and-OpenResponses-.patch) | `#1206` | Non-Harmony Responses API support for `CustomTool` (`"type": "custom"`), `custom_tool_call` / `custom_tool_call_output` history replay, custom-tool streaming events, tool schema/xgrammar helpers, and OpenResponses input normalization (grammar-format custom tools rejected with `400`). | Responses API frontend & schema helpers only; zero chat-completion, kernel, weight, graph, or collective changes. | `tests/entrypoints/openai/test_responses_custom_tools.py` |
 | [`0827`](vllm/0827-fix-dsv41-rename-quantization-ignored-layers-into-th.patch) | PR `#1235` (owner request, 2026-11-19) | The V4.1 VL wrapper (`vllm/models/deepseek_v41/nvidia/vl_model.py`, inherited by the GB10 wrapper) gets a class-level `hf_to_vllm_mapper` with its module renames, so `configure_quant_config` renames a quantization config's `ignored_layers` (`layers.1.engram.wkv` -> `language_model.model.layers.1.engram.wkv`) before any layer is built. | Inert on the served checkpoints: `DeepSeek-V4.1-Flash` and `-Flash-1017` list no ignored layers and store both Engram projections as FP8, so every layer keeps its method. Zero kernel, weight, graph, or collective changes. | `tests/models/test_deepseek_v4_1_quant_ignore.py` |
 | [`0828`](vllm/0828-perf-dsv41-lsa-group32-dominance-fp8-summary.patch) | PR `#954` (backed by `#976`, `#1014`, `#1017`) | Upgrades opt-in `VLLM_DS41_LSA=1` from BF16 block-8 mean summaries (`STATE_BYTES=100`) to `float8_e4m3fn` Group-32 dominance-blended summaries (`0.85 * mean + 0.15 * k*`, `STATE_BYTES=84`) and routes `r=1` decode at `score_width >= 262144` through `PageShortlistPlan`. | **Default-off invariant (`VLLM_DS41_LSA` unset/`0`)**: keeps `state_content_bytes=68`, declares zero LSA kernels (`summarize_blocks`/`QueryReusePlan` skipped, `jit_new_files = 0`), writes no summaries, and uses `IndexerV41Plan` unchanged. When `VLLM_DS41_LSA=1`, halves LSA summary overhead (`+16` vs `+32 B/slot`). | `tests/models/test_deepseek_v4_1_lsa.py` (updated) |
+| [`0829`](vllm/0829-fix-dsv41-hold-back-an-unfinished-next-parameter-tag.patch) | found by this candidate's release tests (2026-11-19) | `vllm/parser/deepseek_v41.py`: `0824`'s text-path argument converter and open-value extender again hold back an unfinished next parameter tag while a value is open, as the previous parser did. Without it, when the model leaves out a parameter closer, the next head was streamed as argument text. | Tool-argument streaming on the text path only (no token ids); the token-provenance path, complete arguments and `0824`'s closer rules are unchanged. Zero kernel, weight, graph, or collective changes. | `tests/parser/test_deepseek_v41_structural_closers.py` (extended); restores `tests/parser/engine/test_deepseek_v41.py::test_partial_tag_after_gt_is_held_back` |
 
 ## Benchmark Carry-Over & Qualification Scope
 
