@@ -526,6 +526,95 @@ class RoceGidTest(unittest.TestCase):
         )
 
 
+# /proc/buddyinfo summed over zones, 64 KiB pages, as dgx4 reported it on 2026-11-18:
+# up ten days, and a minute after its reboot.
+BUDDY_TEN_DAYS = "3354,5561,5949,5688,4717,3686,2913,2212,1649,829,104,15,0,0"
+BUDDY_FRESH = "143,63,43,39,36,30,17,10,4,5,4,4,2,233"
+
+
+class MemoryBlocksTest(unittest.TestCase):
+    def test_free_memory_by_block_size(self) -> None:
+        free_gib, share, block_mib = spark.free_memory_blocks(facts(buddy=BUDDY_FRESH, page_kb="64"))
+        self.assertEqual(block_mib, 512)
+        self.assertAlmostEqual(free_gib, 118.3, places=1)
+        self.assertGreater(share, 0.94)
+        self.assertEqual(spark.free_memory_blocks(facts(buddy=BUDDY_TEN_DAYS, page_kb="64"))[1], 0.0)
+
+    def test_fresh_node_passes(self) -> None:
+        self.assertEqual(
+            spark.memory_block_warnings("dgx4", facts(buddy=BUDDY_FRESH, page_kb="64", gpu_apps="0")), []
+        )
+
+    def test_idle_node_without_large_blocks_warns(self) -> None:
+        warnings = spark.memory_block_warnings("dgx1", facts(buddy=BUDDY_TEN_DAYS, page_kb="64", gpu_apps="0"))
+        self.assertEqual(len(warnings), 1)
+        self.assertIsInstance(warnings[0], spark.Warn)
+        self.assertIn("dgx1: 0% of the 106 GiB free is in 512 MiB blocks", warnings[0])
+        self.assertIn("--stream-rate", warnings[0])
+
+    def test_node_whose_gpu_is_held_is_not_judged(self) -> None:
+        # A serving engine holds most of the memory: what is left says nothing.
+        self.assertEqual(
+            spark.memory_block_warnings("dgx1", facts(buddy="900,400,90,20,4,0,0,0,0,0,0,0,0,0", page_kb="64", gpu_apps="1")),
+            [],
+        )
+
+    def test_little_free_memory_is_not_judged(self) -> None:
+        self.assertEqual(
+            spark.memory_block_warnings("dgx1", facts(buddy="900,400,90,20,4,0,0,0,0,0,0,0,0,0", page_kb="64", gpu_apps="0")),
+            [],
+        )
+
+    def test_unreadable_blocks_warn(self) -> None:
+        for changes in ({"buddy": "", "page_kb": "64"}, {"buddy": "1,2,3", "page_kb": ""}, {"buddy": "0,0,0", "page_kb": "4"}):
+            warnings = spark.memory_block_warnings("dgx2", facts(gpu_apps="0", **changes))
+            self.assertEqual(warnings, ["dgx2: cannot read free memory by block size (/proc/buddyinfo)"])
+
+    def test_query_reads_the_blocks_and_the_gpus_processes(self) -> None:
+        for needle in ("/proc/buddyinfo", "getconf PAGESIZE", "--query-compute-apps=pid"):
+            self.assertIn(needle, spark.HOST_FACTS_QUERY)
+
+
+class StreamRateTest(unittest.TestCase):
+    def test_fast_node_is_printed_without_a_warning(self) -> None:
+        line, warnings = spark.stream_rate_findings("dgx4", 'noise\n{"stream_gbs": 253.6}\n')
+        self.assertEqual(line, "dgx4: memory reads at 253.6 GB/s")
+        self.assertEqual(warnings, [])
+
+    def test_slow_node_warns(self) -> None:
+        line, warnings = spark.stream_rate_findings("dgx1", '{"stream_gbs": 235.8}')
+        self.assertEqual(line, "dgx1: memory reads at 235.8 GB/s")
+        self.assertEqual(len(warnings), 1)
+        self.assertIsInstance(warnings[0], spark.Warn)
+        self.assertIn("below 245", warnings[0])
+
+    def test_skipped_node_is_reported_without_a_warning(self) -> None:
+        line, warnings = spark.stream_rate_findings("dgx2", '{"skipped": "a process holds the GPU"}')
+        self.assertEqual(line, "dgx2: memory read not measured (a process holds the GPU)")
+        self.assertEqual(warnings, [])
+
+    def test_failed_probe_warns_with_its_last_line(self) -> None:
+        line, warnings = spark.stream_rate_findings("dgx3", "", "docker: Error response from daemon: no such image")
+        self.assertEqual(line, "dgx3: memory read not measured")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("no such image", warnings[0])
+
+    def test_script_skips_a_held_gpu_and_runs_the_profiles_image(self) -> None:
+        script = spark.stream_rate_script("spark-ds41f:candidate-60")
+        self.assertIn("--query-compute-apps=pid", script)
+        self.assertIn("flock -n 9", script)
+        self.assertIn("/tmp/spark-lab-gpu.lock", script)
+        self.assertIn("--entrypoint python3 spark-ds41f:candidate-60 -c", script)
+        self.assertLess(script.index("flock -n 9"), script.index("docker run"))
+
+    def test_stream_rate_needs_live(self) -> None:
+        args = mock.Mock(live=False, stream_rate=True, fragmentation_commands=False, cluster_config=None)
+        with mock.patch.object(spark.doctor, "configuration", return_value=({}, {}, {})), \
+                mock.patch.object(spark.doctor, "cluster_config_path", return_value=("x", "x")):
+            with self.assertRaises(SystemExit):
+                spark.command_doctor(args)
+
+
 class ClockLatchTest(unittest.TestCase):
     def test_serving_node_at_full_clock_passes(self) -> None:
         self.assertEqual(spark.clock_latch_problems("dgx1", facts(gpu="2411, 11.47"), True), [])

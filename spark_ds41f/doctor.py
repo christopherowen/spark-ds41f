@@ -564,6 +564,13 @@ printf 'wireless_ifaces=%s\n' "$(for d in /sys/class/net/*; do
   printf '%s:%s\n' "$ifname" "$ips"
 done | paste -sd, -)"
 """
+HOST_FACTS_QUERY += r"""printf 'buddy=%s\n' "$(awk '{
+  for (i = 5; i <= NF; i++) free[i - 5] += $i
+  if (NF - 5 > top) top = NF - 5
+} END {for (i = 0; i <= top; i++) printf "%s%s", free[i] + 0, (i < top ? "," : "")}' /proc/buddyinfo 2>/dev/null)"
+printf 'page_kb=%s\n' "$(( $(getconf PAGESIZE) / 1024 ))"
+printf 'gpu_apps=%s\n' "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)"
+"""
 
 
 def host_facts(output: str) -> dict[str, str]:
@@ -1096,6 +1103,157 @@ def roce_gid_problems(node_name: str, index: int, hcas: list[str], output: str,
     return problems
 
 
+# Free memory by block size (/proc/buddyinfo). A freshly booted GB10 has almost all of
+# its free memory in the largest blocks (dgx4, 2026-11-18: 233 of 512 MiB, 96% of 124
+# GiB); after ten days of engine boots dgx1..dgx4 had none there. Memory taken from such
+# a node as it comes (a kernel-lab bundle, the read probe below) read 7 to 9% slower. The
+# engine is mostly spared: its loader soaks the small fragments first and places the
+# weights in blocks of 2 MiB or more, and a rebooted node's rank was 2% faster in two
+# kernels, at most 0.6% of a single-stream step (experiments/2026-11-17-c1-floor-now).
+# The share below which this warns is between the two states measured, not a measured
+# threshold, and it does not predict the read rate: two hours and an image build after
+# its reboot dgx4 still had most of its free memory in 512 MiB blocks and read 238 to 245.
+MEMORY_BLOCKS_MIN_SHARE = 0.5
+MEMORY_BLOCKS_MIN_FREE_GIB = 32.0
+
+# The plain read of experiments/2026-10-26-c1-100tps's expert-rate bundle: torch.sum
+# over cold 220 MiB FP32 buffers, the L2 flushed before each replay. A freshly booted
+# GB10 reads 249 to 254 GB/s; the nodes up ten days read 229 to 237, and dgx4 two hours
+# and an image build after its reboot 238 to 245. It is the rate of memory taken now, as
+# it comes: what a kernel-lab timing on this node will see, not what a running engine
+# has (see above).
+STREAM_RATE_MIN_GBS = 245.0
+STREAM_RATE_PROBE = r"""
+import json, statistics, torch
+MIB, COUNT, REPEATS = 220, 8, 7
+flush = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+buffers = [torch.ones((MIB << 20) // 4, dtype=torch.float32, device="cuda") for _ in range(COUNT)]
+sums = [torch.empty((), dtype=torch.float32, device="cuda") for _ in buffers]
+side = torch.cuda.Stream()
+side.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(side):
+    for buffer, out in list(zip(buffers, sums))[:2]:
+        torch.sum(buffer, dim=0, out=out)
+torch.cuda.current_stream().wait_stream(side)
+torch.cuda.synchronize()
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    for buffer, out in zip(buffers, sums):
+        torch.sum(buffer, dim=0, out=out)
+samples = []
+for _ in range(REPEATS):
+    flush.zero_()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    samples.append(start.elapsed_time(end) * 1e3 / COUNT)
+print(json.dumps({"stream_gbs": round((MIB << 20) / statistics.median(samples) / 1e3, 1)}))
+"""
+
+
+def free_memory_blocks(facts: dict[str, str]) -> tuple[float, float, int] | None:
+    """(GiB free in the buddy allocator, the share of it in the largest block size, that
+    size in MiB), from the node's free blocks by order; None when they cannot be read."""
+    try:
+        counts = [int(count) for count in facts.get("buddy", "").split(",")]
+        page_kb = int(facts.get("page_kb", ""))
+    except ValueError:
+        return None
+    sizes = [count * page_kb * (1 << order) for order, count in enumerate(counts)]
+    if page_kb <= 0 or not sum(sizes):
+        return None
+    return sum(sizes) / 2**20, sizes[-1] / sum(sizes), page_kb * (1 << (len(counts) - 1)) // 1024
+
+
+def memory_block_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Warn when an idle node's free memory is no longer in its largest blocks.
+
+    A node whose GPU a process holds is not judged: its free memory is what the engine
+    left. ``cluster start`` drops caches and compacts before a launch
+    (``host.defragment_before_start``), which does not rebuild blocks that kernel
+    allocations have split; a reboot does. The warning is about timings taken on the
+    node, not a reason to reboot a serving node: the engine's loader places its weights
+    in blocks of 2 MiB or more either way.
+    """
+    if facts.get("gpu_apps", "0") not in ("", "0"):
+        return []
+    blocks = free_memory_blocks(facts)
+    if blocks is None:
+        return [Warn(f"{node_name}: cannot read free memory by block size (/proc/buddyinfo)")]
+    free_gib, share, block_mib = blocks
+    if free_gib < MEMORY_BLOCKS_MIN_FREE_GIB or share >= MEMORY_BLOCKS_MIN_SHARE:
+        return []
+    return [
+        Warn(
+            f"{node_name}: {share:.0%} of the {free_gib:.0f} GiB free is in {block_mib} MiB blocks, "
+            "the largest (a 64 KiB node after a boot: 96% in 512 MiB blocks). Kernel-lab timings "
+            "on such nodes read memory 7 to 9% slower; the engine lost at most 0.6% of a step "
+            "(experiments/2026-11-17-c1-floor-now). Measure the node with doctor --live "
+            "--stream-rate; a reboot restores the blocks until the memory is used again"
+        )
+    ]
+
+
+def stream_rate_script(image: str) -> str:
+    """The node's command for the read probe: nothing when a process holds the GPU or the
+    kernel lab's GPU lock is taken, else one container of ``image`` for about a second of
+    GPU time."""
+    return "\n".join((
+        'if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ]; then',
+        "  echo '{\"skipped\": \"a process holds the GPU\"}'; exit 0",
+        "fi",
+        "exec 9>>/tmp/spark-lab-gpu.lock",
+        "if ! flock -n 9; then echo '{\"skipped\": \"the kernel lab holds the GPU lock\"}'; exit 0; fi",
+        f"docker run --rm --gpus all --ipc=host --entrypoint python3 {shlex.quote(image)} -c {shlex.quote(STREAM_RATE_PROBE)}",
+    ))
+
+
+def stream_rate_findings(node_name: str, output: str, stderr: str = "") -> tuple[str, list[str]]:
+    """(the line to print, warnings) for one node's probe output."""
+    record = None
+    for line in reversed(output.splitlines()):
+        if line.startswith("{"):
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            break
+    if not isinstance(record, dict) or not ({"stream_gbs", "skipped"} & set(record)):
+        lines = [line.strip() for line in (stderr or output).splitlines() if line.strip()]
+        detail = next((line for line in lines if "rror" in line), lines[-1] if lines else "no output")
+        return f"{node_name}: memory read not measured", [
+            Warn(f"{node_name}: the memory read probe failed ({detail[:160]})")
+        ]
+    if "skipped" in record:
+        return f"{node_name}: memory read not measured ({record['skipped']})", []
+    rate = float(record["stream_gbs"])
+    line = f"{node_name}: memory reads at {rate:.1f} GB/s"
+    if rate >= STREAM_RATE_MIN_GBS:
+        return line, []
+    return line, [
+        Warn(
+            f"{node_name}: memory reads at {rate:.1f} GB/s, below {STREAM_RATE_MIN_GBS:.0f} "
+            "(a freshly booted GB10 reads 249 to 254): kernel-lab timings here will read low "
+            "against a fresh node's; the engine is mostly spared (experiments/2026-11-17-c1-floor-now)"
+        )
+    ]
+
+
+def stream_rates(cluster: dict, nodes: dict) -> tuple[list[str], list[str]]:
+    """Each node's read probe, run at once: (lines to print, warnings)."""
+    script = stream_rate_script(cluster["container"]["image"])
+
+    def probe(node: dict) -> tuple[str, list[str]]:
+        result = remote_shell(nodes, node, script)
+        return stream_rate_findings(node["name"], result.stdout, result.stderr)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        results = list(pool.map(probe, nodes["nodes"]))
+    return [line for line, _ in results], [warning for _, warnings in results for warning in warnings]
+
+
 LATCHED_CLOCK_MHZ = 1000
 
 
@@ -1310,6 +1468,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(wireless_warnings(node["name"], facts, node=node, env=cluster.get("environment")))
         problems.extend(fan_control_problems(
             node["name"], facts, fan_control=fan_control_enabled(cluster)))
+        problems.extend(memory_block_warnings(node["name"], facts))
         _, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
         problems.extend(roce_gid_findings(cluster, node, gids.stdout, hcas=hcas))
@@ -1602,11 +1761,18 @@ def command_doctor(args: argparse.Namespace) -> int:
         for finding in weight_fragmentation_findings(cluster, nodes, commands=True):
             print(finding)
         return 0
+    if getattr(args, "stream_rate", False) and not args.live:
+        raise SystemExit("--stream-rate measures the nodes: use it with --live")
     findings = local_doctor(cluster, nodes, upstreams)
     if args.live and not split_findings(findings)[0]:
         findings.extend(live_doctor(cluster, nodes))
         if not split_findings(findings)[0]:
             findings.extend(weight_fragmentation_findings(cluster, nodes))
+        if getattr(args, "stream_rate", False):
+            lines, warnings = stream_rates(cluster, nodes)
+            for line in lines:
+                print(line)
+            findings.extend(warnings)
     problems, warnings = split_findings(findings)
     if args.live and not getattr(args, "verbose", False):
         warnings = summarize_live_warnings(warnings, canonical)
