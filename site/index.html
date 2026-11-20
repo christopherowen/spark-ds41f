@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>switchless* · DeepSeek V4.1 Flash on DGX Spark</title>
-  <meta name="description" content="DeepSeek V4.1 Flash on three to eight DGX Sparks: native weights, a million tokens of context, correctness first, then speed. No switch required.">
+  <meta name="description" content="DeepSeek V4.1 Flash on __SPARK_RANGE__ DGX Sparks: native weights, a million tokens of context, correctness first, then speed. No switch required.">
   <meta property="og:title" content="switchless* · DeepSeek V4.1 Flash on DGX Spark">
   <meta property="og:description" content="Native weights, a million tokens of context, correctness first, then speed. No switch required.*">
   <meta property="og:type" content="website">
@@ -559,7 +559,7 @@
         <div class="ch-body reveal">
           <div class="facts">
             <div class="fact"><h3>Nothing re-quantized</h3><p>The published FP8, FP4 and BF16 weights load directly from the checkpoint. No distillation, no community re-quant, no "close enough" build. <span id="model-line"></span></p></div>
-            <div class="fact"><h3>Split, never altered</h3><p>Tensor parallelism shards every layer across three to eight Sparks. The cables carry the partial sums; the arithmetic follows DeepSeek's reference.</p></div>
+            <div class="fact"><h3>Split, never altered</h3><p>Tensor parallelism shards every layer across <span id="tp-range">three to eight</span> Sparks. The cables carry the partial sums; the arithmetic follows DeepSeek's reference.</p></div>
             <div class="fact"><h3>The whole feature set</h3><p>Full 1M-token context, vision, tool calls, reasoning effort, DeepSeek's own speculative drafter, and an OpenAI-compatible API that also speaks DeepSeek's dialect.</p></div>
           </div>
         </div>
@@ -666,7 +666,7 @@
           <div class="ch-no"><b>06</b> · Shapes</div>
           <div>
             <h2>One recipe, <em>every way to cable it.</em></h2>
-            <p>Three Sparks make a triangle and four make a ring, with nothing between them but cable. If you would rather use a switch<span class="ast">*</span>, the same image serves three to eight. A shape starts only after a release benchmark has qualified it on real hardware.</p>
+            <p><span id="shapes-lede">Three Sparks make a triangle and four make a ring, with nothing between them but cable. If you would rather use a switch<span class="ast">*</span>, the same image serves three to eight.</span> A shape starts only after a release benchmark has qualified it on real hardware.</p>
           </div>
         </div>
         <div class="ch-body reveal">
@@ -737,7 +737,7 @@
         <div>
           <div class="ch-no" style="padding:0 0 14px"><b>09</b> · Start</div>
           <h2>Cable it. Check it. <em>Start it.</em></h2>
-          <p style="color:var(--ink-2);font-size:17px;max-width:30em">You need three or more DGX Sparks and the cables between them. The tools print a plan before they touch anything, and refuse to start a cluster whose cabling, kernel or image does not match the recipe.</p>
+          <p style="color:var(--ink-2);font-size:17px;max-width:30em"><span id="need">You need three or more DGX Sparks and the cables between them.</span> The tools print a plan before they touch anything, and refuse to start a cluster whose cabling, kernel or image does not match the recipe.</p>
           <div class="cta" style="margin-top:24px">
             <a class="btn primary" href="https://github.com/christopherowen/spark-ds41f#quick-start" rel="noopener">Quick start on GitHub <span aria-hidden="true">→</span></a>
             <a class="btn" href="https://github.com/christopherowen/spark-ds41f/blob/main/docs/setup.md" rel="noopener">Full setup guide</a>
@@ -808,6 +808,8 @@ __MANIFEST_DATA__
     const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
       "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen"];
     const word = n => WORDS[n] || String(n);
+    // The fewest and the most Sparks the model is split across: one Spark alone has nothing to split.
+    const SPLIT = (l => [Math.min.apply(null, l), Math.max.apply(null, l)])(DATA.shapes.map(s => s.nodes).filter(n => n > 1));
     const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
     const shortRel = r => String(r).replace(/^\d{4}-\d{2}-\d{2}-/, "").replace(/^spark-ds41f-/, "").replace(/-tp\d.*$/, "");
 
@@ -842,7 +844,7 @@ __MANIFEST_DATA__
         gain: "3.2×", gainNote: "on the summary kernel; no serving claim yet" }
     ];
     const MORE = [
-      ["Any split from three to eight.", "The model has 64 experts and 4 attention heads, which do not divide by five or seven. Padded shards and cyclic head replication make every count work."],
+      [`Any split from ${word(SPLIT[0])} to ${word(SPLIT[1])}.`, "The model has 64 experts and 4 attention heads, which do not divide by five or seven. Padded shards and cyclic head replication make every count work."],
       ["One-shot RoCE collectives.", "sparknet moves each tensor-parallel reduction in a single RDMA exchange, timed on the GPU clock."],
       ["Late admission.", "A new request joins at decoder layer 30 instead of the next step: first token 26 to 30% sooner under load."],
       ["Expert scale codes.", "Routed-expert scales stored as 4-bit, then 2-bit codes freed about 2.1 GiB per Spark, which is what bought a million tokens on three."],
@@ -860,20 +862,26 @@ __MANIFEST_DATA__
     /* ---------- shapes and suites ---------- */
     const fabricOf = s => /switched/.test(s.transport || s.name || "") ? "switched" : "switchless";
     const SHAPES = DATA.shapes.map(s => Object.assign({ fabric: fabricOf(s) }, s));
+    const topStreams = suite => [16, 8, 4, 2].find(n => suite.runs["c" + n]) || 0;
     const suiteFor = s => DATA.suites.find(x => x.path === s.benchmark_reference)
       || DATA.suites.find(x => x.id === DATA.promoted_baseline + "-" + s.name) || null;
     // One diagram entry per (fabric, node count): the first shape listed wins, so the 4 KiB variant stays in the table only.
     const DIAGRAM = {};
     SHAPES.forEach(s => { const k = s.fabric + s.nodes; if (!DIAGRAM[k]) DIAGRAM[k] = s; });
     const counts = f => SHAPES.filter(s => s.fabric === f).map(s => s.nodes).filter((n, i, a) => a.indexOf(n) === i).sort((a, b) => a - b);
-    const HOW = {
-      "oneshot-ring4": "each Spark cabled to its two neighbours",
-      "oneshot-direct": "every Spark cabled to both of the others",
-      "oneshot-switched": "one cable each, into a switch"
-    };
+    const sparks = n => n === 1 ? "one Spark" : `${word(n)} Sparks`;
+    // How a shape is laid out, in a word: the table, the fabric menu and the link-preview card all use it.
+    const layout = (fabric, n) => fabric === "switched" ? "switched" : n === 1 ? "local" : n === 2 ? "direct" : n === 3 ? "triangle" : "ring";
+    const how = s => s.fabric === "switched" ? "one cable each, into a switch"
+      : s.nodes === 1 ? "on its own: no cables, no peers"
+      : s.nodes === 2 ? "one cable between them"
+      : s.nodes === 3 ? "every Spark cabled to both of the others"
+      : "each Spark cabled to its two neighbours";
 
     function geometry(fabric, n, cx, cy, R) {
-      const off = fabric === "switched" || n % 2 ? -90 : -90 - 180 / n;
+      // One Spark sits alone in the middle; two with a switch sit either side of it.
+      if (n === 1) return { pts: [[cx, cy]], edges: [] };
+      const off = fabric === "switched" ? (n === 2 ? 180 : -90) : n % 2 ? -90 : -90 - 180 / n;
       const pts = [];
       for (let i = 0; i < n; i++) {
         const a = (off + i * 360 / n) * Math.PI / 180;
@@ -881,6 +889,7 @@ __MANIFEST_DATA__
       }
       let edges;
       if (fabric === "switched") edges = pts.map(p => `M${p[0]},${p[1]} L${cx},${cy}`);
+      else if (n === 2) edges = [`M${pts[0][0]},${pts[0][1]} L${pts[1][0]},${pts[1][1]}`];
       else if (n === 3) edges = pts.map((p, i) => `M${p[0]},${p[1]} L${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
       else edges = pts.map((p, i) => `M${p[0]},${p[1]} A${R},${R} 0 0 1 ${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
       return { pts, edges };
@@ -889,7 +898,9 @@ __MANIFEST_DATA__
     function glyph(fabric, n) {
       const g = geometry(fabric, n, 15, 15, 11);
       return `<svg class="glyph" viewBox="0 0 30 30" aria-hidden="true">${g.edges.map(d => `<path d="${d}"/>`).join("")}` +
-        g.pts.map(p => `<circle cx="${p[0]}" cy="${p[1]}" r="2.4"/>`).join("") + `</svg>`;
+        g.pts.map(p => `<circle cx="${p[0]}" cy="${p[1]}" r="2.4"/>`).join("") +
+        // Two Sparks through a switch would otherwise draw as two cabled directly: mark the switch.
+        (fabric === "switched" && n === 2 ? `<circle cx="15" cy="15" r="1.5"/>` : "") + `</svg>`;
     }
 
     const state = { fabric: "switchless", nodes: 4 };
@@ -916,11 +927,15 @@ __MANIFEST_DATA__
       }
       if (fabric === "switched") {
         out += `<g class="hub"><rect x="${cx - 37}" y="${cy - 17}" width="74" height="34" rx="17"/><text x="${cx}" y="${cy + 4}">switch*</text></g>`;
+      } else if (n === 1) {
+        out += `<text class="hub-label" x="${cx}" y="${cy + 96}">no switch, no cables</text>`;
+      } else if (n === 2) {
+        out += `<text class="hub-label" x="${cx}" y="${cy + 30}">no switch</text>`;
       } else {
         out += `<circle class="hub-ghost" cx="${cx}" cy="${cy}" r="34"/><text class="hub-label" x="${cx}" y="${cy + 4}">no switch</text>`;
       }
       // A Spark, drawn as its own low slab: plain lid and flank, a foam front with a grip at each end.
-      const k = n <= 4 ? 1.6 : n <= 6 ? 1.34 : 1.08;
+      const k = n === 1 ? 2.2 : n <= 4 ? 1.6 : n <= 6 ? 1.34 : 1.08;
       g.pts.forEach((p, i) => {
         const at = (x, y) => `${(p[0] + x * k).toFixed(1)},${(p[1] + y * k).toFixed(1)}`;
         const poly = (cls, pts) => `<polygon class="${cls}" points="${pts.map(q => at(q[0], q[1])).join(" ")}"/>`;
@@ -966,7 +981,7 @@ __MANIFEST_DATA__
         `<button type="button" data-n="${n}" aria-pressed="${n === state.nodes}">${n}</button>`).join("");
       drawFabric();
       $("#fabric-name").textContent = s.name;
-      $("#fabric-how").textContent = `${cap(word(s.nodes))} Sparks, ${HOW[s.transport] || s.transport}`;
+      $("#fabric-how").textContent = `${cap(sparks(s.nodes))}, ${how(s)}`;
 
       const kv = s.kv_capacity;
       tween($("#t-ctx"), s.max_model_len, int);
@@ -981,12 +996,12 @@ __MANIFEST_DATA__
       if (!suite || !suite.runs || !suite.runs.c1) {
         tiles.hidden = true; none.hidden = false;
         none.innerHTML = s.qualified_release
-          ? `<code>${esc(s.name)}</code> is qualified by the release benchmark on ${word(s.nodes)} Sparks. A full serving suite is recorded for ${esc(suiteShapes())}; pick one of those to see its throughput.`
+          ? `<code>${esc(s.name)}</code> is qualified by the release benchmark on ${sparks(s.nodes)}. A full serving suite is recorded for ${esc(suiteShapes())}; pick one of those to see its throughput.`
           : `<code>${esc(s.name)}</code> has no release benchmark yet, so it shows no throughput.`;
         $("#live-src").innerHTML = `<b>${esc(s.name)}</b> · ${esc(DATA.promoted_short)}`;
       } else {
         tiles.hidden = false; none.hidden = true;
-        const top = suite.runs.c16 ? 16 : 8, run = suite.runs["c" + top];
+        const top = topStreams(suite), run = suite.runs["c" + top];
         // A run whose request table names each prompt splits one stream into prose and code.
         const one = suite.runs.c1, split = one.tps_by_style;
         const firstToken = one.ttft_p50_s ? `; first token in ${one.ttft_p50_s.toFixed(2)} s` : "";
@@ -997,8 +1012,12 @@ __MANIFEST_DATA__
         tween($("#t-c1"), split ? split.prose.tps : one.output_tps, v => v.toFixed(1));
         $("#t-c1-d").textContent = (split ? "decode, prose prompts" : "decode, one conversation") + firstToken;
         if (split) tween($("#t-code", CODE_TILE), split.code.tps, v => v.toFixed(1));
-        $("#t-cn-k").textContent = `${cap(word(top))} streams`;
-        tween($("#t-cn"), run.output_tps, v => v.toFixed(1));
+        const cnTile = $("#t-cn").closest(".tile");
+        cnTile.style.visibility = run ? "" : "hidden";
+        if (run) {
+          $("#t-cn-k").textContent = `${cap(word(top))} streams`;
+          tween($("#t-cn"), run.output_tps, v => v.toFixed(1));
+        }
         const pf = (suite.prefill || []).find(p => p.size === 131072) || (suite.prefill || [])[0];
         const pfTile = $("#t-pf").closest(".tile");
         pfTile.style.visibility = pf ? "" : "hidden";
@@ -1035,8 +1054,19 @@ __MANIFEST_DATA__
     /* ---------- static header bits ---------- */
     $("#eyebrow-release").textContent = "release " + shortRel(DATA.promoted_short);
     (function () {
-      const sw = counts("switched");
-      if (sw.length) $("#fn-range").textContent = `${cap(word(sw[0]))} to ${word(sw[sw.length - 1])} Sparks`;
+      const sw = counts("switched"), sl = counts("switchless");
+      const span = l => l.length > 1 ? `${word(l[0])} to ${word(l[l.length - 1])}` : word(l[0]);
+      if (sw.length) $("#fn-range").textContent = `${cap(span(sw))} Sparks`;
+      $("#tp-range").textContent = `${word(SPLIT[0])} to ${word(SPLIT[1])}`;
+      const made = { 2: "cable straight to each other", 3: "make a triangle", 4: "make a ring" };
+      const cabled = sl.filter(n => n > 1).map((n, i) => `${i ? word(n) : cap(word(n)) + " Sparks"} ${made[n] || "cable to their neighbours"}`);
+      const list = cabled.length > 1 ? cabled.slice(0, -1).join(", ") + " and " + cabled[cabled.length - 1] : cabled[0];
+      $("#shapes-lede").innerHTML = (sl[0] === 1 ? "One Spark serves the model on its own. " : "") +
+        (list ? `${list}, with nothing between them but cable. ` : "") +
+        (sw.length ? `If you would rather use a switch<span class="ast">*</span>, the same image serves ${span(sw)}.` : "");
+      const least = Math.min.apply(null, SHAPES.map(s => s.nodes));
+      $("#need").textContent = least === 1 ? "You need one DGX Spark, or several and the cables between them."
+        : `You need ${word(least)} or more DGX Sparks and the cables between them.`;
       $("#model-line").innerHTML = `Served: <code>${esc(DATA.model_repo)}</code> at <code>${esc(DATA.model_revision)}</code>.`;
       $("#m-stock").textContent = DATA.served_models[0];
       $("#m-glp").textContent = DATA.served_models[1];
@@ -1136,8 +1166,7 @@ __MANIFEST_DATA__
     };
     const LANES = {};
     DATA.suites.forEach(s => { const l = laneOf(s); s._lane = l; (LANES[l.key] = LANES[l.key] || []).push(s); });
-    const laneNames = { "tp4": "Four Sparks, ring", "tp3": "Three Sparks, triangle" };
-    const laneLabel = k => laneNames[k] || `${cap(word(+k.replace(/\D/g, "")))} Sparks, switched`;
+    const laneLabel = k => { const n = +k.replace(/\D/g, ""); return `${cap(sparks(n))}, ${layout(/switched/.test(k) ? "switched" : "switchless", n)}`; };
     const laneKeys = Object.keys(LANES).sort((a, b) => (LANES[b].length - LANES[a].length) || a.localeCompare(b));
     const laneSel = $("#lane"), baseSel = $("#base"), candSel = $("#cand");
     laneSel.innerHTML = laneKeys.map(k => `<option value="${k}">${esc(laneLabel(k))}</option>`).join("");
@@ -1160,7 +1189,7 @@ __MANIFEST_DATA__
       const list = LANES[laneSel.value];
       const base = list.find(s => s.id === baseSel.value) || list[0];
       const cand = list.find(s => s.id === candSel.value) || list[list.length - 1];
-      const top = list.some(s => s.runs.c16) ? 16 : 8, mid = top / 2;
+      const top = Math.max.apply(null, list.map(topStreams)) || 8, mid = top / 2;
       const col = k => list.map(s => s.runs[k] ? s.runs[k].output_tps : null);
       lineChart($("#chart-decode"), {
         title: "Decode throughput by release",
@@ -1228,7 +1257,7 @@ __MANIFEST_DATA__
       return `<tr>
         <td>${glyph(s.fabric, s.nodes)}</td>
         <td class="lead nw"><code>${esc(s.name)}</code>${s.default ? '<span class="pill">default</span>' : ""}</td>
-        <td class="nw">${cap(word(s.nodes))} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}${s.page_size_bytes < 65536 ? " · stock 4 KiB kernel" : ""}</td>
+        <td class="nw">${cap(sparks(s.nodes))}, ${layout(s.fabric, s.nodes)}${s.page_size_bytes < 65536 ? " · stock 4 KiB kernel" : ""}</td>
         <td class="n">${int(s.max_model_len)}</td>
         <td class="n">${s.max_num_seqs}</td>
         <td class="n">${kv.full_contexts} full contexts</td>
@@ -1280,8 +1309,8 @@ __MANIFEST_DATA__
     /* ---------- link-preview card ---------- */
     if (CARD) {
       const s = SHAPES.find(x => x.name === DATA.default_shape) || SHAPES[0], suite = suiteFor(s);
-      const top = suite && suite.runs.c16 ? 16 : 8, run = suite && suite.runs["c" + top];
-      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}`;
+      const top = suite ? topStreams(suite) : 0, run = suite && suite.runs["c" + top];
+      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} Spark${s.nodes === 1 ? "" : "s"}, ${layout(s.fabric, s.nodes)}`;
       $("#og-ctx").textContent = s.max_model_len >= 1e6 ? Math.floor(s.max_model_len / 1e6) + "M" : Math.round(s.max_model_len / 1024) + "K";
       $("#og-seq").textContent = s.max_num_seqs;
       // One stream splits into prose and code when the run's request table allows it; sixteen streams
