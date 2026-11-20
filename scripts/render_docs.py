@@ -51,6 +51,8 @@ sb_stats = sonar.module("stats")
 SITE_TEMPLATE = ROOT / "site/index.html"
 SITE_DATA_MARKER = "__MANIFEST_DATA__"
 SITE_VERSION_MARKER = "__SITE_VERSION__"
+SITE_RANGE_MARKER = "__SPARK_RANGE__"
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight")
 
 MARKER_RE = re.compile(
     r"(<!-- BEGIN GENERATED: ([a-z0-9_-]+) -->)\n.*?(<!-- END GENERATED: \2 -->)",
@@ -949,7 +951,16 @@ def render_site_html(data: dict[str, Any]) -> str:
     # The link-preview image's URL carries a digest of the page, so a crawler that cached the
     # previous image fetches the new one whenever the page or its numbers change.
     version = hashlib.sha256((template + embedded_json).encode()).hexdigest()[:10]
-    return template.replace(SITE_VERSION_MARKER, version).replace(SITE_DATA_MARKER, embedded_json)
+    # The page description names the node counts the recipe's shapes cover; a crawler runs no script.
+    counts = [int(shape["nodes"]) for shape in data["shapes"]]
+    spark_range = " to ".join(
+        _NUMBER_WORDS[n] if n < len(_NUMBER_WORDS) else str(n) for n in sorted({min(counts), max(counts)})
+    )
+    return (
+        template.replace(SITE_VERSION_MARKER, version)
+        .replace(SITE_RANGE_MARKER, spark_range)
+        .replace(SITE_DATA_MARKER, embedded_json)
+    )
 
 
 def render_targets(data: dict[str, Any]) -> dict[Path, str]:
