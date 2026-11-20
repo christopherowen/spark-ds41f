@@ -147,6 +147,46 @@ Report one and eight streams for every decode change, and sixteen on TP4.
 - **Shared packages move forward only.** When components disagree on a shared
   runtime package, patch the lagging pin forward.
 
+## Attempt ledger and idle-time runs
+
+Two process changes proposed 2026-11-18. Neither is started; the second depends
+on the first.
+
+- **Keep a ledger of attempts, grouped by problem and read at the start of every
+  round.** The experiment folders are ordered by date (339 on 2026-11-20) and
+  this file is 72 KB of results, so a round begins by surveying history: sizing
+  draft accuracy needed eighteen drafter records read first
+  ([`experiments/2026-11-18-draft-accuracy-sizing`](experiments/2026-11-18-draft-accuracy-sizing/README.md)).
+  One file per area. Under each recurring problem, every attempt records:
+  1. the change and why it was expected to help;
+  2. the predicted result, written before the run (22 of the 339 experiment
+     READMEs mention a prediction at all);
+  3. the measured result, losses included, with a link to the experiment;
+  4. the conditions it was measured under and those it depends on (image and
+     calibration, shape and kernel page size, workload), so a new base, shape,
+     workload or checkpoint names the entries to measure again;
+  5. checks prepared and not run.
+     [`experiments/2026-10-26-dspark-acceptance`](experiments/2026-10-26-dspark-acceptance/README.md)
+     has held two since 2026-11-04 (a chat-format probe of the drafter and a CPU
+     reference parity run), found again only by that survey.
+
+  Start with speculative decoding, from the records that survey already covers,
+  and judge the format there before backfilling another area.
+- **Run the ledger's open entries when the machines are idle.** A runner takes
+  the top open entry, writes its prediction, builds, screens through the lab
+  queue behind the hold file and the idle guard, records the outcome, and
+  proposes a pass for the open candidate as a pull request. Promotion stays the
+  owner's. Before a runner may count anything as a pass:
+  - **The screen must be shown to track the goal.** One `c1` boot reads ±5.7%
+    (`c61-r20`), and most open levers are worth 0.5 to 1.5%, so many unattended
+    attempts at that noise collect false passes. An AgentX A/B of a known gain
+    at the production session count is the check, and it is not run.
+  - **Fixed gates:** zero greedy diffs, two boots, and a result that matches the
+    prediction written beforehand. A gain that was not predicted is noise until
+    a repeat confirms it.
+  - **The owner names the machines.** A lab window stops the promoted service
+    for its duration; start on the Spaceports, not the ring.
+
 ## Memory and safety
 
 - `dgx1` hosts rank 0 and the API server, so it is always the tightest node.
