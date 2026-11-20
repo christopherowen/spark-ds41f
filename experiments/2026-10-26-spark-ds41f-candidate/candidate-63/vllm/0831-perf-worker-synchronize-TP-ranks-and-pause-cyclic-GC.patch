@@ -1,0 +1,269 @@
+From 95acec32065b868f42d798cbf10312252c56192c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:22:29 +0100
+Subject: [PATCH 831/831] perf(worker): synchronize TP ranks and pause cyclic
+ GC across engine_grid timed replays
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (series 0001..0830).
+Upstream status: local candidate-63 patch for TP boot-to-boot grid variance.
+Quality implications: none; engine_grid profiling harness only, zero serving or numerical changes.
+
+Rationale:
+4-rank Torch Profiler traces showed multi-millisecond host/rank arrival skew on
+one rank causing the other three ranks to spin inside oneshot_allreduce_kernel.
+In GPUModelRunner.engine_grid(), drain the GPU stream, run gc.collect(), and
+barrier all TP ranks on tp_group.cpu_group between warmup and the timed loop,
+then pause cyclic GC across the timed replay loop (restoring GC state in
+finally) so asynchronous per-rank GC pauses cannot skew collective arrivals.
+
+Tests:
+- pytest --noconftest tests/v1/worker/test_engine_grid_sync.py (2 passed).
+---
+ tests/v1/worker/test_engine_grid_sync.py | 173 +++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py       |  43 ++++--
+ 2 files changed, 203 insertions(+), 13 deletions(-)
+ create mode 100644 tests/v1/worker/test_engine_grid_sync.py
+
+diff --git a/tests/v1/worker/test_engine_grid_sync.py b/tests/v1/worker/test_engine_grid_sync.py
+new file mode 100644
+index 000000000..ae8f97195
+--- /dev/null
++++ b/tests/v1/worker/test_engine_grid_sync.py
+@@ -0,0 +1,173 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import ast
++from contextlib import contextmanager
++import gc
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++import torch
++
++
++def _load_engine_grid_fn():
++    """Import GPUModelRunner.engine_grid directly when the GPU runtime is present,
++    or compile the exact method from model_runner.py when running CPU-only."""
++    try:
++        from vllm.v1.worker.gpu import model_runner as mr_mod
++
++        return mr_mod.GPUModelRunner.engine_grid, mr_mod
++    except (ImportError, AttributeError):
++        src_path = (
++            Path(__file__).resolve().parents[3]
++            / "vllm"
++            / "v1"
++            / "worker"
++            / "gpu"
++            / "model_runner.py"
++        )
++        tree = ast.parse(src_path.read_text(encoding="utf-8"), filename=str(src_path))
++        method_node = None
++        for node in tree.body:
++            if isinstance(node, ast.ClassDef) and node.name == "GPUModelRunner":
++                for item in node.body:
++                    if isinstance(item, ast.FunctionDef) and item.name == "engine_grid":
++                        method_node = item
++                        break
++        assert method_node is not None
++        # Strip decorators (e.g. @torch.inference_mode()) so the unbound method runs directly.
++        method_node.decorator_list = []
++        mod_ast = ast.Module(body=[method_node], type_ignores=[])
++        ast.fix_missing_locations(mod_ast)
++        ns: dict[str, Any] = {
++            "Any": Any,
++            "gc": gc,
++            "torch": torch,
++            "get_tensor_model_parallel_world_size": lambda: 1,
++            "get_tp_group": lambda: SimpleNamespace(cpu_group=None),
++        }
++        exec(compile(mod_ast, str(src_path), "exec"), ns)
++        return ns["engine_grid"], ns
++
++
++class _FakeEvent:
++    def __init__(self, enable_timing: bool = False):
++        self.enable_timing = enable_timing
++
++    def record(self) -> None:
++        pass
++
++    def elapsed_time(self, other: "_FakeEvent") -> float:
++        return 12.5
++
++
++class _FakeStepTiming:
++    @contextmanager
++    def collect(self):
++        yield []
++
++
++class _FakeRunner:
++    def __init__(self, trace: list, *, fail_on_call: int | None = None):
++        self.trace = trace
++        self.fail_on_call = fail_on_call
++        self.calls = 0
++        self.step_timing = _FakeStepTiming()
++
++    def _fill_real_context(self, context_len: int) -> None:
++        self.trace.append(("fill", context_len))
++
++    def _dummy_run(self, **kwargs) -> None:
++        self.calls += 1
++        self.trace.append(("run", self.calls, gc.isenabled()))
++        if self.fail_on_call is not None and self.calls == self.fail_on_call:
++            raise RuntimeError("injected dummy failure")
++
++
++def _patch_target(monkeypatch, target, name: str, value: Any) -> None:
++    if isinstance(target, dict):
++        monkeypatch.setitem(target, name, value)
++    else:
++        monkeypatch.setattr(target, name, value)
++
++
++def test_engine_grid_synchronizes_tp_ranks_and_pauses_gc(monkeypatch):
++    engine_grid_fn, target = _load_engine_grid_fn()
++    trace: list = []
++    cpu_group = object()
++
++    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
++    monkeypatch.setattr(
++        torch.cuda, "synchronize", lambda: trace.append(("cuda_sync", gc.isenabled()))
++    )
++    monkeypatch.setattr(
++        gc, "collect", lambda *a, **kw: trace.append(("gc_collect", gc.isenabled())) or 0
++    )
++    _patch_target(monkeypatch, target, "get_tensor_model_parallel_world_size", lambda: 4)
++    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
++    _patch_target(
++        monkeypatch, target, "get_tp_group", lambda: SimpleNamespace(cpu_group=cpu_group)
++    )
++    monkeypatch.setattr(
++        torch.distributed,
++        "barrier",
++        lambda group=None: trace.append(("barrier", group is cpu_group)),
++    )
++
++    was_enabled = gc.isenabled()
++    gc.enable()
++    try:
++        runner = _FakeRunner(trace)
++        spec = {
++            "shapes": [{"num_tokens": 6, "num_reqs": 1, "context_len": 4096}],
++            "replays": 2,
++            "warmup": 1,
++            "settle": 1,
++        }
++        out = engine_grid_fn(runner, spec)
++        assert out["replays"] == 2
++        assert len(out["shapes"][0]["step_ms"]) == 2
++        assert gc.isenabled() is True
++    finally:
++        if not was_enabled:
++            gc.disable()
++
++    assert trace == [
++        ("fill", 0),
++        ("run", 1, True),
++        ("cuda_sync", True),
++        ("gc_collect", True),
++        ("barrier", True),
++        ("run", 2, False),
++        ("run", 3, False),
++        ("run", 4, False),
++        ("run", 5, False),
++        ("cuda_sync", False),
++    ]
++
++
++def test_engine_grid_restores_gc_on_exception(monkeypatch):
++    engine_grid_fn, target = _load_engine_grid_fn()
++    trace: list = []
++    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
++    _patch_target(monkeypatch, target, "get_tensor_model_parallel_world_size", lambda: 1)
++
++    was_enabled = gc.isenabled()
++    gc.enable()
++    try:
++        runner = _FakeRunner(trace, fail_on_call=2)
++        spec = {
++            "shapes": [{"num_tokens": 6, "num_reqs": 1, "context_len": 4096}],
++            "replays": 1,
++            "warmup": 1,
++            "settle": 1,
++        }
++        with pytest.raises(RuntimeError, match="injected dummy failure"):
++            engine_grid_fn(runner, spec)
++        assert gc.isenabled() is True
++    finally:
++        if not was_enabled:
++            gc.disable()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 14d6c21c3..9ea2494a2 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -41,6 +41,7 @@ from vllm.distributed.parallel_state import (
+     get_pp_group,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
++    get_tp_group,
+ )
+ from vllm.forward_context import (
+     BatchDescriptor,
+@@ -1113,22 +1114,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         for shape in shapes:
+             for _ in range(warmup):
+                 run(shape)
++        torch.cuda.synchronize()
++        gc.collect()
++        if (
++            get_tensor_model_parallel_world_size() > 1
++            and torch.distributed.is_initialized()
++        ):
++            tp_group = get_tp_group()
++            cpu_group = getattr(tp_group, "cpu_group", None)
++            if cpu_group is not None:
++                torch.distributed.barrier(group=cpu_group)
+         order: list[int] = []
+         events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+-        with self.step_timing.collect() as timings:
+-            for replay in range(replays):
+-                indices = range(len(shapes))
+-                for index in indices if replay % 2 == 0 else reversed(indices):
+-                    for _ in range(settle):
++        gc_was_enabled = gc.isenabled()
++        gc.disable()
++        try:
++            with self.step_timing.collect() as timings:
++                for replay in range(replays):
++                    indices = range(len(shapes))
++                    for index in indices if replay % 2 == 0 else reversed(indices):
++                        for _ in range(settle):
++                            run(shapes[index])
++                        start = torch.cuda.Event(enable_timing=True)
++                        end = torch.cuda.Event(enable_timing=True)
++                        start.record()
+                         run(shapes[index])
+-                    start = torch.cuda.Event(enable_timing=True)
+-                    end = torch.cuda.Event(enable_timing=True)
+-                    start.record()
+-                    run(shapes[index])
+-                    end.record()
+-                    events.append((start, end))
+-                    order.append(index)
+-        torch.cuda.synchronize()
++                        end.record()
++                        events.append((start, end))
++                        order.append(index)
++            torch.cuda.synchronize()
++        finally:
++            if gc_was_enabled:
++                gc.enable()
+         results = [
+             {
+                 "shape": shape,

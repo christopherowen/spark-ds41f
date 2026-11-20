@@ -416,6 +416,30 @@ def _patch_suite_and_prefill(suite_mod, prefill_mod) -> None:
 def _patch_engine(engine_mod) -> None:
     if not getattr(engine_mod, "_spark_ds41f_ext_applied", False):
         orig_default_shapes = engine_mod.default_shapes
+        orig_summarize = engine_mod.summarize
+        orig_compare = engine_mod.compare
+        orig_boot_ratios = engine_mod.boot_ratios
+        orig_spread = engine_mod.spread
+
+        def floor_samples(
+            values: list[float],
+            *,
+            fraction: float = 0.25,
+            min_count: int = 5,
+        ) -> tuple[list[float], int]:
+            """Fixed lower-order-statistic sample (fastest ``fraction`` of replays).
+
+            Unlike ``median + 5 * MAD``, a fixed lower-quartile slice has no phase
+            transition when asynchronous single-rank forward spikes affect 35-50% of
+            replays in a 100-sample grid shape.
+            """
+            clean = sorted(v for v in values if v is not None)
+            if not clean:
+                return [], 0
+            if len(clean) <= min_count:
+                return clean, 0
+            keep = min(len(clean), max(min_count, int(round(len(clean) * fraction))))
+            return clean[:keep], len(clean) - keep
 
         def _patched_default_shapes(drafts: int = 5, max_context: int | None = None, prefill: bool = False,
                                     max_requests: int = 16, real_rows: bool = False) -> list[dict]:
@@ -432,6 +456,142 @@ def _patch_engine(engine_mod) -> None:
             if shape.get("prefill"):
                 return f"prefill {shape['num_tokens']}{real} @{depth}"
             return f"decode {shape.get('num_reqs', '?')}x{shape['num_tokens']}{real} rows @{depth}"
+
+        def _patched_summarize(raw: dict) -> list[dict]:
+            rows = orig_summarize(raw)
+            for row, timed in zip(rows, raw["grid"]):
+                kept_step, _ = floor_samples(timed["step_ms"])
+                row["step_ms_floor"] = engine_mod.stats.describe(kept_step)
+                if timed.get("forward_ms"):
+                    kept_fwd, _ = floor_samples(timed["forward_ms"])
+                    row["forward_ms_floor"] = engine_mod.stats.describe(kept_fwd)
+            return rows
+
+        def _patched_compare(base: dict, candidate: dict, *, tolerance_pct: float = 0.5,
+                             confidence: float = 0.95, estimator: str = "5mad") -> dict:
+            if estimator not in ("5mad", "floor25"):
+                raise ValueError(f"unsupported engine grid estimator: {estimator}")
+            import math
+            by_label = {row["label"]: row for row in base["engine"]}
+            if estimator == "5mad":
+                out = orig_compare(base, candidate, tolerance_pct=tolerance_pct, confidence=confidence)
+                floor_logs = []
+                by_cand = {row["label"]: row for row in candidate["engine"]}
+                for entry in out["rows"]:
+                    metric = entry.get("metric")
+                    other = by_label.get(metric)
+                    row = by_cand.get(metric)
+                    if other is None or row is None:
+                        continue
+                    fa, _ = floor_samples(other["samples"])
+                    fb, _ = floor_samples(row["samples"])
+                    if fa and fb:
+                        ma, mb = sum(fa) / len(fa), sum(fb) / len(fb)
+                        if ma:
+                            chg = 100.0 * (mb / ma - 1.0)
+                            entry["floor_base"] = ma
+                            entry["floor_candidate"] = mb
+                            entry["floor_change_pct"] = chg
+                            if not row["shape"].get("prefill"):
+                                floor_logs.append(math.log(mb / ma))
+                if len(floor_logs) > 1:
+                    gm_pct = 100.0 * (math.exp(sum(floor_logs) / len(floor_logs)) - 1.0)
+                    out["floor_decode_gm_pct"] = gm_pct
+                    for entry in out["rows"]:
+                        if str(entry.get("metric", "")).startswith("decode geometric mean"):
+                            entry["floor_change_pct"] = gm_pct
+                return out
+
+            pairs, warnings = [], []
+            for row in candidate["engine"]:
+                other = by_label.get(row["label"])
+                if other is None:
+                    warnings.append(f"{row['label']}: not in the base run")
+                else:
+                    pairs.append((other, row))
+            family = 1 - (1 - confidence) / max(len(pairs), 1)
+            rows, logs = [], []
+            for other, row in pairs:
+                a, dropped_a = floor_samples(other["samples"])
+                b, dropped_b = floor_samples(row["samples"])
+                test = engine_mod.stats.welch(a, b, confidence=family)
+                if test is None:
+                    continue
+                ma, mb = sum(a) / len(a), sum(b) / len(b)
+                rows.append({
+                    "metric": row["label"], "base": ma, "candidate": mb,
+                    "floor_base": ma, "floor_candidate": mb,
+                    "change_pct": test["change_pct"], "floor_change_pct": test["change_pct"],
+                    "ci95_pct": test["ci95_pct"], "trimmed": dropped_a + dropped_b,
+                    "verdict": engine_mod.stats.verdict(test["change_pct"], test["ci95_pct"], False, tolerance_pct),
+                })
+                if not row["shape"].get("prefill"):
+                    logs.append((math.log(1 + test["change_pct"] / 100), test["se_pct"] / 100))
+            floor_gm = None
+            if len(logs) > 1:
+                mean = sum(l for l, _ in logs) / len(logs)
+                se = math.sqrt(sum(s * s for _, s in logs)) / len(logs)
+                change = 100 * (math.exp(mean) - 1)
+                ci = 100 * engine_mod.stats.t_quantile(1 - (1 - confidence) / 2, 1e6) * se
+                floor_gm = change
+                rows.append({
+                    "metric": f"decode geometric mean ({len(logs)})",
+                    "base": None, "candidate": None,
+                    "change_pct": change, "floor_change_pct": change, "ci95_pct": ci,
+                    "verdict": engine_mod.stats.verdict(change, ci, False, tolerance_pct),
+                })
+            note = (f"intervals hold for all {len(pairs)} shapes at once ({100 * confidence:.0f}%, Bonferroni); "
+                    f"fastest-25% order-statistic floor slice used (upper 75% dropped: "
+                    f"{sum(r.get('trimmed', 0) for r in rows)})")
+            out = {"warnings": warnings, "rows": rows, "note": note, "estimator": "floor25"}
+            if floor_gm is not None:
+                out["floor_decode_gm_pct"] = floor_gm
+            return out
+
+        def _patched_boot_ratios(results: list[dict], reference: dict, *, estimator: str = "5mad") -> list[float]:
+            if estimator == "5mad":
+                return orig_boot_ratios(results, reference)
+            if estimator != "floor25":
+                raise ValueError(f"unsupported engine grid estimator: {estimator}")
+            import math
+            def means(run: dict) -> dict:
+                out = {}
+                for row in run["engine"]:
+                    if not row["shape"].get("prefill"):
+                        kept, _ = floor_samples(row["samples"])
+                        out[row["label"]] = sum(kept) / len(kept)
+                return out
+            base = means(reference)
+            ratios = []
+            for run in results:
+                logs = [math.log(value / base[label]) for label, value in means(run).items() if label in base]
+                ratios.append(math.exp(sum(logs) / len(logs)) if logs else float("nan"))
+            return ratios
+
+        def _patched_spread(runs: list[dict], against: list[dict] | None = None,
+                            *, estimator: str = "5mad") -> dict:
+            if estimator == "5mad":
+                return orig_spread(runs, against)
+            if estimator != "floor25":
+                raise ValueError(f"unsupported engine grid estimator: {estimator}")
+            import math
+            ratios = _patched_boot_ratios(runs, runs[0], estimator="floor25")
+            middle = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
+            pct = [100 * (r / middle - 1) for r in ratios]
+            out = {"boots": [{"label": run.get("label"), "vs_mean_pct": round(v, 3)} for run, v in zip(runs, pct)],
+                   "sd_pct": engine_mod.stats.describe(pct).get("sd"), "range_pct": max(pct) - min(pct),
+                   "estimator": "floor25"}
+            if against:
+                others = [100 * (r / middle - 1) for r in _patched_boot_ratios(against, runs[0], estimator="floor25")]
+                out["against"] = {"boots": [{"label": run.get("label"), "vs_mean_pct": round(v, 3)}
+                                            for run, v in zip(against, others)],
+                                  "sd_pct": engine_mod.stats.describe(others).get("sd")}
+                mean_a, mean_b = sum(pct) / len(pct), sum(others) / len(others)
+                test = engine_mod.stats.welch([100 + v for v in pct], [100 + v for v in others])
+                out["difference"] = {"change_pct": mean_b - mean_a, "ci95_pct": test["ci95_pct"] if test else None,
+                                     "verdict": engine_mod.stats.verdict(
+                                         mean_b - mean_a, test["ci95_pct"] if test else None, False, 0.0)}
+            return out
 
         def _patched_engine_run(base_url: str, shapes: list[dict], *, replays: int = 100, warmup: int = 2,
                                 settle: int = 1, timeout: float = 3600.0, require_idle: bool = True,
@@ -465,8 +625,13 @@ def _patch_engine(engine_mod) -> None:
                     "replays": replays, "warmup": warmup, "settle": rank0.get("settle"), "shapes": shapes,
                     "grid": rank0["shapes"]}
 
+        engine_mod.floor_samples = floor_samples
         engine_mod.default_shapes = _patched_default_shapes
         engine_mod.label = _patched_label
+        engine_mod.summarize = _patched_summarize
+        engine_mod.compare = _patched_compare
+        engine_mod.boot_ratios = _patched_boot_ratios
+        engine_mod.spread = _patched_spread
         engine_mod.run = _patched_engine_run
         engine_mod._spark_ds41f_ext_applied = True
 

@@ -1,0 +1,548 @@
+From 47d3a2eae74a214c4898cc65e24a9acae2d1c5b9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:21:14 +0100
+Subject: [PATCH 830/831] perf(loader): ladder 64 KiB buddy sponge, allocate
+ dense arena last, retain across drafter
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 (series 0001..0829).
+Upstream status: local candidate-63 patch for GB10 UMA boot-to-boot variance.
+Quality implications: none; physical page placement and sponge lifetime only, zero numerical or graph changes.
+
+Rationale:
+1. select_buddy_sponge_target previously fell straight from 512 MiB (Order 13) to
+   2 MiB (Order 5) whenever Order-13 free bytes dropped below required_bytes,
+   leaving 2..16 MiB fragments unsoaked on aged 64 KiB nodes that still hold
+   > 75 GiB in 32..512 MiB blocks. Walk descending 64 KiB orders (512 MiB down
+   to 4 MiB) before falling back to 2 MiB..512 KiB; 4 KiB kernels keep their
+   2 MiB hugepage ceiling unchanged.
+2. bind_weight_arena previously allocated the permanent ~11 GiB dense weight
+   arena (Q/KV/WO/shared/LM-head, streamed by tight L2 prefetch windows) before
+   temporary pre-tile MoE storages, letting nvidia.ko's bottom-up buddy drain
+   place leftover low-order fragments into the dense arena. Allocate temporary
+   MoE storages first so the permanent dense arena claims top-order contiguous
+   blocks.
+3. BaseModelLoader.load_model released the target's buddy sponge before
+   DraftModelSpeculator.load_model ran, forcing the drafter to re-soak newly
+   freed low-order pages. Add hold_weight_arena_sponge / trim_held_weight_arena_sponges
+   so GPUModelRunner.load_model retains (and headroom-trims to >= 16 GiB) the
+   buddy sponge across target + drafter loading and releases once before KV
+   allocation.
+
+Tests:
+- pytest --noconftest tests/model_executor/model_loader/test_direct_loader.py (50 passed).
+---
+ .../model_loader/test_direct_loader.py        | 189 ++++++++++++++++++
+ .../model_loader/base_loader.py               |   6 +-
+ .../model_loader/direct_loader.py             | 140 +++++++++++--
+ vllm/v1/worker/gpu/model_runner.py            |  59 +++---
+ 4 files changed, 348 insertions(+), 46 deletions(-)
+
+diff --git a/tests/model_executor/model_loader/test_direct_loader.py b/tests/model_executor/model_loader/test_direct_loader.py
+index 74a920e6c..90a68f457 100644
+--- a/tests/model_executor/model_loader/test_direct_loader.py
++++ b/tests/model_executor/model_loader/test_direct_loader.py
+@@ -729,3 +729,192 @@ def test_select_buddy_sponge_target_covers_both_4k_and_64k_kernels():
+     assert target64 == 2 << 20
+     assert sub64 == (32 * 65536) + (16 * 131072)
+     assert high64 == (200 * (2 << 20)) + (50 * (4 << 20))
++
++
++def test_select_buddy_sponge_target_ladders_intermediate_64k_orders():
++    # Aged 64 KiB GB10 node: 34 GiB in 512 MiB (order 13) + 50 GiB in 32..256 MiB
++    # (orders 9..12) = 84 GiB >= 75.5 GiB required, plus 8 GiB in 2..16 MiB.
++    # Must select 32 MiB (order 9) instead of dropping straight from 512 MiB to 2 MiB.
++    buddy_dgx_aged = (
++        "Node 0, zone   Normal   "
++        "0 0 0 0 0  512 256 256 256  "
++        "256 256 128 40 68\n"
++    )
++    target, sub_b, high_b = direct_loader.select_buddy_sponge_target(
++        buddy_dgx_aged, required_bytes=78 << 30, page_bytes=65536
++    )
++    assert target == 32 << 20
++    assert sub_b == 8 << 30
++    assert high_b == 84 << 30
++
++    # When 64..512 MiB alone covers required_bytes (76 GiB), target steps up to 64 MiB.
++    target64, sub64, high64 = direct_loader.select_buddy_sponge_target(
++        buddy_dgx_aged, required_bytes=76 << 30, page_bytes=65536
++    )
++    assert target64 == 64 << 20
++    assert sub64 == 16 << 30
++    assert high64 == 76 << 30
++
++    # On 4 KiB kernels, 2 MiB hugepages remain the ceiling (never soak 2 MiB for 4 MiB).
++    buddy_4k_order10 = (
++        "Node 0, zone   Normal   0 0 0 0  256 0 0 0 0  128 256 0 0 0\n"
++    )
++    t4k, sub4k, high4k = direct_loader.select_buddy_sponge_target(
++        buddy_4k_order10, required_bytes=512 << 20, page_bytes=4096
++    )
++    assert t4k == 2 << 20
++    assert sub4k == 16 << 20
++    assert high4k == (128 * (2 << 20)) + (256 * (4 << 20))
++
++
++def test_hold_weight_arena_sponge_defers_trims_and_releases(tmp_path, monkeypatch):
++    class _DummyModel(torch.nn.Module):
++        pass
++
++    reclaimed: list[bool] = []
++    monkeypatch.setattr(
++        direct_loader,
++        "reclaim_uma_memory",
++        lambda device, synchronize=False: reclaimed.append(synchronize),
++    )
++
++    m0 = _DummyModel()
++    m0._direct_buddy_sponge = [torch.empty((16,), dtype=torch.uint8)]
++    assert direct_loader.defer_weight_arena_sponge_release(m0) is False
++
++    m1 = _DummyModel()
++    m1._direct_buddy_sponge = [torch.empty((2 << 20,), dtype=torch.uint8) for _ in range(6)]
++    m1._direct_buddy_sponge_target_bsz = 2 << 20
++
++    buddy_ok = tmp_path / "buddy"
++    buddy_ok.write_text(
++        "Node 0, zone Normal 0 0 0 0 0 0 0 0 0 256 0 0 0 0\n", encoding="utf-8"
++    )
++    mem_tight = tmp_path / "meminfo"
++    mem_tight.write_text(f"MemAvailable: {12 << 10} kB\n", encoding="utf-8")
++    monkeypatch.setattr(
++        direct_loader,
++        "_available_uma_or_gpu_bytes",
++        lambda device, meminfo_path=None: 12 << 20,
++    )
++    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
++
++    with direct_loader.hold_weight_arena_sponge(torch.device("cpu")):
++        assert direct_loader.defer_weight_arena_sponge_release(m1) is True
++        direct_loader.trim_held_weight_arena_sponges(
++            torch.device("cpu"),
++            buddyinfo_path=buddy_ok,
++            meminfo_path=mem_tight,
++            page_bytes=4096,
++            post_load_headroom_bytes=16 << 20,
++        )
++        assert len(m1._direct_buddy_sponge) == 4
++        assert len(reclaimed) == 0
++
++    assert not hasattr(m1, "_direct_buddy_sponge")
++    assert not hasattr(m1, "_direct_buddy_sponge_target_bsz")
++    assert len(reclaimed) == 1
++
++    m2 = _DummyModel()
++    m2._direct_buddy_sponge = [torch.empty((8,), dtype=torch.uint8)]
++    with pytest.raises(RuntimeError, match="boom"):
++        with direct_loader.hold_weight_arena_sponge(torch.device("cpu")):
++            assert direct_loader.defer_weight_arena_sponge_release(m2) is True
++            raise RuntimeError("boom")
++    assert not hasattr(m2, "_direct_buddy_sponge")
++
++
++def test_bind_weight_arena_allocates_moe_before_dense_arena(monkeypatch):
++    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
++        FusedMoEMethodBase,
++    )
++
++    class _FakeMoEMethod(FusedMoEMethodBase):
++        def create_weights(self, *args, **kwargs):
++            pass
++
++        def apply(self, *args, **kwargs):
++            pass
++
++        def get_fused_moe_quant_config(self, layer):
++            return None
++
++    class _FakeDevice:
++        type = "cuda"
++        index = 0
++
++    class _FakeData:
++        def __init__(self, tensor: torch.Tensor):
++            self._t = tensor
++            self.device = _FakeDevice()
++
++        def numel(self):
++            return self._t.numel()
++
++        def untyped_storage(self):
++            return self._t.untyped_storage()
++
++        def element_size(self):
++            return self._t.element_size()
++
++        def storage_offset(self):
++            return self._t.storage_offset()
++
++        @property
++        def shape(self):
++            return self._t.shape
++
++        @property
++        def stride(self):
++            return self._t.stride
++
++    class _FakeParam:
++        def __init__(self, nbytes: int):
++            self.data = _FakeData(torch.empty((nbytes,), dtype=torch.uint8))
++            self.rebound: list[tuple] = []
++
++        def set_(self, storage, offset, shape, stride):
++            self.rebound.append((storage.data_ptr(), offset, shape, stride))
++
++    class _FakeMoE:
++        def __init__(self):
++            self.quant_method = _FakeMoEMethod(None)
++            self.w13 = _FakeParam(4096)
++
++        def parameters(self, recurse=True):
++            return [self.w13]
++
++    class _FakeModel:
++        def __init__(self):
++            self.dense = _FakeParam(1024)
++            self.experts = _FakeMoE()
++
++        def modules(self):
++            return [self, self.experts]
++
++        def parameters(self):
++            return [self.dense, self.experts.w13]
++
++    model = _FakeModel()
++    orig_empty = torch.empty
++    alloc_sizes: list[int] = []
++
++    def tracking_empty(size, *args, **kwargs):
++        kwargs.pop("device", None)
++        if len(size) == 1 and size[0] > 0:
++            alloc_sizes.append(size[0])
++        return orig_empty(size, *args, **kwargs)
++
++    monkeypatch.setattr(torch, "empty", tracking_empty)
++    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
++    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *_a, **_kw: None)
++    monkeypatch.setattr(direct_loader, "reclaim_uma_memory", lambda *_a, **_kw: None)
++    monkeypatch.setattr(direct_loader, "_PRESERVE_STORAGE_MAX_BYTES", 0)
++
++    arena = direct_loader.bind_weight_arena(
++        model, torch.device("cpu"), order13_sponge=False
++    )
++    assert arena is not None
++    assert alloc_sizes == [4096, 1024]
++    assert model.dense.rebound[-1][0] == arena.untyped_storage().data_ptr()
++    assert model.experts.w13.rebound[-1][0] != arena.untyped_storage().data_ptr()
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index a6163d927..89a4eda84 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -65,6 +65,7 @@ class BaseModelLoader(ABC):
+         )
+         target_device = torch.device(load_device)
+         model: nn.Module | None = None
++        load_ok = False
+         try:
+             with set_default_torch_dtype(model_config.dtype):
+                 with target_device:
+@@ -95,13 +96,16 @@ class BaseModelLoader(ABC):
+                     finalize_layerwise_processing(model, model_config)
+ 
+                 process_weights_after_loading(model, model_config, target_device)
++                load_ok = True
+         finally:
+             if model is not None and hasattr(model, "_direct_buddy_sponge"):
+                 from vllm.model_executor.model_loader.direct_loader import (
++                    defer_weight_arena_sponge_release,
+                     release_weight_arena_sponge,
+                 )
+ 
+-                release_weight_arena_sponge(model, target_device)
++                if not load_ok or not defer_weight_arena_sponge_release(model):
++                    release_weight_arena_sponge(model, target_device)
+ 
+         return model.eval()
+ 
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index c792f7330..66dfc925d 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -39,6 +39,7 @@ format). Changed: no GDS transport, shared read group, IPC-exportable allocation
+ progress panel.
+ """
+ 
++from contextlib import contextmanager
+ import dataclasses
+ import gc
+ import heapq
+@@ -78,6 +79,8 @@ _SPONGE_POST_LOAD_SCRATCH_BYTES = 512 << 20
+ _SPONGE_RESERVE_HIGH_MAX_BYTES = 512 << 20
+ _NVIDIA_MIN_SYS_ALLOC_BYTES = 65536
+ _GPU_HUGEPAGE_BYTES = 1 << 21
++_HIGH_ORDER_SPONGE_TARGETS_64K = tuple(65536 << order for order in range(13, 5, -1))
++_HELD_SPONGE_STACK: list[list[torch.nn.Module]] = []
+ 
+ 
+ def _align_up(value: int, alignment: int) -> int:
+@@ -158,24 +161,39 @@ def select_buddy_sponge_target(
+ 
+     ``nvidia.ko`` (`nv_alloc_system_pages`) satisfies `cuMemCreate` allocations on
+     UMA by draining smaller buddy orders from ``64 KiB`` upward before splitting
+-    ``>= 2 MiB`` physical blocks. Low-order ``64 KiB .. 256 KiB`` physical fragments
+-    self-conflict across GB10's physically-indexed 24 MiB L2 slices (+12-13% slower
+-    prefetched GEMMs vs ``>= 2 MiB`` contiguous blocks).
++    higher-order physical blocks. Low-order physical fragments self-conflict across
++    GB10's physically-indexed 24 MiB L2 slices and DRAM banks.
+ 
+-    1. On 64 KiB kernels with ample ``512 MiB`` (`Order 13`) blocks, target ``512 MiB``.
++    1. On 64 KiB kernels, walk descending high-order targets from ``512 MiB``
++       (Order 13) down to ``4 MiB`` (Order 6) and choose the largest target whose
++       cumulative free bytes at or above that order cover
++       ``max(required_bytes, _SPONGE_CHUNK_BYTES)``.
+     2. Otherwise, pick the highest block size in ``(2 MiB, 1 MiB, 512 KiB)`` whose
+        cumulative free bytes at or above that order cover ``min(required_bytes, 512 MiB)``,
+        counting only ``>= 64 KiB`` blocks in ``sub_target_bytes`` (the orders ``nvidia.ko``
+        consumes ahead of the target).
+     """
+-    sub13, ord13 = parse_buddyinfo_order13(text, page_bytes=page_bytes)
+-    if ord13 >= max(required_bytes, _SPONGE_CHUNK_BYTES) and sub13 > 0:
+-        return 65536 << 13, sub13, ord13
+-
+     blocks = parse_buddyinfo_blocks(text, page_bytes=page_bytes)
+     if not blocks:
+         return 0, 0, 0
+ 
++    eff_page_bytes = page_bytes
++    if eff_page_bytes is None:
++        try:
++            eff_page_bytes = os.sysconf("SC_PAGE_SIZE")
++        except (AttributeError, OSError, ValueError):
++            eff_page_bytes = 0
++
++    if eff_page_bytes == 65536:
++        full_cover = max(required_bytes, _SPONGE_CHUNK_BYTES)
++        for target_bsz in _HIGH_ORDER_SPONGE_TARGETS_64K:
++            high_bytes = sum(tot for bsz, tot in blocks.items() if bsz >= target_bsz)
++            sub_bytes = sum(
++                tot for bsz, tot in blocks.items() if min_alloc_bytes <= bsz < target_bsz
++            )
++            if high_bytes >= full_cover and sub_bytes > 0:
++                return target_bsz, sub_bytes, high_bytes
++
+     min_high_needed = min(max(required_bytes // 4, _GPU_HUGEPAGE_BYTES), 512 << 20)
+     for target_bsz in (_GPU_HUGEPAGE_BYTES, 1 << 20, 512 << 10):
+         high_bytes = sum(tot for bsz, tot in blocks.items() if bsz >= target_bsz)
+@@ -479,12 +497,87 @@ def release_weight_arena_sponge(
+     sponge = getattr(model, "_direct_buddy_sponge", None)
+     if hasattr(model, "_direct_buddy_sponge"):
+         delattr(model, "_direct_buddy_sponge")
++    if hasattr(model, "_direct_buddy_sponge_target_bsz"):
++        delattr(model, "_direct_buddy_sponge_target_bsz")
+     had_sponge = bool(sponge)
+     if sponge:
+         sponge.clear()
+     reclaim_uma_memory(device, synchronize=had_sponge and device is not None and device.type == "cuda")
+ 
+ 
++def defer_weight_arena_sponge_release(model: torch.nn.Module) -> bool:
++    """Defer releasing ``model._direct_buddy_sponge`` when a ``hold_weight_arena_sponge``
++    scope is active (for example, to keep the target's buddy sponge pinned until a
++    speculative drafter finishes loading)."""
++    if not _HELD_SPONGE_STACK or not hasattr(model, "_direct_buddy_sponge"):
++        return False
++    held = _HELD_SPONGE_STACK[-1]
++    if model not in held:
++        held.append(model)
++    return True
++
++
++def trim_held_weight_arena_sponges(
++    device: torch.device,
++    *,
++    buddyinfo_path: Path = Path("/proc/buddyinfo"),
++    meminfo_path: Path | None = Path("/proc/meminfo"),
++    page_bytes: int | None = None,
++    post_load_headroom_bytes: int = _SPONGE_POST_LOAD_HEADROOM_BYTES,
++) -> None:
++    """Trim or release any sponges held in the active ``hold_weight_arena_sponge``
++    scope so ``MemAvailable`` stays at or above ``post_load_headroom_bytes`` before
++    a subsequent model (such as a speculative drafter) allocates weights."""
++    if not _HELD_SPONGE_STACK:
++        return
++    for model in list(_HELD_SPONGE_STACK[-1]):
++        sponge = getattr(model, "_direct_buddy_sponge", None)
++        if not sponge:
++            continue
++        target_bsz = int(getattr(model, "_direct_buddy_sponge_target_bsz", 0))
++        remaining = _trim_sponge_for_post_load(
++            sponge,
++            device,
++            target_bsz=target_bsz,
++            buddyinfo_path=buddyinfo_path,
++            meminfo_path=meminfo_path,
++            page_bytes=page_bytes,
++            post_load_headroom_bytes=post_load_headroom_bytes,
++        )
++        if not remaining:
++            if hasattr(model, "_direct_buddy_sponge"):
++                delattr(model, "_direct_buddy_sponge")
++            if hasattr(model, "_direct_buddy_sponge_target_bsz"):
++                delattr(model, "_direct_buddy_sponge_target_bsz")
++
++
++@contextmanager
++def hold_weight_arena_sponge(device: torch.device | None = None):
++    """Hold retained buddy sponges across sequential model loads (target + drafter)
++    and release them together on exit."""
++    held: list[torch.nn.Module] = []
++    _HELD_SPONGE_STACK.append(held)
++    try:
++        yield held
++    finally:
++        _HELD_SPONGE_STACK.pop()
++        had_sponge = False
++        for model in held:
++            sponge = getattr(model, "_direct_buddy_sponge", None)
++            if hasattr(model, "_direct_buddy_sponge"):
++                delattr(model, "_direct_buddy_sponge")
++            if hasattr(model, "_direct_buddy_sponge_target_bsz"):
++                delattr(model, "_direct_buddy_sponge_target_bsz")
++            if sponge:
++                had_sponge = True
++                sponge.clear()
++        if had_sponge:
++            reclaim_uma_memory(
++                device,
++                synchronize=device is not None and device.type == "cuda",
++            )
++
++
+ def _refresh_module_weight_views(model: torch.nn.Module) -> None:
+     """Rebind cached tensor slice views (e.g. ``shard_weight``) after ``param.set_``."""
+     for module in model.modules():
+@@ -645,6 +738,23 @@ def bind_weight_arena(
+     kept_sponge = False
+     try:
+         with torch.no_grad():
++            # Allocate temporary pre-tile MoE storages before the permanent dense
++            # weight arena: nvidia.ko drains smaller remaining buddy orders upward,
++            # so placing MoE buffers first ensures the permanent L2-prefetched dense
++            # arena (Q/KV/WO/shared/LM-head) claims the highest-order contiguous blocks.
++            for ptr, (nbytes, views) in sorted(
++                moe_groups.items(), key=lambda item: item[1][0], reverse=True
++            ):
++                moe_buf = torch.empty((nbytes,), dtype=torch.uint8, device=device)
++                if nbytes >= _TOUCH_STRIDE_BYTES:
++                    moe_buf[::_TOUCH_STRIDE_BYTES].zero_()
++                if ptr in cpu_snapshots:
++                    moe_buf.copy_(cpu_snapshots.pop(ptr))
++                moe_storage = moe_buf.untyped_storage()
++                for param, _, orig_offset, shape, stride in views:
++                    param.set_(moe_storage, orig_offset, shape, stride)
++                del moe_buf, moe_storage
++
+             if arena_bytes > 0:
+                 arena = torch.empty((arena_bytes,), dtype=torch.uint8, device=device)
+                 if arena_bytes >= _TOUCH_STRIDE_BYTES:
+@@ -664,19 +774,6 @@ def bind_weight_arena(
+                     offset += _align_up(nbytes, _ARENA_ALIGN_BYTES)
+                 model._direct_weight_arena = arena
+ 
+-            for ptr, (nbytes, views) in sorted(
+-                moe_groups.items(), key=lambda item: item[1][0], reverse=True
+-            ):
+-                moe_buf = torch.empty((nbytes,), dtype=torch.uint8, device=device)
+-                if nbytes >= _TOUCH_STRIDE_BYTES:
+-                    moe_buf[::_TOUCH_STRIDE_BYTES].zero_()
+-                if ptr in cpu_snapshots:
+-                    moe_buf.copy_(cpu_snapshots.pop(ptr))
+-                moe_storage = moe_buf.untyped_storage()
+-                for param, _, orig_offset, shape, stride in views:
+-                    param.set_(moe_storage, orig_offset, shape, stride)
+-                del moe_buf, moe_storage
+-
+             _refresh_module_weight_views(model)
+ 
+         if sponge or total_bytes >= _TOUCH_STRIDE_BYTES:
+@@ -691,6 +788,7 @@ def bind_weight_arena(
+             )
+         if retain_sponge and sponge:
+             model._direct_buddy_sponge = sponge
++            model._direct_buddy_sponge_target_bsz = sponge_target_bsz
+             kept_sponge = True
+     finally:
+         cpu_snapshots.clear()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 71c54bfcb..14d6c21c3 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -521,33 +521,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             model_loader = get_model_loader(self.vllm_config.load_config)
+             logger.info_once("Loading model from scratch...")
+ 
+-            # Capture warmup providers selected while constructing the model.
+-            with self.jit_warmup_registry.activate():
+-                self.model = model_loader.load_model(
+-                    vllm_config=self.vllm_config,
+-                    model_config=self.vllm_config.model_config,
+-                )
+-            if self.lora_config:
+-                self.model = self.load_lora_model(
+-                    self.model, self.vllm_config, self.device
+-                )
++            from vllm.model_executor.model_loader.direct_loader import (
++                hold_weight_arena_sponge,
++                trim_held_weight_arena_sponges,
++            )
+ 
+-            if self.use_aux_hidden_state_outputs:
+-                assert self.speculative_config is not None
+-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+-                if self.use_pp:
+-                    assert self.speculative_config.method is not None
+-                    verify_supports_aux_hidden_states_over_pp(
+-                        self.model, self.speculative_config.method
++            with hold_weight_arena_sponge(self.device):
++                # Capture warmup providers selected while constructing the model.
++                with self.jit_warmup_registry.activate():
++                    self.model = model_loader.load_model(
++                        vllm_config=self.vllm_config,
++                        model_config=self.vllm_config.model_config,
+                     )
+-                    assert self.pp_handler is not None
+-                    self.pp_handler.configure_aux_hidden_state_relay(self.model)
+-            if isinstance(self.speculator, DraftModelSpeculator):
+-                with use_workspace_lane(self._draft_workspace_lane):
+-                    self.speculator.load_model(self.model)
+-                    eplb_models_added = self.eplb.maybe_register_speculator(
+-                        self.speculator, self.speculative_config, load_dummy_weights
++                if self.lora_config:
++                    self.model = self.load_lora_model(
++                        self.model, self.vllm_config, self.device
+                     )
++
++                if self.use_aux_hidden_state_outputs:
++                    assert self.speculative_config is not None
++                    set_eagle3_aux_hidden_state_layers(
++                        self.model, self.speculative_config
++                    )
++                    if self.use_pp:
++                        assert self.speculative_config.method is not None
++                        verify_supports_aux_hidden_states_over_pp(
++                            self.model, self.speculative_config.method
++                        )
++                        assert self.pp_handler is not None
++                        self.pp_handler.configure_aux_hidden_state_relay(self.model)
++                if isinstance(self.speculator, DraftModelSpeculator):
++                    trim_held_weight_arena_sponges(self.device)
++                    with use_workspace_lane(self._draft_workspace_lane):
++                        self.speculator.load_model(self.model)
++                        eplb_models_added = self.eplb.maybe_register_speculator(
++                            self.speculator,
++                            self.speculative_config,
++                            load_dummy_weights,
++                        )
+             # Before any kernel plan or graph sees the weights; the drafter
+             # aliases the target's embedding and head, which loaded in place.
+             if display_carveout.required():
