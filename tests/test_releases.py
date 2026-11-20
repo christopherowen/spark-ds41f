@@ -129,7 +129,12 @@ class ReleaseTest(unittest.TestCase):
 
         data = render_docs.collect_manifest_data()
         production = load("config/cluster.json")
+        upstreams_lock = load("upstreams.lock.json")
         self.assertEqual(data["promoted_baseline"], production["promoted_baseline"])
+        self.assertEqual(
+            [u["patch_count"] for u in data["upstreams"] if u["name"] == "vllm"],
+            [upstreams_lock["sources"]["vllm"]["patch_count"]],
+        )
         self.assertEqual(
             [s["name"] for s in data["shapes"]],
             list(production["shapes"].keys()),
@@ -159,6 +164,8 @@ class ReleaseTest(unittest.TestCase):
             site_data = json.loads((site_dir / "data.json").read_text())
             self.assertEqual(site_data["promoted_baseline"], production["promoted_baseline"])
             html_text = (site_dir / "index.html").read_text()
+            self.assertNotIn("__SPARK_RANGE__", html_text)
+            self.assertIn("one to eight DGX Sparks", html_text)
             match = re.search(
                 r'<script id="manifest-data" type="application/json">\s*(.*?)\s*</script>',
                 html_text,
@@ -168,6 +175,22 @@ class ReleaseTest(unittest.TestCase):
             embedded = json.loads(match.group(1))
             self.assertEqual(embedded["promoted_baseline"], production["promoted_baseline"])
             self.assertEqual(len(embedded["suites"]), len(suite_dirs))
+            self.assertIn("benchmarks", embedded)
+            bench_by_path = {b["path"]: b for b in embedded["benchmarks"]}
+            suite_by_path = {s["path"]: s for s in embedded["suites"]}
+            suite_by_id = {s["id"]: s for s in embedded["suites"]}
+            for s in embedded["shapes"]:
+                ref = s.get("benchmark_reference")
+                if ref and ref.endswith(".json"):
+                    self.assertIn(ref, bench_by_path, s["name"])
+                rec = (
+                    suite_by_path.get(ref)
+                    or suite_by_id.get(f"{embedded['promoted_baseline']}-{s['name']}")
+                    or bench_by_path.get(ref)
+                )
+                self.assertIsNotNone(rec, f"missing site benchmark/suite for {s['name']}")
+                self.assertIn("c1", rec["runs"], s["name"])
+                self.assertTrue(rec["prefill"], f"missing prefill points for {s['name']}")
 
 
 if __name__ == "__main__":

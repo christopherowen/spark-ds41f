@@ -1,6 +1,35 @@
 # Current state
 
-Production is **spark-ds41f-1107** ([config/cluster.json](../config/cluster.json), frozen in
+Production is **spark-ds41f-1120** ([config/cluster.json](../config/cluster.json), frozen in
+[releases/spark-ds41f-1120](../releases/spark-ds41f-1120/)), serving DeepSeek-V4.1-Flash-1017 across
+all 12 hardware shapes (`tp4-ring` by default on dgx1-dgx4; `tp1`, `tp2-direct`, `tp3-triangle`,
+`tp3-triangle-4k`; and `tp2-switched` through `tp8-switched` on sp1-sp8). It was promoted 2026-11-20 as
+[`2026-11-20-spark-ds41f-1120`](../manifests/baselines/2026-11-20-spark-ds41f-1120.json)
+([release record](../experiments/2026-10-26-spark-ds41f-candidate/README.md#spark-ds41f-1120-candidate-62),
+[release notes](../experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)): image
+`spark-ds41f:1120` (`sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08`, built on dgx4
+as `spark-ds41f:candidate-62` and copied to dgx1-dgx3 and sp1-sp8, one image ID on all 12 nodes),
+CUDA `13.5.37` (hash-locked over the base image's CUDA `13.0.2`), complete B12X retirement (`0802`),
+vLLM `0762-0829` (`702` active patches in `candidate-62/vllm/series`, patch head `9b251a18`, tree `8fc99ca7`),
+TileLang `2123e412ce22` (`14` patches, tree `741806c7`), TileKernels `2.0.0` (`1` patch, tree `cb2fa41c`),
+and sparknet `0.5.0` (`3` patches, tree `e06f6a06`). It raises `TP4..TP8` concurrency from `16` to `32`
+streams (`1-192` CUDA graphs) and KV pools (`16.50 GiB` / `17` full 1M contexts on `tp4-*`, up to
+`25.50 GiB` / `27` full 1M contexts on `tp8-switched`), adds `tp1`, `tp2-direct`, `tp2-switched`, and
+`tp3-triangle-4k` (`4 KiB`, `256K` context), adds zero-copy `io_uring` expert slots on `TP1`/`TP2` (`0822`)
+and RM `nvidiactl` display scanout carve-out on `TP2`/`TP3` (`0821`), hardens SP prefill / MoE PDL /
+Clock-Pro Engram / DSpark piecewise TP3 verification / grid-40 persistent vocab / DSML streaming and API
+handling (`0762-0829`), and ships opt-in FP8 group-32 LSA (`VLLM_DS41_LSA=1`, off by default). Against
+`spark-ds41f-1107` on 2-boot Sonar suites: `tp4-ring` decode grid `-7.73%` (`19.36 ms`), paired `c16 +3.07%`
+(`280.43 tok/s`), `c8 +2.70%` (`213.57 tok/s`), `single-stream c1 +7.30%` (`89.06 tok/s`), prefill `+12.91%..+56.31%`
+(`9,615..9,397 tok/s`), `tp3-triangle` `c8 +5.99%` (`170.68 tok/s`), `c4 +6.26%` (`131.59 tok/s`),
+`c1 +10.39%` (`70.36 tok/s`), prefill `+12.17%..+55.69%` (`7,270..6,922 tok/s`), `tp4-switched` grid
+`-9.83%` (`19.05 ms`), `tp8-switched` grid `-9.92%` (`17.60 ms`, `c16 395.40 tok/s`, prefill up to `12,429 tok/s`),
+and `tp3-switched` (`c8 168.92 tok/s`, `c1 69.26 tok/s`), with 2-boot `bin/spark bench` matrices recorded
+for all 12 shapes ([manifests/benchmarks/2026-11-20-spark-ds41f-1120-*.json](../manifests/benchmarks/)).
+In-image gate: `12,023` passed, `356` skipped, `0` failed across `169` files. `spark-ds41f-1107` (frozen in
+[releases/spark-ds41f-1107](../releases/spark-ds41f-1107/), image `spark-ds41f:1107`) is the rollback.
+
+Before spark-ds41f-1120 production was **spark-ds41f-1107** ([releases/spark-ds41f-1107](../releases/spark-ds41f-1107/)), serving DeepSeek-V4.1-Flash-1017 at
 [releases/spark-ds41f-1107](../releases/spark-ds41f-1107/)), serving DeepSeek-V4.1-Flash-1017 at
 1,048,576 tokens on the `tp4-ring` shape (dgx1-dgx4). It was promoted 2026-11-07 as
 [`2026-11-07-spark-ds41f-1107`](../manifests/baselines/2026-11-07-spark-ds41f-1107.json)
@@ -300,7 +329,7 @@ rollback.
 | Promoted baseline | `2026-11-20-spark-ds41f-1120` (`spark-ds41f-1120`, frozen in `releases/spark-ds41f-1120/`); default shape `tp4-ring` |
 | Served models | `deepseek-v4.1-flash` (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, revision `1bae0e10`) and per-request GLP-steered `deepseek-v4.1-flash-weightless` (`msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75`, revision `2715ffd5`) |
 | Kernel backend | TileLang only (`kernel_backend: tilelang`, vLLM 0493-0496): TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (`741806c7`), DeepSeek TileKernels 2.0.0 (`cb2fa41c`), sparknet 0.5.0 (`e06f6a06`) one-shot RoCE collectives; every serving kernel is TileLang including the vision tower, CED row selection, RoPE, compressor, KV writers, Engram gate/hash/gather, sparse MLA, WO projection, drafter context-KV, sampling and block verification |
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/candidate-62/vllm/series` (8 patches, patch head `9b251a18`, tree `8fc99ca7`), TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (14 patches), TileKernels 2.0.0 (1 patch), sparknet 0.5.0 (3 patches), NCCL 2.30.7 (4 patches, tree `6af10aa7`), CUDA 13.5.37; direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/candidate-62/vllm/series` (702 patches, patch head `9b251a18`, tree `8fc99ca7`), TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (14 patches), TileKernels 2.0.0 (1 patch), sparknet 0.5.0 (3 patches), NCCL 2.30.7 (4 patches, tree `6af10aa7`), CUDA 13.5.37; direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
 | Image | `spark-ds41f:1120` (built as `spark-ds41f:candidate-62`, `sha256:5c12472565a7`), one digest on all ranks, built by `bin/spark build` |
 | Decode tiles & PDL | block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count and split-K tiles up to 128 rows for 16-stream steps, programmatic dependent launch (PDL) along the decode chain (vLLM 0520-0525), attention front in one launch (0543-0544), 64-row prefill MoE tiles and panel rasterization past L2 (0043) |
 | Batch invariance | temperature-0 outputs do not depend on the batch: rank-order FP32 reductions with one rounding, compressor projection one TileLang arithmetic at every row count, aligned prefill chunks (`--long-prefill-token-threshold` 16,192 on `tp4-ring`, 6,096 on `tp3-triangle`, 4,048 on `tp3-triangle-4k`), CED replays a prompt's last 128 rows wherever its chunks end (0526-0527), and mixed steps run sparse MLA per request |
@@ -347,10 +376,11 @@ including images a chat client resends with conversation history. Requests
 with more than 67 images receive
 `400: At most 67 image(s) may be provided in one prompt`.
 
-The [default-change record](../manifests/runtime-defaults/2026-11-04-images-67.json)
-preserves the distinction from the frozen spark-ds41f-1030 recipe, which used
-four images. Historical qualification and memory observations below retain
-that original count; 67 has not been serving-qualified here.
+The [default-change records](../manifests/runtime-defaults/2026-11-20-images-67.json)
+(and [2026-11-04](../manifests/runtime-defaults/2026-11-04-images-67.json), plus
+[2026-11-20-per-request-metrics](../manifests/runtime-defaults/2026-11-20-per-request-metrics.json))
+preserve the distinction from the frozen `spark-ds41f-1120` recipe, which qualified at `16` images.
+Historical qualification and memory observations below retain the original limit; `67` is a site default and has not been serving-qualified above `16`.
 
 A site profile raises the limit by writing another count in that entry (`{"image":80}`), or
 omits both entries to take vLLM's default of 999 per prompt. `{"image":0}` (or

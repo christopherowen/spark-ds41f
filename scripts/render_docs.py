@@ -43,6 +43,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import kv_capacity  # noqa: E402
 import recipe  # noqa: E402
+from spark_ds41f import build as spark_build  # noqa: E402
 from spark_ds41f import sonar  # noqa: E402
 
 sb_prompts = sonar.module("prompts")
@@ -86,11 +87,8 @@ def _count_series_patches(series_rel_path: str | None) -> int | None:
     path = ROOT / series_rel_path
     if not path.is_file():
         return None
-    return sum(
-        1
-        for line in path.read_text().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    )
+    _, entries = spark_build.series_files_and_entries(path)
+    return len(entries)
 
 
 # Sonar's default prompt set crosses sixteen task styles with topics. Two styles ask for
@@ -368,6 +366,158 @@ def load_suite_directory(suite_dir: Path) -> dict[str, Any]:
     }
 
 
+def _stat_mean(obj: Any) -> float | None:
+    if isinstance(obj, dict):
+        val = obj.get("mean")
+        return float(val) if val is not None else None
+    if isinstance(obj, (int, float)):
+        return float(obj)
+    return None
+
+
+def _benchmark_shape(stem: str, ident: dict[str, Any]) -> str | None:
+    nodes = len((ident.get("topology") or {}).get("nodes") or [])
+    transport = ident.get("transport") or ""
+    cfg = ident.get("cluster_config") or ""
+    if transport == "local" or nodes == 1 or stem.endswith("-tp1"):
+        return "tp1"
+    if nodes == 2 or stem.endswith(("-direct2", "-switched2")):
+        return "tp2-switched" if (transport == "oneshot-switched" or "switched" in stem) else "tp2-direct"
+    if nodes == 3 or stem.endswith(("-tp3", "-tp34k", "-switched3")):
+        if transport == "oneshot-switched" or "switched" in stem:
+            return "tp3-switched"
+        if "4k" in stem or "4k" in cfg:
+            return "tp3-triangle-4k"
+        return "tp3-triangle"
+    if nodes == 4 or stem.endswith(("-tp4", "-switched")):
+        return "tp4-switched" if (transport == "oneshot-switched" or "switched" in stem) else "tp4-ring"
+    if nodes in (5, 6, 7, 8):
+        return f"tp{nodes}-switched"
+    for n in (5, 6, 7, 8):
+        if stem.endswith(f"-switched{n}"):
+            return f"tp{n}-switched"
+    return None
+
+
+def load_benchmark_file(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text())
+    stem = path.stem
+    m = re.match(
+        r"^(\d{4}-\d{2}-\d{2})-(?:karmic-kraken-)?(.+?)(?:-(tp1|direct2|switched[2-8]?|tp34k|tp3|tp4))?$",
+        stem,
+    )
+    date_str = m.group(1) if m else ""
+    release_name = m.group(2) if m else stem
+    ident = data.get("identity", {})
+    suites_data = data.get("suites", {})
+
+    decode_pts = (suites_data.get("decode") or {}).get("points") or {}
+    decode: dict[str, dict[str, Any]] = {}
+    for style in ("prose", "code"):
+        by_conc: dict[str, Any] = {}
+        for c in (1, 2, 4, 8, 16):
+            row = decode_pts.get(f"{style}-c{c}")
+            if not isinstance(row, dict):
+                continue
+            tps_obj = row.get("tps")
+            tps_mean = _stat_mean(tps_obj)
+            if tps_mean is None:
+                continue
+            entry: dict[str, Any] = {
+                "concurrency": c,
+                "tps": round(tps_mean, 2),
+                "ci95_pct": round(float(tps_obj["ci95_pct"]), 2)
+                if isinstance(tps_obj, dict) and tps_obj.get("ci95_pct") is not None
+                else None,
+                "n": int(tps_obj["n"]) if isinstance(tps_obj, dict) and tps_obj.get("n") is not None else None,
+                "ttft_s": round(_stat_mean(row.get("ttft_s")), 3) if _stat_mean(row.get("ttft_s")) is not None else None,
+                "step_ms": round(_stat_mean(row.get("step_ms")), 3) if _stat_mean(row.get("step_ms")) is not None else None,
+                "tokens_per_step": round(_stat_mean(row.get("tokens_per_step")), 3)
+                if _stat_mean(row.get("tokens_per_step")) is not None
+                else None,
+                "accepted_per_draft": round(_stat_mean(row.get("accepted_per_draft")), 3)
+                if _stat_mean(row.get("accepted_per_draft")) is not None
+                else None,
+            }
+            by_conc[f"c{c}"] = entry
+        if by_conc:
+            decode[style] = by_conc
+
+    prose_dec = decode.get("prose", {})
+    code_dec = decode.get("code", {})
+    runs: dict[str, Any] = {}
+    if "c1" in prose_dec:
+        p1 = prose_dec["c1"]
+        c1 = code_dec.get("c1")
+        tpot_ms = None
+        if p1.get("step_ms") and p1.get("tokens_per_step"):
+            tpot_ms = round(p1["step_ms"] / p1["tokens_per_step"], 2)
+        run1: dict[str, Any] = {
+            "concurrency": 1,
+            "output_tps": p1["tps"],
+            "code_tps": c1["tps"] if c1 else None,
+            "ttft_p50_s": p1.get("ttft_s"),
+            "step_ms": p1.get("step_ms"),
+            "tpot_p50_ms": tpot_ms,
+        }
+        if c1:
+            run1["tps_by_style"] = {
+                "prose": {"tps": round(p1["tps"], 1), "requests": p1.get("n")},
+                "code": {"tps": round(c1["tps"], 1), "requests": c1.get("n")},
+            }
+        runs["c1"] = run1
+    for c in (2, 4, 8, 16):
+        k = f"c{c}"
+        if k not in prose_dec:
+            continue
+        p = prose_dec[k]
+        code_entry = code_dec.get(k)
+        runs[k] = {
+            "concurrency": c,
+            "output_tps": p["tps"],
+            "prose_tps": p["tps"],
+            "code_tps": code_entry["tps"] if code_entry else None,
+            "ttft_p50_s": p.get("ttft_s"),
+            "step_ms": p.get("step_ms"),
+        }
+
+    prefill_pts = (suites_data.get("prefill") or {}).get("points") or {}
+    prefill: list[dict[str, Any]] = []
+    for size_key, row in sorted(prefill_pts.items(), key=lambda kv: int(kv[0])):
+        if not isinstance(row, dict):
+            continue
+        tps_obj = row.get("prefill_tps") or row.get("tps") or {}
+        mean_val = _stat_mean(tps_obj)
+        if mean_val is None or mean_val <= 0:
+            continue
+        prefill.append(
+            {
+                "size": int(size_key),
+                "prompt_tokens": row.get("prompt_tokens"),
+                "tps": round(mean_val, 1),
+                "ci95_pct": round(float(tps_obj["ci95_pct"]), 2)
+                if isinstance(tps_obj, dict) and tps_obj.get("ci95_pct") is not None
+                else None,
+            }
+        )
+
+    return {
+        "id": stem,
+        "path": f"manifests/benchmarks/{path.name}",
+        "kind": "bench",
+        "date": date_str,
+        "release": release_name,
+        "shape": _benchmark_shape(stem, ident),
+        "kernel_backend": ident.get("kernel_backend"),
+        "transport": ident.get("transport"),
+        "started_utc": data.get("started_utc"),
+        "image": ident.get("image"),
+        "decode": decode,
+        "runs": runs,
+        "prefill": prefill,
+    }
+
+
 def _load_shape_memory(bench_ref: str | None, override_raw: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if not bench_ref:
         return None
@@ -436,6 +586,13 @@ def collect_manifest_data() -> dict[str, Any]:
         parsed = load_suite_directory(suite_dir)
         suites.append(parsed)
         suites_by_path[parsed["path"]] = parsed
+
+    benchmarks: list[dict[str, Any]] = []
+    benchmarks_by_path: dict[str, dict[str, Any]] = {}
+    for bench_path in sorted((ROOT / "manifests/benchmarks").glob("*.json")):
+        parsed_bench = load_benchmark_file(bench_path)
+        benchmarks.append(parsed_bench)
+        benchmarks_by_path[parsed_bench["path"]] = parsed_bench
 
     promoted_stem = cluster["promoted_baseline"]
     promoted_manifest = baselines_by_stem[promoted_stem]
@@ -562,6 +719,7 @@ def collect_manifest_data() -> dict[str, Any]:
         "upstreams": upstreams_summary,
         "suites": suites,
         "suites_by_path": suites_by_path,
+        "benchmarks": benchmarks,
         "timeline": timeline,
     }
 
@@ -941,6 +1099,7 @@ def render_site_html(data: dict[str, Any]) -> str:
         "shapes": data["shapes"],
         "upstreams": data["upstreams"],
         "suites": data["suites"],
+        "benchmarks": data["benchmarks"],
         "timeline": data["timeline"],
     }
     # "</" never appears inside the JSON, so no manifest string can end the <script> element early.

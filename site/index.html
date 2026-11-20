@@ -496,7 +496,7 @@
         <div>
           <div class="eyebrow"><span class="dot"></span><span>DeepSeek V4.1 Flash</span><span>·</span><span>DGX Spark</span><span>·</span><span id="eyebrow-release">current release</span></div>
           <h1>A frontier model<br>on your own Sparks.<br><em>switch optional</em></h1>
-          <p class="lede"><strong>spark-ds41f</strong> serves DeepSeek V4.1 Flash across DGX Sparks cabled straight to one another: <strong>native weights</strong>, a <strong>million tokens of context</strong>, sixteen sessions at once. Correct first, then fast, and every number on this page is read from a committed benchmark.</p>
+          <p class="lede"><strong>spark-ds41f</strong> serves DeepSeek V4.1 Flash across DGX Sparks cabled straight to one another: <strong>native weights</strong>, a <strong>million tokens of context</strong>, <span id="hero-seq">thirty-two</span> sessions at once. Correct first, then fast, and every number on this page is read from a committed benchmark.</p>
           <div class="cta">
             <a class="btn primary" href="https://github.com/christopherowen/spark-ds41f#quick-start" rel="noopener">Get the recipe <span aria-hidden="true">→</span></a>
             <a class="btn" href="#numbers">See the numbers <span aria-hidden="true">↓</span></a>
@@ -536,8 +536,8 @@
           </div>
           <div class="tiles" id="perf-tiles">
             <div class="tile"><div class="k" id="t-c1-k">One stream</div><div class="v"><span id="t-c1">–</span><small>tok/s</small></div><div class="d" id="t-c1-d">decode, one conversation</div></div>
-            <div class="tile" id="t-code-tile"><div class="k">One stream, code</div><div class="v"><span id="t-code">–</span><small>tok/s</small></div><div class="d">decode, Python and SQL prompts</div></div>
-            <div class="tile"><div class="k" id="t-cn-k">Sixteen streams</div><div class="v"><span id="t-cn">–</span><small>tok/s</small></div><div class="d">decode, combined output</div></div>
+            <div class="tile" id="t-code-tile"><div class="k">One stream, code</div><div class="v"><span id="t-code">–</span><small>tok/s</small></div><div class="d" id="t-code-d">decode, Python and SQL prompts</div></div>
+            <div class="tile"><div class="k" id="t-cn-k">Sixteen streams</div><div class="v"><span id="t-cn">–</span><small>tok/s</small></div><div class="d" id="t-cn-d">decode, combined output</div></div>
             <div class="tile"><div class="k">Prefill</div><div class="v"><span id="t-pf">–</span><small>tok/s</small></div><div class="d" id="t-pf-d">reading a 131K-token prompt</div></div>
             <div class="tile"><div class="k">First token, busy</div><div class="v"><span id="t-st">–</span><small>s</small></div><div class="d" id="t-st-d">short request beside a 131K prefill</div></div>
           </div>
@@ -807,7 +807,8 @@ __MANIFEST_DATA__
     const still = CARD || (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
     const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
       "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen"];
-    const word = n => WORDS[n] || String(n);
+    const MORE_WORDS = { 32: "thirty-two" };
+    const word = n => WORDS[n] || MORE_WORDS[n] || String(n);
     // The fewest and the most Sparks the model is split across: one Spark alone has nothing to split.
     const SPLIT = (l => [Math.min.apply(null, l), Math.max.apply(null, l)])(DATA.shapes.map(s => s.nodes).filter(n => n > 1));
     const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
@@ -817,10 +818,10 @@ __MANIFEST_DATA__
     const GATES = [
       ["Reference arithmetic", "DeepSeek's reference implementation, followed term for term: FP32 logits, an exact FP32 mHC projection, MoE partial sums rounded once."],
       ["Batch invariance", "At temperature 0, your answer does not depend on who else happens to be in the batch."],
-      ["A determinism gate", "Repeated runs must agree to the token and the logprob, and match the release before. Release 1107 went 20 for 20, bit-identical, on five cluster shapes."],
+      ["A determinism gate", "Repeated runs must agree to the token and the logprob, and match the release before. Release 1120 passed 2-boot determinism and greedy parity across its verified topologies alongside 1107's 20-for-20 across five shapes."],
       ["NaNs stay NaNs", "Kernels keep a NaN instead of clamping it into something plausible. Ten kernel families carry non-finite contract tests."],
       ["A fabric that fails loudly", "A collective that times out stops, and names the peer and the lane. There is no quiet fallback path to hide a bad cable."],
-      ["Quality, every promotion", "Release 1107: 648 release tests passed, RULER 26 of 26 from 4K to 256K, HumanEval+ 164 of 164, and a one-hour agent run with zero errors."],
+      ["Quality, every promotion", "Release 1120: 12,023 release tests passed across 169 files and 5/5 live quality checks on all 12 shapes (building on 1107's RULER 26 of 26 from 4K to 256K, HumanEval+ 164 of 164, and 1h AgentX runs with zero errors)."],
       ["The losing runs are kept", "More than 280 experiments live in the repository, each with its commands, its runs and its verdict, including the ones that lost."]
     ];
     const GAINERS = [
@@ -865,9 +866,12 @@ __MANIFEST_DATA__
     const topStreams = suite => [16, 8, 4, 2].find(n => suite.runs["c" + n]) || 0;
     const suiteFor = s => DATA.suites.find(x => x.path === s.benchmark_reference)
       || DATA.suites.find(x => x.id === DATA.promoted_baseline + "-" + s.name) || null;
+    const benchFor = s => (DATA.benchmarks || []).find(x => x.path === s.benchmark_reference)
+      || (DATA.benchmarks || []).find(x => x.shape === s.name && shortRel(x.release) === shortRel(DATA.promoted_short)) || null;
     // One diagram entry per (fabric, node count): the first shape listed wins, so the 4 KiB variant stays in the table only.
     const DIAGRAM = {};
-    SHAPES.forEach(s => { const k = s.fabric + s.nodes; if (!DIAGRAM[k]) DIAGRAM[k] = s; });
+    const SHAPE_BY_NAME = {};
+    SHAPES.forEach(s => { const k = s.fabric + s.nodes; if (!DIAGRAM[k]) DIAGRAM[k] = s; SHAPE_BY_NAME[s.name] = s; });
     const counts = f => SHAPES.filter(s => s.fabric === f).map(s => s.nodes).filter((n, i, a) => a.indexOf(n) === i).sort((a, b) => a - b);
     const sparks = n => n === 1 ? "one Spark" : `${word(n)} Sparks`;
     // How a shape is laid out, in a word: the table, the fabric menu and the link-preview card all use it.
@@ -991,9 +995,9 @@ __MANIFEST_DATA__
       tween($("#t-kv"), kv.vllm_capacity_tokens / 1e6, v => v.toFixed(1) + "M");
       $("#t-kv-d").textContent = `tokens of KV kept warm: ${word(kv.full_contexts)} full context${kv.full_contexts === 1 ? "" : "s"}`;
 
-      const suite = suiteFor(s);
+      const suite = suiteFor(s), bench = suite ? null : benchFor(s), rec = suite || bench;
       const tiles = $("#perf-tiles"), none = $("#perf-none");
-      if (!suite || !suite.runs || !suite.runs.c1) {
+      if (!rec || !rec.runs || !rec.runs.c1) {
         tiles.hidden = true; none.hidden = false;
         none.innerHTML = s.qualified_release
           ? `<code>${esc(s.name)}</code> is qualified by the release benchmark on ${sparks(s.nodes)}. A full serving suite is recorded for ${esc(suiteShapes())}; pick one of those to see its throughput.`
@@ -1001,51 +1005,70 @@ __MANIFEST_DATA__
         $("#live-src").innerHTML = `<b>${esc(s.name)}</b> · ${esc(DATA.promoted_short)}`;
       } else {
         tiles.hidden = false; none.hidden = true;
-        const top = topStreams(suite), run = suite.runs["c" + top];
+        const isBench = !suite, top = topStreams(rec), run = rec.runs["c" + top];
         // A run whose request table names each prompt splits one stream into prose and code.
-        const one = suite.runs.c1, split = one.tps_by_style;
+        const one = rec.runs.c1, split = one.tps_by_style;
         const firstToken = one.ttft_p50_s ? `; first token in ${one.ttft_p50_s.toFixed(2)} s` : "";
         if (split && !CODE_TILE.isConnected) tiles.insertBefore(CODE_TILE, tiles.children[1]);
         if (!split) CODE_TILE.remove();
         tiles.classList.toggle("five", !!split);
         $("#t-c1-k").textContent = split ? "One stream, prose" : "One stream";
         tween($("#t-c1"), split ? split.prose.tps : one.output_tps, v => v.toFixed(1));
-        $("#t-c1-d").textContent = (split ? "decode, prose prompts" : "decode, one conversation") + firstToken;
-        if (split) tween($("#t-code", CODE_TILE), split.code.tps, v => v.toFixed(1));
+        $("#t-c1-d").textContent = (split ? (isBench ? "decode, prose prompt" : "decode, prose prompts") : "decode, one conversation") + firstToken;
+        if (split) {
+          tween($("#t-code", CODE_TILE), split.code.tps, v => v.toFixed(1));
+          $("#t-code-d").textContent = isBench ? "decode, code prompt" : "decode, Python and SQL prompts";
+        }
         const cnTile = $("#t-cn").closest(".tile");
         cnTile.style.visibility = run ? "" : "hidden";
         if (run) {
-          $("#t-cn-k").textContent = `${cap(word(top))} streams`;
+          $("#t-cn-k").textContent = isBench ? `${cap(word(top))} streams, prose` : `${cap(word(top))} streams`;
           tween($("#t-cn"), run.output_tps, v => v.toFixed(1));
+          $("#t-cn-d").textContent = isBench
+            ? (run.code_tps ? `shared-prefix bench · code ${run.code_tps.toFixed(1)} tok/s` : "shared-prefix release bench")
+            : "decode, combined output";
         }
-        const pf = (suite.prefill || []).find(p => p.size === 131072) || (suite.prefill || [])[0];
+        const pfs = rec.prefill || [];
+        const pf = pfs.find(p => p.size === 131072) || pfs[pfs.length - 1];
         const pfTile = $("#t-pf").closest(".tile");
         pfTile.style.visibility = pf ? "" : "hidden";
         if (pf) {
-          tween($("#t-pf"), pf.tps, int);
-          $("#t-pf-d").textContent = `reading a ${Math.round(pf.size / 1000)}K-token prompt`;
+          tween($("#t-pf"), pf.tps, v => v < 100 ? v.toFixed(1) : int(v));
+          const pfLbl = pf.size === 1000000 ? "1M" : pf.size >= 1024 ? Math.round(pf.size / 1000) + "K" : String(pf.size);
+          $("#t-pf-d").textContent = `reading a ${pf.size === 1024 ? "1K" : pfLbl}-token prompt`;
         }
-        const st = (suite.stalls || {})["stall-3"];
+        const st = !isBench && (rec.stalls || {})["stall-3"];
         const stTile = $("#t-st").closest(".tile");
         stTile.style.visibility = st && st.probe_ttft_p50_s ? "" : "hidden";
         if (st && st.probe_ttft_p50_s) tween($("#t-st"), st.probe_ttft_p50_s, v => v.toFixed(2));
-        $("#live-src").innerHTML = `<b>${esc(s.name)}</b> · ${esc(DATA.promoted_short)} · <a href="${REPO}/tree/main/${esc(suite.path)}" rel="noopener">${esc(suite.path)}</a>`;
+        $("#live-src").innerHTML = isBench
+          ? `<b>${esc(s.name)}</b> · ${esc(DATA.promoted_short)} · release bench · <a href="${REPO}/blob/main/${esc(rec.path)}" rel="noopener">${esc(rec.path)}</a>`
+          : `<b>${esc(s.name)}</b> · ${esc(DATA.promoted_short)} · <a href="${REPO}/tree/main/${esc(rec.path)}" rel="noopener">${esc(rec.path)}</a>`;
       }
+      return s;
     }
     function suiteShapes() {
       return SHAPES.filter(s => { const x = suiteFor(s); return x && x.runs && x.runs.c1; }).map(s => s.name).join(", ");
     }
 
-    document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => { state.fabric = b.dataset.fabric; selectShape(); }));
+    function syncLaneToShape(s) {
+      if (!s) return;
+      const k = s.name === "tp4-ring" ? "tp4" : s.name === "tp3-triangle" ? "tp3" : (LANES[s.name] ? s.name : null);
+      if (k && LANES[k] && laneSel.value !== k) {
+        laneSel.value = k;
+        fillReleases();
+      }
+    }
+    document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => { state.fabric = b.dataset.fabric; syncLaneToShape(selectShape()); }));
     $("#node-chips").addEventListener("click", e => {
       const b = e.target.closest("button"); if (!b) return;
-      state.nodes = +b.dataset.n; selectShape();
+      state.nodes = +b.dataset.n; syncLaneToShape(selectShape());
     });
     function plugIn(e) {
       if (e) e.preventDefault();
       state.fabric = state.fabric === "switched" ? "switchless" : "switched";
       if (state.fabric === "switched") state.nodes = 6;
-      selectShape();
+      syncLaneToShape(selectShape());
       const box = $(".fabric").getBoundingClientRect();
       if (box.top < 70 || box.bottom > window.innerHeight) $(".fabric").scrollIntoView({ behavior: still ? "auto" : "smooth", block: "center" });
     }
@@ -1054,6 +1077,8 @@ __MANIFEST_DATA__
     /* ---------- static header bits ---------- */
     $("#eyebrow-release").textContent = "release " + shortRel(DATA.promoted_short);
     (function () {
+      const def = SHAPES.find(s => s.name === DATA.default_shape) || SHAPES[0];
+      if ($("#hero-seq") && def) $("#hero-seq").textContent = word(def.max_num_seqs);
       const sw = counts("switched"), sl = counts("switchless");
       const span = l => l.length > 1 ? `${word(l[0])} to ${word(l[l.length - 1])}` : word(l[0]);
       if (sw.length) $("#fn-range").textContent = `${cap(span(sw))} Sparks`;
@@ -1096,7 +1121,7 @@ __MANIFEST_DATA__
       for (let v = a; v <= b + step / 2; v += step) t.push(+v.toFixed(6));
       return t;
     }
-    const kfmt = v => v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + "k" : String(v);
+    const kfmt = v => v >= 1000 ? (v / 1000).toFixed(v % 100 ? 2 : v % 1000 ? 1 : 0) + "k" : String(v);
 
     // series: [{name, color, width, values: [number|null], label: bool}]
     function lineChart(host, o) {
@@ -1166,8 +1191,20 @@ __MANIFEST_DATA__
     };
     const LANES = {};
     DATA.suites.forEach(s => { const l = laneOf(s); s._lane = l; (LANES[l.key] = LANES[l.key] || []).push(s); });
-    const laneLabel = k => { const n = +k.replace(/\D/g, ""); return `${cap(sparks(n))}, ${layout(/switched/.test(k) ? "switched" : "switchless", n)}`; };
-    const laneKeys = Object.keys(LANES).sort((a, b) => (LANES[b].length - LANES[a].length) || a.localeCompare(b));
+    SHAPES.forEach(s => {
+      if (LANES[s.name] || (s.name === "tp4-ring" && LANES.tp4) || (s.name === "tp3-triangle" && LANES.tp3)) return;
+      const runs = (DATA.benchmarks || []).filter(b => b.kernel_backend === "tilelang" && b.shape === s.name && b.runs && b.runs.c1);
+      if (runs.length) LANES[s.name] = runs;
+    });
+    const isBenchLane = k => LANES[k] && LANES[k][0] && LANES[k][0].kind === "bench";
+    const laneLabel = k => {
+      const sh = SHAPE_BY_NAME[k];
+      if (isBenchLane(k) && sh) return `${cap(sparks(sh.nodes))}, ${layout(sh.fabric, sh.nodes)}${sh.page_size_bytes < 65536 ? " · 4 KiB" : ""} (bench)`;
+      const m = /^tp(\d+)/.exec(k);
+      const n = m ? +m[1] : 0;
+      return `${cap(sparks(n))}, ${layout(/switched/.test(k) ? "switched" : "switchless", n)}`;
+    };
+    const laneKeys = Object.keys(LANES).sort((a, b) => (isBenchLane(a) - isBenchLane(b)) || (LANES[b].length - LANES[a].length) || a.localeCompare(b));
     const laneSel = $("#lane"), baseSel = $("#base"), candSel = $("#cand");
     laneSel.innerHTML = laneKeys.map(k => `<option value="${k}">${esc(laneLabel(k))}</option>`).join("");
     const defaultLane = (suiteFor(SHAPES.find(s => s.name === DATA.default_shape) || SHAPES[0]) || {})._lane;
@@ -1185,34 +1222,41 @@ __MANIFEST_DATA__
       const p = (c - b) / b * 100, good = lowerBetter ? p < -0.3 : p > 0.3, bad = lowerBetter ? p > 0.3 : p < -0.3;
       return `<span class="${good ? "up" : bad ? "down" : "flat"}">${p > 0 ? "+" : ""}${p.toFixed(1)}%</span>`;
     }
+    const SIZE_LABELS = { 512: "512", 1024: "1K", 32768: "32K", 131072: "131K", 262144: "262K", 524288: "524K", 1000000: "1M" };
+    const sizeLabel = z => SIZE_LABELS[z] || (z >= 1000 ? Math.round(z / 1000) + "K" : String(z));
     function drawNumbers() {
       const list = LANES[laneSel.value];
       const base = list.find(s => s.id === baseSel.value) || list[0];
       const cand = list.find(s => s.id === candSel.value) || list[list.length - 1];
-      const top = Math.max.apply(null, list.map(topStreams)) || 8, mid = top / 2;
+      const isBench = list[0] && list[0].kind === "bench";
+      const top = Math.max.apply(null, list.map(topStreams)) || 4, mid = Math.max(2, top / 2);
       const col = k => list.map(s => s.runs[k] ? s.runs[k].output_tps : null);
+      const decSeries = [{ name: `${top} streams`, color: "var(--s3)", values: col("c" + top), label: true }];
+      if (mid !== top) decSeries.push({ name: `${mid} streams`, color: "var(--s2)", values: col("c" + mid), label: true });
+      decSeries.push({ name: "1 stream", color: "var(--s1)", values: col("c1"), label: true });
       lineChart($("#chart-decode"), {
         title: "Decode throughput by release",
-        sub: "Output tokens per second, higher is better",
+        sub: isBench ? "Prose output tokens per second (shared-prefix release bench), higher is better" : "Output tokens per second, higher is better",
         x: list.map(s => shortRel(s.release)), xTip: list.map(s => `${shortRel(s.release)} · ${s.date}`),
         fmt: v => v.toFixed(1) + " tok/s",
-        series: [
-          { name: `${top} streams`, color: "var(--s3)", values: col("c" + top), label: true },
-          { name: `${mid} streams`, color: "var(--s2)", values: col("c" + mid), label: true },
-          { name: "1 stream", color: "var(--s1)", values: col("c1"), label: true }
-        ]
+        series: decSeries
       });
-      const sizes = [32768, 131072, 262144, 524288, 1000000];
+      const seenSizes = [];
+      list.forEach(s => (s.prefill || []).forEach(p => { if (seenSizes.indexOf(p.size) < 0) seenSizes.push(p.size); }));
+      seenSizes.sort((a, b) => a - b);
+      const sizes = seenSizes.some(z => z >= 32768)
+        ? [32768, 131072, 262144, 524288, 1000000].filter(z => seenSizes.indexOf(z) >= 0 || (z === 524288 && seenSizes.indexOf(500000) >= 0))
+        : (seenSizes.length ? seenSizes : [32768, 131072, 262144, 524288, 1000000]);
       const at = (s, z) => { const p = (s.prefill || []).find(q => q.size === z || (z === 524288 && q.size === 500000)); return p ? p.tps : null; };
       const others = list.filter(s => s !== cand && s !== base && (s.prefill || []).length);
       const ser = others.map((s, i) => ({ name: i ? shortRel(s.release) : "Earlier releases", color: "var(--ink-3)", width: 1.2, opacity: 0.45, values: sizes.map(z => at(s, z)), legend: i === 0, tip: false }));
-      if (base !== cand) ser.push({ name: shortRel(base.release), color: "var(--s2)", values: sizes.map(z => at(base, z)), label: true });
-      ser.push({ name: shortRel(cand.release), color: "var(--s1)", width: 2.4, values: sizes.map(z => at(cand, z)), label: true, dots: true });
+      if (base !== cand && (base.prefill || []).length) ser.push({ name: shortRel(base.release), color: "var(--s2)", values: sizes.map(z => at(base, z)), label: true });
+      if ((cand.prefill || []).length) ser.push({ name: shortRel(cand.release), color: "var(--s1)", width: 2.4, values: sizes.map(z => at(cand, z)), label: true, dots: true });
       lineChart($("#chart-prefill"), {
         title: "Prefill throughput by prompt size",
         sub: "Prompt tokens read per second, higher is better",
-        x: ["32K", "131K", "262K", "524K", "1M"], xTip: ["32K-token prompt", "131K-token prompt", "262K-token prompt", "524K-token prompt", "1M-token prompt"],
-        fmt: v => int(v) + " tok/s", series: ser
+        x: sizes.map(sizeLabel), xTip: sizes.map(z => `${sizeLabel(z)}-token prompt`),
+        fmt: v => (v < 100 ? v.toFixed(1) : int(v)) + " tok/s", series: ser
       });
 
       $("#th-base").textContent = shortRel(base.release);
@@ -1220,31 +1264,47 @@ __MANIFEST_DATA__
       const rows = [];
       const push = (name, b, c, f, lower, note) => { if (b == null && c == null) return; rows.push([name, b == null ? "–" : f(b), c == null ? "–" : f(c), delta(b, c, lower), note || ""]); };
       const f1 = v => v.toFixed(1), f2 = v => v.toFixed(2);
-      ["c16", "c8", "c4", "c1"].forEach(k => {
-        const b = base.runs[k], c = cand.runs[k]; if (!b && !c) return;
-        const nstr = +k.slice(1), r = c || b;
-        push(`Decode, ${nstr === 1 ? "one stream" : word(nstr) + " streams"} (tok/s)`, b && b.output_tps, c && c.output_tps, f1, false,
-          r.ttft_p50_s ? `first token ${r.ttft_p50_s.toFixed(2)} s · ${r.tpot_p50_ms.toFixed(1)} ms per token` : "");
-        if (nstr !== 1) return;
-        const bs = b && b.tps_by_style, cs = c && c.tps_by_style, any = cs || bs;
-        if (!any) return;
-        [["prose", "prose prompts"], ["code", "Python and SQL prompts"]].forEach(([style, what]) =>
-          push(`Decode, one stream, ${style} (tok/s)`, bs && bs[style].tps, cs && cs[style].tps, f1, false,
-            `${any[style].requests} ${what} in the run`));
-      });
-      const bp = base.runs.poisson, cp = cand.runs.poisson;
-      if (bp || cp) push("Decode, random arrivals (tok/s)", bp && bp.output_tps, cp && cp.output_tps, f1, false, `Poisson, ${(cp || bp).rate} requests/s`);
-      ["c16", "c8", "c1"].forEach(k => {
-        const b = (base.sampled || {})[k], c = (cand.sampled || {})[k]; if (!b && !c) return;
-        push(`Sampled decode, ${word(+k.slice(1))} stream${k === "c1" ? "" : "s"} (tok/s)`, b && b.output_tps, c && c.output_tps, f1, false, "temperature 1.0, seeded");
-      });
-      sizes.forEach((z, i) => push(`Prefill, ${["32K", "131K", "262K", "524K", "1M"][i]} prompt (tok/s)`, at(base, z), at(cand, z), int, false, "uncached source text"));
-      Object.keys(cand.stalls || {}).sort((a, b) => cand.stalls[a].streams - cand.stalls[b].streams).forEach(k => {
-        const c = cand.stalls[k], b = (base.stalls || {})[k];
-        if (!c.probe_ttft_p50_s) return;
-        push(`First token beside a 131K prefill, ${c.streams} streams (s)`, b && b.probe_ttft_p50_s, c.probe_ttft_p50_s, f2, true, "short request arriving mid-prefill");
-      });
-      if (base.grid || cand.grid) push(`Decode step, geometric mean of ${(cand.grid || base.grid).shape_count} shapes (ms)`, base.grid && base.grid.geomean_ms, cand.grid && cand.grid.geomean_ms, f2, true, "fixed-shape engine grid");
+      const fmtPf = v => v < 100 ? f1(v) : int(v);
+      if (isBench) {
+        ["c16", "c8", "c4", "c2", "c1"].forEach(k => {
+          ["prose", "code"].forEach(style => {
+            const b = ((base.decode || {})[style] || {})[k], c = ((cand.decode || {})[style] || {})[k];
+            if (!b && !c) return;
+            const nstr = +k.slice(1), r = c || b;
+            const parts = [];
+            if (r.ttft_s != null) parts.push(`first token ${r.ttft_s.toFixed(2)} s`);
+            if (r.step_ms != null) parts.push(`${r.step_ms.toFixed(1)} ms/step`);
+            push(`Decode, ${style}, ${nstr === 1 ? "one stream" : word(nstr) + " streams"} (tok/s)`, b && b.tps, c && c.tps, f1, false, parts.join(" · "));
+          });
+        });
+        sizes.forEach(z => push(`Prefill, ${sizeLabel(z)} prompt (tok/s)`, at(base, z), at(cand, z), fmtPf, false, "uncached source text"));
+      } else {
+        ["c16", "c8", "c4", "c1"].forEach(k => {
+          const b = base.runs[k], c = cand.runs[k]; if (!b && !c) return;
+          const nstr = +k.slice(1), r = c || b;
+          push(`Decode, ${nstr === 1 ? "one stream" : word(nstr) + " streams"} (tok/s)`, b && b.output_tps, c && c.output_tps, f1, false,
+            r.ttft_p50_s ? `first token ${r.ttft_p50_s.toFixed(2)} s · ${r.tpot_p50_ms.toFixed(1)} ms per token` : "");
+          if (nstr !== 1) return;
+          const bs = b && b.tps_by_style, cs = c && c.tps_by_style, any = cs || bs;
+          if (!any) return;
+          [["prose", "prose prompts"], ["code", "Python and SQL prompts"]].forEach(([style, what]) =>
+            push(`Decode, one stream, ${style} (tok/s)`, bs && bs[style].tps, cs && cs[style].tps, f1, false,
+              `${any[style].requests ? any[style].requests + " " : ""}${what} in the run`));
+        });
+        const bp = base.runs.poisson, cp = cand.runs.poisson;
+        if (bp || cp) push("Decode, random arrivals (tok/s)", bp && bp.output_tps, cp && cp.output_tps, f1, false, `Poisson, ${(cp || bp).rate} requests/s`);
+        ["c16", "c8", "c1"].forEach(k => {
+          const b = (base.sampled || {})[k], c = (cand.sampled || {})[k]; if (!b && !c) return;
+          push(`Sampled decode, ${word(+k.slice(1))} stream${k === "c1" ? "" : "s"} (tok/s)`, b && b.output_tps, c && c.output_tps, f1, false, "temperature 1.0, seeded");
+        });
+        sizes.forEach(z => push(`Prefill, ${sizeLabel(z)} prompt (tok/s)`, at(base, z), at(cand, z), fmtPf, false, "uncached source text"));
+        Object.keys(cand.stalls || {}).sort((a, b) => cand.stalls[a].streams - cand.stalls[b].streams).forEach(k => {
+          const c = cand.stalls[k], b = (base.stalls || {})[k];
+          if (!c.probe_ttft_p50_s) return;
+          push(`First token beside a 131K prefill, ${c.streams} streams (s)`, b && b.probe_ttft_p50_s, c.probe_ttft_p50_s, f2, true, "short request arriving mid-prefill");
+        });
+        if (base.grid || cand.grid) push(`Decode step, geometric mean of ${(cand.grid || base.grid).shape_count} shapes (ms)`, base.grid && base.grid.geomean_ms, cand.grid && cand.grid.geomean_ms, f2, true, "fixed-shape engine grid");
+      }
       $("#compare").innerHTML = rows.map(r => `<tr><td class="lead">${esc(r[0])}</td><td class="n">${r[1]}</td><td class="n">${r[2]}</td><td class="n">${r[3]}</td><td>${esc(r[4])}</td></tr>`).join("");
     }
     laneSel.addEventListener("change", fillReleases);
@@ -1254,6 +1314,10 @@ __MANIFEST_DATA__
     /* ---------- shapes table ---------- */
     $("#shape-rows").innerHTML = SHAPES.map(s => {
       const kv = s.kv_capacity, m = s.memory;
+      const refKind = s.benchmark_reference && s.benchmark_reference.endsWith(".json") ? "blob" : "tree";
+      const qual = s.qualified_release && s.benchmark_reference
+        ? `<a href="${REPO}/${refKind}/main/${esc(s.benchmark_reference)}" rel="noopener">${esc(shortRel(s.qualified_release))}</a>`
+        : s.qualified_release ? esc(shortRel(s.qualified_release)) : '<span class="flat">not yet</span>';
       return `<tr>
         <td>${glyph(s.fabric, s.nodes)}</td>
         <td class="lead nw"><code>${esc(s.name)}</code>${s.default ? '<span class="pill">default</span>' : ""}</td>
@@ -1262,7 +1326,7 @@ __MANIFEST_DATA__
         <td class="n">${s.max_num_seqs}</td>
         <td class="n">${kv.full_contexts} full context${kv.full_contexts === 1 ? "" : "s"}</td>
         <td class="n">${m ? m.head_min_available_gib.toFixed(1) + " GiB" : "–"}</td>
-        <td>${s.qualified_release ? esc(shortRel(s.qualified_release)) : '<span class="flat">not yet</span>'}</td>
+        <td>${qual}</td>
       </tr>`;
     }).join("");
 

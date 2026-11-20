@@ -89,7 +89,7 @@ replaces NCCL with sparknet cannot run it, and it requires
 
 ## Qualification scope
 
-**Four nodes at TP4 is the reference switched shape measured in this repository, and six nodes at TP6 has an external switched measurement ([experiments/2026-10-29-tp6-switch](../experiments/2026-10-29-tp6-switch/README.md)).** Switched maps of three to eight nodes (`TP3` through `TP8`) are accepted by the tooling (`scripts/topology.py`) and supported by the TileLang collectives, mHC, GLP steering, and MoE padding kernels (`0625`–`0628`), and `scripts/probe_collectives.py` accepts `--world-size` `2..8`. Shapes other than TP4 remain **unqualified** in the reference cluster until `bin/spark topology probe` and paired serving benchmarks are recorded on the target switch.
+**Two to eight nodes (`tp2-switched` through `tp8-switched`) are qualified in `spark-ds41f-1120`:** `tp2-switched` serves `262,144` context (`4` sequences, `8.00 GiB` KV) using the zero-copy `io_uring` expert slot cache (`vLLM 0822`) and RM display scanout carve-out (`vLLM 0821`); `tp3-switched` serves `1,048,576` context (`8` sequences, `4.90625 GiB` KV); and `tp4-switched` through `tp8-switched` serve `1,048,576` context at `32` sequences (`192`-row CUDA graphs, `13.00–25.50 GiB` KV/rank). Each shape has a two-boot `bin/spark bench` reference (`manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched*.json`) alongside example site node maps (`config/examples/nodes-switched*.json`), and `tp3-switched`, `tp4-switched`, and `tp8-switched` also carry full 2-boot Sonar release/single-stream/sampled suites (`manifests/suites/2026-11-20-spark-ds41f-1120-tp*-switched/`).
 
 ## Qualifying one
 

@@ -1,15 +1,11 @@
-# Three- and four-node switchless deployments
+# Single-node and switchless deployments (one to four Sparks)
 
-The deployment tools accept three or four Sparks, with one GPU and one TP rank
-per node. Both layouts are shapes of one recipe,
-[config/cluster.json](../config/cluster.json): `tp3-triangle` for the
-three-node triangle and `tp4-ring` for the four-node ring (the full 1M context
-with 16 sequences), each with the TileLang kernel family and sparknet's
+The deployment tools accept one to four Sparks without a switch (`one GPU and one TP rank per node`), all as shapes of one recipe,
+[config/cluster.json](../config/cluster.json): `tp1` (single-node `local` executor, `262,144` context, `4` sequences, `8.00 GiB` KV), `tp2-direct` (two Sparks cabled directly over ConnectX-7, `262,144` context, `4` sequences, `8.00 GiB` KV, using the zero-copy `io_uring` expert slot cache and RM carve-out), `tp3-triangle-4k` (stock `4 KiB` pages without Memory Saver, `262,144` context, `8` sequences, `2.20 GiB` KV), `tp3-triangle` (`1,048,576` context, `8` sequences, `4.90625 GiB` KV), and `tp4-ring` for the four-node ring (`1,048,576` context, `32` sequences, `16.50 GiB` KV), each with the TileLang kernel family and sparknet's
 one-shot collectives ([r6 record](../experiments/2026-10-05-tilelang-r6/README.md)).
 The site names its cabling with `bin/spark site shape NAME --apply`. The
-`tp4-ring` shape reads the site's ring map from the git-ignored
-`config/nodes-ring4.local.json`; start from
-[config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json).
+`tp4-ring` shape reads the site's ring map from `config/nodes-ring4.local.json`
+([config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json)); `tp2-direct` reads `config/nodes-direct2.local.json` ([config/examples/nodes-direct2.json](../config/examples/nodes-direct2.json)), and `tp1` reads `config/nodes-tp1.local.json` ([config/examples/nodes-tp1.json](../config/examples/nodes-tp1.json)).
 
 The history of the four-node path, measured with B12X: NCCL ring, RoCEnante CPU
 relay and NIC forwarding pass the hardware collective probe on four connected

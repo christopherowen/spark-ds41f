@@ -2,7 +2,7 @@
 
 **DeepSeek V4.1 Flash on DGX Sparks. No switch required.\***
 
-A reproducible deployment of DeepSeek-V4.1-Flash-1017 across three to eight DGX Sparks:
+A reproducible deployment of DeepSeek-V4.1-Flash-1017 across one to eight DGX Sparks:
 the Docker/vLLM build, the tuning, and every benchmark behind it. The site,
 [switchle.ss](https://switchle.ss), is rendered from this repository's manifests.
 
@@ -16,76 +16,75 @@ the Docker/vLLM build, the tuning, and every benchmark behind it. The site,
 
 | | |
 | --- | --- |
-| Context | 1,048,576 tokens in one request |
-| Sessions | 16 at once on four or more Sparks, 8 on three |
-| Prompt cache | a KV pool that holds 11 full 1M contexts (5 on three Sparks); every response reports its cache hits |
-| Fabrics | switchless: a triangle of three or a ring of four; switched\*: three to eight |
-| Speed | DSpark and CopyDrafter speculative decoding, the CED row skip, prefill yield, TileLang kernels, one-shot RoCE collectives; current numbers in [Performance](#performance) |
+| Context | 1,048,576 tokens on 3–8 Sparks (`262,144` on 1–2 Sparks and 4 KiB TP3) |
+| Sessions | 32 at once on 4–8 Sparks (`192`-row CUDA graphs), 8 on 3 Sparks, 4 on 1–2 Sparks |
+| Prompt cache | up to 27 full 1M contexts (`25.5 GiB`/rank on TP8) or 17 full 1M contexts on TP4 (`16.5 GiB`/rank; 5 on TP3; 34 full 256K contexts on TP1/TP2); every response reports its cache hits |
+| Fabrics | single-node (`tp1`), switchless direct (`tp2-direct`), triangle (`tp3-triangle`, `-4k`), ring (`tp4-ring`), and switched\* (`tp2-switched` to `tp8-switched`) |
+| Speed | DSpark and CopyDrafter speculative decoding, CED row skip, prefill yield, CUDA `13.5.37`, TileLang kernels, one-shot RoCE collectives, zero-copy `io_uring` expert slot cache (`TP1`/`TP2`); current numbers in [Performance](#performance) |
 | Steering | [weightless](https://weightle.ss): a second served name, `deepseek-v4.1-flash-weightless`, steered per request by a GLP vector, with the stock name bit-identical beside it |
-| API | OpenAI-compatible, with the DeepSeek API's effort aliases and `thinking` switch |
+| API | OpenAI-compatible, with the DeepSeek API's effort aliases and `thinking` switch, plus OpenResponses / `CustomTool` support |
 
-\* We do support switches: `tp3-switched` to `tp8-switched`, qualified since
-spark-ds41f-1107 ([docs/switched-fabric.md](docs/switched-fabric.md)). We just never needed one.
+\* We do support switches: `tp2-switched` to `tp8-switched`, all qualified in
+`spark-ds41f-1120` ([docs/switched-fabric.md](docs/switched-fabric.md)). We just never needed one.
 
-Production is **spark-ds41f-1107**, serving DeepSeek-V4.1-Flash-1017 at 1M context
-([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
+Production is **spark-ds41f-1120**, serving DeepSeek-V4.1-Flash-1017 across all
+twelve hardware shapes ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md#spark-ds41f-1120-candidate-62),
 [release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md), frozen in
-[releases/spark-ds41f-1107](releases/spark-ds41f-1107/)). It is the first release qualified on
-every shape of the recipe: the switchless ring and triangle, and three to eight Sparks through a
-switch. [Release history](#release-history) has what each release changed and measured.
+[releases/spark-ds41f-1120](releases/spark-ds41f-1120/)). It advances onto CUDA `13.5.37`, retires
+B12X completely (`0802`), adds `tp1`, `tp2-direct`, `tp2-switched`, and `tp3-triangle-4k`, and
+raises `TP4..TP8` concurrency from 16 to 32 streams with expanded KV pools.
+[Release history](#release-history) has what each release changed and measured.
 
-The promoted kernel family is **TileLang** (r6): TileLang kernels for SM121,
+The promoted kernel family is **TileLang** (the only kernel family in the image;
+B12X was retired in `vLLM 0802` / #1096): TileLang kernels for SM121 (`CUDA 13.5.37`),
 with DeepSeek's TileKernels and the one-shot RoCE collectives of
-[sparknet](https://github.com/christopherowen/dgx-spark-networking), in place
-of B12X's attention, linear, MoE, mHC, vocabulary and collective kernels
-(`kernel_backend: tilelang`, see `scripts/kernel_backend.py`). Since
-spark-ds41f-1030 (`vLLM 0493-0496`), TileLang is the only kernel family in the
-image and checkpoints load directly (`--load-format direct`, `VLLM_PLUGINS`
-empty). The [r6 promotion record](experiments/2026-10-05-tilelang-r6/README.md)
-has both recipes and their benchmarks, and the
+[sparknet](https://github.com/christopherowen/dgx-spark-networking). Checkpoints load
+directly (`--load-format direct`, `VLLM_PLUGINS` empty). The
+[r6 promotion record](experiments/2026-10-05-tilelang-r6/README.md) has the initial promotion, and the
 [decode-kernel experiment](experiments/2026-10-05-tilelang-decode-kernels/README.md)
-compares the two families kernel by kernel.
+compares the retired and promoted families kernel by kernel.
 [docs/fundamentals.md](docs/fundamentals.md) explains the model itself: GEMM
 shapes, number formats, one decoder layer, attention, mHC, Engram, DSpark, and
 how TP3 and TP4 split the layers. The site, [switchle.ss](https://switchle.ss), is
 [docs/index.html](docs/index.html): the page in [site/index.html](site/index.html)
 with the manifests' numbers embedded by `scripts/render_docs.py`.
 
-One recipe, [config/cluster.json](config/cluster.json), serves every shape on one image:
-four nodes in a [switchless ring](docs/switchless-topology.md) (`tp4-ring`, the checkpoint's
-full 1,048,576-token context with 16 sequences, benchmarked at those limits, see
-[Performance](#performance)), three in a triangle (`tp3-triangle`, the same 1,048,576-token
-context with 8 sequences since r6x), and three to eight through a switch (`tp3-switched` to
-`tp8-switched`, [docs/switched-fabric.md](docs/switched-fabric.md)). The shapes differ only in
+One recipe, [config/cluster.json](config/cluster.json), serves all twelve shapes
+on one image (`spark-ds41f:1120`): single-node (`tp1`), two nodes direct or switched
+(`tp2-direct`, `tp2-switched`), three nodes in a [switchless triangle](docs/switchless-topology.md)
+(`tp3-triangle`, `tp3-triangle-4k`) or switched (`tp3-switched`), four in a
+ring (`tp4-ring`, 1,048,576-token context with 32 sequences, [Performance](#performance)),
+and four to eight through a switch (`tp4-switched` to `tp8-switched`,
+[docs/switched-fabric.md](docs/switched-fabric.md)). The shapes differ only in
 their cabling (node map, transport, NCCL settings) and their memory sizing.
-
-This repository is being promoted from a forensic capture of the running cluster
-into its only operational source of truth. Until the transition checklist is
-complete, files are explicit about whether they describe observed state, desired
-state, or an experiment.
 
 ## Quick start
 
-You need three DGX Sparks cabled as a triangle, four cabled as a ring, or three
-to eight cabled into a switch, on DGX OS 26.09.2 or later. Each node needs about 480 GiB of free disk, Docker
-with the NVIDIA runtime, and passwordless SSH and `sudo` from the head node.
-Two Sparks are not supported. [docs/setup.md](docs/setup.md) is the full
-guide: what each stage changes on your machines, how to check it, and how to
-undo it.
+You need one DGX Spark (`tp1`), two to four Sparks cabled switchless (`tp2-direct`,
+`tp3-triangle`, `tp3-triangle-4k`, `tp4-ring`), or two to eight cabled into a
+switch (`tp2-switched` to `tp8-switched`), on DGX OS 26.09.2 or later. Each node
+needs about 480 GiB of free disk, Docker with the NVIDIA runtime, and
+passwordless SSH and `sudo` from the head node.
+[docs/setup.md](docs/setup.md) is the full guide: what each stage changes on your
+machines, how to check it, and how to undo it.
 
 | Sparks | Shape of [config/cluster.json](config/cluster.json) | Context | Kernel | [Memory saver](https://github.com/christopherowen/dgx-spark-memory-saver) |
-| --- | --- | ---: | --- | --- |
+| ---: | --- | ---: | --- | --- |
+| 1 | `tp1` (`local`) | 262,144 | 64 KiB | required |
+| 2 | `tp2-direct`, `tp2-switched` | 262,144 | 64 KiB | required |
 | 3 | `tp3-triangle-4k` | 262,144 | stock 4 KiB | not needed |
-| 3 | `tp3-triangle` | 1,048,576 | 64 KiB | required |
-| 4 | `tp4-ring` | 1,048,576 | 64 KiB | required |
-| 3 to 8, switched | `tp3-switched` to `tp8-switched` ([docs/switched-fabric.md](docs/switched-fabric.md)) | 1,048,576 | 64 KiB | required |
+| 3 | `tp3-triangle`, `tp3-switched` | 1,048,576 | 64 KiB | required |
+| 4 | `tp4-ring`, `tp4-switched` | 1,048,576 | 64 KiB | required |
+| 5 to 8, switched | `tp5-switched` to `tp8-switched` ([docs/switched-fabric.md](docs/switched-fabric.md)) | 1,048,576 | 64 KiB | required |
 
 Name your cabling once with `bin/spark site shape NAME --apply`; every command
 then resolves the recipe at that shape (`--shape NAME` overrides it). A site that
-names none gets the recipe's default, `tp4-ring`. The 4 KiB
-shape needs no kernel change, so it is the shortest path to a running service.
-A shape starts only once a release benchmark has qualified the recipe's image
-on it (`benchmark_reference`); `cluster start --unqualified-shape` overrides that.
+names none gets the recipe's default, `tp4-ring`. On a fresh clone before you add
+your host node maps, run `scripts/example_site.py` once to populate git-ignored
+example maps so offline `bin/spark doctor`, `bin/spark build prepare`, and unit
+tests run across all twelve shapes out of the box. The 4 KiB shape needs no
+kernel change; `tp1` needs only one host with no ConnectX-7 cables.
+Every shape in `config/cluster.json` has a qualified `benchmark_reference` (`cluster start --unqualified-shape` overrides checks on custom profiles).
 
 | Stage | Do | Check |
 | --- | --- | --- |
@@ -111,12 +110,13 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 ## Current baseline
 
 The baseline is
-[manifests/baselines/2026-11-07-spark-ds41f-1107.json](manifests/baselines/2026-11-07-spark-ds41f-1107.json)
-([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
-[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)), on the ring
-(`tp4-ring`), the triangle (`tp3-triangle`) and three to eight Sparks through a switch, at 1M
-context. See [docs/current-state.md](docs/current-state.md) and [switchle.ss](https://switchle.ss)
-([docs/index.html](docs/index.html), regenerated and verified by `scripts/render_docs.py`).
+[manifests/baselines/2026-11-20-spark-ds41f-1120.json](manifests/baselines/2026-11-20-spark-ds41f-1120.json)
+([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md#spark-ds41f-1120-candidate-62),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)), qualified
+across all twelve topologies (`tp1`, `tp2-direct`, `tp2-switched`..`tp8-switched`, `tp3-triangle`,
+`tp3-triangle-4k`, `tp4-ring`). See [docs/current-state.md](docs/current-state.md) and
+[switchle.ss](https://switchle.ss) ([docs/index.html](docs/index.html), regenerated and
+verified by `scripts/render_docs.py`).
 
 <!-- BEGIN GENERATED: current-baseline-summary -->
 | Shape | Ranks & transport | Context | Sequences | Batch budget | KV pool / rank | Min free RAM (head / workers) | Full contexts held (startup line) | Qualified reference |
@@ -135,100 +135,54 @@ context. See [docs/current-state.md](docs/current-state.md) and [switchle.ss](ht
 | `tp1` | TP1 `local` (64 KiB) | 262,144 | 4 (up to 262,144 tok each) | 4,096 | 8.0 GiB | 18.76 / 18.76 GiB | 34 (34.35x; startup `8,999,170` / `34.33x`) | [`spark-ds41f-1120`](manifests/benchmarks/2026-11-20-spark-ds41f-1120-tp1.json) |
 <!-- END GENERATED: current-baseline-summary -->
 
-The promoted deployment (`tp4-ring` on four nodes by default; `tp3-triangle` on three nodes
-differs only in cabling, transport and memory sizing):
+The promoted deployment (`tp4-ring` on four nodes by default; all twelve shapes share one
+image, `spark-ds41f:1120`, differing only in cabling, transport, carve-out/expert-slot policy,
+and memory sizing):
 
-- four DGX Spark nodes in a switchless ring using tensor parallelism 4 (`tp4-ring`, pinned to the
-  GB10's ten fast cores `--cpuset-cpus=5-9,15-19`), or three in a triangle using tensor
-  parallelism 3 (`tp3-triangle`), on DGX Spark 26.09.2 with kernel `7.0.0-1019-nvidia-64k`
+- twelve qualified shapes across `1..8` DGX Sparks: `tp4-ring` (`1M`, `32` seqs, `16.5 GiB` KV,
+  `--cpuset-cpus=5-9,15-19`), `tp4..8-switched` (`1M`, `32` seqs, `13.0–25.5 GiB` KV),
+  `tp3-triangle` and `tp3-switched` (`1M`, `8` seqs, `4.90625 GiB` KV), `tp3-triangle-4k` (`4 KiB`,
+  `256K`, `8` seqs, `2.20 GiB` KV without Memory Saver), `tp2-direct` and `tp2-switched` (`256K`, `4`
+  seqs, `8.00 GiB` KV), and single-node `tp1` (`local` `uni` executor, `256K`, `4` seqs, `8.00 GiB`
+  KV), all (except `tp3-triangle-4k`) on DGX Spark 26.09.2 with kernel `7.0.0-1019-nvidia-64k`
   (`kho=off`), signed memory-saver DKMS 0.4.1 with UVM leaf-table packing enabled, no desktop,
   `vm.watermark_boost_factor=0`, and glibc malloc pinned (`MALLOC_ARENA_MAX=2`,
   `MALLOC_MMAP_THRESHOLD_=1048576`); vLLM's usage reporting off (`VLLM_NO_USAGE_STATS=1`,
   `DO_NOT_TRACK=1`, in the recipe and the image);
-- dual ConnectX-7 200 GbE RoCE paths between every adjacent pair of nodes (`oneshot-ring4` on four
-  nodes, `oneshot-direct` on three);
-- Local Inference Lab's `integration/karmic-kraken-beta` vLLM (`19f2c20e`) with the
-  spark-ds41f-1030 series (`0001-0567`, tree `ea1281f8`) and TileLang as the only kernel family
-  (`vLLM 0493-0496`):
-  - TileLang 0.1.15 with four patches (`0001-0004`, tree `222b895d`) that enable SM120/SM121
-    block-scaled MMAs (MXFP8, FP8 × FP4, MXFP4) and prepare and freeze every declared TileLang
-    call before memory profiling (277 calls at TP4);
-  - DS4.1 TileLang kernels for sparse MLA (with the attention front in one launch, `0543-0544`),
-    the MXFP4 indexer, the block-32 FP8 and BF16 projections, the FP8 × FP4 routed experts (64-row
-    prefill tiles, coded stage arrivals `0538`, block-scale grid `0537`), the vocabulary heads,
-    programmatic dependent launch (PDL) along the decode chain (`0520-0525`), and the TileLang
-    vision tower (`0300-0488`);
-  - DeepSeek's TileKernels 2.0.0 (`cb2fa41c`) for the MoE top-k gate and mHC, with the mHC stream
-    projection and finalize MXFP8 cast in TileLang and the routed experts' SwiGLU and MXFP8 cast
-    (`moe_swiglu_cast`, `0181`) over the dispatch layout's live tiles only;
-  - the routed experts' UE8M0 weight scales kept as a per-row base exponent and 4-bit deltas
-    (`0182-0183`), with 2-bit deltas for narrow experts stored in the 4-bit codes' buffer
-    (`0563-0564`, `0566`: model loading 71.67 GiB a rank at TP4);
-  - TileLang kernels for RoPE, the CSA compressor and its projection, the CED row selection and
-    its non-final row skip with last-128-row replay (`0229-0255`, `0526-0527`), the KV cache
-    writers without per-allocation zeroing (`0502-0503`), the Engram gate, host/GPU hash and row
-    gather (`0145-0154`, `0567`), the WO projection (`0177`, `0179`), the drafter's context-KV
-    projection (`0131`), sampling, block verification, logprobs and generation controls;
-  - sparknet 0.5.0's (`f997a594`) one-shot RoCE all-reduce (up to 2 MiB) and all-gather, explicit
-    and fail-stop (`SPARKNET_ROCE_TIMEOUT_MS=10000`), for every TP collective including DSpark's
-    per-step broadcast (`0185`, so serving never touches the PyTorch NCCL process group);
-  - L2 weight prefetch during decode (`VLLM_L2_PREFETCH_KERNELS=tilelang`, `0044`, `0119`);
-  - direct O_DIRECT checkpoint loading through anonymous memory (`--load-format direct`, `0147`,
-    `0499`, `VLLM_PLUGINS` empty);
-- NCCL 2.30.7 rebuilt (`6af10aa7`) with the AArch64 InfiniBand send-path fence
-  (NVIDIA/nccl#2393) and the four-node switchless ring patches (bidirectional rings, balanced
-  channels);
-- DeepSeek-V4.1-Flash-1017 (`1bae0e10`) native FP8/FP4/BF16 weights, with the TileLang vision
-  tower loaded (up to 67 images per request and 16 MP per image, `VLLM_MAX_IMAGE_PIXELS=16777216`;
-  see [images per request](docs/current-state.md#images-per-request)), served under both
-  `deepseek-v4.1-flash` and the per-request GLP-steered `deepseek-v4.1-flash-weightless`
-  (`0541-0542`, msuiche's 39-layer vector for 1017); the output head is stored in an exact 12-bit
-  packed form of its BF16 weights (in regular memory on `tp4-ring` for L2 reuse, and in the GB10
-  display carve-out on `tp3-triangle`);
-- arithmetic at DeepSeek's reference precision (`inference/model.py`): FP32
-  logits from the packed head, the mHC stream projection in FP32 (each FP32
-  weight split into three exact TF32 parts), the shared expert's SwiGLU in
-  FP32 with one rounding, MoE partials rounded once per rank with the
-  shared expert added in the combine, and WO-A on BF16 activations with its
-  input quantized as the reference's 2026-10-12 revision does (`act_quant`,
-  block 32, UE8M0);
-- every row's result is independent of its batch at temperature 0: each kernel adds its
-  reduction in a fixed order, the collectives add every rank's partial in rank
-  order with one FP32 rounding, prefill chunks leave room for every stream's
-  decode and draft rows (`--long-prefill-token-threshold` 16,288 on `tp4-ring`, 6,096 on
-  `tp3-triangle`), and a step that mixes decode and prefill runs sparse MLA per request;
-- the ratio-2 compressor carries its open pair across decode steps, so
-  compressed entries for generated tokens match the ones prefill builds;
-- DSpark speculative decoding with five draft tokens (the drafter's trained
-  block) and block rejection with fresh random draws per verification round (`0228`),
-  `FULL_AND_PIECEWISE` CUDA graphs for decode batches up to 96 rows on `tp4-ring` (16 streams × 6
-  rows; 48 rows on `tp3-triangle`), and a draft budget that is a rule of the inputs (row cost
-  0.035, `0184`), so nothing is timed at boot; verification rows below survival 0.2 skip the
-  routed experts (`0504`), the drafter marks its padding rows for the MoE routers, and greedy
-  verification reduces per-rank vocabulary shards when no request reads logits (`0112-0114`);
-- late admission (`VLLM_LATE_ADMISSION_LAYER=30`, `0222`, `0226`) and prefill yield
-  (`--prefill-yield short --prefill-yield-limit-s 10`, `0545`), so a waiting short request takes
-  the next step from a long prompt's prefill (first token in 3.3–3.6 s instead of 12.4–12.8 s
-  beside a 131K prefill);
-- sink detection and draft-zero rejection for DeepSeek V4.1, on by default
-  (`VLLM_SINK_REJECTION=0` turns it off, `0221`, `0223`, `0264`, `0266`);
-- DeepSeek API effort aliases, `thinking` switch, `response_format`, `tool_choice: none`,
-  assistant prefix (`0256-0257`, `0539-0540`), prompt-cache hit and per-request timing reporting
-  (`--enable-prompt-tokens-details`, `--enable-per-request-metrics`), and control-token spellings kept as plain text (`0227`);
-- 1,048,576-token per-request limit on both 64 KiB shapes:
-  - `tp4-ring`: 16 admitted sequences, 16,384 batched tokens, and a 10.5 GiB-per-rank KV pool
-    that holds 11 full 1M contexts at once (`11,554,122` tokens / `11.02x` on vLLM's startup line,
-    or all 16 sequences at up to 718,848 tokens each);
-  - `tp3-triangle`: 8 admitted sequences, 6,144 batched tokens in the recipe (8,192 in
-    spark-ds41f-1025's qualified run), and a 4.90625 GiB-per-rank KV pool that holds 5 full 1M
-    contexts at once (`5,488,353` tokens / `5.23x` with vLLM 0491, or all 8 sequences at up to
-    682,240 tokens each; see [KV capacity](docs/memory-profiles.md#kv-capacity));
-- one concurrent prefill, fail-closed 5 GiB startup and 3 GiB steady memory guards, and
-  FlashInfer autotune and JIT monitor disabled (`--no-enable-flashinfer-autotune`,
-  `--jit-monitor-mode off`).
+- dual ConnectX-7 200 GbE RoCE paths between every adjacent pair on switchless (`oneshot-ring4`,
+  `oneshot-direct`) or through a switch (`oneshot-switched`), or local `uni` on `tp1`;
+- Local Inference Lab's `integration/karmic-kraken-beta` vLLM (`19f2c20e`) with `candidate-62`'s
+  vLLM series (`0001-0829`, `702` active patches, patch head `9b251a18`, tree `8fc99ca7`),
+  CUDA `13.5.37` (hash-locked `.deb` layer over base `13.0.2`), and complete B12X retirement
+  (`0802`):
+  - TileLang `0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464` (`14` patches, tree `741806c7`)
+    and a device-compiler cache key (`0014`), preparing and freezing every declared kernel before memory profiling;
+  - DS4.1 TileLang kernels end to end: sparse MLA front/indexer/quantize (`0777`, `0808`, `0813`, `0817`),
+    64K globaltimer-paced SP prefill L2 prefetch (`0781`), sliced SP Engram row exchange (`0779`),
+    Clock-Pro shielded direct native Engram reader (`0815`), grid-40 persistent vocab refine (`0819`),
+    MoE down PDL preload (`0822`), UMA buddy sponge across post-load (`0800-0801`), zero-copy
+    `io_uring` expert slot cache on `TP1`/`TP2` (`0822`), RM `nvidiactl` display carve-out on `TP2`/`TP3`
+    (`0821`), and TileLang vision tower with multi-image packing and fast MM prefix cache (`0812`);
+  - DeepSeek's TileKernels 2.0.0 (`cb2fa41c`, `1` patch) and sparknet 0.5.0 (`e06f6a06`, `3` patches:
+    big-core RoCE proxy, pipelined multi-stage RoCE collectives, PDL collective chaining) with
+    fail-stop `SPARKNET_ROCE_TIMEOUT_MS=10000`;
+  - direct O_DIRECT checkpoint loading (`--load-format direct`, `VLLM_PLUGINS` empty) and rebuilt
+    NCCL `2.30.7` (`6af10aa7`, `4` patches, 6-channel bidirectional ring on `tp3-triangle`);
+- DeepSeek-V4.1-Flash-1017 (`1bae0e10`) native FP8/FP4/BF16 weights, with exact 12-bit packed BF16
+  LM head (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`, `VLLM_DS41_HEAD_DTYPE=float32`) and both
+  `deepseek-v4.1-flash` and GLP-steered `deepseek-v4.1-flash-weightless`; opt-in FP8 group-32 LSA
+  available via `VLLM_DS41_LSA=1` (`0828`, off by default);
+- DSpark 5-token speculative decoding (`FULL_AND_PIECEWISE` CUDA graphs `1-192` on `TP4..TP8`, `1-48`
+  on `TP3`, `PIECEWISE` `1-24` on `TP1`/`TP2`), margin confidence head + grid-40 Markov refinement
+  (`0814`, `0819-0820`), calibrated piecewise curve on `TP3`, and CopyDrafter + late admission +
+  prefill yield;
+- hardened DSML token-provenance streaming/holdback (`0824`, `0829`), structured-output bitmask
+  sizing (`0823`), SSE keep-alive callback binding (`0825`), OpenResponses / `CustomTool` (`0826`),
+  and checkpoint `ignored_layers` normalization (`0827`).
 
-One content-addressed image runs on every node in the shape and passes the release
-test suite (6,686 passed, 0 failed); see [Performance](#performance).
+One content-addressed image (`spark-ds41f:1120`, `sha256:5c12472565a7`) runs identically on all 12
+nodes (`dgx1..dgx4`, `sp1..sp8`) and passes the release test suite (`12,023` passed, `356` skipped,
+`0` failed across `169` files); see [Performance](#performance).
 
 The machine-readable desired configuration is the recipe
 [config/cluster.json](config/cluster.json): everything the shapes share once,
@@ -672,7 +626,25 @@ See [Benchmarking](#benchmarking) to reproduce them.
 
 ## Release history
 
-Production is **spark-ds41f-1107**, serving DeepSeek-V4.1-Flash-1017 at 1M context
+Production is **spark-ds41f-1120**, serving DeepSeek-V4.1-Flash-1017 across all
+twelve supported topologies ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md#spark-ds41f-1120-candidate-62),
+[release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). It advances
+`spark-ds41f-1107` onto CUDA `13.5.37` (hash-locked over `13.0.2`), retires B12X (`0802`), updates
+vLLM through `0829` (`702` active patches), raises `TP4..TP8` concurrency from 16 to 32 streams
+(`192`-row CUDA graphs, expanded KV pools up to `25.5 GiB`/rank on TP8), adds `tp1`, `tp2-direct`,
+`tp2-switched`, and `tp3-triangle-4k` (with zero-copy `io_uring` expert slot cache on `TP1`/`TP2`
+and RM `nvidiactl` carve-out on `TP2`/`TP3`), and passes `12,023` in-image release tests. Against
+`spark-ds41f-1107` in 2-boot Sonar suites: `tp4-ring` decode grid `-7.73%` (`19.36 ms`), paired `c16`
+`+3.07%` (`280.43 tok/s`), `c8 +2.70%` (`213.57 tok/s`), `single-stream c1 +7.30%` (`89.06 tok/s`),
+prefill `+12.91%..+56.31%` (`9,615..9,397 tok/s`), stall `131K` prefill TTFT p50 `0.73 / 1.14 s`;
+`tp3-triangle` `c8 +5.99%` (`170.68 tok/s`), `c4 +6.26%` (`131.59 tok/s`), `c1 +10.39%` (`70.36 tok/s`),
+prefill `+12.17%..+55.69%` (`7,270..6,922 tok/s`); `tp4-switched` grid `-9.83%`, `tp8-switched` grid
+`-9.92%` (`c16 395.40 tok/s`, prefill up to `12,429 tok/s`), and `tp3-switched` (`c8 168.92 tok/s`,
+`c1 69.26 tok/s`), alongside 2-boot `bin/spark bench` matrices across all 12 shapes. The recipe
+and lock are frozen in [releases/spark-ds41f-1120](releases/spark-ds41f-1120/); `spark-ds41f-1107`'s,
+the rollback, in [releases/spark-ds41f-1107](releases/spark-ds41f-1107/).
+
+Before spark-ds41f-1120, production was **spark-ds41f-1107**, serving DeepSeek-V4.1-Flash-1017 at 1M context
 ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md),
 [release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). It is
 spark-ds41f-1030 with vLLM 0568-0761 (641 active patches), the TileLang compiler refresh and
