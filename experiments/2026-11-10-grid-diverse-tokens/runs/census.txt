@@ -1,0 +1,38 @@
+INFO 11-10 17:32:25 [api_utils.py:341] non-default args: {'tokenizer_mode': 'deepseek_v41', 'load_format': 'dummy', 'dtype': 'bfloat16', 'max_model_len': 1048576, 'moe_backend': 'tilelang', 'linear_backend': 'tilelang', 'block_size': 256, 'enable_prefix_caching': True, 'gpu_memory_utilization': 0.85, 'kv_cache_memory_bytes': 6442450944, 'max_num_batched_tokens': 512, 'long_prefill_token_threshold': 256, 'max_num_seqs': 16, 'disable_log_stats': True, 'hf_overrides': functools.partial(<function shrink at 0xf4af8dc25da0>, overrides={'num_hidden_layers': 40, 'compress_ratios': [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], 'kv_source_layer_ids': [2, 8, 14, 20], 'index_source_layer_ids': [2, 8, 14, 20, 24, 28, 32, 36], 'candidate_source_layer_id': 20, 'engram_layer_ids': [], 'dspark_target_layer_ids': [37, 38, 39], 'num_attention_heads': 16, 'o_groups': 2, 'moe_intermediate_size': 576}), 'enforce_eager': True, 'limit_mm_per_prompt': {'image': 1}, 'mm_processor_cache_gb': 0, 'speculative_config': {'method': 'dspark', 'num_speculative_tokens': 5, 'draft_tensor_parallel_size': 1, 'attention_backend': 'TILELANG', 'draft_sample_method': 'greedy', 'rejection_sample_method': 'block', 'enable_adaptive_verification': True, 'adaptive_verification_row_cost': 0.035}, 'jit_monitor_mode': 'off', 'generation_config': 'vllm', 'attention_backend': 'TILELANG', 'async_scheduling': True, 'model': '/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170'}
+WARNING 11-10 17:32:25 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_KERNELS
+WARNING 11-10 17:32:25 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_DS41_KERNEL_BACKEND
+WARNING 11-10 17:32:25 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_L2_PREFETCH_GRID
+WARNING 11-10 17:32:25 [envs.py:2719] Unknown vLLM environment variable detected: VLLM_NATIVE_CACHE_DIR
+WARNING 11-10 17:32:25 [arg_utils.py:1970] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+INFO 11-10 17:32:25 [config.py:852] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+INFO 11-10 17:32:36 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-10 17:32:36 [model.py:2066] Using max model len 1048576
+WARNING 11-10 17:32:36 [model.py:997] Model does not support mm_device_do_normalize, forcing mm_device_do_normalize = False.
+INFO 11-10 17:32:36 [model.py:693] Resolved architecture: DeepseekV41ForCausalLM
+INFO 11-10 17:32:36 [model.py:2066] Using max model len 1048576
+INFO 11-10 17:32:46 [scheduler.py:436] Chunked prefill is enabled with max_num_batched_tokens=512.
+WARNING 11-10 17:32:46 [vllm.py:1838] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 11-10 17:32:46 [vllm.py:1861] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 11-10 17:32:46 [kernel.py:435] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+WARNING 11-10 17:32:46 [vllm.py:2425] max_num_scheduled_tokens is set to 512 based on the speculative decoding settings. This may lead to suboptimal performance. Consider increasing max_num_batched_tokens to accommodate the additional draft token slots, or decrease num_speculative_tokens.
+INFO 11-10 17:32:46 [vllm.py:2071] Cudagraph is disabled under eager mode
+Traceback (most recent call last):
+  File "/h/census.py", line 148, in <module>
+    main()
+  File "/h/census.py", line 85, in main
+    llm = LLM(
+          ^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/llm.py", line 343, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/v1/engine/llm_engine.py", line 181, in from_engine_args
+    vllm_config = engine_args.create_engine_config(usage_context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/vllm/engine/arg_utils.py", line 2836, in create_engine_config
+    config = VllmConfig(
+             ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+    s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for VllmConfig
+  Value error, Adaptive verification requires full CUDA graphs. Use cudagraph mode FULL, FULL_DECODE_ONLY, or FULL_AND_PIECEWISE, or disable adaptive verification. [type=value_error, input_value=ArgsKwargs((), {'model_co... 'shutdown_timeout': 0}), input_type=ArgsKwargs]
+    For further information visit https://errors.pydantic.dev/2.13/v/value_error

@@ -1,0 +1,247 @@
+From 0cea8c0084d43e10d2172c2933a4d8f36cff6b73 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 17:22:47 +0000
+Subject: [PATCH] [DS4.1] Engine grid: real rows from token ids
+
+Base: candidate-57's vLLM tree d74e38eefbda (the 1107 series with
+candidates 55-57); engine_grid, make_dummy and the DSpark drafter's
+padding rows are as in candidate-58's tree.
+
+Rationale:
+A dummy batch's rows are token 0 and marked padding (make_dummy), and
+the MoE routers give padding rows expert -1 (VLLM_MOE_SKIP_PADDING, on
+by default), as the DSpark drafter does for its dummy query rows. So
+every engine-grid step ran no routed expert at any shape: the grid
+timed a decode step without its largest cost.
+
+GPUModelRunner.engine_grid shapes may now carry token_ids (num_tokens
+ids). Their dummy batches take those ids and mark their rows real, in
+the target (InputBatch.make_dummy, via InputBuffers.dummy_input_ids) and
+in the drafter's query (DFlashSpeculator.dummy_rows_live), so the
+routers route them as they route text. Rows past the ids (a CUDA
+graph's padding) stay token 0 and padding, as in serving. Each shape's
+result reports real_rows, so a client can tell a server that ignored
+the ids. Without token_ids nothing changes.
+
+Quality:
+Serving is unchanged: the ids are set only inside engine_grid (the
+dev-mode collective RPC) and cleared after each dummy run. Graph
+capture, the memory profile, the cost profile and every other dummy run
+keep token 0 and padding rows.
+
+Tests:
+- tests/v1/worker/test_engine_grid_token_ids.py (new, CUDA): dummy
+  batches take the ids as real rows, rows past them stay padding, and
+  clearing the ids restores token 0 and padding.
+- pytest tests/v1/worker/test_engine_grid_token_ids.py
+  tests/v1/worker/test_gpu_input_batch_v2.py tests/v1/worker/test_dead_rows.py
+  on spark-ds41f:candidate-57 with this commit mounted (sp8): 70 passed.
+- spark-ds41f experiments/2026-11-10-grid-diverse-tokens: the routes
+  census and the grid's step times with and without token ids.
+
+Upstream status: local, for spark-ds41f's servebench engine grid
+(version 2); engine_grid itself is a local patch (0139).
+---
+ tests/v1/worker/test_engine_grid_token_ids.py | 28 ++++++++++
+ vllm/v1/worker/gpu/input_batch.py             | 12 +++++
+ vllm/v1/worker/gpu/model_runner.py            | 53 +++++++++++++++----
+ .../gpu/spec_decode/dflash/speculator.py      | 10 ++--
+ 4 files changed, 89 insertions(+), 14 deletions(-)
+ create mode 100644 tests/v1/worker/test_engine_grid_token_ids.py
+
+diff --git a/tests/v1/worker/test_engine_grid_token_ids.py b/tests/v1/worker/test_engine_grid_token_ids.py
+new file mode 100644
+index 000000000..549e099b8
+--- /dev/null
++++ b/tests/v1/worker/test_engine_grid_token_ids.py
+@@ -0,0 +1,28 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_dummy_batches_take_the_engine_grids_token_ids_as_real_rows():
++    buffers = InputBuffers(max_num_reqs=4, max_num_tokens=16, device=torch.device("cuda"))
++    buffers.input_ids.fill_(7)
++    batch = InputBatch.make_dummy(2, 8, buffers)
++    assert batch.input_ids.cpu().tolist() == [0] * 8
++    assert bool(batch.is_padding.all())
++
++    # Six ids for an eight-row batch: the two rows past them pad it, as a CUDA
++    # graph's padding rows do in serving.
++    buffers.dummy_input_ids = torch.arange(100, 106, dtype=torch.int32, device="cuda")
++    batch = InputBatch.make_dummy(2, 8, buffers)
++    assert batch.input_ids.cpu().tolist() == [100, 101, 102, 103, 104, 105, 0, 0]
++    assert batch.is_padding.cpu().tolist() == [False] * 6 + [True] * 2
++
++    buffers.dummy_input_ids = None
++    batch = InputBatch.make_dummy(2, 8, buffers)
++    assert batch.input_ids.cpu().tolist() == [0] * 8
++    assert bool(batch.is_padding.all())
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index d85cc7a09..8a512d79d 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -28,6 +28,11 @@ class InputBuffers:
+         self.device = device
+ 
+         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
++        # Token ids the next dummy batches take for their first rows (int32, on
++        # the device), which are then real rows rather than padding; None (the
++        # default): every dummy row is token 0 and padding. Set only by the engine
++        # grid, so its steps route the MoE as text does.
++        self.dummy_input_ids: torch.Tensor | None = None
+         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
+         self.logits_indices = torch.zeros(
+@@ -258,6 +263,13 @@ class InputBatch:
+         positions = input_buffers.positions[:num_tokens].zero_()
+ 
+         input_buffers.is_padding[:num_tokens].fill_(True)
++        given = input_buffers.dummy_input_ids
++        if given is not None:
++            # The engine grid's rows: its token ids, routed as real rows. Rows past
++            # them (a CUDA graph's padding) stay token 0 and padding, as in serving.
++            live = min(int(given.numel()), num_tokens)
++            input_ids[:live].copy_(given[:live])
++            input_buffers.is_padding[:live].fill_(False)
+         is_padding = input_buffers.is_padding[:num_tokens]
+ 
+         # int64, as a real step's: the dummy runs the kernels serving runs.
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 3573d1aa7..422dde861 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1002,15 +1002,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         drafter, the target forward and drafter split, step by step.
+ 
+         The steps are the cost profile's dummy runs: identical work on every build,
+-        with no text, acceptance or scheduling in them. Run only on an idle server,
+-        and reset the prefix cache afterwards, since dummy steps write KV slots.
++        with no text, acceptance or scheduling in them. Without ``token_ids`` every
++        row is token 0 and padding, which the MoE routers skip
++        (``VLLM_MOE_SKIP_PADDING``), so such a step runs no routed expert. A shape
++        may carry ``token_ids`` (``num_tokens`` ids): its rows then take those ids
++        and are real rows, in the target and in the drafter's query, so the
++        routers route them as they route text. Run only on an idle server, and
++        reset the prefix cache afterwards, since dummy steps write KV slots.
+         """
+         shapes = spec["shapes"]
+         replays = int(spec.get("replays", 30))
+         warmup = int(spec.get("warmup", 2))
+         settle = int(spec.get("settle", 1))
++        token_ids: list[torch.Tensor | None] = []
++        for shape in shapes:
++            ids = shape.get("token_ids")
++            if ids is None:
++                token_ids.append(None)
++                continue
++            if len(ids) != int(shape["num_tokens"]):
++                raise ValueError(
++                    f"engine grid: {len(ids)} token ids for {shape['num_tokens']} rows"
++                )
++            if not all(0 <= int(i) < self.vocab_size for i in ids):
++                raise ValueError("engine grid: token ids outside the vocabulary")
++            token_ids.append(
++                torch.tensor([int(i) for i in ids], dtype=torch.int32, device=self.device)
++            )
+ 
+-        def run(shape: dict) -> None:
++        def run(index: int) -> None:
++            shape = shapes[index]
+             kwargs: dict[str, Any] = {
+                 "num_tokens": int(shape["num_tokens"]),
+                 "context_len": int(shape.get("context_len", 0)),
+@@ -1019,11 +1040,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 kwargs["single_request_prefill"] = True
+             elif shape.get("num_reqs") is not None:
+                 kwargs["profile_num_reqs"] = int(shape["num_reqs"])
+-            self._dummy_run(**kwargs)
+-
+-        for shape in shapes:
++            ids = token_ids[index]
++            self.input_buffers.dummy_input_ids = ids
++            if self.speculator is not None:
++                self.speculator.dummy_rows_live = ids is not None
++            try:
++                self._dummy_run(**kwargs)
++            finally:
++                self.input_buffers.dummy_input_ids = None
++                if self.speculator is not None:
++                    self.speculator.dummy_rows_live = False
++
++        for index in range(len(shapes)):
+             for _ in range(warmup):
+-                run(shape)
++                run(index)
+         order: list[int] = []
+         events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+         with self.step_timing.collect() as timings:
+@@ -1031,24 +1061,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 indices = range(len(shapes))
+                 for index in indices if replay % 2 == 0 else reversed(indices):
+                     for _ in range(settle):
+-                        run(shapes[index])
++                        run(index)
+                     start = torch.cuda.Event(enable_timing=True)
+                     end = torch.cuda.Event(enable_timing=True)
+                     start.record()
+-                    run(shapes[index])
++                    run(index)
+                     end.record()
+                     events.append((start, end))
+                     order.append(index)
+         torch.cuda.synchronize()
+         results = [
+             {
+-                "shape": shape,
++                "shape": {k: v for k, v in shape.items() if k != "token_ids"},
++                "real_rows": ids is not None,
+                 "step_ms": [],
+                 "forward_ms": [],
+                 "drafter_ms": [],
+                 "modes": [],
+             }
+-            for shape in shapes
++            for shape, ids in zip(shapes, token_ids)
+         ]
+         for index, (start, end) in zip(order, events):
+             # The whole dummy run on the stream: target, drafter and every gap
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 5f025021b..d5dba3f8a 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -71,6 +71,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self.max_num_tokens, dtype=torch.bool, device=device
+         )
+         self._padding_live = 0
++        # Set by the engine grid while its dummy steps carry token ids: their
++        # query rows are live, as a serving step's are, so the routers route them.
++        self.dummy_rows_live = False
+ 
+         # Multimodal inputs not currently supported.
+         self.supports_mm_inputs = False
+@@ -876,11 +879,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+         self._prepare_eplb_forward(num_query_tokens)
+ 
+         # Rows past the live query rows pad the batch, and a dummy batch is all
+-        # padding, like the target's. Written eagerly before the graph replays,
+-        # so the routers skip exactly these rows.
++        # padding, like the target's, unless the engine grid gave its rows token
++        # ids (dummy_rows_live). Written eagerly before the graph replays, so the
++        # routers skip exactly these rows.
+         from vllm.v1.worker.gpu import tilelang_inputs
+ 
+-        live = 0 if dummy_run else num_query_tokens
++        live = num_query_tokens if not dummy_run or self.dummy_rows_live else 0
+         last_live = getattr(self, "_padding_live", None)
+         if last_live != live:
+             tilelang_inputs.padding_rows(
+-- 
+2.43.0
+

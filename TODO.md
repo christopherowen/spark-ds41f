@@ -137,6 +137,14 @@ Open after `1120`:
      (`experiments/2026-11-17-indexer-decode-share/receipts/tp4-switched/profile-real-rows`);
      its repeat (`profile-real-rows-again-tp4-switched.json`) has no receipts
      and the README no write-up of either.
+   - **What the grid leaves out was measured on `candidate-57`**
+     ([`experiments/2026-11-10-grid-diverse-tokens`](experiments/2026-11-10-grid-diverse-tokens/README.md)):
+     its rows route 0 of 384 experts in every target layer and the drafter's
+     three at every shape, where real text reaches `9.7` a layer at `1x2` and
+     `114.8` at `16x96`. With real text's routes the step is `2.50x` the grid's
+     at the geometric mean of 14 TP4 shapes (`1.23x` with real text through
+     dummy gates). Its version-2 grid was a `servebench` change and was never
+     merged.
 3. **`tp3-triangle` short-request TTFT beside six streams.** In the same
    reference, a short request's TTFT p50 during a 131K prefill beside six
    streams reads `1.76 s` against `1.18 s` on `1107` (`+48.88% ±16.13%`,
@@ -182,7 +190,29 @@ Open after `1120`:
    sweep: `tp5..tp8-switched` inherit TP4's `17-32=10` without a measurement
    of their own, and `NEXT 15` (`0.26%` and `0.49%` faster at the two TP4
    testbeds, under the rule's margin) was left as a lead and not followed.
-7. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
+7. **Torch for the toolkit is not in `1120`.** The owner asked on 2026-11-13
+   for torch to match the CUDA build. `candidate-55`'s seventh build carried
+   torch `2.16.0.dev20261113+cu135` with NCCL `2.32.3` (which that torch
+   needs) and vLLM `0808`
+   ([record](experiments/2026-10-26-spark-ds41f-candidate/candidate-55/README.md),
+   "Seventh build"). Its grid read `2.18%` faster at `tp4-ring` and `4.11%` at
+   `tp4-switched`, and `c16` `1.58%` faster at `tp4-switched`, with outputs
+   identical to `candidate-54`'s. It was not promoted:
+   - 172 release tests failed: torch's Triton `3.9` against the TileLang
+     sampling, top-k/top-p and rejection kernels at signed zeros, infinities,
+     NaN and top-p ties;
+   - the base image's DeepGEMM extension did not load, and no NIXL wheel was
+     built for it;
+   - `tp4-ring` booted only with `TORCH_DIST_USE_NCCL2=0`;
+   - `tp3-switched` fell below its startup and bench memory floors;
+   - 262K prefill at `tp4-ring` was `0.92%` slower.
+
+   The eighth build went back to torch `2.13.0+cu130` and NCCL `2.30.7`, which
+   `1120` ships. Retry it on a newer torch:
+   1. settle those edge values in the tests or the kernels;
+   2. rebuild DeepGEMM and NIXL against it;
+   3. measure the grid gain again.
+8. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
    Sonar's `matrix`) once no active workflow references it; the suites in
    `config/suites/`, run by Sonar (`docs/release-benchmark.md`), are the release
    benchmark authority.
@@ -268,6 +298,19 @@ Report one and eight streams for every decode change, and sixteen on TP4.
   `fallback`, `compile failed`) and for any JIT compilation after readiness.
 - **Shared packages move forward only.** When components disagree on a shared
   runtime package, patch the lagging pin forward.
+- **The bench's multi-stream decode points are bimodal.** `prose-cN` and
+  `code-cN` send N copies of one prompt.
+  - A sample is fast only while the copies stay in step, with every request's
+    `last_s` equal. Once they drift it is 25–45% slower, so a point's mean is
+    mostly how many of its samples stayed in step. This held for every `c4` and
+    `c8` sample of `1107` (both boots), `c58-final` and `candidate-61` at
+    `tp3-switched`, checked 2026-11-18.
+  - Classify samples by `last_s` spread and compare `step_ms` within a mode.
+  - When `output_sha256` differs between builds, tok/s and tokens per step on
+    that point are not comparable.
+  - Judge `c8` and `c1` on the distinct-prompt suites.
+
+  `docs/methodology.md` does not say this yet.
 
 ## Attempt ledger and idle-time runs
 
@@ -328,6 +371,19 @@ on the first.
   (for example to 60) only to chase a suspected carve-out fault. It costs
   about 20 ms per check and nothing when unset. Serving-path changes for
   quality must not add computation.
+- **#1134's third part was not carried.** Its first two ship:
+  - `cluster.py`'s pre-boot defragmentation with `0800`'s buddy sponge;
+  - `0801`'s L3-aware core pinning.
+
+  The third is not on `main`:
+  - a `memguard` that caches the container's PID and polls `/proc` with no
+    forks (`scripts/memguard.sh` still runs `docker inspect` on every poll);
+  - `memguard` and the lab's telemetry confined to the efficiency cores 0–4
+    (`AllowedCPUs`).
+
+  #1134 measured the three parts together (the host gap's boot-to-boot SD
+  `16.4x` lower on `sp8`). Measure the third alone on the host gap before
+  carrying it.
 
 ## Mixed prefill and decode
 
@@ -610,6 +666,23 @@ committed token, step time and serving tok/s alongside the kernel timings.
     The record does not isolate why the wide shapes gained. Find it, then
     screen it for steps above 32 rows only, with the `block_K=256` tile kept
     below.
+17. **A second NCCL communicator made at load slows the decode grid about 1%,
+    for a reason not known.** The turn-learning experiment's grids at
+    `tp4-switched`
+    ([record](experiments/2026-11-17-dspark-turn-learning/README.md), "What slows
+    the grid") measured it against the pooled learner-off boots (sd `0.15%`):
+    - a communicator made at load and left idle: `+1.13%` (4 boots);
+    - one made at load and destroyed after use: `+1.23%` (1 boot);
+    - one made after the graphs are captured: nothing measurable.
+
+    Memory held from load, bare streams and NCCL operations on the step's own
+    communicator each cost nothing. No kernel takes longer: the step's critical
+    path lengthens after its all-reduces (`mhc_project_streams_kernel` ends
+    later). Two things follow:
+    - a feature that needs a communicator of its own makes it after startup;
+    - count the NCCL communicators serving already makes at load (vLLM's
+      groups, the prefill path's). If one beyond the step's own is made before
+      capture, moving it after capture is a lever to screen. This is unmeasured.
 
 ## Speculative decoding
 
@@ -951,7 +1024,17 @@ Open levers:
   [`experiments/2026-11-09-site-d-lsa`](experiments/2026-11-09-site-d-lsa/README.md)).
   `0828` has its unit tests and the default-off check only: no boot has served
   with `VLLM_DS41_LSA=1` on `1120`. Run prefill, decode and that record's
-  quality cases with it on before the question of enabling it is put.
+  quality cases with it on before the question of enabling it is put. An
+  offline study of `0741`'s selection on three documents' captured operands
+  ([`experiments/2026-11-17-lsa-recall-breakdown`](experiments/2026-11-17-lsa-recall-breakdown/README.md))
+  found:
+  - the native keys it drops are lone picks in their 8-key block (91–100% of
+    misses);
+  - a better block mean recovers only 1.2–2.1 points, and a 512-key recent
+    window 0.0–0.9;
+  - only a larger budget moves recall: dense ×4 reaches 98.1–99.3% mean.
+
+  `0828`'s summaries were not in that study.
 - **BF16 sparse attention** (patch `0023`, off in configuration): measure its
   fidelity with a teacher-forced comparison against
   `VLLM_DS41_ATTENTION_COMPUTE=reference` on long agent transcripts before
@@ -1032,6 +1115,16 @@ Remaining kernel-level investigations:
   proposal), #1237 (whether the `tp4-ring` minimum free RAM is a measured
   floor) and #1243 (`1120` at TP1 on a DGX Station GB300, `sm_103a`: a new
   hardware report).
+- **Four records misname their sources or have no outcome:**
+  - `candidate-62`'s README lists issues #1224 and #1049 as pull requests it
+    took;
+  - the `1120` baseline's notes credit `0821` (the `nvidiactl` carve-out) to
+    #1225, whose patches are `0817..0819`;
+  - `experiments/2026-11-14-c56-batch1` and
+    `experiments/2026-11-14-c56-host-and-adapt` end without a result.
+
+  The baseline is immutable, so correct its attribution in the next release's
+  notes. Fix the README, and write the two outcomes from their receipts.
 
 ## Tried and not adopted
 
@@ -1044,7 +1137,11 @@ Don't repeat these without a new reason:
   (`experiments/2026-11-06-verification-budget-hardware`, regressed throughput
   vs `0.030`); minimum-match-8 CopyDrafter policy (dropped at source review);
   C39/C41 CopyDrafter preparation-overlap variations
-  (`experiments/2026-11-04-copy-overlap-rework`); lowering `effective_dead_rows_tau`
+  (`experiments/2026-11-04-copy-overlap-rework`); widening what CopyDrafter
+  reaches (`experiments/2026-11-17-copy-drafter-reach`: with the prompts in the
+  history every rule change is within ±0.1% or a loss, scanning the whole
+  history gains `+0.04%`, minimum matches below 16 lose, and 86.6% of steps
+  have no 4-token match anywhere in the request); lowering `effective_dead_rows_tau`
   ~3.7× at `c1` (`PR #1003` sunk-cost rule, `c61-r1-2`: pushed low-survival tail
   rows into 384-expert MoE, adding `+1.78 ms/step` and regressing `c1` `-3.25%`);
   cohort-atomic budgeting + `COALESCED_ROW_COST_SCALE=0.28` (`PR #953`/`#986`,
@@ -1053,8 +1150,11 @@ Don't repeat these without a new reason:
   and confidence-head updates after every step
   (`experiments/2026-11-08-online-dspark-adaptation`, #1002: c1 decode −3.8% coding
   and −5.5% held-out at `tp4-switched`; shorter `0504` budgets and ~0.8 ms a step;
-  end-of-turn shadow learner `experiments/2026-11-17-dspark-turn-learning`: `+0.37%..+1.06%`
-  target-forward overhead with learner idle).
+  the end-of-turn shadow learner, `experiments/2026-11-17-dspark-turn-learning`,
+  in no patch and off by default: drafts never read its learned table, so no
+  serving gain is measured. It costs the grid `+0.37..+0.48%` from its per-step
+  capture, and its end of turn costs nothing measurable once its communicator
+  is made after startup; made at load, `+1.06%`, see Decode #17).
 - **Decode kernels:** 1-launch atomic last-CTA `mHC project_and_finalize_streams`
   for `M <= 16` (`experiments/2026-11-06-mhc-project-finalize`, #946: 12–34%
   slower than 2-launch PDL due to atomic/fence serialization and register
@@ -1087,7 +1187,11 @@ Don't repeat these without a new reason:
   `_mxfp8_gemm` stage-0 weight preload on `sp8` saved only `-0.01..-0.02 ms/40L`
   with `pf_l1_k01` and regressed `+0.05 ms/40L` with `b0_shared`, not adopted);
   Decode #8 `q` RoPE piggyback (`0.59 µs/layer` on `aux_stream`, KV-RoPE already
-  fused in `attention_front`); and Decode #13 mid-network Layer 16/20 routed-MoE
+  fused in `attention_front`); intra-request `KPool` register-tile prefix reuse
+  with `<1>`/`<6>`/`<4>` row-block specialization in `indexer.py`
+  (`experiments/2026-11-15-decode-prefix-reuse`: bit-exact and faster alone at
+  `rows=6..32`, `0.121` against `0.154 ms` at 32, but no decode gain over two
+  boots and source prefill `0.73–1.88%` behind `c58` Step 3); and Decode #13 mid-network Layer 16/20 routed-MoE
   pruning (DS4.1 safetensors carry no intermediate Layer 16/20 LM head/probe
   weights). Other `sp8` Cold-L2 decode screens: `dspark.main_proj` (`1280x15360`,
   `M=6`) split-K `shards=2/3/4` regressed `104.71 -> 109.71 / 104.88 / 109.63 us`
