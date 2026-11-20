@@ -676,10 +676,12 @@ Open levers:
      $q(x_t) < 1$ into cumulative prefix importance-ratio verification
      ($h_i = w_i / (w_i + 1 - w_{i-1})$), paired with a two-level Gumbel-Max
      residual/target draw over 64-token vocabulary quads.
-- **Grouped 3-layer DSpark context-KV projection: shipped.** `1120` runs all
-  three DSpark layers' context-KV projections and RoPE in one grouped launch
-  over the tapped hidden states from target layers `{1, 30, 60}`
-  (`context_kv_front_3layer`, `0817` and `0820`; `candidate-61` Rank 10).
+- **Grouped 3-layer DSpark context-KV projection.** Concatenate
+  `mtp.{0,1,2}.attn.wkv` so all three DSpark layers' context-KV projections and
+  RoPE execute in a single grouped launch over the tapped hidden states from
+  target layers `{1, 30, 60}` rather than three separate per-layer launches.
+  Shipped in `1120` (`context_kv_front_3layer`, `0817` and `0820`;
+  `candidate-61` Rank 10).
 - **Drafter reuse of the target's token selection (`experiments/2026-11-08-dspark-topk-selection-reuse`, that experiment's own vLLM `0762`).**
   Not in `1120` (#1004 is merged as a record; the series' `0762` is a different
   patch), and it would change nothing there while the drafter's attention is
