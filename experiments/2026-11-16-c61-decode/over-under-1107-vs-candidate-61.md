@@ -1,8 +1,11 @@
 # `1107` vs `candidate-61` Over/Under Scorecard (By Cluster Type)
 
-> **Build tested**: `spark-ds41f:candidate-61` (`sha256:44e8aa6bc4d6c2445eb38aafa3a05ea8d710b9bcbb69a2f4acc6c7f73dcc39ad`, deployment commit `37a270e71`, `release-tests`: `11,918 passed, 0 failed`).  
-> **Run standard**: Every run below executes immediately after a fresh machine reboot on every participating node, passes `5/5` quality checks on every boot (`0` failed requests, `0.0 ms` thermal slowdown), stays above the `5.5 GiB` startup `MemAvailable` floor, and cools nodes between suites/steps and before every prefill sample.  
-> **Snapshot timestamp**: `2026-11-18T23:02Z` (`2026-11-19 00:02 CET`).  
+> **Build tested**: `spark-ds41f:candidate-61` (`sha256:44e8aa6bc4d6c2445eb38aafa3a05ea8d710b9bcbb69a2f4acc6c7f73dcc39ad`, deployment commit `37a270e71`, `release-tests`: `11,918 passed, 0 failed`).
+>
+> **Run standard**: Every run below executes immediately after a fresh machine reboot on every participating node, passes `5/5` quality checks on every boot (`0` failed requests, `0.0 ms` thermal slowdown), stays above the `5.5 GiB` startup `MemAvailable` floor, and cools nodes between suites/steps and before every prefill sample.
+>
+> **Snapshot timestamp**: `2026-11-18T23:02Z` (`2026-11-19 00:02 CET`).
+>
 > **Baseline**: [2026-11-07-spark-ds41f-1107.json](../../manifests/baselines/2026-11-07-spark-ds41f-1107.json) and its immutable suite/benchmark receipts in `manifests/suites/2026-11-07-spark-ds41f-1107-*` and `manifests/benchmarks/2026-11-07-spark-ds41f-1107*.json`.
 
 ---
