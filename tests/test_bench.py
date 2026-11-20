@@ -661,6 +661,56 @@ class BetweenBenchCoolingTest(unittest.TestCase):
             self.assertIn("quality", report["suites"])
             self.assertNotIn("decode", report["suites"])
 
+    def test_cool_below_threshold_targets_warm_back_to_back_boots(self) -> None:
+        self.assertEqual(spark.COOL_BELOW_C, 49.0)
+        options = spark.parser().parse_args(["bench"])
+        self.assertEqual(options.cool_below, 49.0)
+
+    def test_sonar_engine_floor25_avoids_5mad_bimodal_breakdown(self) -> None:
+        engine = spark.sonar.module("engine")
+        shape1 = {"kind": "decode", "num_reqs": 1, "num_tokens": 3, "context_len": 4096}
+        shape2 = {"kind": "decode", "num_reqs": 4, "num_tokens": 12, "context_len": 4096}
+        # Simulate the observed 38% vs 51% asynchronous spike shift where median + 5*MAD
+        # breaks down and jumps > 1.5% while the spike-free floor moves +0.4%.
+        boot1_s1 = [13.75 + 0.001 * i for i in range(62)] + [14.65 + 0.002 * i for i in range(38)]
+        boot2_s1 = [13.805 + 0.001 * i for i in range(49)] + [14.70 + 0.002 * i for i in range(51)]
+        boot1_s2 = [15.00 + 0.001 * i for i in range(70)] + [15.80 + 0.002 * i for i in range(30)]
+        boot2_s2 = [15.06 + 0.001 * i for i in range(49)] + [15.86 + 0.002 * i for i in range(51)]
+
+        raw1 = {
+            "shapes": [shape1, shape2],
+            "grid": [
+                {"shape": shape1, "step_ms": boot1_s1, "forward_ms": [v - 0.1 for v in boot1_s1], "drafter_ms": [0.1] * 100},
+                {"shape": shape2, "step_ms": boot1_s2, "forward_ms": [v - 0.1 for v in boot1_s2], "drafter_ms": [0.1] * 100},
+            ],
+        }
+        raw2 = {
+            "shapes": [shape1, shape2],
+            "grid": [
+                {"shape": shape1, "step_ms": boot2_s1, "forward_ms": [v - 0.1 for v in boot2_s1], "drafter_ms": [0.1] * 100},
+                {"shape": shape2, "step_ms": boot2_s2, "forward_ms": [v - 0.1 for v in boot2_s2], "drafter_ms": [0.1] * 100},
+            ],
+        }
+        sum1 = engine.summarize(raw1)
+        sum2 = engine.summarize(raw2)
+        self.assertEqual(sum1[0]["step_ms_floor"]["n"], 25)
+        self.assertEqual(sum1[0]["forward_ms_floor"]["n"], 25)
+        self.assertAlmostEqual(sum1[0]["step_ms_floor"]["mean"], sum(sorted(boot1_s1)[:25]) / 25, places=6)
+
+        run1 = {"label": "b1", "engine": sum1}
+        run2 = {"label": "b2", "engine": sum2}
+        cmp_5mad = engine.compare(run1, run2)
+        cmp_floor = engine.compare(run1, run2, estimator="floor25")
+        self.assertGreater(cmp_5mad["rows"][0]["change_pct"], 1.5)
+        self.assertAlmostEqual(cmp_5mad["rows"][0]["floor_change_pct"], 0.4, delta=0.05)
+        self.assertAlmostEqual(cmp_floor["rows"][0]["change_pct"], 0.4, delta=0.05)
+        self.assertAlmostEqual(cmp_5mad["floor_decode_gm_pct"], cmp_floor["floor_decode_gm_pct"], places=6)
+
+        sp_5mad = engine.spread([run1, run2])
+        sp_floor = engine.spread([run1, run2], estimator="floor25")
+        self.assertLess(sp_floor["range_pct"], sp_5mad["range_pct"])
+        self.assertAlmostEqual(sp_floor["range_pct"], 0.4, delta=0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

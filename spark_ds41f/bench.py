@@ -278,8 +278,11 @@ class MemoryWatch:
 # below COOL_BELOW_C. If any node is above it, all of them run at the maximum
 # fan floor of dgx-spark-fan-control until the last one is below it, then
 # their fans return to their usual control (the dgx-fan-control service's
-# curve, or firmware automatic) before measuring.
-COOL_BELOW_C = 55.0
+# curve, or firmware automatic) before measuring. Back-to-back boots start at
+# 49.5-51.5 C after passive cooldown and droop 6-9 MHz below cold boots (45-47 C),
+# while every dgx and spaceport node clears < 49.0 C at fan floor 12 well within
+# COOL_TIMEOUT_S.
+COOL_BELOW_C = 49.0
 COOL_TIMEOUT_S = 600.0
 COOL_POLL_S = 5.0
 FAN_SERVICE = "dgx-fan-control.service"
