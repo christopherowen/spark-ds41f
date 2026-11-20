@@ -901,6 +901,7 @@ PROFILE_LABEL = "spark.cluster-config"
 # What "the engine's shape" means: a start that changes any of these is a different
 # deployment, not a restart.
 SHAPE_FLAGS = (("nodes", "--nnodes"), ("tp", "--tensor-parallel-size"),
+               ("pp", "--pipeline-parallel-size"),
                ("context", "--max-model-len"), ("kv", "--kv-cache-memory-bytes"))
 
 
@@ -914,13 +915,14 @@ def require_named_profile(args: argparse.Namespace) -> None:
 
 
 def engine_shape(command: list[str]) -> dict[str, str | None]:
-    """Node count, tensor parallelism, context and KV bytes of a vLLM command."""
+    """Node count, tensor/pipeline parallelism, context and KV bytes of a vLLM command."""
     def value(flag: str) -> str | None:
         return command[command.index(flag) + 1] if flag in command[:-1] else None
 
     shape = {key: value(flag) for key, flag in SHAPE_FLAGS}
     shape["nodes"] = shape["nodes"] or "1"
     shape["tp"] = shape["tp"] or "1"
+    shape["pp"] = shape["pp"] or "1"
     return shape
 
 
@@ -928,7 +930,9 @@ def engine_text(shape: dict[str, str | None]) -> str:
     context, kv = shape.get("context"), shape.get("kv")
     context_text = f"{int(context):,}" if context and context.isdigit() else context or "default"
     kv_text = f"{int(kv) / 2**30:.1f} GiB" if kv and kv.isdigit() else kv or "default"
-    return f"{shape['nodes']} nodes, TP{shape['tp']}, context {context_text}, KV {kv_text}"
+    pp = shape.get("pp")
+    pp_text = f"PP{pp} " if pp and pp != "1" else ""
+    return f"{shape['nodes']} nodes, {pp_text}TP{shape['tp']}, context {context_text}, KV {kv_text}"
 
 
 def head_node(nodes: dict) -> dict:

@@ -55,8 +55,9 @@ GLP_KEYS = ("served_model_name", "repo", "revision", "file", "sha256")
 SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes",
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
-SHAPE_KEYS = {"extends", "nodes", "nodes_config", "fabric", "sizing", "cudagraph_mode",
-              "speculative", "environment", "host", "engram_on_disk", "benchmark_reference", "notes"}
+SHAPE_KEYS = {"extends", "nodes", "pipeline_parallel_size", "nodes_config", "fabric", "sizing",
+              "cudagraph_mode", "speculative", "environment", "host", "engram_on_disk",
+              "benchmark_reference", "notes"}
 SWITCHED_STRIP_RING_KEYS = (
     "NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
     "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
@@ -322,13 +323,21 @@ def _with_engram_on_disk(cluster: dict, on_disk: bool) -> None:
 
 
 def _with_speculative(cluster: dict, shape: dict) -> None:
-    """Apply per-shape ``--speculative-config`` overrides (None removes a key)."""
+    """Apply per-shape ``--speculative-config`` overrides (None removes a key; False strips the flag)."""
     overrides = shape.get("speculative")
+    if overrides is None:
+        return
+    args = list(cluster["serve_args"])
+    if overrides is False:
+        if "--speculative-config" in args:
+            at = args.index("--speculative-config")
+            del args[at : at + 2]
+        cluster["serve_args"] = args
+        return
     if not overrides:
         return
     if not isinstance(overrides, dict):
-        raise SystemExit("shape.speculative must be an object")
-    args = list(cluster["serve_args"])
+        raise SystemExit("shape.speculative must be an object or false")
     if "--speculative-config" in args:
         at = args.index("--speculative-config") + 1
         if at < len(args):
@@ -342,18 +351,47 @@ def _with_speculative(cluster: dict, shape: dict) -> None:
     cluster["serve_args"] = args
 
 
+def _with_pipeline_parallel(cluster: dict, pp: int, nodes: int) -> None:
+    """Render ``--pipeline-parallel-size`` and ``--nnodes`` when ``pp > 1``.
+
+    Leaves ``pp == 1`` shapes byte-identical to their existing ``serve_args``.
+    """
+    if pp <= 1:
+        return
+    args = list(cluster["serve_args"])
+    if "--nnodes" in args:
+        args[args.index("--nnodes") + 1] = str(nodes)
+    else:
+        args.extend(["--nnodes", str(nodes)])
+    if "--pipeline-parallel-size" in args:
+        args[args.index("--pipeline-parallel-size") + 1] = str(pp)
+    elif "--tensor-parallel-size" in args:
+        at = args.index("--tensor-parallel-size") + 2
+        args[at:at] = ["--pipeline-parallel-size", str(pp)]
+    else:
+        args.extend(["--pipeline-parallel-size", str(pp)])
+    cluster["serve_args"] = args
+
+
 def values(recipe: dict, shape: dict) -> dict[str, str]:
     """The placeholders of ``serve_args`` for one shape."""
     sizing = shape["sizing"]
     missing = [key for key in SIZING_KEYS if key not in sizing]
     if missing:
         raise SystemExit(f"shape sizing lacks {', '.join(missing)}")
-    nodes, drafts = int(shape["nodes"]), int(recipe["drafts"])
+    nodes = int(shape["nodes"])
+    pp = int(shape.get("pipeline_parallel_size", 1))
+    if pp < 1 or nodes % pp != 0:
+        raise SystemExit(f"nodes ({nodes}) must be divisible by pipeline_parallel_size ({pp})")
+    tp = nodes // pp
+    drafts = 0 if shape.get("speculative") is False else int(recipe["drafts"])
     rows = int(sizing["max_num_seqs"]) * (1 + drafts)
     on_disk = engram_on_disk(recipe, shape)
     transport = shape["fabric"].get("transport") if isinstance(shape.get("fabric"), dict) else None
     derived = {
-        "tensor_parallel_size": nodes,
+        "tensor_parallel_size": tp,
+        "pipeline_parallel_size": pp,
+        "nnodes": nodes,
         "max_cudagraph_capture_size": rows,
         "cudagraph_capture_sizes": json.dumps(capture_sizes(rows), separators=(",", ":")),
         "cudagraph_mode": shape.get("cudagraph_mode", "FULL_AND_PIECEWISE"),
@@ -378,12 +416,15 @@ def resolve(recipe: dict, name: str) -> dict:
         cluster["serve_args"] = [string.Template(arg).substitute(fill) for arg in recipe["serve_args"]]
     except KeyError as error:
         raise SystemExit(f"serve_args names ${{{error.args[0]}}}, which no shape value defines") from error
+    _with_pipeline_parallel(cluster, int(fill["pipeline_parallel_size"]), int(fill["nnodes"]))
     _with_engram_on_disk(cluster, engram_on_disk(recipe, shape))
     _with_speculative(cluster, shape)
     cluster["environment"] = {**recipe["environment"], **shape.get("environment", {})}
     overlap = set(recipe["environment"]) & set(shape.get("environment", {}))
     if overlap:
         raise SystemExit(f"shape {name} repeats shared environment {', '.join(sorted(overlap))}")
+    if int(fill["pipeline_parallel_size"]) > 1:
+        cluster["environment"].pop("VLLM_LATE_ADMISSION_LAYER", None)
     cluster["fabric"] = shape["fabric"]
     if isinstance(shape.get("fabric"), dict) and shape["fabric"].get("transport") == "local":
         docker_args = cluster.get("container", {}).get("docker_run_args")
@@ -446,6 +487,30 @@ def overlay(arm: dict, base: dict) -> dict:
         _with_generation_defaults(cluster)
     if "engram_on_disk" in sets:
         _with_engram_on_disk(cluster, cluster.pop("engram_on_disk"))
+    if "pipeline_parallel_size" in sets:
+        pp = int(cluster.pop("pipeline_parallel_size"))
+        nodes = int(sets.get("nodes") or _argument(cluster["serve_args"], "--nnodes") or 1)
+        if "nodes" in sets and "nodes" not in base:
+            cluster.pop("nodes", None)
+        if pp < 1 or nodes % pp != 0:
+            raise SystemExit(f"nodes ({nodes}) must be divisible by pipeline_parallel_size ({pp})")
+        tp = nodes // pp
+        args = list(cluster["serve_args"])
+        if "--tensor-parallel-size" in args:
+            args[args.index("--tensor-parallel-size") + 1] = str(tp)
+        if "--nnodes" in args:
+            args[args.index("--nnodes") + 1] = str(nodes)
+        if pp == 1 and "--pipeline-parallel-size" in args:
+            at = args.index("--pipeline-parallel-size")
+            del args[at : at + 2]
+        cluster["serve_args"] = args
+        _with_pipeline_parallel(cluster, pp, nodes)
+        if pp > 1 and "VLLM_LATE_ADMISSION_LAYER" not in sets.get("environment", {}):
+            cluster.get("environment", {}).pop("VLLM_LATE_ADMISSION_LAYER", None)
+        if "--speculative-config" in cluster["serve_args"]:
+            _with_speculative(cluster, {"speculative": {"draft_tensor_parallel_size": tp}})
+    if "speculative" in sets:
+        _with_speculative(cluster, {"speculative": cluster.pop("speculative")})
     for dotted in arm.get("unset", []):
         parts = dotted.split(".")
         node = cluster
@@ -471,6 +536,15 @@ def overlay(arm: dict, base: dict) -> dict:
     if (cluster.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
         _apply_switched_direct_env(cluster, sets.get("environment", {}), arm.get("unset", ()))
+    if cluster.get("fabric", {}).get("transport") == "nccl-socket":
+        env = cluster.get("environment", {})
+        for key in list(env):
+            if key.startswith(("SPARKNET_ROCE_", "NCCL_IB_")) or key in SWITCHED_STRIP_RING_KEYS:
+                env.pop(key, None)
+        env["NCCL_IB_DISABLE"] = "1"
+        env["NCCL_NET"] = "Socket"
+        if "--disable-custom-all-reduce" not in cluster["serve_args"]:
+            cluster["serve_args"] = [*cluster["serve_args"], "--disable-custom-all-reduce"]
     if base.get("glp") or cluster.get("glp"):
         # Rendered again whatever the arm changed: a serve_args or mount list it sets
         # replaces the base's, which held the rendering.

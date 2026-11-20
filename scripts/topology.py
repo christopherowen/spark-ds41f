@@ -47,11 +47,23 @@ def transport(cluster: dict) -> str | None:
 # sparknet's one-shot transports and their one-shot topology. They are always
 # on (no enable switch).
 LOCAL = "local"
-ONE_SHOT = {"oneshot-direct": "direct", "oneshot-ring4": "ring4", "oneshot-switched": "direct"}
-TRANSPORTS = (*ONE_SHOT, "nccl-ring", "nccl-switched", LOCAL)
+SOCKET = "nccl-socket"
+PP2_RING4 = "oneshot-pp2-ring4"
+ONE_SHOT = {
+    "oneshot-direct": "direct",
+    "oneshot-ring4": "ring4",
+    PP2_RING4: "direct",
+    "oneshot-switched": "direct",
+}
+TRANSPORTS = (*ONE_SHOT, "nccl-ring", "nccl-switched", SOCKET, LOCAL)
 
 def switched(mode: str | None) -> bool:
     return mode in ("oneshot-switched", "nccl-switched")
+
+
+def pp2_ring4(mode: str | None) -> bool:
+    """Four-node switchless ring split into PP=2 x TP=2 (direct TP pairs 0-1, 2-3; direct PP pairs 0-2, 1-3)."""
+    return mode == PP2_RING4
 
 
 def one_shot_topology(mode: str | None) -> str | None:
@@ -65,6 +77,16 @@ def neighbour_ring(mode: str | None) -> bool:
 
 def is_sparknet(mode: str | None) -> bool:
     return mode in ONE_SHOT
+
+
+def pipeline_parallel_size(cluster: dict) -> int:
+    raw = argument(cluster, "--pipeline-parallel-size")
+    return int(raw) if raw and str(raw).isdigit() else 1
+
+
+def tensor_parallel_size(cluster: dict) -> int | None:
+    raw = argument(cluster, "--tensor-parallel-size")
+    return int(raw) if raw and str(raw).isdigit() else None
 
 
 def argument(cluster: dict, flag: str) -> str | None:
@@ -104,10 +126,194 @@ def fabric_map(nodes: dict, *, strip_gid_index: bool = False) -> dict:
     return {**nodes, "nodes": [fabric_node(node, strip_gid_index=strip_gid_index) for node in nodes.get("nodes", [])]}
 
 
+def _pp2_ring4_hcas(node: dict) -> list[str]:
+    """All local RDMA HCAs of a node in a 4-node switchless PP=2 x TP=2 ring (TP + PP cables)."""
+    peers = node.get("roce_peer_hcas") or {}
+    seen: list[str] = []
+    for peer in sorted(peers, key=lambda key: int(key) if str(key).isdigit() else str(key)):
+        for hca in peers[peer]:
+            if hca not in seen:
+                seen.append(hca)
+    return sorted(seen)
+
+
+def pp2_ring4_node_map(ring4_nodes: dict) -> dict:
+    """Derive a PP=2 x TP=2 switchless ring node map from a 4-node TP=4 ring map.
+
+    Swaps ranks 2 and 3 (and their ``roce_peer_hcas`` keys) so Stage 0 (ranks 0, 1)
+    and Stage 1 (ranks 2, 3) each sit on a direct ConnectX-7 cable while PP pairs
+    (0-2 and 1-3) also sit on direct cables with zero recabling.
+    """
+    entries = ring4_nodes.get("nodes", [])
+    if len(entries) != 4:
+        raise ValueError(f"pp2_ring4_node_map requires a 4-node ring map, got {len(entries)} nodes")
+    remap = {0: 0, 1: 1, 2: 3, 3: 2}
+    remapped = []
+    for entry in entries:
+        old_rank = int(entry["rank"])
+        if old_rank not in remap:
+            raise ValueError(f"unexpected ring rank {old_rank!r}; expected 0..3")
+        node = json.loads(json.dumps(entry))
+        node["rank"] = remap[old_rank]
+        peers = node.get("roce_peer_hcas")
+        if isinstance(peers, dict):
+            node["roce_peer_hcas"] = {
+                str(remap[int(k)]) if str(k).isdigit() and int(k) in remap else k: v
+                for k, v in peers.items()
+            }
+        remapped.append(node)
+    remapped.sort(key=lambda item: int(item["rank"]))
+    out = {k: json.loads(json.dumps(v)) for k, v in ring4_nodes.items() if k != "nodes"}
+    out["nodes"] = remapped
+    return out
+
+
+def _pp2_ring4_tp_hcas(node: dict) -> list[str]:
+    """Local RDMA HCAs reaching this node's TP=2 peer (rank ^ 1) in a PP=2 x TP=2 ring."""
+    rank = int(node["rank"])
+    peers = node.get("roce_peer_hcas") or {}
+    return list(peers.get(str(rank ^ 1), ()))
+
+
+def _pp2_ring4_node_environment(cluster: dict, node: dict, base: dict[str, str]) -> dict[str, str]:
+    """Per-node fabric environment for PP=2 x TP=2 on a 4-node switchless ring.
+
+    Each TP=2 stage ({0,1} and {2,3}) runs sparknet one-shot direct over its TP
+    cable only (keyed by TP-local peer rank 0/1), while NCCL sees all four local
+    HCAs (both TP and PP cables) with subnet-aware routing and runtime connect.
+    """
+    sparknet = fabric(cluster)
+    pinned = gid_pinned(cluster)
+    env = dict(base)
+    for key in ("SPARKNET_ROCE_PEER_HCAS", "SPARKNET_ROCE_TOPOLOGY", "SPARKNET_ROCE_HCA",
+                "SPARKNET_ROCE_SUBNETS", "SPARKNET_ROCE_TRAFFIC_CLASS"):
+        env.pop(key, None)
+    if not pinned:
+        for key in GID_PINS:
+            env.pop(key, None)
+    env.update(sparknet.render.RING_ENV)
+    env["NCCL_IB_HCA"] = "=" + ",".join(_pp2_ring4_hcas(node))
+    rank = int(node["rank"])
+    tp_peer_local = str((rank % 2) ^ 1)
+    tp_hcas = _pp2_ring4_tp_hcas(node)
+    env["SPARKNET_ROCE_TOPOLOGY"] = "direct"
+    env["SPARKNET_ROCE_PEER_HCAS"] = json.dumps({tp_peer_local: tp_hcas}, separators=(",", ":"))
+    if pinned:
+        for key in GID_PINS:
+            if key in base:
+                env[key] = base[key]
+        if "roce_gid_index" in node:
+            env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
+            env["SPARKNET_ROCE_GID_INDEX"] = str(node["roce_gid_index"])
+    else:
+        declared = node.get("roce_subnets", {})
+        subnets = {h: declared[h] for h in tp_hcas if h in declared}
+        if subnets:
+            env["SPARKNET_ROCE_SUBNETS"] = json.dumps(subnets, separators=(",", ":"))
+    iface = node.get("management_interface")
+    if iface:
+        env.update(NCCL_SOCKET_IFNAME="=" + iface, GLOO_SOCKET_IFNAME=iface, TP_SOCKET_IFNAME=iface)
+    return env
+
+
+def _pp2_ring4_problems(cluster: dict, nodes: dict) -> list[str]:
+    """Validate a 4-node switchless ring mapped to PP=2 x TP=2 (TP pairs 0-1 & 2-3, PP pairs 0-2 & 1-3)."""
+    errors: list[str] = []
+    entries = nodes.get("nodes", [])
+    if len(entries) != 4:
+        return [f"{PP2_RING4} requires 4 nodes, got {len(entries)}"]
+    by_rank: dict[int, dict] = {}
+    heads = 0
+    for node in entries:
+        rank = node.get("rank")
+        if type(rank) is not int or rank not in (0, 1, 2, 3) or rank in by_rank:
+            errors.append(f"{node.get('name')}: {PP2_RING4} requires unique integer ranks 0..3")
+            continue
+        by_rank[rank] = node
+        if node.get("head"):
+            heads += 1
+            if rank != 0:
+                errors.append(f"{node.get('name')}: {PP2_RING4} requires head=true on rank 0")
+    if heads != 1:
+        errors.append(f"{PP2_RING4} requires exactly one head node (rank 0)")
+    if len(by_rank) != 4:
+        return errors
+    for rank, node in sorted(by_rank.items()):
+        name = node.get("name", f"rank {rank}")
+        peers = node.get("roce_peer_hcas")
+        if not isinstance(peers, dict):
+            errors.append(f"{name}: roce_peer_hcas is required for {PP2_RING4}")
+            continue
+        expected_peers = {str(rank ^ 1), str(rank ^ 2)}
+        if set(peers) != expected_peers:
+            errors.append(
+                f"{name} (rank {rank}): {PP2_RING4} requires direct peers "
+                f"{sorted(expected_peers)} (TP peer {rank ^ 1}, PP peer {rank ^ 2}), got {sorted(peers)}"
+            )
+            continue
+        seen_local: set[str] = set()
+        subnets = node.get("roce_subnets", {})
+        for peer_key in sorted(expected_peers):
+            route = peers[peer_key]
+            if not isinstance(route, list) or not 1 <= len(route) <= 2 or len(set(route)) != len(route):
+                errors.append(f"{name}: peer {peer_key} must list 1 or 2 unique HCAs")
+                continue
+            for hca in route:
+                if hca in seen_local:
+                    errors.append(f"{name}: HCA {hca} cannot belong to more than one peer")
+                seen_local.add(hca)
+                if hca not in subnets:
+                    errors.append(f"{name}: HCA {hca} lacks a roce_subnets entry")
+    # Check symmetry and matching cable subnets on every TP and PP edge.
+    for a, b in ((0, 1), (2, 3), (0, 2), (1, 3)):
+        pa = (by_rank[a].get("roce_peer_hcas") or {}).get(str(b), [])
+        pb = (by_rank[b].get("roce_peer_hcas") or {}).get(str(a), [])
+        if len(pa) != len(pb):
+            errors.append(f"rank {a}<->{b}: asymmetric stripe count ({len(pa)} vs {len(pb)})")
+            continue
+        sa = by_rank[a].get("roce_subnets", {})
+        sb = by_rank[b].get("roce_subnets", {})
+        nets_a = {sa[h] for h in pa if h in sa}
+        nets_b = {sb[h] for h in pb if h in sb}
+        if nets_a != nets_b:
+            errors.append(f"rank {a}<->{b}: mismatched roce_subnets ({sorted(nets_a)} vs {sorted(nets_b)})")
+    settings = cluster.get("environment", {})
+    sparknet = fabric(cluster)
+    pinned = gid_pinned(cluster)
+    check_settings = {k: v for k, v in settings.items() if k not in GID_PINS} if pinned else settings
+    if hasattr(sparknet.render, "base_problems"):
+        errors.extend(sparknet.render.base_problems(check_settings))
+    for key, value in {**sparknet.render.RING_ENV, **VLLM_RING_ENV}.items():
+        if str(settings.get(key)) != value:
+            errors.append(f"{PP2_RING4} requires {key}={value}")
+    for key in (*sparknet.render.FORBIDDEN_RING_KEYS, "NCCL_SWITCHLESS_BIDIRECTIONAL"):
+        if key in settings:
+            errors.append(f"{PP2_RING4} forbids {key}")
+    if "--disable-custom-all-reduce" in cluster.get("serve_args", []):
+        errors.append(f"{PP2_RING4} requires custom all-reduce enabled")
+    if "--enable-expert-parallel" in cluster.get("serve_args", []):
+        errors.append(f"{PP2_RING4} does not support expert-parallel all-to-all")
+    return errors
+
+
 def node_environment(cluster: dict, node: dict) -> dict[str, str]:
     base = {key: str(value) for key, value in cluster["environment"].items()}
     mode = transport(cluster)
-    if mode in TRANSPORTS and mode != LOCAL:
+    if pp2_ring4(mode):
+        env = _pp2_ring4_node_environment(cluster, node, base)
+    elif mode == SOCKET:
+        env = {
+            k: v
+            for k, v in base.items()
+            if not k.startswith(("SPARKNET_ROCE_", "NCCL_IB_"))
+            and k != "NCCL_SWITCHLESS_BIDIRECTIONAL"
+        }
+        env["NCCL_IB_DISABLE"] = "1"
+        env["NCCL_NET"] = "Socket"
+        iface = node.get("management_interface")
+        if iface:
+            env.update(NCCL_SOCKET_IFNAME=iface, GLOO_SOCKET_IFNAME=iface, TP_SOCKET_IFNAME=iface)
+    elif mode in TRANSPORTS and mode != LOCAL:
         sparknet = fabric(cluster)
         pinned = gid_pinned(cluster)
         clean_node = fabric_node(node, strip_gid_index=True)
@@ -147,14 +353,18 @@ def control_ip(node: dict) -> str:
 
 def hcas(cluster: dict, node: dict) -> list[str]:
     """The node's RDMA devices for the configured transport."""
-    if transport(cluster) == LOCAL:
+    mode = transport(cluster)
+    if mode in (LOCAL, SOCKET):
         return []
-    return fabric(cluster).nodes.nccl_hcas(fabric_node(node), transport(cluster))
+    if pp2_ring4(mode):
+        return _pp2_ring4_hcas(node)
+    return fabric(cluster).nodes.nccl_hcas(fabric_node(node), mode)
 
 
 def problems(cluster: dict, nodes: dict) -> list[str]:
     errors = []
     entries = nodes.get("nodes", [])
+    mode = transport(cluster)
     pinned = gid_pinned(cluster)
     for node in entries:
         if "ssh_host" in node:
@@ -162,7 +372,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 f"{node.get('name')}: ssh_host is no longer used because name is now the SSH "
                 "target; either rename the node to its SSH target or add an SSH Host alias"
             )
-        if "roce_gid_index" in node:
+        if "roce_gid_index" in node and mode not in (LOCAL, SOCKET):
             if not pinned:
                 errors.append(
                     f"{node.get('name')}: roce_gid_index is not read by a configuration that finds GIDs by "
@@ -172,13 +382,12 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             elif type(node["roce_gid_index"]) is not int or node["roce_gid_index"] < 0:
                 errors.append(f"{node.get('name')}: roce_gid_index must be a nonnegative integer")
     count = len(entries)
-    mode = transport(cluster)
     if mode == LOCAL:
         if count != 1:
             errors.append(f"local deployment requires 1 node, got {count}")
-    elif switched(mode):
+    elif switched(mode) or mode == SOCKET:
         if not 2 <= count <= 8:
-            errors.append(f"switched deployment requires 2 to 8 nodes, got {count}")
+            errors.append(f"{mode} deployment requires 2 to 8 nodes, got {count}")
     elif count not in (2, 3, 4):
         errors.append(f"deployment requires 2, 3 or 4 nodes, got {count}")
     settings = cluster.get("environment", {})
@@ -196,6 +405,17 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 errors.append("single-node deployment requires rank=0")
             if not head_node.get("name") or not head_node.get("management_ip"):
                 errors.append("single-node deployment requires name and management_ip")
+    elif mode == SOCKET:
+        ranks = [node.get("rank") for node in entries]
+        if sorted(r for r in ranks if isinstance(r, int)) != list(range(count)):
+            errors.append(f"{SOCKET} requires ranks 0..{count - 1}")
+        for node in entries:
+            if not node.get("name") or not node.get("management_ip"):
+                errors.append(f"{SOCKET} requires name and management_ip on every node")
+        if "--disable-custom-all-reduce" not in cluster.get("serve_args", []):
+            errors.append(f"{SOCKET} runs plain NCCL over Ethernet; it requires --disable-custom-all-reduce")
+    elif pp2_ring4(mode):
+        errors.extend(_pp2_ring4_problems(cluster, nodes))
     else:
         sparknet = fabric(cluster)
         errors.extend(sparknet.nodes.problems(fabric_map(nodes, strip_gid_index=True), mode))
@@ -234,15 +454,40 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 errors.append("NCCL_SWITCHLESS_BIDIRECTIONAL=2 needs two or a multiple of four channels")
     if mode is not None and not is_sparknet(mode) and any(k.startswith("SPARKNET_ROCE_") for k in settings):
         errors.append(f"{mode} does not run sparknet; SPARKNET_ROCE_* settings do not apply")
-    for flag in ("--tensor-parallel-size", "--nnodes"):
-        if argument(cluster, flag) != str(count):
-            errors.append(f"{flag} must equal the configured node count ({count})")
+    if argument(cluster, "--nnodes") != str(count):
+        errors.append(f"--nnodes must equal the configured node count ({count})")
+    pp = pipeline_parallel_size(cluster)
+    tp = tensor_parallel_size(cluster)
+    if pp < 1:
+        errors.append(f"--pipeline-parallel-size must be >= 1, got {pp}")
+    elif pp == 1:
+        if argument(cluster, "--tensor-parallel-size") != str(count):
+            errors.append(f"--tensor-parallel-size must equal the configured node count ({count})")
+    else:
+        if tp is None or tp * pp != count:
+            errors.append(
+                f"--tensor-parallel-size ({tp}) x --pipeline-parallel-size ({pp}) "
+                f"must equal the configured node count ({count})"
+            )
+        elif pp2_ring4(mode):
+            if (pp, tp) != (2, 2):
+                errors.append(f"{PP2_RING4} requires --pipeline-parallel-size 2 and --tensor-parallel-size 2")
+        elif switched(mode) or mode == SOCKET:
+            if pp != 2 or tp not in (2, 3, 4):
+                errors.append(
+                    f"{mode} pipeline parallelism supports PP=2 with TP in 2..4, got PP={pp} TP={tp}"
+                )
+        elif not neighbour_ring(mode):
+            errors.append(f"{mode} requires --pipeline-parallel-size=1")
+    expected_draft_tp = tp if (pp > 1 and tp is not None) else count
     try:
         spec = json.loads(argument(cluster, "--speculative-config") or "{}")
         if not isinstance(spec, dict):
             raise ValueError("expected object")
-        if spec and spec.get("draft_tensor_parallel_size") != count:
-            errors.append(f"draft_tensor_parallel_size must equal the node count ({count})")
+        if spec and spec.get("draft_tensor_parallel_size") != expected_draft_tp:
+            errors.append(
+                f"draft_tensor_parallel_size must equal the tensor-parallel size ({expected_draft_tp})"
+            )
     except (ValueError, AttributeError):
         errors.append("--speculative-config must be a JSON object")
     if neighbour_ring(mode):

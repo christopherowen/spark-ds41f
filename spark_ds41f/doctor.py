@@ -142,9 +142,18 @@ def _cluster_shape(cluster: dict) -> str | None:
     if not tp_raw or not str(tp_raw).isdigit():
         return None
     tp = int(tp_raw)
+    pp = topology.pipeline_parallel_size(cluster)
     fabric = cluster.get("fabric", {})
     transport = fabric.get("transport") if isinstance(fabric, dict) else None
     topo = fabric.get("topology") if isinstance(fabric, dict) else None
+    if pp > 1:
+        if topo == "switched" or (isinstance(transport, str) and transport.endswith("-switched")):
+            return f"pp{pp}-tp{tp}-switched"
+        if transport == topology.SOCKET:
+            return f"pp{pp}-tp{tp}-socket"
+        if transport == topology.PP2_RING4 and pp == 2 and tp == 2:
+            return "pp2-tp2-ring"
+        return f"pp{pp}-tp{tp}"
     if transport == "local" or tp == 1:
         return "tp1"
     if topo == "switched" or (isinstance(transport, str) and transport.endswith("-switched")):
@@ -1087,6 +1096,8 @@ def roce_gid_findings(cluster: dict, node: dict, output: str,
     """
     if hcas is None:
         hcas = roce_hcas(cluster, node)
+    if not hcas:
+        return []
     missing = {line.split()[0] for line in output.splitlines() if line.split()[1:] == ["missing"]}
     problems = [f"{node['name']}: RDMA device {hca} is missing" for hca in hcas if hca in missing]
     problems += topology.gid_subnet_problems(node, output)
