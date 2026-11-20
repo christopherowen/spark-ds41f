@@ -60,31 +60,35 @@ their cabling (node map, transport, NCCL settings) and their memory sizing.
 
 ## Quick start
 
-You need one DGX Spark (`tp1`), two to four Sparks cabled switchless (`tp2-direct`,
-`tp3-triangle`, `tp3-triangle-4k`, `tp4-ring`), or two to eight cabled into a
-switch (`tp2-switched` to `tp8-switched`), on DGX OS 26.09.2 or later. Each node
-needs about 480 GiB of free disk, Docker with the NVIDIA runtime, and
-passwordless SSH and `sudo` from the head node.
-[docs/setup.md](docs/setup.md) is the full guide: what each stage changes on your
-machines, how to check it, and how to undo it.
+You need one DGX Spark, two cabled to each other, three cabled as a triangle, four
+cabled as a ring, or two to eight cabled into a switch, on DGX OS 26.09.2 or later.
+Each node needs about 480 GiB of free disk, Docker
+with the NVIDIA runtime, and passwordless SSH and `sudo` from the head node.
+One or two Sparks read routed experts from disk on demand, so they serve a shorter
+context and decode far slower than three or more
+([docs/setup.md](docs/setup.md#requirements-and-tested-configurations)).
+[docs/setup.md](docs/setup.md) is the full
+guide: what each stage changes on your machines, how to check it, and how to
+undo it.
 
 | Sparks | Shape of [config/cluster.json](config/cluster.json) | Context | Kernel | [Memory saver](https://github.com/christopherowen/dgx-spark-memory-saver) |
-| ---: | --- | ---: | --- | --- |
-| 1 | `tp1` (`local`) | 262,144 | 64 KiB | required |
-| 2 | `tp2-direct`, `tp2-switched` | 262,144 | 64 KiB | required |
+| --- | --- | ---: | --- | --- |
+| 1 | `tp1` | 262,144 | 64 KiB | required |
+| 2 | `tp2-direct` | 262,144 | 64 KiB | required |
 | 3 | `tp3-triangle-4k` | 262,144 | stock 4 KiB | not needed |
-| 3 | `tp3-triangle`, `tp3-switched` | 1,048,576 | 64 KiB | required |
-| 4 | `tp4-ring`, `tp4-switched` | 1,048,576 | 64 KiB | required |
-| 5 to 8, switched | `tp5-switched` to `tp8-switched` ([docs/switched-fabric.md](docs/switched-fabric.md)) | 1,048,576 | 64 KiB | required |
+| 3 | `tp3-triangle` | 1,048,576 | 64 KiB | required |
+| 4 | `tp4-ring` | 1,048,576 | 64 KiB | required |
+| 2, switched | `tp2-switched` ([docs/switched-fabric.md](docs/switched-fabric.md)) | 262,144 | 64 KiB | required |
+| 3 to 8, switched | `tp3-switched` to `tp8-switched` ([docs/switched-fabric.md](docs/switched-fabric.md)) | 1,048,576 | 64 KiB | required |
 
 Name your cabling once with `bin/spark site shape NAME --apply`; every command
 then resolves the recipe at that shape (`--shape NAME` overrides it). A site that
-names none gets the recipe's default, `tp4-ring`. On a fresh clone before you add
-your host node maps, run `scripts/example_site.py` once to populate git-ignored
-example maps so offline `bin/spark doctor`, `bin/spark build prepare`, and unit
-tests run across all twelve shapes out of the box. The 4 KiB shape needs no
-kernel change; `tp1` needs only one host with no ConnectX-7 cables.
-Every shape in `config/cluster.json` has a qualified `benchmark_reference` (`cluster start --unqualified-shape` overrides checks on custom profiles).
+names none gets the recipe's default, `tp4-ring`. The 4 KiB
+shape needs no kernel change, so it is the shortest path to a running service.
+A shape starts only once a release benchmark has qualified the recipe's image
+on it (`benchmark_reference`); `cluster start --unqualified-shape` overrides that.
+Before writing your site's node maps, `./scripts/example_site.py` initializes
+git-ignored example maps on a fresh clone for offline `bin/spark doctor` and test runs.
 
 | Stage | Do | Check |
 | --- | --- | --- |

@@ -1,9 +1,9 @@
 # Setting up DeepSeek V4.1 Flash on DGX Spark
 
-This guide takes one to eight DGX Sparks from a fresh DGX OS install to the
+This guide takes one to four DGX Sparks from a fresh DGX OS install to the
 promoted deployment: DeepSeek V4.1 Flash on the TileLang kernel family, with
-tensor parallelism across the Sparks over direct-cabled ConnectX-7 links, a
-switch, or single-node local execution (`tp1`).
+tensor parallelism across the Sparks over direct-cabled ConnectX-7 links (a
+single Spark serves alone, with no fabric).
 
 Every stage says what it changes on your machines, which profiles need it,
 how to check it, and how to undo it. Read the [summary of host
@@ -11,43 +11,45 @@ changes](#what-changes-on-your-machines) before you start.
 
 ## Requirements and tested configurations
 
-One recipe, [config/cluster.json](../config/cluster.json), serves all twelve
-shapes on one image (`spark-ds41f:1120`); a shape changes only its cabling and
-its memory sizing.
+One recipe, [config/cluster.json](../config/cluster.json), serves every
+shape on one image; a shape changes only its cabling and its memory sizing.
 
 | Sparks | Cabling | Shape | Context | Sequences | KV per rank | Kernel | Memory saver |
-| ---: | --- | --- | ---: | ---: | ---: | --- | --- |
-| 1 | local (`uni`) | `tp1` | 262,144 | 4 | 8.0 GiB | 64 KiB | required |
-| 2 | direct cables | `tp2-direct` | 262,144 | 4 | 8.0 GiB | 64 KiB | required |
-| 2 | switched | `tp2-switched` | 262,144 | 4 | 8.0 GiB | 64 KiB | required |
+| --- | --- | --- | ---: | ---: | ---: | --- | --- |
+| 1 | none | `tp1` | 262,144 | 4 | 8 GiB | 64 KiB | required |
+| 2 | one cable | `tp2-direct` | 262,144 | 4 | 8 GiB | 64 KiB | required |
 | 3 | triangle | `tp3-triangle-4k` | 262,144 | 8 | 2.2 GiB | stock 4 KiB | not needed |
 | 3 | triangle | `tp3-triangle` | 1,048,576 | 8 | 4.91 GiB | 64 KiB | required |
-| 3 | switched | `tp3-switched` | 1,048,576 | 8 | 4.91 GiB | 64 KiB | required |
 | 4 | ring | `tp4-ring` | 1,048,576 | 32 | 16.5 GiB | 64 KiB | required |
-| 4 | switched | `tp4-switched` | 1,048,576 | 32 | 16.5 GiB | 64 KiB | required |
-| 5 | switched | `tp5-switched` | 1,048,576 | 32 | 24.0 GiB | 64 KiB | required |
-| 6 | switched | `tp6-switched` | 1,048,576 | 32 | 13.0 GiB | 64 KiB | required |
-| 7 | switched | `tp7-switched` | 1,048,576 | 32 | 16.0 GiB | 64 KiB | required |
-| 8 | switched | `tp8-switched` | 1,048,576 | 32 | 25.5 GiB | 64 KiB | required |
 
 A shape is qualified for the recipe's image when the recipe names its release
 benchmark (`benchmark_reference`); `cluster start` refuses an unqualified one
-unless given `--unqualified-shape`. All twelve shapes above are qualified on
-`spark-ds41f:1120`.
+unless given `--unqualified-shape`. Two to eight Sparks cabled into a switch
+are in [switched-fabric.md](switched-fabric.md).
 
-**One and two Sparks (`tp1`, `tp2-direct`, `tp2-switched`)** serve the full
-native model at `262,144` context (`4` sequences, `8.0 GiB` KV per rank) using
-the zero-copy `io_uring` expert slot cache (`/cache/ds41_expert_slots`,
-`vLLM 0822`), with `tp2-*` also placing weights in the display carve-out via RM
-`nvidiactl` (`0821`). `tp1` needs only one host (`uni` executor, no ConnectX-7
-cables) and leaves ~`18.8 GiB` free RAM, making it the simplest single-node
-entry point when ConnectX-7 links or multiple hosts are unavailable.
+**Externally reported, not qualified here.** Another site ran `tp4-ring` at
+the recipe's sizing of the time (1,048,576 context, 16 sequences, KV 10.5 GiB) on the
+stock 4 KiB kernel of DGX OS 7.5.0 (`6.17.0-1032-nvidia`), with no memory saver
+and Secure Boot on. MemAvailable stayed at 18-21 GiB per node, including
+through a 993K-token prefill. That run used the r6u image plus r6v's vLLM 0180
+and was started with `--unqualified-shape`
+([receipt](../experiments/2026-10-17-site-tp4-4k-1017/README.md)). The
+qualified recipe is unchanged: `tp4-ring` requires the 64 KiB kernel and the
+memory saver.
 
-**The 4 KiB profile (`tp3-triangle-4k`)** needs no kernel change and no
-out-of-tree module. The 64 KiB profiles recover about 1.8 GiB per node with the
-[memory saver](https://github.com/christopherowen/dgx-spark-memory-saver),
-which pays for larger contexts, `tp1`/`tp2-*` weight residency, and `32`-stream
-concurrency on `TP4..TP8`.
+**One or two Sparks** (`tp1`, `tp2-direct`, `tp2-switched`) load routed experts
+from NVMe into GPU-accessible slots on demand, through an `io_uring` cache under
+the checkout's `cache/ds41_expert_slots`. That is what lets the model fit, and it
+is why these shapes are slow: one stream decodes at about 4 tok/s on one Spark
+and 18 tok/s on two, and four streams together reach about 11 and 53 tok/s
+(prose, each shape's release benchmark in
+[manifests/benchmarks](../manifests/benchmarks/)). They serve 262,144 tokens of
+context and four sequences.
+
+**The 4 KiB profile is the shortest path to a running service**: it needs no
+kernel change and no out-of-tree module. The 64 KiB profiles recover about
+1.8 GiB per node with the [memory saver](https://github.com/christopherowen/dgx-spark-memory-saver),
+which pays for their larger context.
 
 Each node needs:
 
@@ -170,10 +172,9 @@ services as warnings; serving still starts, with less memory margin.
 ### Kernel mode setting
 
 DGX OS ships `nvidia-drm-options-modeset0`, which turns `nvidia-drm` mode
-setting off. The `tp2-*` and `tp3-*` profiles load the embedding and output head
-into the GB10 display carve-out (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`, using
-RM scanout allocation via `/dev/nvidiactl`), which needs mode setting, and a
-display attached after boot stays dark without it:
+setting off. The promoted profiles load the embedding and output head into
+the GB10 display carve-out (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`), which needs
+mode setting, and a display attached after boot stays dark without it:
 
 ```sh
 sudo apt-get purge nvidia-drm-options-modeset0
@@ -383,16 +384,14 @@ between two Sparks gives two RDMA paths.
 
 | Topology | Cables | Cabling | Transport |
 | --- | ---: | --- | --- |
-| 1 Spark, local (`tp1`) | 0 | single host, no RDMA (`uni` executor) | `local` |
-| 2 Sparks, direct (`tp2-direct`) | 1 or 2 | both ports cabled directly between `dgx1` and `dgx2` | `oneshot-direct` |
-| 3 Sparks, triangle (`tp3-triangle`) | 3 | every pair cabled directly: port 0 to the next node, port 1 to the previous | `oneshot-direct` |
-| 4 Sparks, ring (`tp4-ring`) | 4 | each node to the next and the previous, `1-2-3-4-1` | `oneshot-ring4` |
-| 2 to 8 Sparks, switched | 1 per node | each node's two-lane ConnectX-7 port into a RoCEv2 switch | `oneshot-switched` |
+| 1 Spark | 0 | none | `local` |
+| 2 Sparks, direct | 1 | one cable between the two nodes | `oneshot-direct` |
+| 3 Sparks, triangle | 3 | every pair cabled directly: port 0 to the next node, port 1 to the previous | `oneshot-direct` |
+| 4 Sparks, ring | 4 | each node to the next and the previous, `1-2-3-4-1` | `oneshot-ring4` |
 
-For `tp1`, skip fabric cabling and addressing. For `tp2-direct`, `tp3-triangle`,
-and `tp4-ring`, no switch is involved: each rank in a ring exchanges data only
-with its previous and next ranks, so the ranks in the node map must follow
-the cable order. For switched setups, see [switched-fabric.md](switched-fabric.md).
+No switch is involved. In the ring each rank exchanges data only with its
+previous and next ranks, so the ranks in the node map must follow the cable
+order.
 
 **Addressing.** Give every cable path its own /24 subnet,
 `10.<a><b>.<path>.<node>`: the dgx1-dgx2 cable's first path is `10.12.1.1` on
@@ -444,15 +443,17 @@ the cables that moved; re-run the discovery.
 
 Two files describe your site and stay out of git:
 
-- **Node map.** Every shape has a git-ignored site map initialized from
-  `config/examples/` (or run `scripts/example_site.py` on a fresh clone to
-  initialize all twelve maps from their examples before running offline
-  `bin/spark doctor` or `unittest`):
-  - `config/nodes.json` for `tp3-triangle` / `tp3-triangle-4k` ([config/nodes.example.json](../config/nodes.example.json))
-  - `config/nodes-ring4.local.json` for `tp4-ring` ([config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json))
-  - `config/nodes-direct2.local.json` for `tp2-direct` ([config/examples/nodes-direct2.json](../config/examples/nodes-direct2.json))
-  - `config/nodes-tp1.local.json` for `tp1` ([config/examples/nodes-tp1.json](../config/examples/nodes-tp1.json))
-  - `config/nodes-switched{,2,3,5,6,7,8}.local.json` for switched shapes ([config/examples/nodes-switched.json](../config/examples/nodes-switched.json) and [switched-fabric.md](switched-fabric.md))
+- **Node map.** `config/nodes.json` for the three-node profiles (start from
+  [config/nodes.example.json](../config/nodes.example.json)),
+  `config/nodes-tp1.local.json` for one Spark (start from
+  [config/examples/nodes-tp1.json](../config/examples/nodes-tp1.json)),
+  `config/nodes-direct2.local.json` for two cabled directly (start from
+  [config/examples/nodes-direct2.json](../config/examples/nodes-direct2.json)),
+  `config/nodes-ring4.local.json` for the TP4 ring profile (start from
+  [config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json)), or
+  `config/nodes-switched.local.json` for a switched four-node deployment (start from
+  [config/examples/nodes-switched.json](../config/examples/nodes-switched.json) and see
+  [switched-fabric.md](switched-fabric.md)). For offline checks on a fresh clone before writing host maps, `./scripts/example_site.py` initializes git-ignored example maps for every shape.
   It names each node (`name`, which is used both as the SSH target and in status
   messages and must resolve via `~/.ssh/config` or DNS/hosts; if an earlier node
   map set `ssh_host`, either rename nodes to their SSH targets or add SSH
@@ -602,9 +603,8 @@ bin/spark --cluster-config config/cluster.json build image --apply
 ```
 
 `build prepare` fetches the pinned vLLM, NCCL, CUTLASS, TileLang, TileKernels
-and sparknet sources, plus the hash-locked CUDA `13.5.37`, CuTe DSL, and
-torch wheel sets, applies the patch series, and checks every result
-against the recorded trees (`B12X` was retired in `spark-ds41f-1120`).
+and sparknet sources plus the hash-locked CUDA `13.5.37` and wheel inputs,
+applies the patch series, and checks every result against the recorded trees.
 `build image --apply` refuses to run next to a
 live service, sizes its compile jobs to available memory, never overwrites
 an existing tag, and runs a GPU import smoke test. The first build takes
