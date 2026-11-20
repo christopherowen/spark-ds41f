@@ -18,11 +18,11 @@ owner.
   `candidate-62` image itself ran the release tests (`12,023 passed, 356
   skipped, 0 failed`) and two-boot checks on `tp3-triangle` and `tp1`. What it
   leaves open is under [Next release](#next-release).
-- **Candidate `61` (shipped in `spark-ds41f-1120` as `candidate-62`'s base)** ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)) stacks on `candidate-60` with decode and infrastructure improvements verified through integrated margin confidence (`9649db2dc` / `45f67d1b4`: 2-boot **`c1 = 86.07 / 86.39` [`86.23 mean`]**, **`c16 = 273.96 / 274.30` [`274.13 mean`]**, `0` diffs) and `c61-r20` (`ad23a0e17`: `mhc.py` `_sinkhorn_stream` shares `aux_stream()`, **`c1 = 86.27 ± 5.69% tok/s`**, **`tpot_p50 = 11.24 ms`**, **`c16 = 273.39 ± 1.13% tok/s`**, `0` greedy diffs, `0` `/dev/dri/card0`) on `tp4-ring` (`dgx1..dgx4`). (`c61-r21` `_WO_A_TILES[16]` `block_K=64` test: **`c1 = 85.78 ± 5.80%`**, `c16 = 274.61 ± 0.91%`, `0` diffs, but engine grid regressed `+0.111..+0.238 ms/step` on `1x` and `+0.297 ms` on `16x16`, so reverted to `c61-r20` `95f23ef91` / `block_K=256`):
-  - Integrated certified 2-pass `W_q` Markov vocab screening + per-row $\ell_2$ scale search + extreme-outlier sign-clamping (`Rank 2`), BF16 compressor replication up to `TP<=4` (`Rank 5`), `PR #1225` (`0817..0819`) + `pipe` + `<2>` dense `indexer_score_v41` + gated `_decode_index_split` (`Rank 6`; also supersedes `PR #1086`), grouped 3-layer DSpark `context_kv` + strided `front.py` (`Rank 10`), `PR #995` CopyDrafter guards/gentle ramp (`Rank 13`), fixed `PR #1072` `shm_broadcast.py` 2 ms post-wakeup spin anchor (`Rank 14`: eliminated 5s stalls, `ttft_p99 = 0.133s`), `PR #1081` shard-local sampled verification + `PR #988` sparse top-k Markov (`Rank 15`), `PR #1078` 48-row decode projection tile (`Rank 16A`), `PR #984` UMA allocator hygiene (`Rank 17`), `PR #987` 128-row `WO-B` / `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16` / `all_reduce_rank_order`, `Decode #3` (`wo_b`, `shared_up`, and `dspark.main_proj` `tile_contiguous=True` + `linear.py` `split_override` unpacking guard), `Decode #5` (`aux_stream` priority `-3` + `_PriorityCUDAGraphExec` `UseNodePriority=0x08` + `MoERunner._forward_impl` `M<=16` `_post_gate_hook` deferral fix), `Decode #6` (`moe_down` PDL prologue weight preload + `LayerChain` fix), `c61-r10` host-vs-GPU $p_k^2$ coverage-squaring elimination (`adaptive_verification.py`), `c61-r12` `SparseMlaV41Plan` `"split"` `skip_inactive=True` (`sparse_mla.py`), `c61-r13` device-side `is_padding` dead-row masking (`metadata.py` + `attention.py`), `c61-r15` hybrid `WQ_ONLY` + 1-warp/ping-pong `vocab.py` refine + `context_kv_front_3layer` + `gemm.py` `M=32/48` retune, `c61-r16`/`r17` `mhc` strict `pdl.chain()`-first + split `finalize_norm`/`finalize_sinkhorn` (`-0.20..-0.23 ms/step`), `c61-r20` `_sinkhorn_stream` sharing `aux_stream()`, `wo.py` `_WO_A_TILES` (`16: split=True, block_K=256`; `64/96/128` restored to `split=True` in `c61-r17`), `/dev/nvidiactl` RM scanout carve-out replacing `/dev/dri/card0`, `c61-r18` `grid_x=40` persistent loop in `refine_vocab_greedy_partials` (`vocab.py`, `4,040 -> 40` CTAs for Target `lm_head` + DSpark Markov), top-2 margin confidence calibration (`confidence.py`, `9649db2dc`), `tilelang_rejection.py` `initcheck` uninitialized-read guard (`705 passed, 0 errors`), `qwen3_dspark.py` `apply_bias_topk` deduplication, and `PR #1222`/`#1223` lab fixes (`124 passed` in `test_lab.py` + `test_source_locks.py`). (`PR #967` `sparse_mla.py` TIRx compiler fixes verified byte-identical in `candidate-60` across all 6 routes.)
+- **Candidate `61` (shipped in `spark-ds41f-1120` as `candidate-62`'s base)** ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)) stacks on `candidate-60` with decode and infrastructure improvements verified through integrated margin confidence (`9649db2dc` / `45f67d1b4`: 2-boot **`c1 = 86.07 / 86.39` [`86.23 mean`]**, **`c16 = 273.96 / 274.30` [`274.13 mean`]**, `0` diffs) and `c61-r20` (`ad23a0e17`: `mhc.py` `_sinkhorn_stream` shares `aux_stream()`, **`c1 = 86.27 ± 5.69% tok/s`**, **`tpot_p50 = 11.24 ms`**, **`c16 = 273.39 ± 1.13% tok/s`**, `0` greedy diffs, `0` `/dev/dri/card0`) on `tp4-ring` (`dgx1..dgx4`). (`c61-r21` `_WO_A_TILES[16]` `block_K=64` test: **`c1 = 85.78 ± 5.80%`**, `c16 = 274.61 ± 0.91%`, `0` diffs, but engine grid regressed `+0.111..+0.238 ms/step` on `1x` and `+0.297 ms` on `16x16`, so reverted to `c61-r20` `95f23ef91` / `block_K=256`; its gain at `M=36/48/96` was not isolated, see Decode #16):
+  - Integrated certified 2-pass `W_q` Markov vocab screening + per-row $\ell_2$ scale search + extreme-outlier sign-clamping (`Rank 2`), BF16 compressor replication up to `TP<=4` (`Rank 5`), `PR #1225` (`0817..0819`) + `pipe` + `<2>` dense `indexer_score_v41` + gated `_decode_index_split` (`Rank 6`; also supersedes `PR #1086`), grouped 3-layer DSpark `context_kv` + strided `front.py` (`Rank 10`), `PR #995` CopyDrafter guards/gentle ramp (`Rank 13`), fixed `PR #1072` `shm_broadcast.py` 2 ms post-wakeup spin anchor (`Rank 14`: eliminated 5s stalls, `ttft_p99 = 0.133s`), `PR #1081` shard-local sampled verification + `PR #988` sparse top-k Markov (`Rank 15`), `PR #1078` 48-row decode projection tile (`Rank 16A`), `PR #984` UMA allocator hygiene (`Rank 17`), `PR #987` 128-row `WO-B` / `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16` / `all_reduce_rank_order`, `Decode #3` (`wo_b`, `shared_up`, and `dspark.main_proj` `tile_contiguous=True` + `linear.py` `split_override` unpacking guard), `Decode #5` (`aux_stream` priority `-3` + `_PriorityCUDAGraphExec` `UseNodePriority=0x08` + `MoERunner._forward_impl` `M<=16` `_post_gate_hook` deferral fix), `Decode #6` (`moe_down` PDL prologue weight preload + `LayerChain` fix), `c61-r10` host-vs-GPU $p_k^2$ coverage-squaring elimination (`adaptive_verification.py`), `c61-r12` `SparseMlaV41Plan` `"split"` `skip_inactive=True` (`sparse_mla.py`), `c61-r13` device-side `is_padding` dead-row masking (`metadata.py` + `attention.py`), `c61-r15` hybrid `WQ_ONLY` + 1-warp/ping-pong `vocab.py` refine + `context_kv_front_3layer` + `gemm.py` `M=32/48` retune, `c61-r16`/`r17` `mhc` strict `pdl.chain()`-first + split `finalize_norm`/`finalize_sinkhorn` (`-0.20..-0.23 ms/step` on the `sp8` kernel screen; the split kernels ship in `0818` but nothing on the serving path calls them, see [Next release](#next-release) item 4), `c61-r20` `_sinkhorn_stream` sharing `aux_stream()`, `wo.py` `_WO_A_TILES` (`16: split=True, block_K=256`; `64/96/128` restored to `split=True` in `c61-r17`), `/dev/nvidiactl` RM scanout carve-out replacing `/dev/dri/card0`, `c61-r18` `grid_x=40` persistent loop in `refine_vocab_greedy_partials` (`vocab.py`, `4,040 -> 40` CTAs for Target `lm_head` + DSpark Markov), top-2 margin confidence calibration (`confidence.py`, `9649db2dc`), `tilelang_rejection.py` `initcheck` uninitialized-read guard (`705 passed, 0 errors`), `qwen3_dspark.py` `apply_bias_topk` deduplication, and `PR #1222`/`#1223` lab fixes (`124 passed` in `test_lab.py` + `test_source_locks.py`). (`PR #967` `sparse_mla.py` TIRx compiler fixes verified byte-identical in `candidate-60` across all 6 routes.)
   - Screened `c61-r13` (`179fd3b75`: **`c1 = 84.78 ± 6.11% tok/s`**, `28.00 ms/step`, **`c16 = 271.66 ± 1.05% tok/s`**, `0` diffs), `c61-r14` (`00306d1ef`: `c1 = 83.62 tok/s`, `c16 = 269.91 tok/s`, `0` diffs), `c61-r15` (`d0a111fa2`: `c1 = 84.11 tok/s`, `c16 = 271.23 tok/s`, `0` diffs), `c61-r16` (`99808dbd5`: `697 passed, 6 skipped`, `984` kernels / `0` PDL viol with `-v /dev/null:/dev/dri/card0`; ready `+132.1 s`, `MemAvailable 117.2–118.0 GiB`, `0` `/dev/dri/card0` mounts; **`c1 = 85.16 ± 5.85% tok/s`** [`27.89 ms/step`, `tpot_p50 = 11.68 ms`, `ttft_p50 = 0.1116 s`, `prose 81.15 / 83.79 dec`, `code 115.56 / 121.51 dec`, `#00 = 76.23 dec`], `c16 = 269.88 tok/s`, `0` diffs), `c61-r17` (`8bcf2b7ea`: `wo.py` `64/96/128` restored to `split=True`; ready `+114.6 s`, `jit_new_files = 0`, **`c1 = 85.45 ± 5.94% tok/s`** [`27.83 ms/step`, **`tpot_p50 = 11.63 ms`**, `ttft_p50 = 0.1117 s`, `prose 81.37 / 84.00 dec`, `code 115.50 / 121.44 dec`, `#00 = 76.22 dec`; **`2-boot mean = 85.30 tok/s`**, `+2.07` vs `c60-base`], **`c16 = 270.80 ± 1.38% tok/s`**, `0` greedy diffs), `c61-r18` (`8a51b5ac0`: `grid_x=40` persistent `refine_vocab_greedy_partials`; `97 passed, 6 skipped`, `0` PDL viol; ready `+129.0 s`, `+34` JIT files, **`c1 = 85.03 ± 5.87% tok/s`** [`27.91 ms/step`, `tpot_p50 = 11.68 ms`, `prose 81.03 / 83.66 dec`, `code 115.54 / 121.51 dec`], `c16 = 269.84 ± 1.33% tok/s`, `0` greedy diffs; `c61_r18_engine_grid.json` `1x` `dft_ms` **`-13.2 us` mean** vs `r17`, `gap_ms` `1.314–1.338 ms`), `c61-r19` (`777822915`: `MoERunner._forward_impl` `M<=16` `_post_gate_hook` deferral fix; `114 passed`, `0` PDL viol; ready `+116.7 s`, `jit_new_files = 0`, **`c1 = 85.28 ± 5.86% tok/s`** [`27.84 ms/step`, `tpot_p50 = 11.62 ms`, `ttft_p50 = 0.1116 s`, `prose 81.32 / 83.95 dec`, `code 115.22 / 121.13 dec`], **`c16 = 270.31 ± 1.14% tok/s`** [`tpot_p50 = 56.82 ms`], `0` greedy diffs; `c61_r19_engine_grid.json` `1x` `-301.8 us` mean vs `r13`, `1x2` `-16.9..-39.4 us` & `multi M<=16` `-10.1 us` vs `r18`), integrated `c61-margin` (`9649db2dc` / `45f67d1b4`: 2-boot **`c1 = 86.07 / 86.39` [`86.23 mean`]**, `tpot_p50 = 11.23 / 11.21 ms`, **`c16 = 273.96 / 274.30` [`274.13 mean`]**, `0` greedy diffs), and `c61-r20` (`ad23a0e17`: `mhc.py` `_sinkhorn_stream` shares `aux_stream()`; `197 passed`, `0` PDL viol; ready `+115.8 s`, `jit_new_files = 0`, `MemAvailable 117.3–118.0 GiB`, **`c1 = 86.27 ± 5.69% tok/s`** [`27.56 ms/step`, `tpot_p50 = 11.24 ms`, `ttft_p50 = 0.1109 s`, `prose 81.80 / 84.48 dec`, `code 116.10 / 122.03 dec`], **`c16 = 273.39 ± 1.13% tok/s`** [`tpot_p50 = 57.04 ms`], `0` greedy diffs; `c61_r20_engine_grid.json` vs `c61-margin`: `1x` `-13.3 us` step / `-19.5 us` fwd, `multi M<=16` `-33.5 us` step / `-72.8 us` fwd, `multi M>16` `+106.7 us` step). Rejected both the `+2,045/-325`-line `step_gate` flat-graph early-exit prototype (`/tmp/rework_dspark/final.patch`) as a bad complexity/trade-off (`+1,118` net production lines across 7 entangled files, 6 duplicated `@T.prim_func` paths, all 4 RoCE `all_gather`s still run, and `+11.33 us/step` `ALL-ALIVE` regression for only `-80.04 us/step` weighted `c1` / `-55.02 us/step` beyond `grid_x=40`) and the `dspark_context` fused MXFP8 cast prototype (`+0.19..+1.15 us` standalone and `+1.23..+3.95 us` end-to-end with `main_proj` across `cap=1..96`).
 - **Candidate `60`** ([`experiments/2026-11-16-c60-prefill`](experiments/2026-11-16-c60-prefill/README.md)) builds on `candidate-59` (via `#1218` / `#1219`) in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
-  - Integrated PR `#992` `bf16x2` producer casts, `indexer.py` `bfloat162` SMEM + warp-shuffle `block_scan` top-$k$, `attention.py` SP prefill compressor/front async overlap + deferred `finish_front` + `cacheable = index_rows <= chunk_rows`, PR `#983` Clock-Pro 2-bit Engram prefill shield + `SPARK_DS41F_ENGRAM_PIN_SCALES`, PR `#1010` hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1006` uncached GPU post-load vectorizations / pressure-gated `release_device_memory_under_pressure` / lazy imports / first-prefill `_warm_model_runtime` warmup (dropping `postload_cache` after measuring slower reload than uncached GPU vectorization on GB10), piece-level parallel prompt tokenizer caching (`vllm/tokenizers/deepseek_v41.py`), PR `#1212` (rebased `#1047`) literal image-token escape, `defer_loading: true` + `tool_reference` inline tool-schema resolution (`serving.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`), and stream/lifecycle/parser hardening (`sp_prefill.py`, `engram_rows/rows.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`; evaluated and removed opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK` from PR `#1150` during optionality cleanup).
+  - Integrated PR `#992` `bf16x2` producer casts, `indexer.py` `bfloat162` SMEM + warp-shuffle `block_scan` top-$k$, `attention.py` SP prefill compressor/front async overlap + deferred `finish_front` + `cacheable = index_rows <= chunk_rows`, PR `#983` Clock-Pro 2-bit Engram prefill shield + pinned two-plane scales (the reader's `pin_scales` argument, on by default; no environment switch of that name is in the series), PR `#1010` hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1006` uncached GPU post-load vectorizations / pressure-gated `release_device_memory_under_pressure` / lazy imports / first-prefill `_warm_model_runtime` warmup (dropping `postload_cache` after measuring slower reload than uncached GPU vectorization on GB10), piece-level parallel prompt tokenizer caching (`vllm/tokenizers/deepseek_v41.py`), PR `#1212` (rebased `#1047`) literal image-token escape, `defer_loading: true` + `tool_reference` inline tool-schema resolution (`serving.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`), and stream/lifecycle/parser hardening (`sp_prefill.py`, `engram_rows/rows.py`, `deepseek_v41.py`, `deepseek_v41_encoding.py`; evaluated and removed opt-in `SPARK_DS41F_PREFILL_MIX_CHUNK` from PR `#1150` during optionality cleanup).
   - Qualified with zero regressions on `tp4-switched` (`model`: `128/128` greedy / `100.00%` identical, `KL mean 0.000e+00`, `8/8` gate determinism/greedy `0` diffs; `grid` `-0.07% ±0.13%` `same`; `c16` `+0.17%` / `+0.15%` `same`; `c1-decisions` `82.91 tok/s`; `prefill 262K` `default-text` **`+2.10% ±0.64%` (`better`, `9,833.2 tok/s`)**, `+4.50%` over `c58-final`; `source` prefill `32K/131K/262K` `9,521 / 9,924 / 9,830 tok/s`, with Step 1 hitting `10,000.1 tok/s` mean at `131K`; `bench` `quality` `5/5` pass) and `tp3-switched` (`model`: `100.00%` identical, `8/8` gate `0` diffs, `grid` `-0.03% ±0.12%` `same`, `c8` `-0.25%` / `-0.23%` `same`, `sp5` startup `min_available_gib` `5.90–5.97 GiB`; `tp4-ring` remained held and untested).
 - **Candidate `59`** ([`experiments/2026-11-15-c59-prefill`](experiments/2026-11-15-c59-prefill/README.md)) builds on `candidate-58` in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
   - Integrated bounded UTF-8 suffix detokenizer priming (`detokenizer.py`), zero-copy `int32` `PickleBuffer` `NewRequestData` admission IPC (`output.py`, `request.py`, `buffer_utils.py`), `bf16x2` / `cvt.rn.bf16x2.e2m1x2` dequant (`sparse_mla.py`), dense `indexer_score_v41` `rows >= 64` `R=4` BF16 dual-row SMEM reduction (`indexer.py`), fused `prefill_gate_up -> moe_swiglu_cast` with 64-col `(gate, up)` slab interleaving (`moe.py`), and PR `#1005` MoE warp-shuffle dispatch scan, sync/PDL tightening, and cascaded `moe_swiglu_cast` preloads (keeping `c58` BF16 SwiGLU intermediate rounding).
@@ -119,6 +119,24 @@ Open after `1120`:
    the fixed step's dummy rows are flagged as padding, skip the routed MoE and
    see no compressed context). A changed suite is a new suite; the recorded
    references stay.
+   - **The padding-row account does not cover `tp3-switched`.** The same image
+     booted twice there and the boots disagree: `1x2 rows @4K` reads `33.82 ms`
+     on one boot and `16.49 ms` on the other
+     ([release table](manifests/suites/2026-11-20-spark-ds41f-1120-tp3-switched/release-table.txt)),
+     so that grid's verdict is `same` only because its repeat spread is
+     `17.75%`. `candidate-61`'s
+     [over/under](experiments/2026-11-16-c61-decode/over-under-1107-vs-candidate-61.md)
+     puts the cost in the drafter at one request on padding rows (target
+     `forward_ms` improved `7.3–7.8%`); a boot that reads `16.49 ms` on the
+     same rows needs a second cause. Find what differs between the two boots
+     before treating the one-request shapes as a grid artefact.
+   - **The grid can already run its rows as real ones and the release does not
+     use it.** `0820` and Sonar carry `real_rows`; both `1120` grids ran with
+     `"real_rows": false` and no suite in `config/suites/` sets it. The
+     real-rows profile has one boot
+     (`experiments/2026-11-17-indexer-decode-share/receipts/tp4-switched/profile-real-rows`);
+     its repeat (`profile-real-rows-again-tp4-switched.json`) has no receipts
+     and the README no write-up of either.
 3. **`tp3-triangle` short-request TTFT beside six streams.** In the same
    reference, a short request's TTFT p50 during a 131K prefill beside six
    streams reads `1.76 s` against `1.18 s` on `1107` (`+48.88% ±16.13%`,
@@ -127,7 +145,44 @@ Open after `1120`:
    six streams is `13.19%` faster. Unexplained and not in the release notes:
    check the prefill yield and admission on the triangle's 6,144 budget before
    the next release.
-4. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
+4. **The mHC finalize split is in the image and never runs.** `0818` adds
+   `mhc_finalize_norm`, `mhc_finalize_sinkhorn`, `async_sinkhorn()` and
+   `wait_sinkhorn()` to `tilelang/mhc.py`, and the split path is taken only
+   inside `async_sinkhorn()`. No patch in `1120`'s series calls either
+   function, so the served step runs the single `mhc_finalize` kernel as on
+   `1107`: `candidate-61`'s traced step on `tp4-ring` lists
+   `mhc_finalize_kernel` and neither split kernel
+   (`experiments/2026-11-17-c1-floor-now/receipts/trace/`). The
+   `-0.20..-0.23 ms/step` recorded for `c61-r16`/`r17`/`r20` is the `sp8`
+   Cold-L2 kernel screen; no served step has measured it. Add the call sites to
+   `nvidia/model.py`, confirm both kernels in a decode trace, then screen `c1`,
+   `c16` and the grid over two boots with zero greedy diffs. If it holds it
+   becomes the only path; if not, `0818`'s split kernels come out.
+5. **GLP-27 did not become the default vector at promotion.** `candidate-55`'s
+   [record](experiments/2026-10-26-spark-ds41f-candidate/candidate-55/README.md)
+   carries the owner's decision of 2026-11-13 ("Yes, at promotion") for the
+   release whose image reads Spec v3: its promotion commit makes
+   `GLP-27-L11-37-a3.5` the default, qualified at three testbeds
+   ([receipts](experiments/2026-10-26-spark-ds41f-candidate/candidate-55/receipts/glp/README.md)).
+   `1120`'s image reads Spec v3 (`0805`), yet
+   `releases/spark-ds41f-1120/cluster.json` and `config/cluster.json` serve
+   `GLP-39-L1-39-a0.75`, and #985, which made the switch, was closed on
+   2026-11-15 as integrated. The owner decides whether the decision stands; the
+   switch changes the promoted configuration and needs its own baseline.
+6. **TP1..TP3 ship a prefetch row band that its sweep did not confirm.**
+   `tp3-triangle`, `tp2-direct` and `tp1` set
+   `VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=12`, and `tp3-switched`,
+   `tp3-triangle-4k` and `tp2-switched` extend them. The sweep's two-boot
+   confirmation at `tp3-switched` missed its mark (grid `0.06%` faster against
+   a `0.30%` margin) and concluded that the shape keeps no band
+   ([sweep](experiments/2026-11-13-prefetch-window-sweep/README.md)). The value
+   entered the recipe with #1218, and `docs/doctor.md` names it the qualified
+   setting for TP3. Confirm it over two boots on `tp3-triangle` against the
+   same image with no band, or take it out. Two smaller things from the same
+   sweep: `tp5..tp8-switched` inherit TP4's `17-32=10` without a measurement
+   of their own, and `NEXT 15` (`0.26%` and `0.49%` faster at the two TP4
+   testbeds, under the rule's margin) was left as a lead and not followed.
+7. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
    Sonar's `matrix`) once no active workflow references it; the suites in
    `config/suites/`, run by Sonar (`docs/release-benchmark.md`), are the release
    benchmark authority.
@@ -388,7 +443,8 @@ collectives, and DSpark drafting.
 7. **Forward-fusing `mHC` stream finalize and MXFP8 quantization into consumer
    projections (plus fused `embed` + Layer-0 `project_streams`).** Unlike
    1-launch atomic `project_and_finalize_streams` (which regressed in `#946`),
-   `c61-r16` lands the intermediate split: `mhc_finalize` (`80×/step`) splits
+   `c61-r16` adds the kernels for the intermediate split, which no serving
+   path calls yet ([Next release](#next-release) item 4): `mhc_finalize` (`80×/step`) splits
    into a 5-CTA critical-path `mhc_finalize_norm` (`1.9 us`) plus off-critical-path
    `mhc_finalize_sinkhorn` (`threads=32`) on `aux_stream()` (reused from
    `vllm.utils.torch_utils.aux_stream()` in `c61-r20`; `_finalize_sinkhorn`
@@ -483,6 +539,16 @@ collectives, and DSpark drafting.
     read rate, and whether the gate is replicated or sharded across ranks.
     Only if it is material, screen one launch for projection, scoring and
     selection with the same order and tie rule.
+16. **A narrower `WO-A` reduction for wide steps only.** `c61-r21` set
+    `_WO_A_TILES[16]` to `block_K=64, num_stages=2` for every step and was
+    reverted whole: the one-request shapes slowed by `+0.111..+0.238 ms/step`
+    and `16x16` by `+0.297 ms`, but the wide shapes gained (`8x36 -0.244`,
+    `8x48 -0.434`, `16x48 -0.489`, `16x96 -0.556 ms`) and the one `c16` boot
+    read `274.61` against `c61-r20`'s `273.39 tok/s`
+    ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)).
+    The record does not isolate why the wide shapes gained. Find it, then
+    screen it for steps above 32 rows only, with the `block_K=256` tile kept
+    below.
 
 ## Speculative decoding
 
@@ -493,7 +559,7 @@ graph retention (`0728`), fused single-rank Markov drafting (`0717`), and
 device-side `prepare_inputs` folding (`0754`) are all active.
 
 Open levers:
-- **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms` (`s3/2` beats `s2/2` across warmed `live=3, 4, 16, 38, 64` at `159.1 vs 160.8`, `192.7 vs 194.6`, `622.8 vs 623.9`, `1423.5 vs 1427.4`, `2369.4 vs 2377.9 us`). Live `dgx1` `c61-r5` `prose-c1` telemetry (`4,701` steady decode steps) shows `36.3%` commit 1 token (`med 25.30 ms`), `30.0%` commit 2 (`25.60 ms`), `21.1%` commit 3 (`26.70 ms`), `8.1%` commit 4 (`28.70 ms`), `3.2%` commit 5 (`30.90 ms`), `1.2%` commit 6 (`33.50 ms`). `c61-r6` (`e0436c584`) tested IRLS warm-start priors (`_WARM_CONFIDENCE_HEAD_INTERCEPTS` + zero-preservation) + `SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` (`tau_c1 = 0.1386`) on `dgx1..dgx4`: warmup req `#00` improved `71.66 -> 73.13 dec tok/s` (`ttft` `0.283s -> 0.163s`), `code-c1` improved `114.25 -> 115.04 dec tok/s` (`med_dt 31.50 -> 29.90 ms`), and `c16` (`271.38`) + determinism (`0` diffs) held, but `prose-c1` shifted `-1.83 ms/step` (`26.58 -> 24.75 ms` mean) against `-0.163 commits/step` (`2.144 -> 1.981`, `81.38 -> 80.72 dec tok/s`), showing the pruned `pos 2..4` tail tokens earned `89.1 tok/s` marginal rate (conditional acceptance > independent confidence product). Keep warm-start priors and drop `scale = 2.5` back to `1.0` in `c61-r7`. In `c61-r9` (`60caa95be`, `tau = 0.06335`), `cov = [1.0, 0.861, 0.482, 0.225, 0.100]` (`2.667`) vs un-squared `sqrt_cov = [1.0, 0.928, 0.694, 0.474, 0.316]` (`3.412`), whereas `c61-r6` (`tau = 0.1386`) raised conditional acceptance `surv/cov` to `[0.662, 0.507, 0.509, 0.543, 0.557]` while squaring `cov` down to `[1.0, 0.619, 0.262, 0.111, 0.056]` (`2.048`) vs un-squared `2.869`: root cause was async `_stale_confidences` ($C_{t-1}$) on the host (`get_num_tokens` / `reallocate_drafts`) intersecting current `_confidence_probs` ($C_t$) on the device (`DeadRows`), squaring per-step survival coverage to $p_k^2$. `c61-r10` restores `SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` (`tau_c1 = 0.1386`) for device `DeadRows` while admitting all `<=5` single-tile DSpark slots on the host (`64 passed, 1 skipped` in `test_adaptive_verification.py` + `test_acceptance_estimator.py`). On `tp4-ring` (`c61-r10`, `2f9eaee88`), `c1` reached **`84.03 ± 6.13% tok/s`** (`code = 112.99 e2e / 118.71 dec`, `prose = 80.06 e2e / 82.64 dec`, `acc/draft = 1.4042` vs `1.3443` in `r9`, `c16 = 271.23 ± 0.87%`, `0` greedy diffs). `c61-r11` (`4cd801eb2`) kept `dspark.main_proj` `TILE_CONTIGUOUS_FP8` (`c16 = 271.31 tok/s`, `tpot_p50 = 11.74 ms`, `0` diffs) while `scale = 1.75` (`tau ~ 0.1035`) measured `c1 = 83.90 tok/s` (`+0.205` rows/step at `+0.42 ms/step` = `2.03 ms/row` for only `+0.0181` accepted tokens/draft = `8.84%` marginal survival, `43.5 tok/s` < `84.03`), so `c61-r12` restores `scale = 2.5`). `c61-r12` (`fcced2855`, `SparseMlaV41Plan` `"split"` `skip_inactive=True`, `-8.10..-13.66 us/L` at `idx_len=16`, `-5.87..-11.81 us/L` at `idx_len=512`, `0` new JIT files) measured **`c1 = 84.75 tok/s`** (`35.707 steps/s`, `prose = 80.78/83.39`, `code = 113.59/119.36`, `c16 = 271.60`, `0` greedy diffs). `c61-r13` (`179fd3b75`, `metadata.py` + `attention.py` `is_padding` dead-row masking, `153 passed, 0 PDL violations`, `IndexerCand -23.09..-28.11 us/L`) measured **`c1 = 84.78 tok/s`** (`35.720 steps/s`, `c16 = 271.66 tok/s`, `0` greedy diffs). (`PR #1002` `VLLM_DSPARK_ONLINE_ADAPT=1` measured `+0.03%` on held-out `c1` (`87.11 -> 87.14`) and `+0.10%` on coding (`160.91 -> 161.07`) in `c57-adapt` and remains opt-in.)
+- **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms` (`s3/2` beats `s2/2` across warmed `live=3, 4, 16, 38, 64` at `159.1 vs 160.8`, `192.7 vs 194.6`, `622.8 vs 623.9`, `1423.5 vs 1427.4`, `2369.4 vs 2377.9 us`). Live `dgx1` `c61-r5` `prose-c1` telemetry (`4,701` steady decode steps) shows `36.3%` commit 1 token (`med 25.30 ms`), `30.0%` commit 2 (`25.60 ms`), `21.1%` commit 3 (`26.70 ms`), `8.1%` commit 4 (`28.70 ms`), `3.2%` commit 5 (`30.90 ms`), `1.2%` commit 6 (`33.50 ms`). `c61-r6` (`e0436c584`) tested IRLS warm-start priors (`_WARM_CONFIDENCE_HEAD_INTERCEPTS` + zero-preservation) + `SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` (`tau_c1 = 0.1386`) on `dgx1..dgx4`: warmup req `#00` improved `71.66 -> 73.13 dec tok/s` (`ttft` `0.283s -> 0.163s`), `code-c1` improved `114.25 -> 115.04 dec tok/s` (`med_dt 31.50 -> 29.90 ms`), and `c16` (`271.38`) + determinism (`0` diffs) held, but `prose-c1` shifted `-1.83 ms/step` (`26.58 -> 24.75 ms` mean) against `-0.163 commits/step` (`2.144 -> 1.981`, `81.38 -> 80.72 dec tok/s`), showing the pruned `pos 2..4` tail tokens earned `89.1 tok/s` marginal rate (conditional acceptance > independent confidence product). Keep warm-start priors and drop `scale = 2.5` back to `1.0` in `c61-r7`. In `c61-r9` (`60caa95be`, `tau = 0.06335`), `cov = [1.0, 0.861, 0.482, 0.225, 0.100]` (`2.667`) vs un-squared `sqrt_cov = [1.0, 0.928, 0.694, 0.474, 0.316]` (`3.412`), whereas `c61-r6` (`tau = 0.1386`) raised conditional acceptance `surv/cov` to `[0.662, 0.507, 0.509, 0.543, 0.557]` while squaring `cov` down to `[1.0, 0.619, 0.262, 0.111, 0.056]` (`2.048`) vs un-squared `2.869`: root cause was async `_stale_confidences` ($C_{t-1}$) on the host (`get_num_tokens` / `reallocate_drafts`) intersecting current `_confidence_probs` ($C_t$) on the device (`DeadRows`), squaring per-step survival coverage to $p_k^2$. `c61-r10` restores `SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` (`tau_c1 = 0.1386`) for device `DeadRows` while admitting all `<=5` single-tile DSpark slots on the host (`64 passed, 1 skipped` in `test_adaptive_verification.py` + `test_acceptance_estimator.py`). On `tp4-ring` (`c61-r10`, `2f9eaee88`), `c1` reached **`84.03 ± 6.13% tok/s`** (`code = 112.99 e2e / 118.71 dec`, `prose = 80.06 e2e / 82.64 dec`, `acc/draft = 1.4042` vs `1.3443` in `r9`, `c16 = 271.23 ± 0.87%`, `0` greedy diffs). `c61-r11` (`4cd801eb2`) kept `dspark.main_proj` `TILE_CONTIGUOUS_FP8` (`c16 = 271.31 tok/s`, `tpot_p50 = 11.74 ms`, `0` diffs) while `scale = 1.75` (`tau ~ 0.1035`) measured `c1 = 83.90 tok/s` (`+0.205` rows/step at `+0.42 ms/step` = `2.03 ms/row` for only `+0.0181` accepted tokens/draft = `8.84%` marginal survival, `43.5 tok/s` < `84.03`), so `c61-r12` restores `scale = 2.5`). `c61-r12` (`fcced2855`, `SparseMlaV41Plan` `"split"` `skip_inactive=True`, `-8.10..-13.66 us/L` at `idx_len=16`, `-5.87..-11.81 us/L` at `idx_len=512`, `0` new JIT files) measured **`c1 = 84.75 tok/s`** (`35.707 steps/s`, `prose = 80.78/83.39`, `code = 113.59/119.36`, `c16 = 271.60`, `0` greedy diffs). `c61-r13` (`179fd3b75`, `metadata.py` + `attention.py` `is_padding` dead-row masking, `153 passed, 0 PDL violations`, `IndexerCand -23.09..-28.11 us/L`) measured **`c1 = 84.78 tok/s`** (`35.720 steps/s`, `c16 = 271.66 tok/s`, `0` greedy diffs). (`PR #1002` `VLLM_DSPARK_ONLINE_ADAPT=1` measured `+0.03%` on held-out `c1` (`87.11 -> 87.14`) and `+0.10%` on coding (`160.91 -> 161.07`) in `c57-adapt`; it is not in `1120`: `VLLM_DSPARK_ONLINE_ADAPT` exists only in the patches of `experiments/2026-11-08-online-dspark-adaptation`, merged as a record.)
 - **Bounded or indexed CopyDrafter history match, forward-locality cursor, and
   payoff-gated wide copy passes at 100K–1M contexts.** Even with warp
   early-exit (`0744`), a decode step that does not hit a 256-token match scans
@@ -541,11 +607,14 @@ Open levers:
      $q(x_t) < 1$ into cumulative prefix importance-ratio verification
      ($h_i = w_i / (w_i + 1 - w_{i-1})$), paired with a two-level Gumbel-Max
      residual/target draw over 64-token vocabulary quads.
-- **Grouped 3-layer DSpark context-KV projection.** Concatenate
-  `mtp.{0,1,2}.attn.wkv` so all three DSpark layers' context-KV projections and
-  RoPE execute in a single grouped launch over the tapped hidden states from
-  target layers `{1, 30, 60}` rather than three separate per-layer launches.
-- **Drafter reuse of the target's token selection (`experiments/2026-11-08-dspark-topk-selection-reuse`, vLLM `0762`).**
+- **Grouped 3-layer DSpark context-KV projection: shipped.** `1120` runs all
+  three DSpark layers' context-KV projections and RoPE in one grouped launch
+  over the tapped hidden states from target layers `{1, 30, 60}`
+  (`context_kv_front_3layer`, `0817` and `0820`; `candidate-61` Rank 10).
+- **Drafter reuse of the target's token selection (`experiments/2026-11-08-dspark-topk-selection-reuse`, that experiment's own vLLM `0762`).**
+  Not in `1120` (#1004 is merged as a record; the series' `0762` is a different
+  patch), and it would change nothing there while the drafter's attention is
+  window-only.
   Measured across 2 boots on `sp5` (`4K..256K`, `TP=4` and `TP=3`, `c1` and `c8`).
   In `1107`, `DeepSeek-V4.1-Flash` configures `compress_ratios = [0, 0, 0]` on all
   3 DSpark draft layers (`layers.40..42`, `mtp.0..2`), so production DSpark draft
@@ -610,7 +679,7 @@ dense `indexer_score_v41` `rows >= 64` `R=4` BF16 SMEM reduction, fused
 and `candidate-60` added PR `#992` `bf16x2` producer casts, `bfloat162` SMEM +
 warp-shuffle `block_scan` top-$k$ (`indexer.py`), SP compressor/front async overlap +
 deferred `finish_front` (`attention.py`), PR `#983` Clock-Pro 2-bit Engram prefill
-shield + pinned two-plane scales (`SPARK_DS41F_ENGRAM_PIN_SCALES`), PR `#1010`
+shield + pinned two-plane scales (`pin_scales`, on by default), PR `#1010`
 hybrid KV retention/eviction, PR `#978` multimodal prefix-cache fastpath, PR `#1006`
 uncached GPU post-load vectorizations + first-prefill `_warm_model_runtime` warmup,
 piece-level parallel prompt tokenizer caching (`_BoundedPieceCache` + cut-after-`\n`
@@ -767,6 +836,12 @@ Open levers:
   runtime plumbing and unit tests; `0828` moves the opt-in path to FP8 group-32
   dominance summaries and declares no LSA kernel when unset. Any future
   enablement requires an independent long-context answer quality evaluation.
+  Evidence so far is for `0741` on `1107`: a second site's `tp4-ring` read 1M
+  source-text prefill at `8,722` against `6,342 tok/s` with it on (#1017,
+  [`experiments/2026-11-09-site-d-lsa`](experiments/2026-11-09-site-d-lsa/README.md)).
+  `0828` has its unit tests and the default-off check only: no boot has served
+  with `VLLM_DS41_LSA=1` on `1120`. Run prefill, decode and that record's
+  quality cases with it on before the question of enabling it is put.
 - **BF16 sparse attention** (patch `0023`, off in configuration): measure its
   fidelity with a teacher-forced comparison against
   `VLLM_DS41_ATTENTION_COMPUTE=reference` on long agent transcripts before
@@ -833,6 +908,20 @@ Remaining kernel-level investigations:
 - **Closing notes of #956 and #957 cite patches `0792`, `0795` and `0796`,
   which no series on `main` has.** Their changes ship in `1120` inside the
   consolidated `0813`, `0814` and `0816`.
+- **The RoCE trace tooling of #962 is in no series.**
+  `experiments/2026-11-08-network-iket-roce-trace` is merged as a record; its
+  `sparknet` and vLLM patches were written before `sparknet` `0002`/`0003`;
+  check that they still apply before the next collective timing (Decode #11)
+  relies on them.
+- **`_c1_calibrated_row_cost` (`0820`, `adaptive_verification.py`) is defined
+  and never called.** Remove it or wire it in with the next change to that
+  file.
+- **Site reports without an answer (2026-11-20):** #1036 (above), #1211
+  (near-tie acceptance, under Speculative decoding), #1230 (32 sequences on
+  `tp4-ring` measured on `1107`; `1120` ships 32), #1233 (cross-request recall
+  proposal), #1237 (whether the `tp4-ring` minimum free RAM is a measured
+  floor) and #1243 (`1120` at TP1 on a DGX Station GB300, `sm_103a`: a new
+  hardware report).
 
 ## Tried and not adopted
 
@@ -849,7 +938,7 @@ Don't repeat these without a new reason:
   ~3.7× at `c1` (`PR #1003` sunk-cost rule, `c61-r1-2`: pushed low-survival tail
   rows into 384-expert MoE, adding `+1.78 ms/step` and regressing `c1` `-3.25%`);
   cohort-atomic budgeting + `COALESCED_ROW_COST_SCALE=0.28` (`PR #953`/`#986`,
-  `c61-r3`: pushed `c16` `sched/step` to `40.05` and regressed `c16` `-3.3 tok/s`);
+  `c61-r3`: pushed `c16` `sched/step` to `40.05` and regressed `c16` `-3.3 tok/s`; the two were served only together, on `tp4-ring`, and reverted together, so neither has a result of its own and #953's burst coalescing has none at `TP6..TP8`);
   online verification-driven DSpark adaptation, per-position calibration plus W1
   and confidence-head updates after every step
   (`experiments/2026-11-08-online-dspark-adaptation`, #1002: c1 decode −3.8% coding
@@ -927,7 +1016,9 @@ Don't repeat these without a new reason:
   (`experiments/2026-11-06-nccl-sp-channels`, `6` channels won while `8` and
   `12` regressed); dense `indexer_score_v41` `<2>` (`2 <= rows < 64`) with
   `16 KiB` `contrib` SMEM (`+0.34%` `@4K` decode regression vs `<1>` + `8 KiB`
-  `contrib` kept for `rows < 64`) and `<8>` (`rows >= 128`, `B_reg[8]` register
+  `contrib` kept for `rows < 64`; `0817` in `1120` calls
+  `__tl_score_rows_dense_fast<2>` there all the same, as `candidate-61`'s
+  Rank 6, so this entry no longer describes what ships) and `<8>` (`rows >= 128`, `B_reg[8]` register
   spill slowed `rows=1/64/4096`, `experiments/2026-11-15-c59-prefill`); on-disk
   `postload_cache` serialization of packed BF16 weights and expert scale codes in
   `candidate-60` Step 3 (reload from `/cache` was slower on GB10 unified memory
