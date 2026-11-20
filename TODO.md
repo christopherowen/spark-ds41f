@@ -138,6 +138,9 @@ Report one and eight streams for every decode change, and sixteen on TP4.
   acceptance, use paired multi-prompt suites (Sonar's) across two boots.
 - **When a decision hinges on 2.5% or less**, watch boot-to-boot variance across
   repeat boots before attributing a small delta to a kernel or policy change.
+- **Record each node's uptime with a run.** Runs do not store how long each node
+  has been up; keep it with the run's evidence so time since reboot can be
+  checked as a source of boot-to-boot variance.
 - **Python-only vLLM changes need no image build to screen.** Bind-mount the
   changed files from the checked patch branch over the last candidate image via
   `container.mounts` (the image imports vLLM from `/opt/spark-ds41f/candidate/vllm`).
@@ -394,6 +397,9 @@ collectives, and DSpark drafting.
     verification broadcasts rank 0's confidence snapshot every decode step
     through NCCL (`adaptive_verification.py`). Bound its share of the step from
     decode traces and screen `sparknet`'s one-shot broadcast path if material.
+    Also test whether the broadcast is needed at all: count on device how often
+    a rank's own snapshot differs from rank 0's, and drop the broadcast if the
+    count stays at zero across the release suites.
 13. **Mid-network (Layer 16/20) dead-row routed-MoE pruning at single stream
     (`c1`).** At `c1`, no other requests in the batch amortize routed-expert
     LPDDR5X reads (4.5 MiB per expert per rank across 40 routed layers), so
@@ -403,6 +409,17 @@ collectives, and DSpark drafting.
     rows from routed MoE at mid-network (Layer 16/20) while masking pruned rows
     as rejected in `rejection_sampler` cuts half of those wasted routed-expert
     DRAM reads while keeping all accepted target tokens 100% bit-exact.
+14. **Engram row-cache capacity on live traffic.** Each disk Engram reader
+    (layers 1 and 14) keeps a 65,536-row 4-way row cache (17.3 MiB);
+    `SPARK_DS41F_ENGRAM_ROW_CACHE_ROWS` resizes it without a rebuild. The size
+    was set on synthetic hot, Zipfian and cold lookups
+    ([`experiments/2026-11-06-engram-step-and-cache`](experiments/2026-11-06-engram-step-and-cache/README.md))
+    and has had no capacity sweep. First record hit rate and evictions per layer
+    on recorded agent traffic (`rows.stats()` reports `cache_hits`; add an
+    eviction count if it has none), because a bench point of identical streams reuses rows and
+    hides misses. If evictions are material, raise the size until they reach
+    about zero, and weigh the gain against 16-stream decode and dgx1 headroom at
+    1M context. Confirm at the first boot that the switch reaches the reader.
 
 ## Speculative decoding
 
