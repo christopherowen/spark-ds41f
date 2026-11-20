@@ -1214,18 +1214,15 @@ class KernelLabTest(unittest.TestCase):
         self.assertIn("B12X_AUTOTUNE=0", command)
         self.assertEqual(command[-3:], ["img:tag", "/r/replay.py", "/cap"])
 
-    def test_display_carveout_bundles_get_the_serving_drm_access(self) -> None:
+    def test_display_carveout_bundles_do_not_mount_drm_card(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bundle = Path(directory)
             plain = lab.bundle_command(bundle, self.CANDIDATE, bundle / "out")
             carveout = lab.bundle_command(bundle, dict(self.CANDIDATE, display_carveout=True), bundle / "out")
-        self.assertFalse([arg for arg in plain if "dri" in arg or "226" in arg])
-        # The legacy DRM carve-out path matches releases/spark-ds41f-1107; 1120 uses RM nvidiactl scanout via --gpus=all.
-        serving_1107 = lab.spark.read_cluster("releases/spark-ds41f-1107/cluster.json", "tp3-triangle")["container"]["docker_run_args"]
-        for arg in ("--mount=type=bind,source=/dev/dri/by-path/pci-000f:01:00.0-card,target=/dev/dri/card0",
-                    "--device-cgroup-rule=c 226:* rw"):
-            self.assertIn(arg, carveout)
-            self.assertIn(arg, serving_1107)
+        # 1120 allocates display carve-out weights via RM /dev/nvidiactl (--gpus all), not /dev/dri/card0.
+        for command in (plain, carveout):
+            self.assertIn("--gpus", command)
+            self.assertFalse([arg for arg in command if "dri" in arg or "226" in arg])
         serving_1120 = lab.spark.read_cluster("config/cluster.json", "tp3-triangle")
         self.assertEqual(serving_1120["environment"].get("SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"), "1")
         self.assertIn("--gpus=all", serving_1120["container"]["docker_run_args"])

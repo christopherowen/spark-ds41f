@@ -600,18 +600,29 @@ def carveout_weights_enabled(cluster: dict) -> bool:
     return cluster.get("environment", {}).get("SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS", "1") != "0"
 
 
+def drm_carveout_enabled(cluster: dict) -> bool:
+    """True when a legacy profile enables carve-out weights AND mounts /dev/dri/card0.
+
+    Since spark-ds41f-1120 (vLLM patch 0821), display carve-out allocations go
+    directly through NVIDIA RM on /dev/nvidiactl (exposed via --gpus=all) and
+    no longer require /dev/dri/card0 or nvidia-drm dumb buffers.
+    """
+    if not carveout_weights_enabled(cluster):
+        return False
+    args = cluster.get("container", {}).get("docker_run_args", [])
+    return any("/dev/dri/card0" in str(arg) for arg in args)
+
+
 def modeset_problems(node_name: str, facts: dict[str, str],
                      *, carveout_weights: bool = True) -> list[str]:
     """Problems when nvidia-drm does not drive displays (kernel mode setting).
 
     Without it only the firmware framebuffer shows a console, and only for a
     display attached at boot: a monitor or KVM connected later stays dark.
-    nvidia-drm also offers DRM dumb buffers only with mode setting, so a
-    profile that places the embedding and output head in the display carve-out
-    (vLLM patch 0021, SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1) cannot allocate
-    it and the worker refuses to start. When the profile keeps weights in
-    regular memory (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0), modeset=N only
-    affects an attached monitor after boot and is a warning.
+    Legacy pre-1120 profiles that mount /dev/dri/card0 for DRM dumb-buffer
+    carve-out weights also require mode setting and refuse to start without it.
+    On 1120+ (RM /dev/nvidiactl carve-out) or when carve-out weights are off,
+    modeset=N only affects an attached monitor after boot and is a warning.
     """
     value = facts.get("modeset", "")
     if value == "Y":
@@ -629,8 +640,9 @@ def modeset_problems(node_name: str, facts: dict[str, str],
             Warn(
                 f"{node_name}: nvidia-drm modeset is {value}, expected Y "
                 "(a display attached after boot stays dark; serving does not use "
-                "the display carve-out on this profile); run sudo apt purge "
-                "nvidia-drm-options-modeset0 and reboot with the service stopped"
+                "DRM dumb buffers for the display carve-out on this profile); run "
+                "sudo apt purge nvidia-drm-options-modeset0 and reboot with the "
+                "service stopped"
             )
         ]
     return [
@@ -667,16 +679,27 @@ def fbdev_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     ]
 
 
-def drm_card_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+def drm_card_problems(node_name: str, facts: dict[str, str],
+                      *, carveout_weights: bool = True) -> list[str]:
     """Problems when no DRM card belongs to the nvidia driver.
 
-    The display carve-out (vLLM patch 0021) allocates through that card, which
-    the container bind-mounts by its PCI path (Docker device flags split on its colons)
-    (/dev/dri/by-path/pci-000f:01:00.0-card): a node that boots with a display
-    attached registers simpledrm first, so the GPU can be card1 there.
+    Legacy pre-1120 profiles mount that card by its PCI path
+    (/dev/dri/by-path/pci-000f:01:00.0-card) for DRM dumb-buffer carve-out
+    allocations and fail without it. On 1120+ (RM /dev/nvidiactl carve-out) or
+    when carve-out weights are off, a missing nvidia DRM card only affects an
+    attached display and is a warning.
     """
     if facts.get("drm_card"):
         return []
+    if not carveout_weights:
+        return [
+            Warn(
+                f"{node_name}: no DRM card belongs to the nvidia driver "
+                "(an attached display may stay dark; serving does not use "
+                "/dev/dri/card0 on this profile); check that nvidia-drm is loaded "
+                "with modeset=Y (ls -l /dev/dri/by-path)"
+            )
+        ]
     return [
         f"{node_name}: no DRM card belongs to the nvidia driver, so the display "
         "carve-out cannot be allocated; check that nvidia-drm is loaded with "
@@ -1445,7 +1468,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     corrections = []
     name = cluster["container"]["name"]
     kernel_profile = cluster.get("host", {}).get("kernel")
-    carveout = carveout_weights_enabled(cluster)
+    drm_carveout = drm_carveout_enabled(cluster)
     for node in nodes["nodes"]:
         desktop = remote_shell(nodes, node, DESKTOP_QUERY)
         if desktop.returncode == 255:
@@ -1470,9 +1493,9 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         boot = run_ssh(nodes, node, "efibootmgr")
         problems.extend(boot_order_problems(node["name"], boot.stdout))
         facts = host_facts(remote_shell(nodes, node, HOST_FACTS_QUERY).stdout)
-        problems.extend(modeset_problems(node["name"], facts, carveout_weights=carveout))
+        problems.extend(modeset_problems(node["name"], facts, carveout_weights=drm_carveout))
         problems.extend(fbdev_problems(node["name"], facts))
-        problems.extend(drm_card_problems(node["name"], facts))
+        problems.extend(drm_card_problems(node["name"], facts, carveout_weights=drm_carveout))
         problems.extend(drm_master_problems(node["name"], facts))
         problems.extend(console_mode_problems(node["name"], facts))
         problems.extend(splash_problems(node["name"], facts))

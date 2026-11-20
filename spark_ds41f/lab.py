@@ -92,8 +92,6 @@ HOLDER_PREFIX = "spark-lab"
 # The image's source trees (vLLM, B12X) live under its candidate root: /opt/spark-ds41f/candidate
 # from the release after spark-ds41f-1022, /opt/spark3/candidate in the images before it.
 SOURCE_ROOTS = ("/opt/spark-ds41f/candidate", "/opt/spark3/candidate")
-# The GPU's DRM card by PCI path, as the serving container mounts it for the display carve-out.
-DRM_CARD = "/dev/dri/by-path/pci-000f:01:00.0-card"
 DEFAULT_MINUTES = 0  # no time cap: a window ends when its work is done or it is asked for
 HEARTBEAT_MAX_AGE = 900
 # The profile a window restores; main() sets it from --production-config or the open window's hold.
@@ -2624,10 +2622,6 @@ def bundle_command(bundle: Path, candidate: dict, out: Path) -> list[str]:
     command = ["docker", "run", "--rm", "--gpus", "all", "--ipc=host", "--ulimit=core=0"]
     for key, value in sorted(candidate.get("env", {}).items()):
         command += ["-e", f"{key}={value}"]
-    if candidate.get("display_carveout"):
-        # Tests that allocate from the display carve-out get the serving container's DRM access.
-        command += [f"--mount=type=bind,source={DRM_CARD},target=/dev/dri/card0",
-                    "--device-cgroup-rule=c 226:* rw"]
     if candidate.get("io_uring"):
         # Tests of io_uring readers (disk Engram rows) get the serving container's
         # allowance: Docker's default seccomp profile refuses io_uring.

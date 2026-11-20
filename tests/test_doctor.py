@@ -310,13 +310,20 @@ class IdleServicesTest(unittest.TestCase):
 class SeverityTest(unittest.TestCase):
     """Required capabilities are errors; latent or minor findings are warnings."""
 
-    def test_missing_nvidia_card_is_an_error(self) -> None:
+    def test_missing_nvidia_card_is_an_error_for_legacy_drm_and_warn_for_rm(self) -> None:
         self.assertEqual(spark.drm_card_problems("dgx3", facts()), [])
         self.assertEqual(spark.drm_card_problems("dgx3", facts(drm_card="1")), [])
         problems = spark.drm_card_problems("dgx3", facts(drm_card=""))
         self.assertEqual(len(problems), 1)
         self.assertNotIsInstance(problems[0], spark.Warn)
         self.assertIn("display carve-out cannot be allocated", problems[0])
+        warn = spark.drm_card_problems("dgx3", facts(drm_card=""), carveout_weights=False)
+        self.assertEqual(len(warn), 1)
+        self.assertIsInstance(warn[0], spark.Warn)
+        self.assertIn("/dev/dri/card0", warn[0])
+        self.assertFalse(spark.drm_carveout_enabled(spark.read_cluster("config/cluster.json", "tp3-triangle")))
+        self.assertTrue(spark.drm_carveout_enabled(
+            spark.read_cluster("releases/spark-ds41f-1107/cluster.json", "tp3-triangle")))
 
     def test_required_display_pieces_are_errors(self) -> None:
         for problems in (

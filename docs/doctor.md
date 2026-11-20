@@ -82,9 +82,9 @@ revert it.
 | Boot target is `multi-user.target` | warn | the desktop's processes and GPU buffers come out of the model's unified memory | `sudo systemctl set-default multi-user.target` |
 | Display manager is not running | error | same | `sudo systemctl disable --now display-manager.service` |
 | Installed OS is first in the UEFI boot order | warn | a network (PXE) entry first adds about a minute of DHCP timeouts to every boot | the printed `sudo efibootmgr --bootorder …` |
-| `nvidia-drm` kernel mode setting (`modeset=Y`) | error when `SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS` is on; warn when off or unreadable | the display carve-out that holds the embedding and output head needs it (the worker refuses to start without it), and a display attached after boot stays dark | `sudo apt purge nvidia-drm-options-modeset0`, then reboot with the service stopped |
+| `nvidia-drm` kernel mode setting (`modeset=Y`) | error for legacy `/dev/dri/card0` carve-out profiles; warn on `1120+` (RM `/dev/nvidiactl`) or when off/unreadable | a display attached after boot stays dark without it; legacy pre-1120 DRM carve-out profiles also refuse to start without it | `sudo apt purge nvidia-drm-options-modeset0`, then reboot with the service stopped |
 | `nvidia-drm` framebuffer console (`fbdev=Y`) | error (unreadable: warn) | an attached display gets no text console | remove the `fbdev=0` option from `/etc/modprobe.d`, `sudo update-initramfs -u`, reboot |
-| A DRM card belongs to the nvidia driver | error | the display carve-out allocates through it | check that `nvidia-drm` loaded with `modeset=Y` (`ls -l /dev/dri/by-path`) |
+| A DRM card belongs to the nvidia driver | error for legacy `/dev/dri/card0` carve-out profiles; warn on `1120+` (RM `/dev/nvidiactl`) | an attached display stays dark without it; legacy pre-1120 DRM carve-out profiles allocate through it | check that `nvidia-drm` loaded with `modeset=Y` (`ls -l /dev/dri/by-path`) |
 | No process holds DRM master | error (unreadable: warn) | the text console stops drawing while one does | stop or restart that process |
 | Active console is in text mode | warn | an attached display shows nothing | `scripts/host-recovery apply` |
 | Kernel command line has no `splash` | warn | Plymouth leaves the console in graphics mode after boot | `scripts/host-recovery apply`, then reboot with the service stopped |
