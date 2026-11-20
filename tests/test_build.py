@@ -616,6 +616,10 @@ class BuildResourcePolicyTest(unittest.TestCase):
         cluster = spark.read_json("config/cluster.json")
         labels = {f"local.spark-ds41f.{name}.tree": inputs[name]["expected_tree"]
                   for name in spark.build_projects(inputs)}
+        if "cuda_toolkit" in inputs:
+            labels["local.spark-ds41f.cuda.version"] = inputs["cuda_toolkit"]["version"]
+        if "torch" in inputs:
+            labels["local.spark-ds41f.torch.version"] = inputs["torch"]["version"]
         with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
             root = Path(temporary)
             directory = root / "build"
