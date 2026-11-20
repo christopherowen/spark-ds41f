@@ -74,6 +74,8 @@ _ROCE_MAX_COLLECTIVE_BY_SHAPE = {
     "tp3-triangle": "4194304",
     "tp3-switched": "4194304",
     "tp3-triangle-4k": "4194304",
+    "tp2-direct": "4194304",
+    "tp2-switched": "4194304",
 }
 _RENDERED_ENV_KEYS = frozenset((
     "GLOO_SOCKET_IFNAME",
@@ -125,7 +127,7 @@ def _overlay_has_sane_l2_defaults(cluster: dict) -> bool:
 def _expected_wo_band(shape: str | None) -> str | None:
     if not isinstance(shape, str) or not shape:
         return None
-    if shape.startswith("tp3"):
+    if re.match(r"^tp[1-3](?:-|$)", shape):
         return "17-32=12"
     if re.match(r"^tp[4-8](?:-|$)", shape):
         return "17-32=10"
@@ -143,10 +145,14 @@ def _cluster_shape(cluster: dict) -> str | None:
     fabric = cluster.get("fabric", {})
     transport = fabric.get("transport") if isinstance(fabric, dict) else None
     topo = fabric.get("topology") if isinstance(fabric, dict) else None
+    if transport == "local" or tp == 1:
+        return "tp1"
     if topo == "switched" or (isinstance(transport, str) and transport.endswith("-switched")):
         return f"tp{tp}-switched"
     if tp == 4 and transport in ("oneshot-ring4", "nccl-ring"):
         return "tp4-ring"
+    if tp == 2 and transport in ("oneshot-direct", "nccl-direct"):
+        return "tp2-direct"
     if tp == 3 and transport in ("oneshot-direct", "nccl-direct"):
         max_len = topology.argument(cluster, "--max-model-len")
         return "tp3-triangle-4k" if str(max_len) == "262144" else "tp3-triangle"

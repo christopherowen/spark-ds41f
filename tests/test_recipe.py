@@ -411,7 +411,11 @@ class RecipeTest(unittest.TestCase):
         different = {key for key in set(tp3["environment"]) | set(tp4["environment"])
                      if tp3["environment"].get(key) != tp4["environment"].get(key)}
         allowed = {key for key in different if key.startswith("NCCL_")} | {
-            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"}
+            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES",
+            "SPARKNET_ROCE_MAX_COLLECTIVE_BYTES",
+            "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS",
+            "VLLM_DS41_L2_PREFETCH_WO_BANDS",
+        }
         self.assertEqual(different, allowed)
         for name, entry in self.recipe["shapes"].items():
             self.assertTrue(entry.get("notes"), f"shape {name} says why it differs")
@@ -420,26 +424,29 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(recipe.capture_sizes(48), [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48])
         self.assertEqual(recipe.capture_sizes(96)[-6:], [56, 64, 72, 80, 88, 96])
         values = recipe.values(self.recipe, recipe.shape_entry(self.recipe, "tp4-ring"))
-        self.assertEqual(values["max_cudagraph_capture_size"], "96")
-        self.assertEqual(values["long_prefill_token_threshold"], "16288")
+        self.assertEqual(values["max_cudagraph_capture_size"], "192")
+        self.assertEqual(values["long_prefill_token_threshold"], "16192")
         self.assertEqual(values["tensor_parallel_size"], "4")
         self.assertEqual(values["engram_on_disk"], "true")
         self.assertEqual(values["engram_table_memory"], "disk")
 
     def test_engram_on_disk_is_true_for_all_shapes(self):
-        """All shapes explicitly set engram_on_disk to true (--engram-config table_memory="disk"),
-        and an overlay can set engram_on_disk to false for table_memory="device"."""
+        """All shapes explicitly set engram_on_disk (`table_memory="disk"` or `"device"`),
+        and an overlay can toggle engram_on_disk either way."""
         self.assertIs(self.recipe["engram_on_disk"], True)
         expected = {
+            "tp1": True,
+            "tp2-direct": True,
+            "tp2-switched": True,
             "tp3-triangle": True,
             "tp3-switched": True,
             "tp3-triangle-4k": True,
             "tp4-ring": True,
             "tp4-switched": True,
             "tp5-switched": True,
-            "tp6-switched": True,
-            "tp7-switched": True,
-            "tp8-switched": True,
+            "tp6-switched": False,
+            "tp7-switched": False,
+            "tp8-switched": False,
         }
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, on_disk in expected.items():
@@ -463,33 +470,41 @@ class RecipeTest(unittest.TestCase):
 
     def test_ending_the_ladder_at_its_rows_keeps_every_shapes_serve_args(self):
         """The capture ladder ends at streams x (1 + drafts) even when that falls between two of
-        its steps (#434). Every shape's rows were a step already (96 on the ring, 48 on the
-        triangles), so each shape renders exactly what it rendered before."""
+        its steps (#434). Every shape renders its exact stream count, capture mode, and ladder."""
         def previous_ladder(max_size):  # the ladder before #434, which could stop below max_size
             ladder = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, max_size + 1, 8)]
             return [size for size in ladder if size <= max_size]
 
-        triangle = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
-        expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
-                    "tp4-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
-                    "tp5-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
-                    "tp6-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
-                    "tp7-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
-                    "tp8-switched": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
-                    "tp3-triangle": ("8", "48", triangle, "6096"),
-                    "tp3-switched": ("8", "48", triangle, "6096"),
-                    "tp3-triangle-4k": ("8", "48", triangle, "4048")}
+        piecewise_24 = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24]
+        triangle = piecewise_24 + [28, 32, 40, 48]
+        tp4_ladder = triangle + list(range(56, 193, 8))
+        expected = {
+            "tp4-ring": ("32", "192", tp4_ladder, "16192", "FULL_AND_PIECEWISE"),
+            "tp4-switched": ("32", "192", tp4_ladder, "16192", "FULL_AND_PIECEWISE"),
+            "tp5-switched": ("32", "192", tp4_ladder, "32576", "FULL_AND_PIECEWISE"),
+            "tp6-switched": ("32", "192", tp4_ladder, "24384", "FULL_AND_PIECEWISE"),
+            "tp7-switched": ("32", "192", tp4_ladder, "32576", "FULL_AND_PIECEWISE"),
+            "tp8-switched": ("32", "192", tp4_ladder, "32576", "FULL_AND_PIECEWISE"),
+            "tp3-triangle": ("8", "48", triangle, "6096", "FULL_AND_PIECEWISE"),
+            "tp3-switched": ("8", "48", triangle, "6096", "FULL_AND_PIECEWISE"),
+            "tp3-triangle-4k": ("8", "48", triangle, "4048", "FULL_AND_PIECEWISE"),
+            "tp2-direct": ("4", "24", piecewise_24, "4072", "PIECEWISE"),
+            "tp2-switched": ("4", "24", piecewise_24, "4072", "PIECEWISE"),
+            "tp1": ("4", "24", piecewise_24, "4072", "PIECEWISE"),
+        }
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
-        for name, (streams, largest, ladder, threshold) in expected.items():
+        for name, (streams, largest, ladder, threshold, mode) in expected.items():
             resolved = recipe.resolve(self.recipe, name)
             with mock.patch.object(recipe, "capture_sizes", previous_ladder):
                 self.assertEqual(resolved, recipe.resolve(self.recipe, name), name)
             self.assertEqual(argument(resolved, "--max-num-seqs"), streams, name)
             self.assertEqual(argument(resolved, "--max-cudagraph-capture-size"), largest, name)
             self.assertEqual(argument(resolved, "--compilation-config"),
-                             '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],'
+                             f'{{"cudagraph_mode":"{mode}","custom_ops":["all"],'
                              f'"cudagraph_capture_sizes":{json.dumps(ladder, separators=(",", ":"))}}}', name)
             self.assertEqual(argument(resolved, "--long-prefill-token-threshold"), threshold, name)
+            self.assertEqual(argument(resolved, "--distributed-executor-backend"),
+                             "uni" if name == "tp1" else "mp", name)
             self.assertEqual(recipe.capture_problems(resolved), ([], []), name)
 
     def test_a_stream_count_between_ladder_steps_renders_a_consistent_pair(self):
@@ -564,14 +579,15 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(capture_findings(base), [])
 
     def test_each_shape_pins_its_prefill_budget(self):
-        """Each shape's long-prefill budget is its own sweep's answer (a TP3 rank holds a
-        third of the model, so its headroom differs): changing one must not move another.
-        The threshold is the budget less streams x (1 + drafts)."""
-        expected = {"tp4-ring": ("16384", "16288"), "tp4-switched": ("16384", "16288"),
-                    "tp5-switched": ("16384", "16288"), "tp6-switched": ("16384", "16288"),
-                    "tp7-switched": ("16384", "16288"), "tp8-switched": ("16384", "16288"),
+        """Each shape's long-prefill budget is its own sweep's answer: changing one must not move
+        another. The threshold is the budget less streams x (1 + drafts)."""
+        expected = {"tp4-ring": ("16384", "16192"), "tp4-switched": ("16384", "16192"),
+                    "tp5-switched": ("32768", "32576"), "tp6-switched": ("24576", "24384"),
+                    "tp7-switched": ("32768", "32576"), "tp8-switched": ("32768", "32576"),
                     "tp3-triangle": ("6144", "6096"), "tp3-switched": ("6144", "6096"),
-                    "tp3-triangle-4k": ("4096", "4048")}
+                    "tp3-triangle-4k": ("4096", "4048"),
+                    "tp2-direct": ("4096", "4072"), "tp2-switched": ("4096", "4072"),
+                    "tp1": ("4096", "4072")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, budget in expected.items():
             values = recipe.values(self.recipe, recipe.shape_entry(self.recipe, name))
@@ -630,17 +646,23 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (ROOT / "config").glob("cluster*.json")), ["cluster.json"])
 
     def test_all_switched_shapes_use_direct_fabric_profile(self):
-        """Every switched shape (tp3-switched through tp8-switched) uses sparknet's direct /
+        """Every switched shape (tp2-switched through tp8-switched) uses sparknet's direct /
         oneshot-switched profile (8 NCCL channels, 1 MiB NCCL buffers, cuMem off, 4 MiB
         one-shot all-gather cap), strips ring-only controls, and declares the direct profile
-        explicitly on both switched base shapes (tp3-switched and tp4-switched)."""
-        for base_switched in ("tp3-switched", "tp4-switched"):
+        explicitly on the switched base shapes."""
+        self.assertEqual(
+            self.recipe["shapes"]["tp4-switched"].get("environment"),
+            recipe.SWITCHED_DIRECT_ENV,
+            "tp4-switched",
+        )
+        for base_switched in ("tp2-switched", "tp3-switched"):
             self.assertEqual(
                 self.recipe["shapes"][base_switched].get("environment"),
-                recipe.SWITCHED_DIRECT_ENV,
+                {**recipe.SWITCHED_DIRECT_ENV, "SPARKNET_ROCE_MAX_COLLECTIVE_BYTES": "4194304"},
                 base_switched,
             )
         switched_shapes = (
+            "tp2-switched",
             "tp3-switched",
             "tp4-switched",
             "tp5-switched",
@@ -661,15 +683,24 @@ class RecipeTest(unittest.TestCase):
             for key, value in recipe.SWITCHED_DIRECT_ENV.items():
                 self.assertEqual(env[key], value, (name, key))
             for key in recipe.SWITCHED_STRIP_RING_KEYS:
-                self.assertNotIn(key, env, (name, key))
-        # Every switched shape renders the exact same NCCL/sparknet fabric environment;
-        # only SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS differs between TP3 (1) and TP4..8 (0).
+                if name in ("tp2-switched", "tp3-switched") and key == "SPARKNET_ROCE_MAX_COLLECTIVE_BYTES":
+                    self.assertEqual(env[key], "4194304", (name, key))
+                else:
+                    self.assertNotIn(key, env, (name, key))
+        # TP4..8 switched shapes render identical environments; TP3 differs only on carve-out,
+        # WO band, and the 4 MiB collective cap; TP2 further adds the io_uring expert-slot cache.
         tp4_env = resolved_envs["tp4-switched"]
         for name in ("tp5-switched", "tp6-switched", "tp7-switched", "tp8-switched"):
             self.assertEqual(resolved_envs[name], tp4_env, name)
+        tp3_diff = {"SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS", "VLLM_DS41_L2_PREFETCH_WO_BANDS",
+                    "SPARKNET_ROCE_MAX_COLLECTIVE_BYTES"}
         self.assertEqual(
-            {k: v for k, v in resolved_envs["tp3-switched"].items() if k != "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"},
-            {k: v for k, v in tp4_env.items() if k != "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"},
+            {k: v for k, v in resolved_envs["tp3-switched"].items() if k not in tp3_diff},
+            {k: v for k, v in tp4_env.items() if k not in tp3_diff},
+        )
+        self.assertEqual(
+            {k: v for k, v in resolved_envs["tp2-switched"].items() if not k.startswith("VLLM_DS41_EXPERT_")},
+            resolved_envs["tp3-switched"],
         )
         # Mutating tp3-triangle's environment does not move tp3-switched's direct profile.
         mutated = json.loads(json.dumps(self.recipe))

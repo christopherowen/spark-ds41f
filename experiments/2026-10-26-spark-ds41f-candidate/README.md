@@ -5,10 +5,11 @@ series on `next-candidate` (head c579b3fe1). This folder is that candidate: its 
 manifest, lock, arms, image, release tests and the specs that qualify it. It is modelled on
 spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 
-**Released (2026-11-07):** [1107/](1107) is `spark-ds41f-1107` across all eight topologies
-(`tp4-ring`, `tp3-triangle`, and `tp3-switched` through `tp8-switched`; [below](#spark-ds41f-1107-1107),
-[release notes](release-notes.md)). Previously released (2026-10-30): candidate 14 is
-`spark-ds41f-1030` on the ring and triangle ([below](#candidate-14-rc14)).
+**Released (2026-11-20):** [candidate-62/](candidate-62) is `spark-ds41f-1120` across all twelve topologies
+(`tp1`, `tp2-direct`, `tp2-switched`..`tp8-switched`, `tp3-triangle`, `tp3-triangle-4k`, `tp4-ring`;
+[below](#spark-ds41f-1120-candidate-62), [release notes](release-notes.md)). Previously released (2026-11-07):
+[1107/](1107) (`spark-ds41f-1107` across eight topologies) and (2026-10-30) candidate 14 (`spark-ds41f-1030`
+on the ring and triangle; [below](#candidate-14-rc14)).
 
 **Frozen candidates (from 2026-11-10):** each merged base verified on all three testbeds is frozen,
 recorded in `manifests/frozen/`, tagged `candidate-<N>` and published as a GitHub pre-release; the
@@ -1113,3 +1114,25 @@ round 3's verdicts do not carry. Round 4's candidates 59-61 had been prepared on
 - Their folders are in Git at commit `07b2adfe`.
 - The determinism investigation that found `0799` moved out of candidate-58 to
   [../2026-11-10-tp4-ring-determinism/](../2026-11-10-tp4-ring-determinism/README.md).
+
+## spark-ds41f-1120 ([candidate-62/](candidate-62))
+
+Promoted as `spark-ds41f-1120` ([manifests/baselines/2026-11-20-spark-ds41f-1120.json](../../manifests/baselines/2026-11-20-spark-ds41f-1120.json),
+[releases/spark-ds41f-1120/](../../releases/spark-ds41f-1120/)) across all twelve topologies (`tp1`, `tp2-direct`,
+`tp2-switched`..`tp8-switched`, `tp3-triangle`, `tp3-triangle-4k`, `tp4-ring`).
+
+- **Source & Image:** [candidate-62/vllm/series](candidate-62/vllm/series) (`702` active patches through `0829`,
+  `patch_head` `9b251a18`, `expected_tree` `8fc99ca7`, `patchset_sha256` `800e726d`), TileLang `0001..0014` (`741806c7`),
+  `sparknet` `0001..0003` (`e06f6a06`), and hash-locked CUDA `13.5.37` with B12X retired (`0802`). Image
+  `spark-ds41f:1120` (`built_as` `spark-ds41f:candidate-62`,
+  `sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08`), identical across all 12 nodes
+  (`dgx1..dgx4` and `sp1..sp8`).
+- **Release Gate Tests & `dgx` Checks:** `12,023 passed, 356 skipped, 0 failed` across `169` files in
+  [bundles/release-tests](candidate-62/bundles/release-tests) (including `106` parser tests across
+  `test_deepseek_v41.py` and `test_deepseek_v41_structural_closers.py`), plus 2-boot `candidate-62` startup memory,
+  wide determinism, greedy identity, and live smoke checks on `tp3-triangle` (`dgx1..dgx3`) and `tp1` (`dgx4`).
+- **Benchmark Carry-Over:** Per the `rc12 -> rc14` precedent (`VLLM_DS41_LSA` unset by default, `jit_new_files = 0`),
+  carries forward the 2-boot `candidate-61` / `candidate-61-r2` Sonar suites (`tp4-ring`, `tp3-triangle`,
+  `tp3-switched`, `tp4-switched`, `tp8-switched` with `-single-stream` and `-sampled`) and 12-shape `bin/spark bench`
+  references (`manifests/benchmarks/2026-11-20-spark-ds41f-1120-*.json`).
+- **Full details:** see [candidate-62/README.md](candidate-62/README.md) and [release-notes.md](release-notes.md).

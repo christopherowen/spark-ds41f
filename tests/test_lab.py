@@ -1220,11 +1220,16 @@ class KernelLabTest(unittest.TestCase):
             plain = lab.bundle_command(bundle, self.CANDIDATE, bundle / "out")
             carveout = lab.bundle_command(bundle, dict(self.CANDIDATE, display_carveout=True), bundle / "out")
         self.assertFalse([arg for arg in plain if "dri" in arg or "226" in arg])
-        serving = lab.spark.read_cluster("config/cluster.json", "tp3-triangle")["container"]["docker_run_args"]
+        # The legacy DRM carve-out path matches releases/spark-ds41f-1107; 1120 uses RM nvidiactl scanout via --gpus=all.
+        serving_1107 = lab.spark.read_cluster("releases/spark-ds41f-1107/cluster.json", "tp3-triangle")["container"]["docker_run_args"]
         for arg in ("--mount=type=bind,source=/dev/dri/by-path/pci-000f:01:00.0-card,target=/dev/dri/card0",
                     "--device-cgroup-rule=c 226:* rw"):
             self.assertIn(arg, carveout)
-            self.assertIn(arg, serving)
+            self.assertIn(arg, serving_1107)
+        serving_1120 = lab.spark.read_cluster("config/cluster.json", "tp3-triangle")
+        self.assertEqual(serving_1120["environment"].get("SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"), "1")
+        self.assertIn("--gpus=all", serving_1120["container"]["docker_run_args"])
+        self.assertFalse([arg for arg in serving_1120["container"]["docker_run_args"] if "dri" in arg or "226" in arg])
 
     def test_io_uring_bundles_get_the_serving_io_uring_allowance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

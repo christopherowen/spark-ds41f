@@ -55,8 +55,8 @@ GLP_KEYS = ("served_model_name", "repo", "revision", "file", "sha256")
 SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes",
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
-SHAPE_KEYS = {"extends", "nodes", "nodes_config", "fabric", "sizing", "environment", "host",
-              "engram_on_disk", "benchmark_reference", "notes"}
+SHAPE_KEYS = {"extends", "nodes", "nodes_config", "fabric", "sizing", "cudagraph_mode",
+              "speculative", "environment", "host", "engram_on_disk", "benchmark_reference", "notes"}
 SWITCHED_STRIP_RING_KEYS = (
     "NCCL_SWITCHLESS_BIDIRECTIONAL", "NCCL_MIN_TRAFFIC_PER_CHANNEL",
     "NCCL_THREAD_THRESHOLDS", "NCCL_ALGO", "NCCL_MIN_NCHANNELS",
@@ -65,6 +65,14 @@ SWITCHED_STRIP_RING_KEYS = (
     "NCCL_COLLNET_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "NCCL_GIN_ENABLE",
     "NCCL_IB_SUBNET_PREFIX_LEN", "NCCL_MNNVL_ENABLE", "NCCL_PAT_ENABLE",
     "NCCL_RMA_DISABLE", "NCCL_RUNTIME_CONNECT",
+    "SPARKNET_ROCE_MAX_COLLECTIVE_BYTES",
+)
+# One-shot RoCE keys irrelevant to single-node local serving.
+LOCAL_STRIP_FABRIC_KEYS = (
+    "SPARKNET_ROCE_ALLREDUCE_CAPACITY_BYTES",
+    "SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES",
+    "SPARKNET_ROCE_PROXY_CPU",
+    "SPARKNET_ROCE_TIMEOUT_MS",
 )
 # sparknet's direct / oneshot-switched fabric settings (replacing tp4-ring's 4-channel ring values).
 SWITCHED_DIRECT_ENV = {
@@ -313,6 +321,27 @@ def _with_engram_on_disk(cluster: dict, on_disk: bool) -> None:
     cluster["serve_args"] = args
 
 
+def _with_speculative(cluster: dict, shape: dict) -> None:
+    """Apply per-shape ``--speculative-config`` overrides (None removes a key)."""
+    overrides = shape.get("speculative")
+    if not overrides:
+        return
+    if not isinstance(overrides, dict):
+        raise SystemExit("shape.speculative must be an object")
+    args = list(cluster["serve_args"])
+    if "--speculative-config" in args:
+        at = args.index("--speculative-config") + 1
+        if at < len(args):
+            speculative = json.loads(args[at])
+            for key, value in overrides.items():
+                if value is None:
+                    speculative.pop(key, None)
+                else:
+                    speculative[key] = value
+            args[at] = json.dumps(speculative, separators=(",", ":"))
+    cluster["serve_args"] = args
+
+
 def values(recipe: dict, shape: dict) -> dict[str, str]:
     """The placeholders of ``serve_args`` for one shape."""
     sizing = shape["sizing"]
@@ -322,11 +351,14 @@ def values(recipe: dict, shape: dict) -> dict[str, str]:
     nodes, drafts = int(shape["nodes"]), int(recipe["drafts"])
     rows = int(sizing["max_num_seqs"]) * (1 + drafts)
     on_disk = engram_on_disk(recipe, shape)
+    transport = shape["fabric"].get("transport") if isinstance(shape.get("fabric"), dict) else None
     derived = {
         "tensor_parallel_size": nodes,
         "max_cudagraph_capture_size": rows,
         "cudagraph_capture_sizes": json.dumps(capture_sizes(rows), separators=(",", ":")),
+        "cudagraph_mode": shape.get("cudagraph_mode", "FULL_AND_PIECEWISE"),
         "long_prefill_token_threshold": int(sizing["max_num_batched_tokens"]) - rows,
+        "distributed_executor_backend": "uni" if transport == "local" else "mp",
         "drafts": drafts,
         "engram_on_disk": str(on_disk).lower(),
         "engram_table_memory": "disk" if on_disk else "device",
@@ -347,11 +379,20 @@ def resolve(recipe: dict, name: str) -> dict:
     except KeyError as error:
         raise SystemExit(f"serve_args names ${{{error.args[0]}}}, which no shape value defines") from error
     _with_engram_on_disk(cluster, engram_on_disk(recipe, shape))
+    _with_speculative(cluster, shape)
     cluster["environment"] = {**recipe["environment"], **shape.get("environment", {})}
     overlap = set(recipe["environment"]) & set(shape.get("environment", {}))
     if overlap:
         raise SystemExit(f"shape {name} repeats shared environment {', '.join(sorted(overlap))}")
     cluster["fabric"] = shape["fabric"]
+    if isinstance(shape.get("fabric"), dict) and shape["fabric"].get("transport") == "local":
+        docker_args = cluster.get("container", {}).get("docker_run_args")
+        if isinstance(docker_args, list):
+            cluster["container"]["docker_run_args"] = [
+                arg for arg in docker_args if arg != "--device=/dev/infiniband:/dev/infiniband:rwm"
+            ]
+        for key in LOCAL_STRIP_FABRIC_KEYS:
+            cluster["environment"].pop(key, None)
     cluster["host"] = _merge(recipe["host"], shape.get("host", {}))
     if "nodes_config" in shape:
         cluster["nodes_config"] = shape["nodes_config"]

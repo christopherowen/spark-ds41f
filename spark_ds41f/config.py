@@ -71,8 +71,10 @@ def cluster_config_path(args: argparse.Namespace | None = None) -> tuple[Path, s
 NODES_FILE = "config/nodes.json"
 NODE_MAP_EXAMPLES = {
     NODES_FILE: "config/nodes.example.json",
+    "config/nodes-direct2.local.json": "config/examples/nodes-direct2.json",
     "config/nodes-ring4.local.json": "config/examples/nodes-ring4.json",
     "config/nodes-switched.local.json": "config/examples/nodes-switched.json",
+    "config/nodes-switched2.local.json": "config/examples/nodes-switched2.json",
     "config/nodes-switched3.local.json": "config/examples/nodes-switched3.json",
     "config/nodes-switched5.local.json": "config/examples/nodes-switched5.json",
     "config/nodes-switched6.local.json": "config/examples/nodes-switched6.json",

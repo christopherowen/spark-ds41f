@@ -867,13 +867,15 @@ __MANIFEST_DATA__
     SHAPES.forEach(s => { const k = s.fabric + s.nodes; if (!DIAGRAM[k]) DIAGRAM[k] = s; });
     const counts = f => SHAPES.filter(s => s.fabric === f).map(s => s.nodes).filter((n, i, a) => a.indexOf(n) === i).sort((a, b) => a - b);
     const HOW = {
+      "local": "single-node, no interconnect",
       "oneshot-ring4": "each Spark cabled to its two neighbours",
       "oneshot-direct": "every Spark cabled to both of the others",
       "oneshot-switched": "one cable each, into a switch"
     };
 
     function geometry(fabric, n, cx, cy, R) {
-      const off = fabric === "switched" || n % 2 ? -90 : -90 - 180 / n;
+      if (n === 1) return { pts: [[cx, cy]], edges: [] };
+      const off = (fabric === "switched" && n !== 2) || n % 2 ? -90 : -90 - 180 / n;
       const pts = [];
       for (let i = 0; i < n; i++) {
         const a = (off + i * 360 / n) * Math.PI / 180;
@@ -881,6 +883,7 @@ __MANIFEST_DATA__
       }
       let edges;
       if (fabric === "switched") edges = pts.map(p => `M${p[0]},${p[1]} L${cx},${cy}`);
+      else if (n === 2) edges = [`M${pts[0][0]},${pts[0][1]} L${pts[1][0]},${pts[1][1]}`];
       else if (n === 3) edges = pts.map((p, i) => `M${p[0]},${p[1]} L${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
       else edges = pts.map((p, i) => `M${p[0]},${p[1]} A${R},${R} 0 0 1 ${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
       return { pts, edges };
@@ -916,7 +919,7 @@ __MANIFEST_DATA__
       }
       if (fabric === "switched") {
         out += `<g class="hub"><rect x="${cx - 37}" y="${cy - 17}" width="74" height="34" rx="17"/><text x="${cx}" y="${cy + 4}">switch*</text></g>`;
-      } else {
+      } else if (n > 2) {
         out += `<circle class="hub-ghost" cx="${cx}" cy="${cy}" r="34"/><text class="hub-label" x="${cx}" y="${cy + 4}">no switch</text>`;
       }
       // A Spark, drawn as its own low slab: plain lid and flank, a foam front with a grip at each end.
@@ -966,7 +969,10 @@ __MANIFEST_DATA__
         `<button type="button" data-n="${n}" aria-pressed="${n === state.nodes}">${n}</button>`).join("");
       drawFabric();
       $("#fabric-name").textContent = s.name;
-      $("#fabric-how").textContent = `${cap(word(s.nodes))} Sparks, ${HOW[s.transport] || s.transport}`;
+      const how = s.transport === "oneshot-direct" && s.nodes === 2
+        ? "cabled directly to each other"
+        : (HOW[s.transport] || s.transport);
+      $("#fabric-how").textContent = `${cap(word(s.nodes))} ${s.nodes === 1 ? "Spark" : "Sparks"}, ${how}`;
 
       const kv = s.kv_capacity;
       tween($("#t-ctx"), s.max_model_len, int);
@@ -974,7 +980,7 @@ __MANIFEST_DATA__
       tween($("#t-seq"), s.max_num_seqs, int);
       $("#t-seq-d").textContent = `at once, ${int(kv.every_sequence_tokens)} tokens each with every seat full`;
       tween($("#t-kv"), kv.vllm_capacity_tokens / 1e6, v => v.toFixed(1) + "M");
-      $("#t-kv-d").textContent = `tokens of KV kept warm: ${word(kv.full_contexts)} full contexts`;
+      $("#t-kv-d").textContent = `tokens of KV kept warm: ${word(kv.full_contexts)} full context${kv.full_contexts === 1 ? "" : "s"}`;
 
       const suite = suiteFor(s);
       const tiles = $("#perf-tiles"), none = $("#perf-none");
@@ -1223,15 +1229,16 @@ __MANIFEST_DATA__
     candSel.addEventListener("change", drawNumbers);
 
     /* ---------- shapes table ---------- */
+    const shapeKind = s => s.nodes === 1 ? "local" : s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : s.nodes === 2 ? "direct" : "ring";
     $("#shape-rows").innerHTML = SHAPES.map(s => {
       const kv = s.kv_capacity, m = s.memory;
       return `<tr>
         <td>${glyph(s.fabric, s.nodes)}</td>
         <td class="lead nw"><code>${esc(s.name)}</code>${s.default ? '<span class="pill">default</span>' : ""}</td>
-        <td class="nw">${cap(word(s.nodes))} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}${s.page_size_bytes < 65536 ? " · stock 4 KiB kernel" : ""}</td>
+        <td class="nw">${cap(word(s.nodes))} ${s.nodes === 1 ? "Spark" : "Sparks"}, ${shapeKind(s)}${s.page_size_bytes < 65536 ? " · stock 4 KiB kernel" : ""}</td>
         <td class="n">${int(s.max_model_len)}</td>
         <td class="n">${s.max_num_seqs}</td>
-        <td class="n">${kv.full_contexts} full contexts</td>
+        <td class="n">${kv.full_contexts} full context${kv.full_contexts === 1 ? "" : "s"}</td>
         <td class="n">${m ? m.head_min_available_gib.toFixed(1) + " GiB" : "–"}</td>
         <td>${s.qualified_release ? esc(shortRel(s.qualified_release)) : '<span class="flat">not yet</span>'}</td>
       </tr>`;
@@ -1281,7 +1288,7 @@ __MANIFEST_DATA__
     if (CARD) {
       const s = SHAPES.find(x => x.name === DATA.default_shape) || SHAPES[0], suite = suiteFor(s);
       const top = suite && suite.runs.c16 ? 16 : 8, run = suite && suite.runs["c" + top];
-      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}`;
+      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} ${s.nodes === 1 ? "Spark" : "Sparks"}, ${shapeKind(s)}`;
       $("#og-ctx").textContent = s.max_model_len >= 1e6 ? Math.floor(s.max_model_len / 1e6) + "M" : Math.round(s.max_model_len / 1024) + "K";
       $("#og-seq").textContent = s.max_num_seqs;
       // One stream splits into prose and code when the run's request table allows it; sixteen streams

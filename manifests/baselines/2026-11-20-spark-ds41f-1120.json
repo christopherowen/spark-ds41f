@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "status": "promoted-baseline",
+  "captured_at": "20261120T114500Z",
+  "container_name": "spark-ds41f",
+  "shape": "tp4-ring",
+  "image_tag": "spark-ds41f:1120",
+  "image_id": "sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08",
+  "nodes": {
+    "dgx1": {
+      "image_id": "sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08",
+      "role": "api-head-rank-0"
+    },
+    "dgx2": {
+      "image_id": "sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08",
+      "role": "headless-rank-1"
+    },
+    "dgx3": {
+      "image_id": "sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08",
+      "role": "headless-rank-2"
+    },
+    "dgx4": {
+      "image_id": "sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08",
+      "role": "headless-rank-3"
+    }
+  },
+  "source_identity": {
+    "vllm_repository": "https://github.com/local-inference-lab/vllm",
+    "vllm_ref": "integration/karmic-kraken-beta",
+    "vllm_revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
+    "vllm_patch_head": "9b251a1860e7e9e123aaf718d15f499a2beb6738",
+    "vllm_tree": "8fc99ca7546c5c538f0fe64e7c82954f1d2d7ae0",
+    "nccl_repository": "https://github.com/NVIDIA/nccl",
+    "nccl_ref": "refs/tags/v2.30.7-1",
+    "nccl_revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "nccl_patch_head": "eeacf1c6343f0499e4e7ab20ec7eecfb6f62eda6",
+    "nccl_tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+    "runtime_base_image": "docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
+    "cuda_toolkit_version": "13.5.37",
+    "cuda_toolkit_lockfile": "requirements/cuda-13-5-sbsa.txt",
+    "image_build_deployment_commit": "fbff20b837f4b62dee7fb9935eea9329bbdc1492",
+    "model_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "image_build_recipe": "bin/spark build (docker/Dockerfile, runtime-tilelang-sparknet stage, CUDA 13.5.37)",
+    "tilelang_repository": "https://github.com/tile-ai/tilelang",
+    "tilelang_ref": "main",
+    "tilelang_revision": "2123e412ce2217b324c50c4ec967213906456ac5",
+    "tilelang_patch_head": "444b0447a201e24982099abfd10f67fd8b6104df",
+    "tilelang_tree": "741806c7357102130a149cdcae2a5f22678eab67",
+    "tilelang_version": "0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464",
+    "tile_kernels_repository": "https://github.com/deepseek-ai/TileKernels",
+    "tile_kernels_ref": "main",
+    "tile_kernels_revision": "66258df6175d2f630ffecb04c5ab66bff8a2ae6a",
+    "tile_kernels_patch_head": "edfa64d018bc64006fcb07c95c32fa196363c0ae",
+    "tile_kernels_tree": "cb2fa41c8af290204c81c547ed678ebf957cca53",
+    "tile_kernels_version": "2.0.0",
+    "sparknet_repository": "https://github.com/christopherowen/dgx-spark-networking",
+    "sparknet_ref": "refs/heads/main",
+    "sparknet_revision": "1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
+    "sparknet_patch_head": "1fdf8dc72bf92e21ca5813ad8f0b63c52af3ad9e",
+    "sparknet_tree": "e06f6a0675cb66638231d2c68948a2b315b69b07",
+    "sparknet_version": "0.5.0",
+    "model_repository": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+  },
+  "runtime_choices": {
+    "kernel_backend": "tilelang: TileLang is the only kernel family and B12X is retired from the image (vLLM 0802, #1096); every serving kernel is TileLang except NCCL and rare-path ATen copies, with VLLM_PLUGINS empty",
+    "speculative": "DSpark, 5 tokens, draft TP equal to node count (TP 1..8), greedy drafting with block verification; adaptive verification enabled on TP3..TP8 with margin confidence head and persistent grid-40 Markov refinement (0814, 0819-0820), fixed linear row cost 0.035 on TP4..8 and calibrated piecewise curve on TP3 (0.049 base, 1.55 single-req scale, 0.75 high-row scale, knee 24, 0.78 wide scale), and adaptive verification off on TP1/TP2",
+    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-192 (32 seats, ladder to 192 rows) on tp4-ring and tp4..8-switched; 1-48 (8 seats) on tp3-*; PIECEWISE 1-24 (4 seats) on tp2-* and tp1",
+    "max_num_batched_tokens": "16384 on tp4-ring and tp4-switched; 24576 on tp6-switched; 32768 on tp5/tp7/tp8-switched; 6144 on tp3-triangle and tp3-switched; 4096 on tp3-triangle-4k, tp2-direct, tp2-switched, and tp1",
+    "memguards_gib": {
+      "startup": 5,
+      "steady": 3
+    },
+    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune); CUDA 13.5.37 toolkit and compat driver",
+    "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
+    "engram_rows": "Clock-Pro shielded direct native reader (vLLM 0145-0154, 0787, 0815) with disk tables on TP1..TP5 and device-resident tables on tp6..tp8-switched",
+    "compile_cache": "/cache/spark-ds41f/jit/vllm",
+    "multimodal": "row-parallel TileLang vision tower with multi-image packing and fast multimodal prefix caching (0812); frozen release recipe qualified at 16 images per request (--limit-mm-per-prompt '{\"image\":16}'); production runtime default updated to 67 images alongside --enable-per-request-metrics",
+    "host_sysctl": "vm.watermark_boost_factor=0 on every node",
+    "l2_prefetch": "on: side-stream per-type L2 prefetch schedule (VLLM_L2_PREFETCH_KERNELS=tilelang, 12/12/15 MB budgets, band override 17-32=10 on TP4..8 and 17-32=12 on TP1..TP3) with MoE down PDL preload (0822)",
+    "nccl": "2.30.7 rebuilt with patches/nccl; TP3 triangle runs 6-channel bidirectional 8 MiB Ring",
+    "chat_template_defaults": "none: thinking is the default when a request names neither key; token-provenance DSML and streaming parser holdback fixes (0768, 0824, 0829)",
+    "prefill": "sequence-parallel above one-shot RoCE all-reduce; 64k chunked globaltimer-paced L2 prefetch (0781), sliced SP Engram row exchange pipeline (0779), SP routing mask cache (0780), and SP stream-lifetime hardening (0816)",
+    "host": "L3-aware RoCE proxy worker placement, UMA buddy sponge retained across post-load (0800-0801), direct O_DIRECT external DMA-BUF acceptance (0804), and tokenizer/detokenizer fast path (0811)",
+    "cutlass_dsl": "4.7.1 (with CUDA 13.5.37 hash-locked deb layer)",
+    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB), TileLang cache (including device-compiler cache key, TileLang 0014), and Triton cache on /cache",
+    "jit_warmup": "trimmed cold-boot kernel preparation before memory profiling with TileLang cache frozen (--jit-monitor-mode off)",
+    "display_carveout": "off on tp4-ring, tp4..8-switched, and tp1 (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0); RM scanout carve-out via nvidiactl on tp3-* and tp2-* (=1; 0821)",
+    "indexer_split": "under SP prefill; hardware e2m1x2 indexer/mxfp4 quantize (0777) and fused sink/sparse-MLA indexer front tuning (0808, 0813, 0817)",
+    "lsa": "FP8 group-32 dominance upgrade available via VLLM_DS41_LSA=1 (0828), off by default across every cluster shape",
+    "host_memory": "64 KiB pages on 11 shapes (memory-saver DKMS 0.4.1) and 4 KiB pages without memory-saver on tp3-triangle-4k (256K ctx, 2.20 GiB KV); UMA buddy sponge (0800) and inter-phase heap flush (0761)",
+    "vocabulary_head": "exact 12-bit packed BF16 (VLLM_DS41_PACKED_BF16_LM_HEAD=1) with FP32 logits (VLLM_DS41_HEAD_DTYPE=float32) and grid-40 persistent refine (0819)",
+    "collective_policy": "sparknet 0.5.0 (`e06f6a06`, 3 patches: big-core RoCE proxy, pipelined single-kernel multi-stage RoCE collectives, and PDL collective chaining); oneshot-ring4, oneshot-direct, oneshot-switched, or local uni (`tp1`)",
+    "expert_slot_cache": "zero-copy io_uring expert slot cache on TP1 (96/48 slots) and TP2 (240/64 slots, prefill protect 24 rows, /cache/ds41_expert_slots; 0822)",
+    "structured_output_and_api": "544/272-row structured-output bitmask sizing (0823), SSE keep-alive per-wait callback binding (0825), CustomTool and OpenResponses API normalization (0826), and hf_to_vllm_mapper quant ignored_layers rename (0827)",
+    "glp_steering": "served under deepseek-v4.1-flash-weightless using GLP Spec v3 folded into hc_fold_pre_engram (0805); stock deepseek-v4.1-flash beside it is bit-identical"
+  },
+  "capacity": {
+    "tp4-ring": {
+      "kv_cache_tokens": 18711942,
+      "max_model_len": 1048576,
+      "max_num_seqs": 32,
+      "reported_full_context_concurrency": 17.85,
+      "kv_cache_memory_bytes": 17716740096,
+      "note": "16.50 GiB KV pool per rank (17 full 1M contexts, 17.85x; up to 579,840 tokens on all 32 sequences)"
+    },
+    "tp4-switched": {
+      "kv_cache_tokens": 18711942,
+      "max_model_len": 1048576,
+      "max_num_seqs": 32,
+      "reported_full_context_concurrency": 17.85,
+      "kv_cache_memory_bytes": 17716740096,
+      "note": "16.50 GiB KV pool per rank (17 full 1M contexts, 17.85x)"
+    },
+    "tp5-switched": {
+      "kv_cache_tokens": 26687154,
+      "max_model_len": 1048576,
+      "max_num_seqs": 32,
+      "reported_full_context_concurrency": 25.45,
+      "kv_cache_memory_bytes": 25769803776,
+      "note": "24.00 GiB KV pool per rank (25 full 1M contexts, 25.45x; disk Engram)"
+    },
+    "tp6-switched": {
+      "kv_cache_tokens": 14050600,
+      "max_model_len": 1048576,
+      "max_num_seqs": 32,
+      "reported_full_context_concurrency": 13.40,
+      "kv_cache_memory_bytes": 13958643712,
+      "note": "13.00 GiB KV pool per rank (13 full 1M contexts, 13.40x; device Engram, sized from 14 GiB for 192-row CG margin)"
+    },
+    "tp7-switched": {
+      "kv_cache_tokens": 17143479,
+      "max_model_len": 1048576,
+      "max_num_seqs": 32,
+      "reported_full_context_concurrency": 16.35,
+      "kv_cache_memory_bytes": 17179869184,
+      "note": "16.00 GiB KV pool per rank (16 full 1M contexts, 16.35x; device Engram)"
+    },
+    "tp8-switched": {
+      "kv_cache_tokens": 28476609,
+      "max_model_len": 1048576,
+      "max_num_seqs": 32,
+      "reported_full_context_concurrency": 27.16,
+      "kv_cache_memory_bytes": 27380416512,
+      "note": "25.50 GiB KV pool per rank (27 full 1M contexts, 27.16x; device Engram, trimmed from 26.0 GiB for 192-row CG margin)"
+    },
+    "tp3-triangle": {
+      "kv_cache_tokens": 5488353,
+      "max_model_len": 1048576,
+      "max_num_seqs": 8,
+      "reported_full_context_concurrency": 5.23,
+      "kv_cache_memory_bytes": 5268045824,
+      "note": "4.90625 GiB KV pool per rank (5 full 1M contexts, 5.23x)"
+    },
+    "tp3-switched": {
+      "kv_cache_tokens": 5488353,
+      "max_model_len": 1048576,
+      "max_num_seqs": 8,
+      "reported_full_context_concurrency": 5.23,
+      "kv_cache_memory_bytes": 5268045824,
+      "note": "4.90625 GiB KV pool per rank (5 full 1M contexts, 5.23x)"
+    },
+    "tp3-triangle-4k": {
+      "kv_cache_tokens": 2304107,
+      "max_model_len": 262144,
+      "max_num_seqs": 8,
+      "reported_full_context_concurrency": 8.79,
+      "kv_cache_memory_bytes": 2362232012,
+      "note": "2.20 GiB KV pool per rank (8 full 256K contexts, 8.79x; stock 4 KiB pages without memory-saver)"
+    },
+    "tp2-direct": {
+      "kv_cache_tokens": 8999170,
+      "max_model_len": 262144,
+      "max_num_seqs": 4,
+      "reported_full_context_concurrency": 34.33,
+      "kv_cache_memory_bytes": 8589934592,
+      "note": "8.00 GiB KV pool per rank (34 full 256K contexts, 34.33x; direct CX-7 links, io_uring expert slot cache)"
+    },
+    "tp2-switched": {
+      "kv_cache_tokens": 8999170,
+      "max_model_len": 262144,
+      "max_num_seqs": 4,
+      "reported_full_context_concurrency": 34.33,
+      "kv_cache_memory_bytes": 8589934592,
+      "note": "8.00 GiB KV pool per rank (34 full 256K contexts, 34.33x; switched fabric, io_uring expert slot cache)"
+    },
+    "tp1": {
+      "kv_cache_tokens": 8999170,
+      "max_model_len": 262144,
+      "max_num_seqs": 4,
+      "reported_full_context_concurrency": 34.33,
+      "kv_cache_memory_bytes": 8589934592,
+      "note": "8.00 GiB KV pool on single node (34 full 256K contexts, 34.33x; local uni executor, io_uring expert slot cache)"
+    },
+    "note": "qualified across all 12 topologies (TP1..TP8, 64 KiB and 4 KiB)"
+  },
+  "change_from_previous": "spark-ds41f-1107 plus vLLM 0762-0829 (702 active vLLM patches), TileLang 0014 (device-compiler cache key), SparkNet 0001-0003 (big-core RoCE proxy, pipelined multi-stage collectives, PDL collective chaining), and CUDA 13.5.37 (#974): full B12X retirement (#1096, 0802); 32-stream concurrency and 1-192 CUDA graph capture across TP4..TP8 with expanded KV pools (13.00-25.50 GiB/rank); single-node tp1, tp2-direct, tp2-switched (with zero-copy io_uring expert slot cache, 0822), and 4 KiB-page tp3-triangle-4k shapes; RM nvidiactl display carve-out on TP2/TP3 (#1225, 0821); UMA buddy sponge across post-load (0800); hardware e2m1x2 indexer quantize (0777), 64K globaltimer-paced L2 prefetch (0781), sliced SP Engram row exchange (0779), MoE combine shared-row post-PDL race fix (0799), Clock-Pro Engram shield (0815), grid-40 persistent vocab refine (0819), DSpark margin confidence head and piecewise TP3 curve (0820), MoE down PDL preload (0822), GLP Spec v3 native fold (0805), strictly default-off FP8 group-32 LSA upgrade (0828), and Python/API/parser fixes 0823-0827/0829",
+  "evidence": {
+    "experiments": [
+      "experiments/2026-10-26-spark-ds41f-candidate/",
+      "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/",
+      "experiments/2026-11-16-c61-decode/"
+    ],
+    "summary": "Qualified across all 12 hardware shapes (`tp4-ring`, `tp3-triangle`, `tp3-triangle-4k`, `tp2-direct`, `tp2-switched` through `tp8-switched`, and `tp1`) per the rc12->rc14 carry-over precedent (vLLM 0823-0829 keep VLLM_DS41_LSA unset by default with jit_new_files=0 and identical kernels/weights). In-image release-tests gate (`candidate-62`): 12,023 passed, 356 skipped, 0 failed across 169 files (including 106 parser tests across test_deepseek_v41.py and test_deepseek_v41_structural_closers.py); 2-boot c62 verification passed on tp3-triangle (`dgx1..dgx3`: min MemAvail 8.27/8.28 GiB head, 10.11..10.34 GiB workers, 0 swap growth; wide determinism 7/7 and greedy 7/7 identical; live smoke issues #1036/#943/#944/#945/#969 pass) and tp1 (`dgx4`: min MemAvail 14.09/14.60 GiB, 0 swap growth; greedy 6/6 identical). Two-boot Sonar comparison against spark-ds41f-1107: on `tp4-ring` (manifests/suites/2026-11-20-spark-ds41f-1120-tp4): decode grid -7.73% (19.36 ms vs 21.05 ms, better); paired c16 +3.07% (output 280.43 tok/s), c8 +2.70% (213.57 tok/s), single-stream c1 +7.30% (89.06 tok/s); sampled c16/c8/c1 +3.23%/+3.01%/+8.61% (276.58/210.02/87.07 tok/s); prefill +12.91%/+16.51%/+21.60%/+31.78%/+56.31% at 32K..1M (9,615/10,109/10,056/9,833/9,397 tok/s, all better); stall-3/11/15 prefill +13.67%/+12.44%/+13.73% (TTFT p50 0.73 s / 1.14 s). On `tp3-triangle` (`...-1120-tp3`): paired c8 +5.99% (170.68 tok/s), c4 +6.26% (131.59 tok/s), single-stream c1 +10.39% (70.36 tok/s), sampled c16/c8/c1 +6.47%/+6.52%/+7.75% (167.22/167.59/68.27 tok/s), prefill +12.17%..+55.69% (7,270/7,502/7,445/7,259/6,922 tok/s); 1x* dummy-padding engine grid shapes higher (25.52 ms vs 21.27 ms, +20.20%) while multi-req shapes improved -3.1%..-12.7%. On `tp3-switched` (`...-1120-tp3-switched`): paired c8 +6.87% (168.92 tok/s), c4 +7.05% (130.01 tok/s), single-stream c1 +12.54% (69.26 tok/s), sampled +6.65%/+6.62%/+10.89% (165.74/165.56/67.36 tok/s), prefill 7,197..6,853 tok/s. On `tp4-switched` (`...-1120-tp4-switched`): grid -9.83% (19.05 ms vs 21.14 ms), paired c16 +6.51% (280.51 tok/s), c8 +6.82% (213.06 tok/s), single-stream c1 +9.39% (88.97 tok/s), sampled +6.64%/+6.68%/+10.90% (276.44/209.60/87.31 tok/s), prefill +12.96%..+56.02% (9,569..9,308 tok/s). On `tp8-switched` (`...-1120-tp8-switched`): grid -9.92% (17.60 ms vs 19.54 ms), paired c16 +6.81% (395.40 tok/s), c8 +7.35% (312.94 tok/s), single-stream c1 +11.74% (129.43 tok/s), sampled +6.53%/+7.21%/+11.19% (387.49/306.80/125.29 tok/s), prefill +5.99%/+9.32%/+12.11%/+18.89%/+34.92% (11,846/12,429/12,383/12,206/11,806 tok/s); stall-3/11/15 prefill +10.25%/+17.17%/+16.39%. All 12 `bin/spark bench` references (`manifests/benchmarks/2026-11-20-spark-ds41f-1120-*.json`) passed 5/5 quality checks, collectives, and the >5.0 GiB startup MemAvailable floor with 0.0 GiB swap growth (tp5..tp7 prefill up to 11,206 tok/s; tp2-direct/tp2-switched 256K context 52.96/53.59 prose-c4 tok/s; tp1 256K 10.94/11.36 tok/s)."
+  },
+  "build": {
+    "image": "spark-ds41f:1120",
+    "image_id": "sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08",
+    "built_utc": "2026-11-19T19:00:06Z",
+    "build_host": "dgx4",
+    "copies": "dgx4 to dgx1..dgx3 and sp1..sp8; the same image ID on every node",
+    "built_as": "spark-ds41f:candidate-62",
+    "note": "built as spark-ds41f:candidate-62 at commit fbff20b837f4b62dee7fb9935eea9329bbdc1492: one image ID across all 12 nodes"
+  },
+  "benchmark_reference": "manifests/suites/2026-11-20-spark-ds41f-1120-tp4",
+  "recipe": "releases/spark-ds41f-1120/cluster.json",
+  "qualified_arms": {
+    "tp4-ring": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp4.json",
+    "tp4-switched": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp4-switched.json",
+    "tp5-switched": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp5-switched.json",
+    "tp6-switched": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp6-switched.json",
+    "tp7-switched": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp7-switched.json",
+    "tp8-switched": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp8-switched.json",
+    "tp3-triangle": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp3.json",
+    "tp3-switched": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp3-switched.json",
+    "tp3-triangle-4k": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp3-triangle-4k.json",
+    "tp2-direct": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp2-direct.json",
+    "tp2-switched": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp2-switched.json",
+    "tp1": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/tp1.json"
+  },
+  "previous_baseline": "2026-11-07-spark-ds41f-1107",
+  "hosts": {
+    "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
+    "kernel": "7.0.0-1019-nvidia-64k with kho=off",
+    "nvidia_driver": "580.178.04",
+    "cuda_toolkit": "13.5.37",
+    "boot_target": "multi-user.target (no desktop)",
+    "sysctl": "vm.watermark_boost_factor=0",
+    "page_size": 65536,
+    "memory_saver": {
+      "package": "dgx-spark-memory-saver",
+      "version": "0.4.1",
+      "repository": "https://github.com/christopherowen/dgx-spark-memory-saver.git"
+    },
+    "secure_boot": "enabled; existing enrolled DGX Fleet key signs the DKMS module",
+    "uvm_leaf_packing": "Y",
+    "boot_default": "7.0.0-1019-nvidia-64k; 7.0.0-1019-nvidia retained",
+    "memory_policy": {
+      "thp": "never",
+      "min_free_kbytes": 45166,
+      "swap": "/swap-64k.img"
+    },
+    "nvme_power": "APST on with 2 s / 60 s idle thresholds (applied 2026-10-16 12:48 UTC)"
+  }
+}

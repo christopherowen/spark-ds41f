@@ -10,7 +10,7 @@
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://switchle.ss/">
   <meta property="og:site_name" content="switchless">
-  <meta property="og:image" content="https://switchle.ss/og.png?v=b1f72442c0">
+  <meta property="og:image" content="https://switchle.ss/og.png?v=009dab4c33">
   <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="2400">
   <meta property="og:image:height" content="1260">
@@ -18,7 +18,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="switchless* · DeepSeek V4.1 Flash on DGX Spark">
   <meta name="twitter:description" content="Native weights, a million tokens of context, correctness first, then speed. No switch required.*">
-  <meta name="twitter:image" content="https://switchle.ss/og.png?v=b1f72442c0">
+  <meta name="twitter:image" content="https://switchle.ss/og.png?v=009dab4c33">
   <meta name="theme-color" content="#0f0d0b">
   <link rel="icon" type="image/png" href="logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -793,8 +793,8 @@ bin/spark --cluster-config config/cluster.json \
 
   <script id="manifest-data" type="application/json">
 {
-  "built_as": "spark-ds41f:1107",
-  "built_utc": "2026-11-07T16:40:25Z",
+  "built_as": "spark-ds41f:candidate-62",
+  "built_utc": "2026-11-19T19:00:06Z",
   "capabilities": [
     "packed-bf16-lm-head",
     "streamed-vocabulary-weights",
@@ -825,7 +825,7 @@ bin/spark --cluster-config config/cluster.json \
     "moe-overlapped-shared-fold",
     "greedy-verification-vocab-shards",
     "mhc-split-while-loading",
-    "moe-combine-early-shared-load",
+    "moe-combine-shared-load-after-wait",
     "vocab-head-token-tiles-fastest",
     "tilelang-named-kernels",
     "tilelang-prefetch-fails-loudly",
@@ -914,7 +914,20 @@ bin/spark --cluster-config config/cluster.json \
     "prebuilt-io-uring-helpers",
     "vision-tower-tp-sharding",
     "ds41-serving-contract",
-    "startup-allocator-heap-flush"
+    "startup-allocator-heap-flush",
+    "tokenizer-fastpath-and-inline-tools",
+    "prefix-cache-block-boundary-retention",
+    "int32-token-ids-ipc",
+    "mm-prefix-cache-fastpath",
+    "engram-clock-pro-shield",
+    "l2-prefetch-unified-defaults",
+    "tilelang-sparse-mla-indexer-front-sp-tune",
+    "decode-wo-contiguous-fp8-pdl-mhc-aux-stream",
+    "vocab-grid40-persistent-refine",
+    "dspark-margin-confidence-head",
+    "rm-nvidiactl-display-carveout",
+    "tp2-io-uring-expert-slot-cache",
+    "moe-down-pdl-preload"
   ],
   "container_name": "spark-ds41f",
   "default_shape": "tp4-ring",
@@ -930,6 +943,7 @@ bin/spark --cluster-config config/cluster.json \
   "hosts": {
     "boot_default": "7.0.0-1019-nvidia-64k; 7.0.0-1019-nvidia retained",
     "boot_target": "multi-user.target (no desktop)",
+    "cuda_toolkit": "13.5.37",
     "kernel": "7.0.0-1019-nvidia-64k with kho=off",
     "memory_policy": {
       "min_free_kbytes": 45166,
@@ -949,94 +963,46 @@ bin/spark --cluster-config config/cluster.json \
     "sysctl": "vm.watermark_boost_factor=0",
     "uvm_leaf_packing": "Y"
   },
-  "image_id": "sha256:3f32a962ce04b7c8d85337cd427a8946b8b6bcaadd97cc8d8a8cd14e8d68a6ce",
-  "image_tag": "spark-ds41f:1107",
+  "image_id": "sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08",
+  "image_tag": "spark-ds41f:1120",
   "kernel_backend": "tilelang",
   "model_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
   "model_revision": "1bae0e10",
-  "promoted_baseline": "2026-11-07-spark-ds41f-1107",
-  "promoted_date": "2026-11-07",
-  "promoted_short": "spark-ds41f-1107",
+  "promoted_baseline": "2026-11-20-spark-ds41f-1120",
+  "promoted_date": "2026-11-20",
+  "promoted_short": "spark-ds41f-1120",
   "runtime_choices": {
-    " uneven_tp_sharding": "TP2..TP8 cross-topology parity with padded uneven shards across attention, MoE, Engram, vision and vocabulary projections (vLLM 0625-0635, 0692-0694)",
-    "batch_invariance": "temperature-0 outputs do not depend on the batch: rank-order FP32 reductions with one rounding, compressor projection one TileLang arithmetic at every row count, aligned prefill chunks, CED local boundary/KV projection, and per-request sparse MLA in mixed steps",
-    "block_scales": "MXFP8 GEMMs load the 32x32 block-scale grid at SFB[row // 32] (vLLM 0537); grouped MoE GEMM coded arrivals (0538)",
-    "block_verification_sampling": "fresh random draws in each verification round (vLLM 0228)",
-    "ced": "compressed-entry row selection in TileLang (vLLM 0229-0255) with fused mHC post-collapse dedup (0648) and local boundary/KV projection (0672-0676)",
-    "chat_encoding": "DeepSeek's 2026-10-16 encoding (vLLM 0178, 0227)",
-    "chat_template_defaults": "none: thinking is the default when a request names neither key, so a client's enable_thinking=false is honored",
-    "checkpoint_copies": "direct O_DIRECT loader with contiguous arena and order-13 sponge (vLLM 0499, 0571-0574)",
-    "collective_policy": "sparknet 0.5.0 (`1fd6a1fbd8dc`, tree `8cc28a5cd3e6`): one-shot RoCE all-reduce restricted to single-slot transfers (<= _slot_bytes, 2 MiB) so large SP prefill chunks use PyNCCL; one-shot all-gather over the ring (`oneshot-ring4`), triangle (`oneshot-direct`), and switched fabric (`oneshot-switched`); GPU-clock timeout 10 s (`SPARKNET_ROCE_TIMEOUT_MS=10000`); proxy thread on a big core (`SPARKNET_ROCE_PROXY_CPU=big`)",
+    "chat_template_defaults": "none: thinking is the default when a request names neither key; token-provenance DSML and streaming parser holdback fixes (0768, 0824, 0829)",
+    "collective_policy": "sparknet 0.5.0 (`e06f6a06`, 3 patches: big-core RoCE proxy, pipelined single-kernel multi-stage RoCE collectives, and PDL collective chaining); oneshot-ring4, oneshot-direct, oneshot-switched, or local uni (`tp1`)",
     "compile_cache": "/cache/spark-ds41f/jit/vllm",
-    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-96 on the ring and TP4..8 switched (16 streams at 1 + 5 rows); 1-48 on the triangle and TP3 switched (8 streams); native-depth verification shapes included in capture and preparation (vLLM 0613-0617); CUDA caching allocator and glibc heap flushed across preparation, profiling, warmup and capture phases (vLLM 0761)",
-    "cutlass_dsl": "4.7.1 for every consumer (vLLM, quack-kernels, B12X via patch 0002, FlashInfer, cuDNN frontend)",
-    "decode_chain_pdl": "programmatic dependent launch along the decode chain (vLLM 0520-0525, 0716-0719, 0725-0728) and attention front in one launch (0543-0544)",
-    "decode_tiles": "block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count, and split-K tiles up to 128 rows for 16-stream steps, TileLang's unspecialized pipeline; selective 12-bit compressor pack12 (vLLM 0695-0698)",
-    "deepseek_api": "DeepSeek API effort aliases, prompt semantics, HTTP disconnect and repeated cancellation handling (vLLM 0539-0540, 0603-0608)",
-    "dense_gemm_stage_release": "not applicable: the TileLang GEMMs' fences are split-K's device-scope fences and multi-warp TMA producer rendezvous (TileLang 0013)",
-    "display_carveout": "off on the ring and TP4..8 switched (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0); on for the triangle and TP3 switched (=1), whose KV budget needs it",
-    "display_carveout_check": "off (SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS unset; patch 0026 debug mode)",
-    "draft_budget": "fixed linear step cost (adaptive_verification_row_cost 0.035, vLLM 0184, 0636) with online IRLS confidence calibration (0637-0641)",
-    "dspark_context_kv": "TileLang block-32 projection with fused KV write (vLLM 0131, 0647)",
-    "engram_debug_timeline": "off (SPARK_DS41F_ENGRAM_TIMELINE)",
-    "engram_host_hash": "host hashes Engram rows of prefill tokens a step early except drafted-prefill requests (vLLM 0567)",
-    "engram_prefill": "under prefill sequence parallelism each rank sends every other rank only that rank's real rows of its Engram wkv column block (vLLM 0150, 0152), and the TileLang gate reads the received blocks in place",
+    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-192 (32 seats, ladder to 192 rows) on tp4-ring and tp4..8-switched; 1-48 (8 seats) on tp3-*; PIECEWISE 1-24 (4 seats) on tp2-* and tp1",
+    "cutlass_dsl": "4.7.1 (with CUDA 13.5.37 hash-locked deb layer)",
+    "display_carveout": "off on tp4-ring, tp4..8-switched, and tp1 (SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0); RM scanout carve-out via nvidiactl on tp3-* and tp2-* (=1; 0821)",
     "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
-    "engram_rows": "one process-wide native reader thread (no Python, no GIL, no CUDA calls) reads both tables' rows in layer order with prebuilt io_uring helpers and multi-CTA packed/cached row gather (vLLM 0145-0154, 0650, 0703-0709)",
-    "expert_scale_codes": "routed experts' UE8M0 weight scales as a per-row base exponent and 4-bit deltas (vLLM 0182-0183), with 2-bit deltas for narrow experts in the same buffer (0563-0564, 0566)",
-    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune): without it the autotuner's dummy runs start; no FlashInfer kernel serves",
-    "four_node_transports": "sparknet's ring4 transport at TP4 switchless and oneshot-switched across TP3..TP8 switched",
-    "generation_controls": "V4.1's tokenizer honours add_generation_prompt and continue_final_message (vLLM 0256), and top-level `thinking` switch (0257)",
-    "glp_steering": "served: requests to deepseek-v4.1-flash-weightless are steered per request with msuiche's published GLP vector for 1017 (vLLM 0541-0542)",
-    "greedy_verification": "an all-greedy verification step whose logits nothing reads reduces each rank's vocabulary shard to a (max, index) pair and applies rejection_sample's greedy rule (vLLM 0112-0114)",
-    "host": "mutating torch custom ops read their argument schema once per call (vLLM patch 0019, vllm/env_override.py), not once per argument",
-    "host_memory": "64 KiB pages; memory-saver DKMS 0.4.1, UVM leaf-table packing enabled; THP never, vm.min_free_kbytes=45166, /swap-64k.img; contiguous direct-loader arena with order-13 sponge (vLLM 0571-0574) and inter-phase allocator/heap flush (vLLM 0761)",
-    "host_sysctl": "vm.watermark_boost_factor=0 on every node (/etc/sysctl.d/90-watermark-boost.conf): a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory guards read",
-    "iket": "available, off by default (VLLM_DS41_IKET unset; vLLM 0546-0562, 0565, 0729-0744)",
-    "indexer_split": "always under sequence-parallel prefill (patch 0025); indexer wq_b RoPE+MXFP4 epilogue fusion and q-cast reuse (vLLM 0642-0644, 0699-0702)",
-    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB limit), the TileLang cache and the Triton cache (the head's load-time packing) on the /cache mount",
-    "jit_warmup": "trimmed cold-boot kernel preparation (vLLM 0156-0172, 0585-0587, TileLang 0004, 0013): before memory profiling each rank compiles every declared TileLang call in one pool and runs TileKernels' warm calls, then freezes TileLang's cache. The JIT monitor is off (--jit-monitor-mode off)",
-    "kernel_backend": "tilelang: TileLang is the only kernel family (vLLM 0493-0496: the B12X family, VLLM_DS41_KERNEL_BACKEND, the ported kernels' Triton originals and B12X remnants go); every kernel serving launches is TileLang except NCCL and a few rare-path ATen copies. B12X 1.3.0 is still in the image for its loader plugin's package, unloaded (VLLM_PLUGINS empty)",
-    "kv_figure": "startup KV figure charges each request its window and the unsettled batches once (vLLM 0491): 11,554,122 tokens (11.02x) at TP4..8; 5,488,353 tokens (5.23x) at TP3",
-    "kv_writes": "no per-allocation KV zeroing (vLLM 0502-0503); global KV fused norm+RoPE+write (0645-0646)",
-    "l2_prefetch": "on: side-stream per-type L2 prefetch schedule of the next decode projections (VLLM_L2_PREFETCH_KERNELS=tilelang; vLLM 0119, 0575-0577); the TileLang scale words ride with each projection's weight (vLLM 0044)",
-    "late_admission": "the async engine decides step N+1 when step N reaches decoder layer 30 (VLLM_LATE_ADMISSION_LAYER=30, vLLM 0222, 0226)",
-    "load_format": "direct (--load-format direct, vLLM 0499); VLLM_PLUGINS is empty",
-    "logprob_token_ids": "speculatively verified tokens carry their custom logprob ids (vLLM 0267)",
-    "long_prefill_token_threshold": 16288,
-    "malloc": "glibc malloc pinned in every process (MALLOC_ARENA_MAX=2, MALLOC_MMAP_THRESHOLD_=1048576)",
-    "max_logprobs": "at most 32; the recipe runs vLLM's default of 20",
-    "max_num_batched_tokens": "16384 on the ring and TP4..8 switched; 6144 on the triangle and TP3 switched (threshold 5984); context-aware prefill chunk step-down at >=256K context and >=1.0s stall decode interleave (vLLM 0581-0584, 0710-0712)",
+    "engram_rows": "Clock-Pro shielded direct native reader (vLLM 0145-0154, 0787, 0815) with disk tables on TP1..TP5 and device-resident tables on tp6..tp8-switched",
+    "expert_slot_cache": "zero-copy io_uring expert slot cache on TP1 (96/48 slots) and TP2 (240/64 slots, prefill protect 24 rows, /cache/ds41_expert_slots; 0822)",
+    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune); CUDA 13.5.37 toolkit and compat driver",
+    "glp_steering": "served under deepseek-v4.1-flash-weightless using GLP Spec v3 folded into hc_fold_pre_engram (0805); stock deepseek-v4.1-flash beside it is bit-identical",
+    "host": "L3-aware RoCE proxy worker placement, UMA buddy sponge retained across post-load (0800-0801), direct O_DIRECT external DMA-BUF acceptance (0804), and tokenizer/detokenizer fast path (0811)",
+    "host_memory": "64 KiB pages on 11 shapes (memory-saver DKMS 0.4.1) and 4 KiB pages without memory-saver on tp3-triangle-4k (256K ctx, 2.20 GiB KV); UMA buddy sponge (0800) and inter-phase heap flush (0761)",
+    "host_sysctl": "vm.watermark_boost_factor=0 on every node",
+    "indexer_split": "under SP prefill; hardware e2m1x2 indexer/mxfp4 quantize (0777) and fused sink/sparse-MLA indexer front tuning (0808, 0813, 0817)",
+    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB), TileLang cache (including device-compiler cache key, TileLang 0014), and Triton cache on /cache",
+    "jit_warmup": "trimmed cold-boot kernel preparation before memory profiling with TileLang cache frozen (--jit-monitor-mode off)",
+    "kernel_backend": "tilelang: TileLang is the only kernel family and B12X is retired from the image (vLLM 0802, #1096); every serving kernel is TileLang except NCCL and rare-path ATen copies, with VLLM_PLUGINS empty",
+    "l2_prefetch": "on: side-stream per-type L2 prefetch schedule (VLLM_L2_PREFETCH_KERNELS=tilelang, 12/12/15 MB budgets, band override 17-32=10 on TP4..8 and 17-32=12 on TP1..TP3) with MoE down PDL preload (0822)",
+    "lsa": "FP8 group-32 dominance upgrade available via VLLM_DS41_LSA=1 (0828), off by default across every cluster shape",
+    "max_num_batched_tokens": "16384 on tp4-ring and tp4-switched; 24576 on tp6-switched; 32768 on tp5/tp7/tp8-switched; 6144 on tp3-triangle and tp3-switched; 4096 on tp3-triangle-4k, tp2-direct, tp2-switched, and tp1",
     "memguards_gib": {
       "startup": 5,
       "steady": 3
     },
-    "model_mount": "the Hugging Face hub cache mounted whole at /hub, served from /hub/<snapshot>",
-    "moe_shared_fold": "the shared expert's output is added in the TileLang MoE combine with one rounding also when it runs on the aux stream (vLLM 0111, 0116)",
-    "multimodal": "row-parallel TileLang vision tower loaded across TP ranks with multi-image packing (vLLM 0651-0656, 0745-0757); frozen release recipe qualified at 16 images per request (--limit-mm-per-prompt '{\"image\":16}'); --mm-processor-cache-gb 0",
-    "names": "container spark-ds41f, image repository spark-ds41f, labels local.spark-ds41f.*, sources under /opt/spark-ds41f, SPARK_DS41F_* variables, caches under /cache/spark-ds41f",
-    "nan_contracts": "non-finite contracts for ten kernel families (vLLM 0134-0138, patches/tile_kernels 0001)",
-    "nccl": "2.30.7 rebuilt with patches/nccl (NVIDIA/nccl#2393 IB send-path fence and the switchless ring/triangle patches) in place of the base image's wheel; TP3 triangle runs 6-channel bidirectional 8 MiB Ring (vLLM 0758-0760)",
-    "prefill": "sequence-parallel once a forward's reduce-scatter exceeds the one-shot RoCE all-reduce (205 tokens; vLLM patches 0014-0018); MXFP8 route gather and CED local boundary/KV projection (0578-0580, 0672-0676)",
-    "prefill_stage_release": "not applicable: TileLang prefill kernels only",
-    "prefill_yield": "short (--prefill-yield short, --prefill-yield-limit-s 10; vLLM 0545) plus >=256K chunk step-down and >=1.0s stall decode interleave (0581-0584, 0710-0712)",
-    "profiling_context": "the fabricated context of startup profiling and dummy runs takes its own blocks per KV cache group and request (vLLM 0039)",
-    "prompt_logprobs": "a request's prompt logprobs go out with it under sink rejection (vLLM 0266, 0720)",
-    "prompt_tokens_details": "on (--enable-prompt-tokens-details): every response's usage reports its prompt-cache hits, with prefix endpoint retention (vLLM 0609-0612)",
-    "reference_precision": "DeepSeek's reference inference/model.py term for term: FP32 logits; exact FP32 mHC stream projection; shared expert SwiGLU in FP32 with one rounding; MoE partials rounded once per rank; WO-A's input through act_quant",
-    "routed_swiglu": "TileLang moe_swiglu_cast (vLLM 0181)",
-    "row_exchange": "Engram's sequence-parallel row all-to-all (vLLM 0150, 0180)",
-    "sampling_defaults": "DeepSeek's recommendation for V4.1 Flash 1017: temperature 1.0, top_p 1.0 for requests that set none",
-    "sink_rejection": "on by default for DeepSeek V4.1 (vLLM 0221, 0223, 0264)",
-    "sparse_mla_fold": "every route (split, decode, extend) folds a segment as fma(l, b, L * a) (vLLM 0132)",
-    "speculative": "DSpark, 5 tokens (the drafter's trained block), draft TP equal to node count (TP 3..8), greedy drafting with block verification; adaptive verification budgets each step's drafts by a rule of the inputs (adaptive_verification_row_cost 0.035, vLLM 0184, 0636) with online IRLS confidence calibration and margin/depth pruning (0637-0641) and CopyDrafter caller-stream continuation/expected-yield pruning (0568-0570, 0688-0691). Nothing is timed at boot.",
-    "startup_rendezvous": "ranks meet before memory profiling on liveness, not a deadline",
-    "token_ranks": "selected-token ranks exclude the vocabulary padding (#504, vLLM 0720)",
-    "topk_ties": "lowest logical position; indexer selections repeat exactly (TileLang)",
-    "vision_tower": "row-parallel TileLang vision tower with multi-image packing (vLLM 0651-0656, 0745-0757); 83.25% overall on the 2,283-item public multimodal benchmark across TP3, TP4 and TP8",
-    "vocabulary_head": "exact 12-bit packed BF16 (VLLM_DS41_PACKED_BF16_LM_HEAD=1; B12X 0012, vLLM 0028): a 4-bit exponent window code plus a per-row list of out-of-window values, bit-identical to the BF16 weights; logits in FP32 (VLLM_DS41_HEAD_DTYPE=float32)",
-    "vocabulary_head_grid": "token tiles vary fastest in the head kernel's grid (vLLM 0117)",
-    "wo_projection": "TileLang: sparse MLA stores WO-A's input; WO-A is a W8A16 GEMM on those BF16 values with split-K tiles up to 128 rows and in-kernel tiles past that; its last kernel rounds to BF16 and applies the reference's per-token cast for WO-B"
+    "multimodal": "row-parallel TileLang vision tower with multi-image packing and fast multimodal prefix caching (0812); frozen release recipe qualified at 16 images per request (--limit-mm-per-prompt '{\"image\":16}'); production runtime default updated to 67 images alongside --enable-per-request-metrics",
+    "nccl": "2.30.7 rebuilt with patches/nccl; TP3 triangle runs 6-channel bidirectional 8 MiB Ring",
+    "prefill": "sequence-parallel above one-shot RoCE all-reduce; 64k chunked globaltimer-paced L2 prefetch (0781), sliced SP Engram row exchange pipeline (0779), SP routing mask cache (0780), and SP stream-lifetime hardening (0816)",
+    "speculative": "DSpark, 5 tokens, draft TP equal to node count (TP 1..8), greedy drafting with block verification; adaptive verification enabled on TP3..TP8 with margin confidence head and persistent grid-40 Markov refinement (0814, 0819-0820), fixed linear row cost 0.035 on TP4..8 and calibrated piecewise curve on TP3 (0.049 base, 1.55 single-req scale, 0.75 high-row scale, knee 24, 0.78 wide scale), and adaptive verification off on TP1/TP2",
+    "structured_output_and_api": "544/272-row structured-output bitmask sizing (0823), SSE keep-alive per-wait callback binding (0825), CustomTool and OpenResponses API normalization (0826), and hf_to_vllm_mapper quant ignored_layers rename (0827)",
+    "vocabulary_head": "exact 12-bit packed BF16 (VLLM_DS41_PACKED_BF16_LM_HEAD=1) with FP32 logits (VLLM_DS41_HEAD_DTYPE=float32) and grid-40 persistent refine (0819)"
   },
   "served_models": [
     "deepseek-v4.1-flash",
@@ -1044,61 +1010,61 @@ bin/spark --cluster-config config/cluster.json \
   ],
   "shapes": [
     {
-      "benchmark_reference": "manifests/suites/2026-11-07-spark-ds41f-1107-tp4",
+      "benchmark_reference": "manifests/suites/2026-11-20-spark-ds41f-1120-tp4",
       "default": true,
       "display_carveout": false,
       "kernel_release": "7.0.0-1019-nvidia-64k",
-      "kv_cache_gib": "10.5 GiB",
-      "kv_cache_memory_bytes": 11274289152,
+      "kv_cache_gib": "16.5 GiB",
+      "kv_cache_memory_bytes": 17716740096,
       "kv_capacity": {
-        "contexts": 11.0266,
-        "every_sequence_tokens": 718848,
-        "full_contexts": 11,
+        "contexts": 17.8568,
+        "every_sequence_tokens": 579840,
+        "full_contexts": 17,
         "max_model_len": 1048576,
         "max_num_batched_tokens": 16384,
-        "max_num_seqs": 16,
+        "max_num_seqs": 32,
         "pool_block_bytes": 227840,
-        "pool_blocks": 49483,
-        "prompt_blocks_in_flight": 3810,
-        "reported_contexts": 6.211,
-        "reported_tokens": 6512700,
+        "pool_blocks": 77759,
+        "prompt_blocks_in_flight": 3795,
+        "reported_contexts": 9.7601,
+        "reported_tokens": 10234243,
         "resident_blocks": 4142,
         "ring_groups": 1,
-        "vllm_capacity_contexts": 11.0189,
-        "vllm_capacity_tokens": 11554122,
+        "vllm_capacity_contexts": 17.8451,
+        "vllm_capacity_tokens": 18711942,
         "window_groups": 15
       },
-      "long_prefill_token_threshold": 16288,
-      "max_cudagraph_capture_size": 96,
+      "long_prefill_token_threshold": 16192,
+      "max_cudagraph_capture_size": 192,
       "max_model_len": 1048576,
       "max_num_batched_tokens": 16384,
-      "max_num_seqs": 16,
+      "max_num_seqs": 32,
       "memory": {
-        "cluster_min_available_gib": 21.47,
-        "head_min_available_gib": 21.47,
-        "headroom_above_startup_guard_gib": 16.47,
-        "headroom_above_steady_guard_gib": 18.47,
+        "cluster_min_available_gib": 16.09,
+        "head_min_available_gib": 16.09,
+        "headroom_above_startup_guard_gib": 11.09,
+        "headroom_above_steady_guard_gib": 13.09,
         "max_swap_growth_gib": 0.0,
         "per_node": {
           "dgx1": {
-            "min_available_gib": 21.47,
+            "min_available_gib": 16.09,
             "swap_growth_gib": 0.0
           },
           "dgx2": {
-            "min_available_gib": 24.49,
+            "min_available_gib": 18.5,
             "swap_growth_gib": 0.0
           },
           "dgx3": {
-            "min_available_gib": 24.38,
+            "min_available_gib": 18.6,
             "swap_growth_gib": 0.0
           },
           "dgx4": {
-            "min_available_gib": 24.32,
+            "min_available_gib": 18.43,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 24.49,
-        "worker_min_available_gib": 24.32
+        "worker_max_available_gib": 18.6,
+        "worker_min_available_gib": 18.43
       },
       "memory_saver_required": true,
       "name": "tp4-ring",
@@ -1106,65 +1072,65 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 8192,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-ring4"
     },
     {
-      "benchmark_reference": "manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched.json",
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched.json",
       "default": false,
       "display_carveout": false,
       "kernel_release": "7.0.0-1019-nvidia-64k",
-      "kv_cache_gib": "10.5 GiB",
-      "kv_cache_memory_bytes": 11274289152,
+      "kv_cache_gib": "16.5 GiB",
+      "kv_cache_memory_bytes": 17716740096,
       "kv_capacity": {
-        "contexts": 11.0266,
-        "every_sequence_tokens": 718848,
-        "full_contexts": 11,
+        "contexts": 17.8568,
+        "every_sequence_tokens": 579840,
+        "full_contexts": 17,
         "max_model_len": 1048576,
         "max_num_batched_tokens": 16384,
-        "max_num_seqs": 16,
+        "max_num_seqs": 32,
         "pool_block_bytes": 227840,
-        "pool_blocks": 49483,
-        "prompt_blocks_in_flight": 3810,
-        "reported_contexts": 6.211,
-        "reported_tokens": 6512700,
+        "pool_blocks": 77759,
+        "prompt_blocks_in_flight": 3795,
+        "reported_contexts": 9.7601,
+        "reported_tokens": 10234243,
         "resident_blocks": 4142,
         "ring_groups": 1,
-        "vllm_capacity_contexts": 11.0189,
-        "vllm_capacity_tokens": 11554122,
+        "vllm_capacity_contexts": 17.8451,
+        "vllm_capacity_tokens": 18711942,
         "window_groups": 15
       },
-      "long_prefill_token_threshold": 16288,
-      "max_cudagraph_capture_size": 96,
+      "long_prefill_token_threshold": 16192,
+      "max_cudagraph_capture_size": 192,
       "max_model_len": 1048576,
       "max_num_batched_tokens": 16384,
-      "max_num_seqs": 16,
+      "max_num_seqs": 32,
       "memory": {
-        "cluster_min_available_gib": 21.5,
-        "head_min_available_gib": 21.5,
-        "headroom_above_startup_guard_gib": 16.5,
-        "headroom_above_steady_guard_gib": 18.5,
+        "cluster_min_available_gib": 14.34,
+        "head_min_available_gib": 14.34,
+        "headroom_above_startup_guard_gib": 9.34,
+        "headroom_above_steady_guard_gib": 11.34,
         "max_swap_growth_gib": 0.0,
         "per_node": {
-          "dgx1": {
-            "min_available_gib": 21.5,
+          "sp1": {
+            "min_available_gib": 14.34,
             "swap_growth_gib": 0.0
           },
-          "dgx2": {
-            "min_available_gib": 23.32,
+          "sp2": {
+            "min_available_gib": 16.58,
             "swap_growth_gib": 0.0
           },
-          "dgx3": {
-            "min_available_gib": 23.3,
+          "sp3": {
+            "min_available_gib": 16.58,
             "swap_growth_gib": 0.0
           },
-          "dgx4": {
-            "min_available_gib": 23.39,
+          "sp4": {
+            "min_available_gib": 16.32,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 23.39,
-        "worker_min_available_gib": 23.3
+        "worker_max_available_gib": 16.58,
+        "worker_min_available_gib": 16.32
       },
       "memory_saver_required": true,
       "name": "tp4-switched",
@@ -1172,69 +1138,69 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 8192,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-switched"
     },
     {
-      "benchmark_reference": "manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched5.json",
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched5.json",
       "default": false,
       "display_carveout": false,
       "kernel_release": "7.0.0-1019-nvidia-64k",
-      "kv_cache_gib": "10.5 GiB",
-      "kv_cache_memory_bytes": 11274289152,
+      "kv_cache_gib": "24.0 GiB",
+      "kv_cache_memory_bytes": 25769803776,
       "kv_capacity": {
-        "contexts": 11.0266,
-        "every_sequence_tokens": 718848,
-        "full_contexts": 11,
+        "contexts": 25.4631,
+        "every_sequence_tokens": 831744,
+        "full_contexts": 25,
         "max_model_len": 1048576,
-        "max_num_batched_tokens": 16384,
-        "max_num_seqs": 16,
+        "max_num_batched_tokens": 32768,
+        "max_num_seqs": 32,
         "pool_block_bytes": 227840,
-        "pool_blocks": 49483,
-        "prompt_blocks_in_flight": 3810,
-        "reported_contexts": 6.211,
-        "reported_tokens": 6512700,
+        "pool_blocks": 113104,
+        "prompt_blocks_in_flight": 7635,
+        "reported_contexts": 9.5794,
+        "reported_tokens": 10044731,
         "resident_blocks": 4142,
         "ring_groups": 1,
-        "vllm_capacity_contexts": 11.0189,
-        "vllm_capacity_tokens": 11554122,
+        "vllm_capacity_contexts": 25.4509,
+        "vllm_capacity_tokens": 26687154,
         "window_groups": 15
       },
-      "long_prefill_token_threshold": 16288,
-      "max_cudagraph_capture_size": 96,
+      "long_prefill_token_threshold": 32576,
+      "max_cudagraph_capture_size": 192,
       "max_model_len": 1048576,
-      "max_num_batched_tokens": 16384,
-      "max_num_seqs": 16,
+      "max_num_batched_tokens": 32768,
+      "max_num_seqs": 32,
       "memory": {
-        "cluster_min_available_gib": 28.8,
-        "head_min_available_gib": 28.8,
-        "headroom_above_startup_guard_gib": 23.8,
-        "headroom_above_steady_guard_gib": 25.8,
+        "cluster_min_available_gib": 9.31,
+        "head_min_available_gib": 9.31,
+        "headroom_above_startup_guard_gib": 4.31,
+        "headroom_above_steady_guard_gib": 6.31,
         "max_swap_growth_gib": 0.0,
         "per_node": {
           "sp1": {
-            "min_available_gib": 28.8,
+            "min_available_gib": 9.31,
             "swap_growth_gib": 0.0
           },
           "sp2": {
-            "min_available_gib": 30.86,
+            "min_available_gib": 11.69,
             "swap_growth_gib": 0.0
           },
           "sp3": {
-            "min_available_gib": 30.83,
+            "min_available_gib": 11.84,
             "swap_growth_gib": 0.0
           },
           "sp4": {
-            "min_available_gib": 30.95,
+            "min_available_gib": 11.61,
             "swap_growth_gib": 0.0
           },
-          "sp5": {
-            "min_available_gib": 31.19,
+          "sp8": {
+            "min_available_gib": 13.24,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 31.19,
-        "worker_min_available_gib": 30.83
+        "worker_max_available_gib": 13.24,
+        "worker_min_available_gib": 11.61
       },
       "memory_saver_required": true,
       "name": "tp5-switched",
@@ -1242,73 +1208,73 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 8192,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-switched"
     },
     {
-      "benchmark_reference": "manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched6.json",
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched6.json",
       "default": false,
       "display_carveout": false,
       "kernel_release": "7.0.0-1019-nvidia-64k",
-      "kv_cache_gib": "10.5 GiB",
-      "kv_cache_memory_bytes": 11274289152,
+      "kv_cache_gib": "13.0 GiB",
+      "kv_cache_memory_bytes": 13958643712,
       "kv_capacity": {
-        "contexts": 11.0266,
-        "every_sequence_tokens": 718848,
-        "full_contexts": 11,
+        "contexts": 13.4112,
+        "every_sequence_tokens": 432384,
+        "full_contexts": 13,
         "max_model_len": 1048576,
-        "max_num_batched_tokens": 16384,
-        "max_num_seqs": 16,
+        "max_num_batched_tokens": 24576,
+        "max_num_seqs": 32,
         "pool_block_bytes": 227840,
-        "pool_blocks": 49483,
-        "prompt_blocks_in_flight": 3810,
-        "reported_contexts": 6.211,
-        "reported_tokens": 6512700,
+        "pool_blocks": 61265,
+        "prompt_blocks_in_flight": 5715,
+        "reported_contexts": 6.1965,
+        "reported_tokens": 6497522,
         "resident_blocks": 4142,
         "ring_groups": 1,
-        "vllm_capacity_contexts": 11.0189,
-        "vllm_capacity_tokens": 11554122,
+        "vllm_capacity_contexts": 13.3997,
+        "vllm_capacity_tokens": 14050600,
         "window_groups": 15
       },
-      "long_prefill_token_threshold": 16288,
-      "max_cudagraph_capture_size": 96,
+      "long_prefill_token_threshold": 24384,
+      "max_cudagraph_capture_size": 192,
       "max_model_len": 1048576,
-      "max_num_batched_tokens": 16384,
-      "max_num_seqs": 16,
+      "max_num_batched_tokens": 24576,
+      "max_num_seqs": 32,
       "memory": {
-        "cluster_min_available_gib": 43.9,
-        "head_min_available_gib": 43.9,
-        "headroom_above_startup_guard_gib": 38.9,
-        "headroom_above_steady_guard_gib": 40.9,
+        "cluster_min_available_gib": 5.38,
+        "head_min_available_gib": 5.38,
+        "headroom_above_startup_guard_gib": 0.38,
+        "headroom_above_steady_guard_gib": 2.38,
         "max_swap_growth_gib": 0.0,
         "per_node": {
-          "dgx1": {
-            "min_available_gib": 43.9,
+          "sp1": {
+            "min_available_gib": 5.38,
             "swap_growth_gib": 0.0
           },
-          "dgx2": {
-            "min_available_gib": 45.93,
+          "sp2": {
+            "min_available_gib": 7.61,
             "swap_growth_gib": 0.0
           },
-          "dgx3": {
-            "min_available_gib": 45.9,
+          "sp3": {
+            "min_available_gib": 7.58,
             "swap_growth_gib": 0.0
           },
-          "dgx4": {
-            "min_available_gib": 46.02,
+          "sp4": {
+            "min_available_gib": 7.58,
             "swap_growth_gib": 0.0
           },
-          "dgx5": {
-            "min_available_gib": 46.31,
+          "sp5": {
+            "min_available_gib": 7.95,
             "swap_growth_gib": 0.0
           },
-          "dgx6": {
-            "min_available_gib": 46.67,
+          "sp6": {
+            "min_available_gib": 8.21,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 46.67,
-        "worker_min_available_gib": 45.9
+        "worker_max_available_gib": 8.21,
+        "worker_min_available_gib": 7.58
       },
       "memory_saver_required": true,
       "name": "tp6-switched",
@@ -1316,77 +1282,77 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 8192,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-switched"
     },
     {
-      "benchmark_reference": "manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched7.json",
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched7.json",
       "default": false,
       "display_carveout": false,
       "kernel_release": "7.0.0-1019-nvidia-64k",
-      "kv_cache_gib": "10.5 GiB",
-      "kv_cache_memory_bytes": 11274289152,
+      "kv_cache_gib": "16.0 GiB",
+      "kv_cache_memory_bytes": 17179869184,
       "kv_capacity": {
-        "contexts": 11.0266,
-        "every_sequence_tokens": 718848,
-        "full_contexts": 11,
+        "contexts": 16.3609,
+        "every_sequence_tokens": 530176,
+        "full_contexts": 16,
         "max_model_len": 1048576,
-        "max_num_batched_tokens": 16384,
-        "max_num_seqs": 16,
+        "max_num_batched_tokens": 32768,
+        "max_num_seqs": 32,
         "pool_block_bytes": 227840,
-        "pool_blocks": 49483,
-        "prompt_blocks_in_flight": 3810,
-        "reported_contexts": 6.211,
-        "reported_tokens": 6512700,
+        "pool_blocks": 75403,
+        "prompt_blocks_in_flight": 7635,
+        "reported_contexts": 6.3863,
+        "reported_tokens": 6696516,
         "resident_blocks": 4142,
         "ring_groups": 1,
-        "vllm_capacity_contexts": 11.0189,
-        "vllm_capacity_tokens": 11554122,
+        "vllm_capacity_contexts": 16.3493,
+        "vllm_capacity_tokens": 17143479,
         "window_groups": 15
       },
-      "long_prefill_token_threshold": 16288,
-      "max_cudagraph_capture_size": 96,
+      "long_prefill_token_threshold": 32576,
+      "max_cudagraph_capture_size": 192,
       "max_model_len": 1048576,
-      "max_num_batched_tokens": 16384,
-      "max_num_seqs": 16,
+      "max_num_batched_tokens": 32768,
+      "max_num_seqs": 32,
       "memory": {
-        "cluster_min_available_gib": 43.51,
-        "head_min_available_gib": 43.51,
-        "headroom_above_startup_guard_gib": 38.51,
-        "headroom_above_steady_guard_gib": 40.51,
+        "cluster_min_available_gib": 5.63,
+        "head_min_available_gib": 5.63,
+        "headroom_above_startup_guard_gib": 0.63,
+        "headroom_above_steady_guard_gib": 2.63,
         "max_swap_growth_gib": 0.0,
         "per_node": {
           "sp1": {
-            "min_available_gib": 43.51,
+            "min_available_gib": 5.63,
             "swap_growth_gib": 0.0
           },
           "sp2": {
-            "min_available_gib": 45.55,
+            "min_available_gib": 7.98,
             "swap_growth_gib": 0.0
           },
           "sp3": {
-            "min_available_gib": 45.53,
+            "min_available_gib": 7.78,
             "swap_growth_gib": 0.0
           },
           "sp4": {
-            "min_available_gib": 45.59,
+            "min_available_gib": 7.79,
             "swap_growth_gib": 0.0
           },
           "sp5": {
-            "min_available_gib": 45.85,
+            "min_available_gib": 8.36,
             "swap_growth_gib": 0.0
           },
           "sp6": {
-            "min_available_gib": 46.27,
+            "min_available_gib": 8.72,
             "swap_growth_gib": 0.0
           },
           "sp7": {
-            "min_available_gib": 46.16,
+            "min_available_gib": 8.28,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 46.27,
-        "worker_min_available_gib": 45.53
+        "worker_max_available_gib": 8.72,
+        "worker_min_available_gib": 7.78
       },
       "memory_saver_required": true,
       "name": "tp7-switched",
@@ -1394,81 +1360,81 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 8192,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-switched"
     },
     {
-      "benchmark_reference": "manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched8.json",
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched8.json",
       "default": false,
       "display_carveout": false,
       "kernel_release": "7.0.0-1019-nvidia-64k",
-      "kv_cache_gib": "10.5 GiB",
-      "kv_cache_memory_bytes": 11274289152,
+      "kv_cache_gib": "25.5 GiB",
+      "kv_cache_memory_bytes": 27380416512,
       "kv_capacity": {
-        "contexts": 11.0266,
-        "every_sequence_tokens": 718848,
-        "full_contexts": 11,
+        "contexts": 27.1697,
+        "every_sequence_tokens": 888320,
+        "full_contexts": 27,
         "max_model_len": 1048576,
-        "max_num_batched_tokens": 16384,
-        "max_num_seqs": 16,
+        "max_num_batched_tokens": 32768,
+        "max_num_seqs": 32,
         "pool_block_bytes": 227840,
-        "pool_blocks": 49483,
-        "prompt_blocks_in_flight": 3810,
-        "reported_contexts": 6.211,
-        "reported_tokens": 6512700,
+        "pool_blocks": 120173,
+        "prompt_blocks_in_flight": 7635,
+        "reported_contexts": 10.1781,
+        "reported_tokens": 10672526,
         "resident_blocks": 4142,
         "ring_groups": 1,
-        "vllm_capacity_contexts": 11.0189,
-        "vllm_capacity_tokens": 11554122,
+        "vllm_capacity_contexts": 27.1574,
+        "vllm_capacity_tokens": 28476609,
         "window_groups": 15
       },
-      "long_prefill_token_threshold": 16288,
-      "max_cudagraph_capture_size": 96,
+      "long_prefill_token_threshold": 32576,
+      "max_cudagraph_capture_size": 192,
       "max_model_len": 1048576,
-      "max_num_batched_tokens": 16384,
-      "max_num_seqs": 16,
+      "max_num_batched_tokens": 32768,
+      "max_num_seqs": 32,
       "memory": {
-        "cluster_min_available_gib": 52.74,
-        "head_min_available_gib": 52.74,
-        "headroom_above_startup_guard_gib": 47.74,
-        "headroom_above_steady_guard_gib": 49.74,
+        "cluster_min_available_gib": 8.99,
+        "head_min_available_gib": 8.99,
+        "headroom_above_startup_guard_gib": 3.99,
+        "headroom_above_steady_guard_gib": 5.99,
         "max_swap_growth_gib": 0.0,
         "per_node": {
-          "dgx1": {
-            "min_available_gib": 52.74,
+          "sp1": {
+            "min_available_gib": 8.99,
             "swap_growth_gib": 0.0
           },
-          "dgx2": {
-            "min_available_gib": 54.84,
+          "sp2": {
+            "min_available_gib": 11.07,
             "swap_growth_gib": 0.0
           },
-          "dgx3": {
-            "min_available_gib": 54.77,
+          "sp3": {
+            "min_available_gib": 11.28,
             "swap_growth_gib": 0.0
           },
-          "dgx4": {
-            "min_available_gib": 54.88,
+          "sp4": {
+            "min_available_gib": 11.29,
             "swap_growth_gib": 0.0
           },
-          "dgx5": {
-            "min_available_gib": 54.75,
+          "sp5": {
+            "min_available_gib": 11.25,
             "swap_growth_gib": 0.0
           },
-          "dgx6": {
-            "min_available_gib": 55.19,
+          "sp6": {
+            "min_available_gib": 11.29,
             "swap_growth_gib": 0.0
           },
-          "dgx7": {
-            "min_available_gib": 55.07,
+          "sp7": {
+            "min_available_gib": 11.11,
             "swap_growth_gib": 0.0
           },
-          "dgx8": {
-            "min_available_gib": 53.95,
+          "sp8": {
+            "min_available_gib": 11.21,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 55.19,
-        "worker_min_available_gib": 53.95
+        "worker_max_available_gib": 11.29,
+        "worker_min_available_gib": 11.07
       },
       "memory_saver_required": true,
       "name": "tp8-switched",
@@ -1476,11 +1442,11 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 8192,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-switched"
     },
     {
-      "benchmark_reference": "manifests/suites/2026-11-07-spark-ds41f-1107-tp3",
+      "benchmark_reference": "manifests/suites/2026-11-20-spark-ds41f-1120-tp3",
       "default": false,
       "display_carveout": true,
       "kernel_release": "7.0.0-1019-nvidia-64k",
@@ -1510,27 +1476,27 @@ bin/spark --cluster-config config/cluster.json \
       "max_num_batched_tokens": 6144,
       "max_num_seqs": 8,
       "memory": {
-        "cluster_min_available_gib": 6.03,
-        "head_min_available_gib": 6.03,
-        "headroom_above_startup_guard_gib": 1.03,
-        "headroom_above_steady_guard_gib": 3.03,
+        "cluster_min_available_gib": 6.38,
+        "head_min_available_gib": 6.38,
+        "headroom_above_startup_guard_gib": 1.38,
+        "headroom_above_steady_guard_gib": 3.38,
         "max_swap_growth_gib": 0.0,
         "per_node": {
           "dgx1": {
-            "min_available_gib": 6.03,
+            "min_available_gib": 6.38,
             "swap_growth_gib": 0.0
           },
           "dgx2": {
-            "min_available_gib": 7.94,
+            "min_available_gib": 8.95,
             "swap_growth_gib": 0.0
           },
           "dgx3": {
-            "min_available_gib": 7.99,
+            "min_available_gib": 8.6,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 7.99,
-        "worker_min_available_gib": 7.94
+        "worker_max_available_gib": 8.95,
+        "worker_min_available_gib": 8.6
       },
       "memory_saver_required": true,
       "name": "tp3-triangle",
@@ -1538,11 +1504,11 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 512,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-direct"
     },
     {
-      "benchmark_reference": "manifests/benchmarks/2026-11-07-spark-ds41f-1107-switched3.json",
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched3.json",
       "default": false,
       "display_carveout": true,
       "kernel_release": "7.0.0-1019-nvidia-64k",
@@ -1572,27 +1538,27 @@ bin/spark --cluster-config config/cluster.json \
       "max_num_batched_tokens": 6144,
       "max_num_seqs": 8,
       "memory": {
-        "cluster_min_available_gib": 6.57,
-        "head_min_available_gib": 6.57,
-        "headroom_above_startup_guard_gib": 1.57,
-        "headroom_above_steady_guard_gib": 3.57,
+        "cluster_min_available_gib": 6.34,
+        "head_min_available_gib": 6.34,
+        "headroom_above_startup_guard_gib": 1.34,
+        "headroom_above_steady_guard_gib": 3.34,
         "max_swap_growth_gib": 0.0,
         "per_node": {
-          "dgx1": {
-            "min_available_gib": 6.57,
+          "sp5": {
+            "min_available_gib": 6.34,
             "swap_growth_gib": 0.0
           },
-          "dgx2": {
-            "min_available_gib": 8.47,
+          "sp6": {
+            "min_available_gib": 7.99,
             "swap_growth_gib": 0.0
           },
-          "dgx3": {
-            "min_available_gib": 8.12,
+          "sp7": {
+            "min_available_gib": 7.92,
             "swap_growth_gib": 0.0
           }
         },
-        "worker_max_available_gib": 8.47,
-        "worker_min_available_gib": 8.12
+        "worker_max_available_gib": 7.99,
+        "worker_min_available_gib": 7.92
       },
       "memory_saver_required": true,
       "name": "tp3-switched",
@@ -1600,11 +1566,11 @@ bin/spark --cluster-config config/cluster.json \
       "page_size_bytes": 65536,
       "page_size_label": "64 KiB",
       "prefix_cache_retention_interval": 512,
-      "qualified_release": "spark-ds41f-1107",
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-switched"
     },
     {
-      "benchmark_reference": null,
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-tp34k.json",
       "default": false,
       "display_carveout": true,
       "kernel_release": "7.0.0-1019-nvidia",
@@ -1633,15 +1599,207 @@ bin/spark --cluster-config config/cluster.json \
       "max_model_len": 262144,
       "max_num_batched_tokens": 4096,
       "max_num_seqs": 8,
-      "memory": null,
+      "memory": {
+        "cluster_min_available_gib": 11.28,
+        "head_min_available_gib": 11.28,
+        "headroom_above_startup_guard_gib": 6.28,
+        "headroom_above_steady_guard_gib": 8.28,
+        "max_swap_growth_gib": 0.0,
+        "per_node": {
+          "dgx1": {
+            "min_available_gib": 11.28,
+            "swap_growth_gib": 0.0
+          },
+          "dgx2": {
+            "min_available_gib": 13.41,
+            "swap_growth_gib": 0.0
+          },
+          "dgx3": {
+            "min_available_gib": 13.17,
+            "swap_growth_gib": 0.0
+          }
+        },
+        "worker_max_available_gib": 13.41,
+        "worker_min_available_gib": 13.17
+      },
       "memory_saver_required": false,
       "name": "tp3-triangle-4k",
       "nodes": 3,
       "page_size_bytes": 4096,
       "page_size_label": "4 KiB",
       "prefix_cache_retention_interval": 512,
-      "qualified_release": null,
+      "qualified_release": "spark-ds41f-1120",
       "transport": "oneshot-direct"
+    },
+    {
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-direct2.json",
+      "default": false,
+      "display_carveout": true,
+      "kernel_release": "7.0.0-1019-nvidia-64k",
+      "kv_cache_gib": "8.0 GiB",
+      "kv_cache_memory_bytes": 8589934592,
+      "kv_capacity": {
+        "contexts": 34.3505,
+        "every_sequence_tokens": 262144,
+        "full_contexts": 34,
+        "max_model_len": 262144,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 4,
+        "pool_block_bytes": 227840,
+        "pool_blocks": 37701,
+        "prompt_blocks_in_flight": 945,
+        "reported_contexts": 18.7102,
+        "reported_tokens": 4904759,
+        "resident_blocks": 1070,
+        "ring_groups": 1,
+        "vllm_capacity_contexts": 34.3291,
+        "vllm_capacity_tokens": 8999170,
+        "window_groups": 15
+      },
+      "long_prefill_token_threshold": 4072,
+      "max_cudagraph_capture_size": 24,
+      "max_model_len": 262144,
+      "max_num_batched_tokens": 4096,
+      "max_num_seqs": 4,
+      "memory": {
+        "cluster_min_available_gib": 9.03,
+        "head_min_available_gib": 9.03,
+        "headroom_above_startup_guard_gib": 4.03,
+        "headroom_above_steady_guard_gib": 6.03,
+        "max_swap_growth_gib": 0.0,
+        "per_node": {
+          "dgx1": {
+            "min_available_gib": 9.03,
+            "swap_growth_gib": 0.0
+          },
+          "dgx2": {
+            "min_available_gib": 11.23,
+            "swap_growth_gib": 0.0
+          }
+        },
+        "worker_max_available_gib": 11.23,
+        "worker_min_available_gib": 11.23
+      },
+      "memory_saver_required": true,
+      "name": "tp2-direct",
+      "nodes": 2,
+      "page_size_bytes": 65536,
+      "page_size_label": "64 KiB",
+      "prefix_cache_retention_interval": 8192,
+      "qualified_release": "spark-ds41f-1120",
+      "transport": "oneshot-direct"
+    },
+    {
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched2.json",
+      "default": false,
+      "display_carveout": true,
+      "kernel_release": "7.0.0-1019-nvidia-64k",
+      "kv_cache_gib": "8.0 GiB",
+      "kv_cache_memory_bytes": 8589934592,
+      "kv_capacity": {
+        "contexts": 34.3505,
+        "every_sequence_tokens": 262144,
+        "full_contexts": 34,
+        "max_model_len": 262144,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 4,
+        "pool_block_bytes": 227840,
+        "pool_blocks": 37701,
+        "prompt_blocks_in_flight": 945,
+        "reported_contexts": 18.7102,
+        "reported_tokens": 4904759,
+        "resident_blocks": 1070,
+        "ring_groups": 1,
+        "vllm_capacity_contexts": 34.3291,
+        "vllm_capacity_tokens": 8999170,
+        "window_groups": 15
+      },
+      "long_prefill_token_threshold": 4072,
+      "max_cudagraph_capture_size": 24,
+      "max_model_len": 262144,
+      "max_num_batched_tokens": 4096,
+      "max_num_seqs": 4,
+      "memory": {
+        "cluster_min_available_gib": 6.61,
+        "head_min_available_gib": 6.61,
+        "headroom_above_startup_guard_gib": 1.61,
+        "headroom_above_steady_guard_gib": 3.61,
+        "max_swap_growth_gib": 0.0,
+        "per_node": {
+          "sp5": {
+            "min_available_gib": 6.61,
+            "swap_growth_gib": 0.0
+          },
+          "sp6": {
+            "min_available_gib": 8.27,
+            "swap_growth_gib": 0.0
+          }
+        },
+        "worker_max_available_gib": 8.27,
+        "worker_min_available_gib": 8.27
+      },
+      "memory_saver_required": true,
+      "name": "tp2-switched",
+      "nodes": 2,
+      "page_size_bytes": 65536,
+      "page_size_label": "64 KiB",
+      "prefix_cache_retention_interval": 8192,
+      "qualified_release": "spark-ds41f-1120",
+      "transport": "oneshot-switched"
+    },
+    {
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-tp1.json",
+      "default": false,
+      "display_carveout": false,
+      "kernel_release": "7.0.0-1019-nvidia-64k",
+      "kv_cache_gib": "8.0 GiB",
+      "kv_cache_memory_bytes": 8589934592,
+      "kv_capacity": {
+        "contexts": 34.3505,
+        "every_sequence_tokens": 262144,
+        "full_contexts": 34,
+        "max_model_len": 262144,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 4,
+        "pool_block_bytes": 227840,
+        "pool_blocks": 37701,
+        "prompt_blocks_in_flight": 945,
+        "reported_contexts": 18.7102,
+        "reported_tokens": 4904759,
+        "resident_blocks": 1070,
+        "ring_groups": 1,
+        "vllm_capacity_contexts": 34.3291,
+        "vllm_capacity_tokens": 8999170,
+        "window_groups": 15
+      },
+      "long_prefill_token_threshold": 4072,
+      "max_cudagraph_capture_size": 24,
+      "max_model_len": 262144,
+      "max_num_batched_tokens": 4096,
+      "max_num_seqs": 4,
+      "memory": {
+        "cluster_min_available_gib": 18.76,
+        "head_min_available_gib": 18.76,
+        "headroom_above_startup_guard_gib": 13.76,
+        "headroom_above_steady_guard_gib": 15.76,
+        "max_swap_growth_gib": 0.0,
+        "per_node": {
+          "dgx4": {
+            "min_available_gib": 18.76,
+            "swap_growth_gib": 0.0
+          }
+        },
+        "worker_max_available_gib": 18.76,
+        "worker_min_available_gib": 18.76
+      },
+      "memory_saver_required": true,
+      "name": "tp1",
+      "nodes": 1,
+      "page_size_bytes": 65536,
+      "page_size_label": "64 KiB",
+      "prefix_cache_retention_interval": 8192,
+      "qualified_release": "spark-ds41f-1120",
+      "transport": "local"
     }
   ],
   "suites": [
@@ -5597,11 +5755,25 @@ bin/spark --cluster-config config/cluster.json \
           "verdict": "better"
         },
         {
+          "change": "+2.29%",
+          "ci95": "0.26%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "-0.38%",
+          "verdict": "better (both candidate boots; window tok/s +2.51% \u00b11.29%)"
+        },
+        {
           "change": "+2.51%",
           "ci95": "1.29%",
           "metric": "c8: output tok/s",
           "repeat": "-0.32%",
           "verdict": "better"
+        },
+        {
+          "change": "+2.68%",
+          "ci95": "0.44%",
+          "metric": "c4: decode tok/s, paired",
+          "repeat": "+0.02%",
+          "verdict": "better (both candidate boots; window tok/s +2.91% \u00b11.79%)"
         },
         {
           "change": "+2.91%",
@@ -5665,6 +5837,13 @@ bin/spark --cluster-config config/cluster.json \
           "metric": "prefill: prefill 500,000 tok/s",
           "repeat": "-0.10%",
           "verdict": "better"
+        },
+        {
+          "change": "+3.76%",
+          "ci95": "0.16%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "-0.04%",
+          "verdict": "better (both candidate boots; window tok/s +3.72% \u00b16.18%)"
         },
         {
           "change": "+3.72%",
@@ -6222,11 +6401,25 @@ bin/spark --cluster-config config/cluster.json \
           "verdict": "better"
         },
         {
+          "change": "+2.05%",
+          "ci95": "0.41%",
+          "metric": "c16: decode tok/s, paired",
+          "repeat": "-0.41%",
+          "verdict": "better (both candidate boots; window tok/s +2.40% \u00b10.68%)"
+        },
+        {
           "change": "+2.40%",
           "ci95": "0.68%",
           "metric": "c16: output tok/s",
           "repeat": "-0.39%",
           "verdict": "better"
+        },
+        {
+          "change": "+2.02%",
+          "ci95": "0.51%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "+0.48%",
+          "verdict": "better (both candidate boots; window tok/s +1.96% \u00b10.87%)"
         },
         {
           "change": "+1.96%",
@@ -6297,6 +6490,13 @@ bin/spark --cluster-config config/cluster.json \
           "metric": "prefill: prefill 1,000,000 tok/s",
           "repeat": "-0.38%",
           "verdict": "better"
+        },
+        {
+          "change": "+3.61%",
+          "ci95": "0.16%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "-0.05%",
+          "verdict": "better (both candidate boots; window tok/s +3.41% \u00b13.35%)"
         },
         {
           "change": "+3.41%",
@@ -6814,11 +7014,25 @@ bin/spark --cluster-config config/cluster.json \
           "verdict": "better"
         },
         {
+          "change": "+1.70%",
+          "ci95": "1.49%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "+0.05%",
+          "verdict": "better (both candidate boots; window tok/s +1.39% \u00b11.34%)"
+        },
+        {
           "change": "+1.39%",
           "ci95": "1.34%",
           "metric": "c8: output tok/s",
           "repeat": "+0.08%",
           "verdict": "same"
+        },
+        {
+          "change": "+2.04%",
+          "ci95": "1.37%",
+          "metric": "c4: decode tok/s, paired",
+          "repeat": "+0.15%",
+          "verdict": "better (both candidate boots; window tok/s +2.08% \u00b11.67%)"
         },
         {
           "change": "+2.08%",
@@ -6891,6 +7105,13 @@ bin/spark --cluster-config config/cluster.json \
           "verdict": "better"
         },
         {
+          "change": "+2.59%",
+          "ci95": "1.28%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "+0.12%",
+          "verdict": "better (both candidate boots; window tok/s +2.62% \u00b14.63%)"
+        },
+        {
           "change": "+2.62%",
           "ci95": "4.63%",
           "metric": "c1: output tok/s",
@@ -6900,7 +7121,7 @@ bin/spark --cluster-config config/cluster.json \
       ]
     },
     {
-      "date": "",
+      "date": "2026-11-07",
       "grid": {
         "geomean_ms": 21.187,
         "shape_count": 15,
@@ -7031,7 +7252,7 @@ bin/spark --cluster-config config/cluster.json \
       "image": "spark-ds41f:1107",
       "path": "manifests/suites/2026-11-07-spark-ds41f-1107-tp3-switched",
       "prefill": [],
-      "release": "2026-11-07-spark-ds41f-1107-tp3-switched",
+      "release": "spark-ds41f-1107",
       "runs": {
         "c1": {
           "accepted_per_draft": 1.372,
@@ -7364,7 +7585,7 @@ bin/spark --cluster-config config/cluster.json \
       },
       "started_utc": "2026-11-07T09:01:21+00:00",
       "suite_version": 3,
-      "topology": "TP3",
+      "topology": "TP3-SWITCHED",
       "transport": "oneshot-switched",
       "verdicts": []
     },
@@ -7915,11 +8136,25 @@ bin/spark --cluster-config config/cluster.json \
           "verdict": "better"
         },
         {
+          "change": "+5.30%",
+          "ci95": "0.86%",
+          "metric": "c16: decode tok/s, paired",
+          "repeat": "-0.91%",
+          "verdict": "better (both candidate boots; window tok/s +5.86% \u00b10.90%)"
+        },
+        {
           "change": "+5.86%",
           "ci95": "0.90%",
           "metric": "c16: output tok/s",
           "repeat": "-0.80%",
           "verdict": "better"
+        },
+        {
+          "change": "+4.04%",
+          "ci95": "0.93%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "-1.01%",
+          "verdict": "better (both candidate boots; window tok/s +4.54% \u00b11.22%)"
         },
         {
           "change": "+4.54%",
@@ -7992,6 +8227,13 @@ bin/spark --cluster-config config/cluster.json \
           "verdict": "better"
         },
         {
+          "change": "+4.92%",
+          "ci95": "2.40%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "-0.72%",
+          "verdict": "better (both candidate boots; window tok/s +5.93% \u00b14.85%)"
+        },
+        {
           "change": "+5.93%",
           "ci95": "4.85%",
           "metric": "c1: output tok/s",
@@ -8001,7 +8243,7 @@ bin/spark --cluster-config config/cluster.json \
       ]
     },
     {
-      "date": "",
+      "date": "2026-11-07",
       "grid": {
         "geomean_ms": 21.141,
         "shape_count": 20,
@@ -8203,7 +8445,7 @@ bin/spark --cluster-config config/cluster.json \
           "tps": 5965.5
         }
       ],
-      "release": "2026-11-07-spark-ds41f-1107-tp4-switched",
+      "release": "spark-ds41f-1107",
       "runs": {
         "c1": {
           "accepted_per_draft": 1.367,
@@ -8536,12 +8778,12 @@ bin/spark --cluster-config config/cluster.json \
       },
       "started_utc": "2026-11-07T09:04:40+00:00",
       "suite_version": 3,
-      "topology": "TP4",
+      "topology": "TP4-SWITCHED",
       "transport": "oneshot-switched",
       "verdicts": []
     },
     {
-      "date": "",
+      "date": "2026-11-07",
       "grid": {
         "geomean_ms": 19.539,
         "shape_count": 20,
@@ -8743,7 +8985,7 @@ bin/spark --cluster-config config/cluster.json \
           "tps": 8750.5
         }
       ],
-      "release": "2026-11-07-spark-ds41f-1107-tp8-switched",
+      "release": "spark-ds41f-1107",
       "runs": {
         "c1": {
           "accepted_per_draft": 1.365,
@@ -9076,12 +9318,3184 @@ bin/spark --cluster-config config/cluster.json \
       },
       "started_utc": "2026-11-07T15:12:28+00:00",
       "suite_version": 3,
-      "topology": "TP3",
+      "topology": "TP8-SWITCHED",
       "transport": null,
       "verdicts": []
+    },
+    {
+      "date": "2026-11-20",
+      "grid": {
+        "geomean_ms": 25.524,
+        "shape_count": 15,
+        "shapes": [
+          {
+            "ci95_pct": 0.58,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 33.272
+          },
+          {
+            "ci95_pct": 0.52,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 18.368
+          },
+          {
+            "ci95_pct": 0.39,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 19.997
+          },
+          {
+            "ci95_pct": 0.68,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 33.243
+          },
+          {
+            "ci95_pct": 0.44,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 18.995
+          },
+          {
+            "ci95_pct": 0.31,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 22.579
+          },
+          {
+            "ci95_pct": 0.41,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 33.696
+          },
+          {
+            "ci95_pct": 0.45,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 18.727
+          },
+          {
+            "ci95_pct": 0.28,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 21.925
+          },
+          {
+            "ci95_pct": 0.29,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 27.425
+          },
+          {
+            "ci95_pct": 0.49,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 33.398
+          },
+          {
+            "ci95_pct": 0.29,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 22.704
+          },
+          {
+            "ci95_pct": 0.44,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 33.322
+          },
+          {
+            "ci95_pct": 0.32,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 22.7
+          },
+          {
+            "ci95_pct": 0.37,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 33.529
+          }
+        ]
+      },
+      "id": "2026-11-20-spark-ds41f-1120-tp3",
+      "image": "spark-ds41f:candidate-61-r2",
+      "path": "manifests/suites/2026-11-20-spark-ds41f-1120-tp3",
+      "prefill": [
+        {
+          "ci95_pct": 0.59,
+          "prompt_tokens": 32761,
+          "size": 32768,
+          "tps": 7270.0
+        },
+        {
+          "ci95_pct": 0.73,
+          "prompt_tokens": 131900,
+          "size": 131072,
+          "tps": 7502.4
+        },
+        {
+          "ci95_pct": 0.51,
+          "prompt_tokens": 262554,
+          "size": 262144,
+          "tps": 7445.2
+        },
+        {
+          "ci95_pct": 0.43,
+          "prompt_tokens": 522774,
+          "size": 524288,
+          "tps": 7258.6
+        },
+        {
+          "ci95_pct": 0.31,
+          "prompt_tokens": 994697,
+          "size": 1000000,
+          "tps": 6921.6
+        }
+      ],
+      "release": "spark-ds41f-1120",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.468,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.783,
+            0.5,
+            0.277,
+            0.159
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.443,
+          "output_tps": 70.36,
+          "output_tps_ci95_pct": 3.8,
+          "per_user_tps_p50": 70.09,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.64,
+          "slo_attainment_pct": null,
+          "steps_per_s": 28.85,
+          "survival": [
+            0.675,
+            0.397,
+            0.218,
+            0.114,
+            0.065
+          ],
+          "tpot_p50_ms": 14.17,
+          "tpot_p99_ms": 16.79,
+          "tps_by_style": {
+            "code": {
+              "requests": 12,
+              "tps": 93.1
+            },
+            "prose": {
+              "requests": 63,
+              "tps": 66.8
+            }
+          },
+          "ttft_p50_s": 0.137,
+          "ttft_p99_s": 0.163
+        },
+        "c4": {
+          "accepted_per_draft": 1.383,
+          "concurrency": 4,
+          "coverage": [
+            1.0,
+            0.634,
+            0.32,
+            0.153,
+            0.073
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 8.697,
+          "output_tps": 131.59,
+          "output_tps_ci95_pct": 1.28,
+          "per_user_tps_p50": 32.79,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 9.39,
+          "slo_attainment_pct": null,
+          "steps_per_s": 15.14,
+          "survival": [
+            0.714,
+            0.366,
+            0.175,
+            0.085,
+            0.043
+          ],
+          "tpot_p50_ms": 30.36,
+          "tpot_p99_ms": 38.84,
+          "tps_by_style": {
+            "code": {
+              "requests": 21,
+              "tps": 47.1
+            },
+            "prose": {
+              "requests": 118,
+              "tps": 31.0
+            }
+          },
+          "ttft_p50_s": 0.236,
+          "ttft_p99_s": 0.292
+        },
+        "c8": {
+          "accepted_per_draft": 1.413,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.627,
+            0.324,
+            0.16,
+            0.084
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.314,
+          "output_tps": 170.68,
+          "output_tps_ci95_pct": 0.92,
+          "per_user_tps_p50": 21.48,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 18.68,
+          "slo_attainment_pct": null,
+          "steps_per_s": 9.87,
+          "survival": [
+            0.722,
+            0.37,
+            0.179,
+            0.091,
+            0.05
+          ],
+          "tpot_p50_ms": 46.56,
+          "tpot_p99_ms": 62.24,
+          "tps_by_style": {
+            "code": {
+              "requests": 24,
+              "tps": 32.2
+            },
+            "prose": {
+              "requests": 156,
+              "tps": 20.2
+            }
+          },
+          "ttft_p50_s": 0.337,
+          "ttft_p99_s": 0.388
+        },
+        "poisson": {
+          "accepted_per_draft": 1.4,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.665,
+            0.347,
+            0.174,
+            0.088
+          ],
+          "goodput_rps": 0.347,
+          "mode": "poisson",
+          "output_tokens_per_step": 8.075,
+          "output_tps": 119.54,
+          "output_tps_ci95_pct": 18.07,
+          "per_user_tps_p50": 32.58,
+          "rate": 0.42,
+          "scheduled_tokens_per_step": 8.7,
+          "slo_attainment_pct": 75.4,
+          "steps_per_s": 16.26,
+          "survival": [
+            0.706,
+            0.375,
+            0.182,
+            0.09,
+            0.048
+          ],
+          "tpot_p50_ms": 30.59,
+          "tpot_p99_ms": 56.76,
+          "tps_by_style": {
+            "code": {
+              "requests": 19,
+              "tps": 41.3
+            },
+            "prose": {
+              "requests": 104,
+              "tps": 24.6
+            }
+          },
+          "ttft_p50_s": 0.257,
+          "ttft_p99_s": 6.952
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.372,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.761,
+            0.447,
+            0.253,
+            0.14
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.346,
+          "output_tps": 68.27,
+          "output_tps_ci95_pct": 3.37,
+          "per_user_tps_p50": 68.44,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.53,
+          "slo_attainment_pct": null,
+          "steps_per_s": 29.14,
+          "survival": [
+            0.653,
+            0.367,
+            0.189,
+            0.105,
+            0.057
+          ],
+          "tpot_p50_ms": 14.61,
+          "tpot_p99_ms": 17.18,
+          "tps_by_style": {
+            "code": {
+              "requests": 12,
+              "tps": 87.4
+            },
+            "prose": {
+              "requests": 61,
+              "tps": 65.1
+            }
+          },
+          "ttft_p50_s": 0.136,
+          "ttft_p99_s": 0.166
+        },
+        "c16": {
+          "accepted_per_draft": 1.35,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.617,
+            0.31,
+            0.147,
+            0.076
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 16.837,
+          "output_tps": 167.22,
+          "output_tps_ci95_pct": 0.98,
+          "per_user_tps_p50": 21.01,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 18.17,
+          "slo_attainment_pct": null,
+          "steps_per_s": 9.94,
+          "survival": [
+            0.701,
+            0.354,
+            0.17,
+            0.081,
+            0.044
+          ],
+          "tpot_p50_ms": 47.6,
+          "tpot_p99_ms": 62.57,
+          "tps_by_style": {
+            "code": {
+              "requests": 20,
+              "tps": 12.4
+            },
+            "prose": {
+              "requests": 149,
+              "tps": 10.2
+            }
+          },
+          "ttft_p50_s": 12.665,
+          "ttft_p99_s": 15.597
+        },
+        "c8": {
+          "accepted_per_draft": 1.338,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.619,
+            0.3,
+            0.143,
+            0.068
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 16.834,
+          "output_tps": 167.59,
+          "output_tps_ci95_pct": 1.02,
+          "per_user_tps_p50": 21.02,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 18.17,
+          "slo_attainment_pct": null,
+          "steps_per_s": 9.96,
+          "survival": [
+            0.705,
+            0.356,
+            0.162,
+            0.077,
+            0.038
+          ],
+          "tpot_p50_ms": 47.56,
+          "tpot_p99_ms": 61.16,
+          "tps_by_style": {
+            "code": {
+              "requests": 24,
+              "tps": 29.7
+            },
+            "prose": {
+              "requests": 152,
+              "tps": 19.9
+            }
+          },
+          "ttft_p50_s": 0.332,
+          "ttft_p99_s": 0.396
+        }
+      },
+      "stalls": {
+        "stall-3": {
+          "during_mean_s": 0.351,
+          "during_p90_s": 0.892,
+          "during_p99_s": 0.917,
+          "prefill_tps": 5339.4,
+          "probe_ttft_max_s": 1.231,
+          "probe_ttft_p50_s": 0.796,
+          "size": 131072,
+          "streams": 3
+        },
+        "stall-6": {
+          "during_mean_s": 0.379,
+          "during_p90_s": 0.913,
+          "during_p99_s": 0.955,
+          "prefill_tps": 5018.6,
+          "probe_ttft_max_s": 2.442,
+          "probe_ttft_p50_s": 1.761,
+          "size": 131072,
+          "streams": 6
+        },
+        "stall-7": {
+          "during_mean_s": 0.38,
+          "during_p90_s": 0.912,
+          "during_p99_s": 0.933,
+          "prefill_tps": 5361.4,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 7
+        }
+      },
+      "started_utc": "2026-11-19T09:22:27+00:00",
+      "suite_version": 3,
+      "topology": "TP3",
+      "transport": "oneshot-direct",
+      "verdicts": [
+        {
+          "change": "+20.20%",
+          "ci95": "0.14%",
+          "metric": "grid: decode geometric mean (15)",
+          "repeat": "-0.19%",
+          "verdict": "worse (both boots of each, reference repeat -0.51%; recorded A/A floor)"
+        },
+        {
+          "change": "+5.99%",
+          "ci95": "1.54%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "+0.40%",
+          "verdict": "better (both boots of each, reference repeat +0.05%; window tok/s +6.15% \u00b11.32%)"
+        },
+        {
+          "change": "+6.23%",
+          "ci95": "1.37%",
+          "metric": "c8: output tok/s",
+          "repeat": "+0.24%",
+          "verdict": "better (both boots of each, reference repeat +0.08%)"
+        },
+        {
+          "change": "+6.26%",
+          "ci95": "1.85%",
+          "metric": "c4: decode tok/s, paired",
+          "repeat": "+0.15%",
+          "verdict": "better (both boots of each, reference repeat +0.15%; window tok/s +6.36% \u00b11.80%)"
+        },
+        {
+          "change": "+6.43%",
+          "ci95": "2.00%",
+          "metric": "c4: output tok/s",
+          "repeat": "+0.14%",
+          "verdict": "better (both boots of each, reference repeat +0.01%)"
+        },
+        {
+          "change": "+0.29%",
+          "ci95": "23.37%",
+          "metric": "poisson: output tok/s",
+          "repeat": "+0.02%",
+          "verdict": "same (both boots of each, reference repeat +0.06%)"
+        },
+        {
+          "change": "+12.64%",
+          "ci95": "2.92%",
+          "metric": "stall-3: prefill 131,072 tok/s under decode",
+          "repeat": "+0.68%",
+          "verdict": "better (both boots of each, reference repeat +0.89%)"
+        },
+        {
+          "change": "+13.19%",
+          "ci95": "4.17%",
+          "metric": "stall-6: prefill 131,072 tok/s under decode",
+          "repeat": "-0.05%",
+          "verdict": "better (both boots of each, reference repeat +1.29%)"
+        },
+        {
+          "change": "+14.31%",
+          "ci95": "4.12%",
+          "metric": "stall-7: prefill 131,072 tok/s under decode",
+          "repeat": "+0.46%",
+          "verdict": "better (both boots of each, reference repeat +0.94%)"
+        },
+        {
+          "change": "+12.17%",
+          "ci95": "1.35%",
+          "metric": "prefill: prefill 32,768 tok/s",
+          "repeat": "+0.29%",
+          "verdict": "better (both boots of each, reference repeat +1.20%)"
+        },
+        {
+          "change": "+15.61%",
+          "ci95": "1.63%",
+          "metric": "prefill: prefill 131,072 tok/s",
+          "repeat": "+0.37%",
+          "verdict": "better (both boots of each, reference repeat +0.66%)"
+        },
+        {
+          "change": "+20.88%",
+          "ci95": "0.63%",
+          "metric": "prefill: prefill 262,144 tok/s",
+          "repeat": "+0.35%",
+          "verdict": "better (both boots of each, reference repeat +1.15%)"
+        },
+        {
+          "change": "+31.12%",
+          "ci95": "0.62%",
+          "metric": "prefill: prefill 524,288 tok/s",
+          "repeat": "+0.38%",
+          "verdict": "better (both boots of each, reference repeat +1.17%)"
+        },
+        {
+          "change": "+55.69%",
+          "ci95": "0.84%",
+          "metric": "prefill: prefill 1,000,000 tok/s",
+          "repeat": "+0.46%",
+          "verdict": "better (both boots of each, reference repeat +0.99%)"
+        },
+        {
+          "change": "+10.39%",
+          "ci95": "2.51%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "+0.24%",
+          "verdict": "better (both boots of each, reference repeat +0.12%; window tok/s +9.46% \u00b14.79%)"
+        },
+        {
+          "change": "+9.67%",
+          "ci95": "4.86%",
+          "metric": "c1: output tok/s",
+          "repeat": "+0.45%",
+          "verdict": "better (both boots of each, reference repeat +0.07%)"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-20",
+      "grid": {
+        "geomean_ms": 25.907,
+        "shape_count": 15,
+        "shapes": [
+          {
+            "ci95_pct": 0.76,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 33.82
+          },
+          {
+            "ci95_pct": 0.56,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 18.478
+          },
+          {
+            "ci95_pct": 0.37,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 20.092
+          },
+          {
+            "ci95_pct": 0.93,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 34.239
+          },
+          {
+            "ci95_pct": 0.54,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 19.113
+          },
+          {
+            "ci95_pct": 0.35,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 22.813
+          },
+          {
+            "ci95_pct": 0.85,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 34.875
+          },
+          {
+            "ci95_pct": 0.53,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 18.948
+          },
+          {
+            "ci95_pct": 0.33,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 22.084
+          },
+          {
+            "ci95_pct": 0.34,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 27.982
+          },
+          {
+            "ci95_pct": 0.78,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 34.213
+          },
+          {
+            "ci95_pct": 0.39,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 22.853
+          },
+          {
+            "ci95_pct": 0.73,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 34.08
+          },
+          {
+            "ci95_pct": 0.32,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 22.841
+          },
+          {
+            "ci95_pct": 0.83,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 34.111
+          }
+        ]
+      },
+      "id": "2026-11-20-spark-ds41f-1120-tp3-switched",
+      "image": "spark-ds41f:candidate-61-r2",
+      "path": "manifests/suites/2026-11-20-spark-ds41f-1120-tp3-switched",
+      "prefill": [
+        {
+          "ci95_pct": 0.66,
+          "prompt_tokens": 32761,
+          "size": 32768,
+          "tps": 7196.9
+        },
+        {
+          "ci95_pct": 1.05,
+          "prompt_tokens": 131900,
+          "size": 131072,
+          "tps": 7428.2
+        },
+        {
+          "ci95_pct": 0.16,
+          "prompt_tokens": 262554,
+          "size": 262144,
+          "tps": 7372.8
+        },
+        {
+          "ci95_pct": 0.25,
+          "prompt_tokens": 522774,
+          "size": 524288,
+          "tps": 7195.4
+        },
+        {
+          "ci95_pct": 0.41,
+          "prompt_tokens": 994697,
+          "size": 1000000,
+          "tps": 6852.8
+        }
+      ],
+      "release": "spark-ds41f-1120",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.464,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.783,
+            0.493,
+            0.274,
+            0.158
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.439,
+          "output_tps": 69.26,
+          "output_tps_ci95_pct": 3.92,
+          "per_user_tps_p50": 68.41,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.63,
+          "slo_attainment_pct": null,
+          "steps_per_s": 28.44,
+          "survival": [
+            0.674,
+            0.397,
+            0.216,
+            0.112,
+            0.064
+          ],
+          "tpot_p50_ms": 14.6,
+          "tpot_p99_ms": 16.92,
+          "tps_by_style": {
+            "code": {
+              "requests": 12,
+              "tps": 91.5
+            },
+            "prose": {
+              "requests": 63,
+              "tps": 65.8
+            }
+          },
+          "ttft_p50_s": 0.139,
+          "ttft_p99_s": 0.168
+        },
+        "c4": {
+          "accepted_per_draft": 1.388,
+          "concurrency": 4,
+          "coverage": [
+            1.0,
+            0.631,
+            0.324,
+            0.152,
+            0.076
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 8.701,
+          "output_tps": 130.01,
+          "output_tps_ci95_pct": 1.6,
+          "per_user_tps_p50": 32.53,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 9.4,
+          "slo_attainment_pct": null,
+          "steps_per_s": 14.96,
+          "survival": [
+            0.715,
+            0.366,
+            0.176,
+            0.087,
+            0.045
+          ],
+          "tpot_p50_ms": 30.73,
+          "tpot_p99_ms": 38.99,
+          "tps_by_style": {
+            "code": {
+              "requests": 21,
+              "tps": 46.8
+            },
+            "prose": {
+              "requests": 118,
+              "tps": 30.6
+            }
+          },
+          "ttft_p50_s": 0.238,
+          "ttft_p99_s": 0.287
+        },
+        "c8": {
+          "accepted_per_draft": 1.411,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.631,
+            0.323,
+            0.155,
+            0.078
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.376,
+          "output_tps": 168.92,
+          "output_tps_ci95_pct": 0.94,
+          "per_user_tps_p50": 21.29,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 18.76,
+          "slo_attainment_pct": null,
+          "steps_per_s": 9.73,
+          "survival": [
+            0.722,
+            0.374,
+            0.179,
+            0.088,
+            0.046
+          ],
+          "tpot_p50_ms": 46.96,
+          "tpot_p99_ms": 61.41,
+          "tps_by_style": {
+            "code": {
+              "requests": 24,
+              "tps": 31.6
+            },
+            "prose": {
+              "requests": 156,
+              "tps": 20.0
+            }
+          },
+          "ttft_p50_s": 0.341,
+          "ttft_p99_s": 0.407
+        },
+        "poisson": {
+          "accepted_per_draft": 1.406,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.663,
+            0.354,
+            0.174,
+            0.09
+          ],
+          "goodput_rps": 0.343,
+          "mode": "poisson",
+          "output_tokens_per_step": 8.249,
+          "output_tps": 119.55,
+          "output_tps_ci95_pct": 17.94,
+          "per_user_tps_p50": 31.67,
+          "rate": 0.42,
+          "scheduled_tokens_per_step": 8.89,
+          "slo_attainment_pct": 74.6,
+          "steps_per_s": 15.93,
+          "survival": [
+            0.706,
+            0.376,
+            0.184,
+            0.091,
+            0.049
+          ],
+          "tpot_p50_ms": 31.18,
+          "tpot_p99_ms": 57.03,
+          "tps_by_style": {
+            "code": {
+              "requests": 19,
+              "tps": 40.6
+            },
+            "prose": {
+              "requests": 104,
+              "tps": 24.0
+            }
+          },
+          "ttft_p50_s": 0.268,
+          "ttft_p99_s": 8.04
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.376,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.751,
+            0.446,
+            0.258,
+            0.145
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.349,
+          "output_tps": 67.36,
+          "output_tps_ci95_pct": 3.15,
+          "per_user_tps_p50": 67.79,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.54,
+          "slo_attainment_pct": null,
+          "steps_per_s": 28.71,
+          "survival": [
+            0.652,
+            0.362,
+            0.193,
+            0.109,
+            0.059
+          ],
+          "tpot_p50_ms": 14.75,
+          "tpot_p99_ms": 17.29,
+          "tps_by_style": {
+            "code": {
+              "requests": 12,
+              "tps": 84.6
+            },
+            "prose": {
+              "requests": 60,
+              "tps": 64.2
+            }
+          },
+          "ttft_p50_s": 0.14,
+          "ttft_p99_s": 0.167
+        },
+        "c16": {
+          "accepted_per_draft": 1.366,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.622,
+            0.311,
+            0.152,
+            0.079
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.006,
+          "output_tps": 165.74,
+          "output_tps_ci95_pct": 0.91,
+          "per_user_tps_p50": 20.78,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 18.37,
+          "slo_attainment_pct": null,
+          "steps_per_s": 9.76,
+          "survival": [
+            0.706,
+            0.358,
+            0.17,
+            0.086,
+            0.046
+          ],
+          "tpot_p50_ms": 48.12,
+          "tpot_p99_ms": 61.47,
+          "tps_by_style": {
+            "code": {
+              "requests": 20,
+              "tps": 12.4
+            },
+            "prose": {
+              "requests": 149,
+              "tps": 10.1
+            }
+          },
+          "ttft_p50_s": 12.829,
+          "ttft_p99_s": 15.25
+        },
+        "c8": {
+          "accepted_per_draft": 1.362,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.629,
+            0.316,
+            0.147,
+            0.073
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 16.934,
+          "output_tps": 165.56,
+          "output_tps_ci95_pct": 0.72,
+          "per_user_tps_p50": 20.91,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 18.28,
+          "slo_attainment_pct": null,
+          "steps_per_s": 9.78,
+          "survival": [
+            0.703,
+            0.364,
+            0.171,
+            0.082,
+            0.041
+          ],
+          "tpot_p50_ms": 47.68,
+          "tpot_p99_ms": 62.24,
+          "tps_by_style": {
+            "code": {
+              "requests": 24,
+              "tps": 28.9
+            },
+            "prose": {
+              "requests": 151,
+              "tps": 19.7
+            }
+          },
+          "ttft_p50_s": 0.343,
+          "ttft_p99_s": 0.419
+        }
+      },
+      "stalls": {
+        "stall-3": {
+          "during_mean_s": 0.359,
+          "during_p90_s": 0.91,
+          "during_p99_s": 0.954,
+          "prefill_tps": 5238.6,
+          "probe_ttft_max_s": 1.317,
+          "probe_ttft_p50_s": 0.813,
+          "size": 131072,
+          "streams": 3
+        },
+        "stall-6": {
+          "during_mean_s": 0.377,
+          "during_p90_s": 0.927,
+          "during_p99_s": 0.972,
+          "prefill_tps": 4888.4,
+          "probe_ttft_max_s": 1.827,
+          "probe_ttft_p50_s": 1.234,
+          "size": 131072,
+          "streams": 6
+        },
+        "stall-7": {
+          "during_mean_s": 0.388,
+          "during_p90_s": 0.927,
+          "during_p99_s": 0.967,
+          "prefill_tps": 5248.5,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 7
+        }
+      },
+      "started_utc": "2026-11-19T18:08:12+00:00",
+      "suite_version": 3,
+      "topology": "TP3-SWITCHED",
+      "transport": "oneshot-switched",
+      "verdicts": [
+        {
+          "change": "+11.42%",
+          "ci95": "0.21%",
+          "metric": "grid: decode geometric mean (15)",
+          "repeat": "-17.75%",
+          "verdict": "same (both candidate boots; recorded A/A floor)"
+        },
+        {
+          "change": "+6.87%",
+          "ci95": "1.10%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "-0.12%",
+          "verdict": "better (both candidate boots; window tok/s +7.39% \u00b11.23%)"
+        },
+        {
+          "change": "+7.39%",
+          "ci95": "1.23%",
+          "metric": "c8: output tok/s",
+          "repeat": "+0.08%",
+          "verdict": "better"
+        },
+        {
+          "change": "+7.05%",
+          "ci95": "2.07%",
+          "metric": "c4: decode tok/s, paired",
+          "repeat": "+0.27%",
+          "verdict": "better (both candidate boots; window tok/s +7.07% \u00b12.18%)"
+        },
+        {
+          "change": "+7.07%",
+          "ci95": "2.18%",
+          "metric": "c4: output tok/s",
+          "repeat": "+0.18%",
+          "verdict": "better"
+        },
+        {
+          "change": "+0.50%",
+          "ci95": "23.07%",
+          "metric": "poisson: output tok/s",
+          "repeat": "-0.04%",
+          "verdict": "same"
+        },
+        {
+          "change": "+12.34%",
+          "ci95": "2.31%",
+          "metric": "stall-3: prefill 131,072 tok/s under decode",
+          "repeat": "+0.54%",
+          "verdict": "better"
+        },
+        {
+          "change": "+12.93%",
+          "ci95": "2.11%",
+          "metric": "stall-6: prefill 131,072 tok/s under decode",
+          "repeat": "+1.09%",
+          "verdict": "better"
+        },
+        {
+          "change": "+13.29%",
+          "ci95": "4.56%",
+          "metric": "stall-7: prefill 131,072 tok/s under decode",
+          "repeat": "+0.87%",
+          "verdict": "better"
+        },
+        {
+          "change": "+12.54%",
+          "ci95": "2.01%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "+0.04%",
+          "verdict": "better (both candidate boots; window tok/s +11.08% \u00b15.46%)"
+        },
+        {
+          "change": "+11.08%",
+          "ci95": "5.46%",
+          "metric": "c1: output tok/s",
+          "repeat": "+0.01%",
+          "verdict": "better"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-20",
+      "grid": {
+        "geomean_ms": 19.364,
+        "shape_count": 20,
+        "shapes": [
+          {
+            "ci95_pct": 0.56,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 13.512
+          },
+          {
+            "ci95_pct": 0.58,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 15.328
+          },
+          {
+            "ci95_pct": 0.43,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 17.449
+          },
+          {
+            "ci95_pct": 0.54,
+            "context_len": 4096,
+            "label": "decode 16x32 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 32,
+            "step_ms": 23.352
+          },
+          {
+            "ci95_pct": 0.52,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.843
+          },
+          {
+            "ci95_pct": 0.32,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 16.035
+          },
+          {
+            "ci95_pct": 0.48,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 20.331
+          },
+          {
+            "ci95_pct": 0.34,
+            "context_len": 4096,
+            "label": "decode 16x48 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 27.519
+          },
+          {
+            "ci95_pct": 0.56,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 15.013
+          },
+          {
+            "ci95_pct": 0.44,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 16.038
+          },
+          {
+            "ci95_pct": 0.31,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 19.537
+          },
+          {
+            "ci95_pct": 0.43,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 26.567
+          },
+          {
+            "ci95_pct": 0.41,
+            "context_len": 4096,
+            "label": "decode 12x72 rows @4K",
+            "num_reqs": 12,
+            "num_tokens": 72,
+            "step_ms": 35.646
+          },
+          {
+            "ci95_pct": 0.45,
+            "context_len": 4096,
+            "label": "decode 16x96 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 96,
+            "step_ms": 39.281
+          },
+          {
+            "ci95_pct": 0.44,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.807
+          },
+          {
+            "ci95_pct": 0.31,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 20.332
+          },
+          {
+            "ci95_pct": 0.33,
+            "context_len": 65536,
+            "label": "decode 16x48 rows @64K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 27.591
+          },
+          {
+            "ci95_pct": 0.52,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.865
+          },
+          {
+            "ci95_pct": 0.45,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 20.1
+          },
+          {
+            "ci95_pct": 0.56,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.883
+          }
+        ]
+      },
+      "id": "2026-11-20-spark-ds41f-1120-tp4",
+      "image": "spark-ds41f:candidate-61",
+      "path": "manifests/suites/2026-11-20-spark-ds41f-1120-tp4",
+      "prefill": [
+        {
+          "ci95_pct": 1.58,
+          "prompt_tokens": 32761,
+          "size": 32768,
+          "tps": 9614.6
+        },
+        {
+          "ci95_pct": 0.55,
+          "prompt_tokens": 131900,
+          "size": 131072,
+          "tps": 10108.5
+        },
+        {
+          "ci95_pct": 0.11,
+          "prompt_tokens": 262554,
+          "size": 262144,
+          "tps": 10056.2
+        },
+        {
+          "ci95_pct": 0.15,
+          "prompt_tokens": 522774,
+          "size": 524288,
+          "tps": 9833.1
+        },
+        {
+          "ci95_pct": 0.14,
+          "prompt_tokens": 994697,
+          "size": 1000000,
+          "tps": 9397.1
+        }
+      ],
+      "release": "spark-ds41f-1120",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.47,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.753,
+            0.457,
+            0.262,
+            0.152
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.422,
+          "output_tps": 89.06,
+          "output_tps_ci95_pct": 2.55,
+          "per_user_tps_p50": 89.88,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.61,
+          "slo_attainment_pct": null,
+          "steps_per_s": 36.79,
+          "survival": [
+            0.681,
+            0.394,
+            0.211,
+            0.116,
+            0.069
+          ],
+          "tpot_p50_ms": 11.09,
+          "tpot_p99_ms": 13.54,
+          "tps_by_style": {
+            "code": {
+              "requests": 16,
+              "tps": 118.6
+            },
+            "prose": {
+              "requests": 79,
+              "tps": 83.9
+            }
+          },
+          "ttft_p50_s": 0.109,
+          "ttft_p99_s": 0.129
+        },
+        "c16": {
+          "accepted_per_draft": 1.425,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.645,
+            0.34,
+            0.169,
+            0.093
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 35.299,
+          "output_tps": 280.43,
+          "output_tps_ci95_pct": 0.79,
+          "per_user_tps_p50": 17.61,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 38.12,
+          "slo_attainment_pct": null,
+          "steps_per_s": 7.95,
+          "survival": [
+            0.714,
+            0.379,
+            0.187,
+            0.093,
+            0.052
+          ],
+          "tpot_p50_ms": 56.77,
+          "tpot_p99_ms": 73.7,
+          "tps_by_style": {
+            "code": {
+              "requests": 39,
+              "tps": 27.3
+            },
+            "prose": {
+              "requests": 253,
+              "tps": 16.5
+            }
+          },
+          "ttft_p50_s": 0.4,
+          "ttft_p99_s": 0.456
+        },
+        "c8": {
+          "accepted_per_draft": 1.411,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.69,
+            0.372,
+            0.186,
+            0.098
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.888,
+          "output_tps": 213.57,
+          "output_tps_ci95_pct": 1.01,
+          "per_user_tps_p50": 26.96,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.31,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.95,
+          "survival": [
+            0.699,
+            0.381,
+            0.188,
+            0.093,
+            0.05
+          ],
+          "tpot_p50_ms": 37.09,
+          "tpot_p99_ms": 48.94,
+          "tps_by_style": {
+            "code": {
+              "requests": 28,
+              "tps": 40.9
+            },
+            "prose": {
+              "requests": 198,
+              "tps": 25.2
+            }
+          },
+          "ttft_p50_s": 0.275,
+          "ttft_p99_s": 0.316
+        },
+        "poisson": {
+          "accepted_per_draft": 1.413,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.708,
+            0.382,
+            0.195,
+            0.098
+          ],
+          "goodput_rps": 0.683,
+          "mode": "poisson",
+          "output_tokens_per_step": 11.917,
+          "output_tps": 180.29,
+          "output_tps_ci95_pct": 15.44,
+          "per_user_tps_p50": 33.81,
+          "rate": 0.7,
+          "scheduled_tokens_per_step": 12.86,
+          "slo_attainment_pct": 96.7,
+          "steps_per_s": 17.5,
+          "survival": [
+            0.693,
+            0.384,
+            0.189,
+            0.097,
+            0.05
+          ],
+          "tpot_p50_ms": 29.45,
+          "tpot_p99_ms": 67.57,
+          "tps_by_style": {
+            "code": {
+              "requests": 25,
+              "tps": 46.5
+            },
+            "prose": {
+              "requests": 169,
+              "tps": 27.9
+            }
+          },
+          "ttft_p50_s": 0.237,
+          "ttft_p99_s": 4.5
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.392,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.732,
+            0.424,
+            0.241,
+            0.139
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.348,
+          "output_tps": 87.07,
+          "output_tps_ci95_pct": 2.27,
+          "per_user_tps_p50": 87.63,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.53,
+          "slo_attainment_pct": null,
+          "steps_per_s": 37.11,
+          "survival": [
+            0.66,
+            0.372,
+            0.195,
+            0.106,
+            0.059
+          ],
+          "tpot_p50_ms": 11.4,
+          "tpot_p99_ms": 13.81,
+          "tps_by_style": {
+            "code": {
+              "requests": 15,
+              "tps": 113.5
+            },
+            "prose": {
+              "requests": 78,
+              "tps": 82.7
+            }
+          },
+          "ttft_p50_s": 0.109,
+          "ttft_p99_s": 0.129
+        },
+        "c16": {
+          "accepted_per_draft": 1.396,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.644,
+            0.337,
+            0.169,
+            0.088
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 34.928,
+          "output_tps": 276.58,
+          "output_tps_ci95_pct": 0.75,
+          "per_user_tps_p50": 17.46,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 37.69,
+          "slo_attainment_pct": null,
+          "steps_per_s": 7.92,
+          "survival": [
+            0.702,
+            0.372,
+            0.182,
+            0.092,
+            0.049
+          ],
+          "tpot_p50_ms": 57.23,
+          "tpot_p99_ms": 75.28,
+          "tps_by_style": {
+            "code": {
+              "requests": 39,
+              "tps": 25.2
+            },
+            "prose": {
+              "requests": 248,
+              "tps": 16.3
+            }
+          },
+          "ttft_p50_s": 0.4,
+          "ttft_p99_s": 0.459
+        },
+        "c8": {
+          "accepted_per_draft": 1.364,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.685,
+            0.366,
+            0.184,
+            0.09
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.589,
+          "output_tps": 210.02,
+          "output_tps_ci95_pct": 0.7,
+          "per_user_tps_p50": 26.52,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.0,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.95,
+          "survival": [
+            0.683,
+            0.368,
+            0.178,
+            0.09,
+            0.046
+          ],
+          "tpot_p50_ms": 37.71,
+          "tpot_p99_ms": 48.85,
+          "tps_by_style": {
+            "code": {
+              "requests": 28,
+              "tps": 37.8
+            },
+            "prose": {
+              "requests": 194,
+              "tps": 24.9
+            }
+          },
+          "ttft_p50_s": 0.274,
+          "ttft_p99_s": 0.324
+        }
+      },
+      "stalls": {
+        "stall-11": {
+          "during_mean_s": 0.573,
+          "during_p90_s": 1.75,
+          "during_p99_s": 1.782,
+          "prefill_tps": 7157.5,
+          "probe_ttft_max_s": 1.891,
+          "probe_ttft_p50_s": 1.14,
+          "size": 131072,
+          "streams": 11
+        },
+        "stall-15": {
+          "during_mean_s": 0.652,
+          "during_p90_s": 1.744,
+          "during_p99_s": 1.768,
+          "prefill_tps": 7851.5,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 15
+        },
+        "stall-3": {
+          "during_mean_s": 0.511,
+          "during_p90_s": 1.7,
+          "during_p99_s": 1.743,
+          "prefill_tps": 7733.6,
+          "probe_ttft_max_s": 1.557,
+          "probe_ttft_p50_s": 0.726,
+          "size": 131072,
+          "streams": 3
+        }
+      },
+      "started_utc": "2026-11-18T17:31:02+00:00",
+      "suite_version": 3,
+      "topology": "TP4",
+      "transport": "oneshot-ring4",
+      "verdicts": [
+        {
+          "change": "-7.73%",
+          "ci95": "0.12%",
+          "metric": "grid: decode geometric mean (20)",
+          "repeat": "+0.12%",
+          "verdict": "better (both boots of each, reference repeat -0.51%; recorded A/A floor)"
+        },
+        {
+          "change": "+3.07%",
+          "ci95": "1.19%",
+          "metric": "c16: decode tok/s, paired",
+          "repeat": "+0.07%",
+          "verdict": "better (both boots of each, reference repeat -0.91%; window tok/s +2.77% \u00b11.05%)"
+        },
+        {
+          "change": "+3.26%",
+          "ci95": "1.07%",
+          "metric": "c16: output tok/s",
+          "repeat": "+0.13%",
+          "verdict": "better (both boots of each, reference repeat -0.80%)"
+        },
+        {
+          "change": "+2.70%",
+          "ci95": "1.15%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "+0.10%",
+          "verdict": "better (both boots of each, reference repeat -1.01%; window tok/s +2.95% \u00b11.39%)"
+        },
+        {
+          "change": "+3.47%",
+          "ci95": "1.46%",
+          "metric": "c8: output tok/s",
+          "repeat": "+0.02%",
+          "verdict": "better (both boots of each, reference repeat -0.99%)"
+        },
+        {
+          "change": "+0.04%",
+          "ci95": "20.04%",
+          "metric": "poisson: output tok/s",
+          "repeat": "-0.03%",
+          "verdict": "same (both boots of each, reference repeat +0.04%)"
+        },
+        {
+          "change": "+13.67%",
+          "ci95": "2.02%",
+          "metric": "stall-3: prefill 131,072 tok/s under decode",
+          "repeat": "+0.59%",
+          "verdict": "better (both boots of each, reference repeat +0.57%)"
+        },
+        {
+          "change": "+12.44%",
+          "ci95": "2.34%",
+          "metric": "stall-11: prefill 131,072 tok/s under decode",
+          "repeat": "+0.85%",
+          "verdict": "better (both boots of each, reference repeat +0.19%)"
+        },
+        {
+          "change": "+13.73%",
+          "ci95": "2.67%",
+          "metric": "stall-15: prefill 131,072 tok/s under decode",
+          "repeat": "+0.19%",
+          "verdict": "better (both boots of each, reference repeat +0.47%)"
+        },
+        {
+          "change": "+12.91%",
+          "ci95": "1.86%",
+          "metric": "prefill: prefill 32,768 tok/s",
+          "repeat": "+0.14%",
+          "verdict": "better (both boots of each, reference repeat +0.31%)"
+        },
+        {
+          "change": "+16.51%",
+          "ci95": "0.69%",
+          "metric": "prefill: prefill 131,072 tok/s",
+          "repeat": "-0.05%",
+          "verdict": "better (both boots of each, reference repeat +0.39%)"
+        },
+        {
+          "change": "+21.60%",
+          "ci95": "0.39%",
+          "metric": "prefill: prefill 262,144 tok/s",
+          "repeat": "+0.03%",
+          "verdict": "better (both boots of each, reference repeat +0.25%)"
+        },
+        {
+          "change": "+31.78%",
+          "ci95": "0.32%",
+          "metric": "prefill: prefill 524,288 tok/s",
+          "repeat": "+0.03%",
+          "verdict": "better (both boots of each, reference repeat +0.08%)"
+        },
+        {
+          "change": "+56.31%",
+          "ci95": "0.75%",
+          "metric": "prefill: prefill 1,000,000 tok/s",
+          "repeat": "-0.06%",
+          "verdict": "better (both boots of each, reference repeat -0.08%)"
+        },
+        {
+          "change": "+7.30%",
+          "ci95": "1.79%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "-0.16%",
+          "verdict": "better (both boots of each, reference repeat -0.72%; window tok/s +7.79% \u00b14.83%)"
+        },
+        {
+          "change": "+8.13%",
+          "ci95": "4.99%",
+          "metric": "c1: output tok/s",
+          "repeat": "-0.28%",
+          "verdict": "better (both boots of each, reference repeat -0.91%)"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-20",
+      "grid": {
+        "geomean_ms": 19.05,
+        "shape_count": 20,
+        "shapes": [
+          {
+            "ci95_pct": 0.68,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 13.367
+          },
+          {
+            "ci95_pct": 0.34,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 15.144
+          },
+          {
+            "ci95_pct": 0.53,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 17.259
+          },
+          {
+            "ci95_pct": 0.36,
+            "context_len": 4096,
+            "label": "decode 16x32 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 32,
+            "step_ms": 22.745
+          },
+          {
+            "ci95_pct": 0.64,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.491
+          },
+          {
+            "ci95_pct": 0.46,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 15.882
+          },
+          {
+            "ci95_pct": 0.53,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 19.754
+          },
+          {
+            "ci95_pct": 0.52,
+            "context_len": 4096,
+            "label": "decode 16x48 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 27.128
+          },
+          {
+            "ci95_pct": 0.64,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 14.647
+          },
+          {
+            "ci95_pct": 0.86,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 16.044
+          },
+          {
+            "ci95_pct": 0.64,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 19.18
+          },
+          {
+            "ci95_pct": 0.46,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 25.814
+          },
+          {
+            "ci95_pct": 0.32,
+            "context_len": 4096,
+            "label": "decode 12x72 rows @4K",
+            "num_reqs": 12,
+            "num_tokens": 72,
+            "step_ms": 35.102
+          },
+          {
+            "ci95_pct": 0.35,
+            "context_len": 4096,
+            "label": "decode 16x96 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 96,
+            "step_ms": 39.729
+          },
+          {
+            "ci95_pct": 0.66,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.796
+          },
+          {
+            "ci95_pct": 0.6,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 19.7
+          },
+          {
+            "ci95_pct": 0.48,
+            "context_len": 65536,
+            "label": "decode 16x48 rows @64K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 26.958
+          },
+          {
+            "ci95_pct": 0.9,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.566
+          },
+          {
+            "ci95_pct": 0.73,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 19.587
+          },
+          {
+            "ci95_pct": 1.05,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 13.742
+          }
+        ]
+      },
+      "id": "2026-11-20-spark-ds41f-1120-tp4-switched",
+      "image": "spark-ds41f:candidate-61",
+      "path": "manifests/suites/2026-11-20-spark-ds41f-1120-tp4-switched",
+      "prefill": [
+        {
+          "ci95_pct": 1.45,
+          "prompt_tokens": 32761,
+          "size": 32768,
+          "tps": 9569.0
+        },
+        {
+          "ci95_pct": 0.95,
+          "prompt_tokens": 131900,
+          "size": 131072,
+          "tps": 10047.5
+        },
+        {
+          "ci95_pct": 1.08,
+          "prompt_tokens": 262554,
+          "size": 262144,
+          "tps": 9973.5
+        },
+        {
+          "ci95_pct": 0.66,
+          "prompt_tokens": 522774,
+          "size": 524288,
+          "tps": 9774.3
+        },
+        {
+          "ci95_pct": 0.54,
+          "prompt_tokens": 994697,
+          "size": 1000000,
+          "tps": 9307.5
+        }
+      ],
+      "release": "spark-ds41f-1120",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.465,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.751,
+            0.456,
+            0.26,
+            0.152
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.418,
+          "output_tps": 88.97,
+          "output_tps_ci95_pct": 2.5,
+          "per_user_tps_p50": 89.18,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.61,
+          "slo_attainment_pct": null,
+          "steps_per_s": 36.82,
+          "survival": [
+            0.679,
+            0.392,
+            0.21,
+            0.115,
+            0.068
+          ],
+          "tpot_p50_ms": 11.2,
+          "tpot_p99_ms": 13.63,
+          "tps_by_style": {
+            "code": {
+              "requests": 16,
+              "tps": 118.0
+            },
+            "prose": {
+              "requests": 79,
+              "tps": 83.9
+            }
+          },
+          "ttft_p50_s": 0.11,
+          "ttft_p99_s": 0.13
+        },
+        "c16": {
+          "accepted_per_draft": 1.427,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.644,
+            0.339,
+            0.171,
+            0.094
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 35.336,
+          "output_tps": 280.51,
+          "output_tps_ci95_pct": 0.94,
+          "per_user_tps_p50": 17.65,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 38.16,
+          "slo_attainment_pct": null,
+          "steps_per_s": 7.94,
+          "survival": [
+            0.714,
+            0.38,
+            0.188,
+            0.094,
+            0.053
+          ],
+          "tpot_p50_ms": 56.63,
+          "tpot_p99_ms": 74.16,
+          "tps_by_style": {
+            "code": {
+              "requests": 39,
+              "tps": 27.1
+            },
+            "prose": {
+              "requests": 253,
+              "tps": 16.5
+            }
+          },
+          "ttft_p50_s": 0.4,
+          "ttft_p99_s": 0.458
+        },
+        "c8": {
+          "accepted_per_draft": 1.403,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.683,
+            0.368,
+            0.186,
+            0.097
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.872,
+          "output_tps": 213.06,
+          "output_tps_ci95_pct": 0.82,
+          "per_user_tps_p50": 26.87,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.29,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.93,
+          "survival": [
+            0.695,
+            0.378,
+            0.186,
+            0.093,
+            0.05
+          ],
+          "tpot_p50_ms": 36.98,
+          "tpot_p99_ms": 49.86,
+          "tps_by_style": {
+            "code": {
+              "requests": 28,
+              "tps": 40.9
+            },
+            "prose": {
+              "requests": 197,
+              "tps": 25.2
+            }
+          },
+          "ttft_p50_s": 0.274,
+          "ttft_p99_s": 0.318
+        },
+        "poisson": {
+          "accepted_per_draft": 1.412,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.703,
+            0.382,
+            0.194,
+            0.099
+          ],
+          "goodput_rps": 0.683,
+          "mode": "poisson",
+          "output_tokens_per_step": 11.942,
+          "output_tps": 180.26,
+          "output_tps_ci95_pct": 15.42,
+          "per_user_tps_p50": 33.72,
+          "rate": 0.7,
+          "scheduled_tokens_per_step": 12.88,
+          "slo_attainment_pct": 96.7,
+          "steps_per_s": 17.44,
+          "survival": [
+            0.695,
+            0.382,
+            0.188,
+            0.096,
+            0.052
+          ],
+          "tpot_p50_ms": 29.46,
+          "tpot_p99_ms": 67.38,
+          "tps_by_style": {
+            "code": {
+              "requests": 25,
+              "tps": 46.4
+            },
+            "prose": {
+              "requests": 168,
+              "tps": 27.8
+            }
+          },
+          "ttft_p50_s": 0.236,
+          "ttft_p99_s": 4.769
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.404,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.739,
+            0.441,
+            0.253,
+            0.142
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.366,
+          "output_tps": 87.31,
+          "output_tps_ci95_pct": 2.33,
+          "per_user_tps_p50": 87.99,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.55,
+          "slo_attainment_pct": null,
+          "steps_per_s": 36.93,
+          "survival": [
+            0.661,
+            0.374,
+            0.198,
+            0.11,
+            0.06
+          ],
+          "tpot_p50_ms": 11.34,
+          "tpot_p99_ms": 13.65,
+          "tps_by_style": {
+            "code": {
+              "requests": 15,
+              "tps": 113.4
+            },
+            "prose": {
+              "requests": 78,
+              "tps": 83.0
+            }
+          },
+          "ttft_p50_s": 0.109,
+          "ttft_p99_s": 0.131
+        },
+        "c16": {
+          "accepted_per_draft": 1.389,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.636,
+            0.332,
+            0.171,
+            0.091
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 34.897,
+          "output_tps": 276.44,
+          "output_tps_ci95_pct": 0.5,
+          "per_user_tps_p50": 17.44,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 37.67,
+          "slo_attainment_pct": null,
+          "steps_per_s": 7.92,
+          "survival": [
+            0.701,
+            0.365,
+            0.181,
+            0.093,
+            0.05
+          ],
+          "tpot_p50_ms": 57.34,
+          "tpot_p99_ms": 73.55,
+          "tps_by_style": {
+            "code": {
+              "requests": 39,
+              "tps": 25.6
+            },
+            "prose": {
+              "requests": 249,
+              "tps": 16.4
+            }
+          },
+          "ttft_p50_s": 0.401,
+          "ttft_p99_s": 0.457
+        },
+        "c8": {
+          "accepted_per_draft": 1.361,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.681,
+            0.36,
+            0.181,
+            0.092
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.6,
+          "output_tps": 209.6,
+          "output_tps_ci95_pct": 0.82,
+          "per_user_tps_p50": 26.34,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.0,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.92,
+          "survival": [
+            0.682,
+            0.366,
+            0.177,
+            0.09,
+            0.046
+          ],
+          "tpot_p50_ms": 37.88,
+          "tpot_p99_ms": 48.93,
+          "tps_by_style": {
+            "code": {
+              "requests": 28,
+              "tps": 38.3
+            },
+            "prose": {
+              "requests": 194,
+              "tps": 24.9
+            }
+          },
+          "ttft_p50_s": 0.275,
+          "ttft_p99_s": 0.334
+        }
+      },
+      "stalls": {
+        "stall-11": {
+          "during_mean_s": 0.596,
+          "during_p90_s": 1.763,
+          "during_p99_s": 1.809,
+          "prefill_tps": 7123.2,
+          "probe_ttft_max_s": 1.964,
+          "probe_ttft_p50_s": 1.175,
+          "size": 131072,
+          "streams": 11
+        },
+        "stall-15": {
+          "during_mean_s": 0.658,
+          "during_p90_s": 1.763,
+          "during_p99_s": 1.793,
+          "prefill_tps": 7765.7,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 15
+        },
+        "stall-3": {
+          "during_mean_s": 0.527,
+          "during_p90_s": 1.717,
+          "during_p99_s": 1.75,
+          "prefill_tps": 7653.9,
+          "probe_ttft_max_s": 1.684,
+          "probe_ttft_p50_s": 0.898,
+          "size": 131072,
+          "streams": 3
+        }
+      },
+      "started_utc": "2026-11-18T22:18:40+00:00",
+      "suite_version": 3,
+      "topology": "TP4-SWITCHED",
+      "transport": "oneshot-switched",
+      "verdicts": [
+        {
+          "change": "-9.83%",
+          "ci95": "0.15%",
+          "metric": "grid: decode geometric mean (20)",
+          "repeat": "+0.14%",
+          "verdict": "better (both candidate boots; recorded A/A floor)"
+        },
+        {
+          "change": "+6.51%",
+          "ci95": "1.04%",
+          "metric": "c16: decode tok/s, paired",
+          "repeat": "-0.21%",
+          "verdict": "better (both candidate boots; window tok/s +6.87% \u00b11.17%)"
+        },
+        {
+          "change": "+6.87%",
+          "ci95": "1.17%",
+          "metric": "c16: output tok/s",
+          "repeat": "-0.09%",
+          "verdict": "better"
+        },
+        {
+          "change": "+6.82%",
+          "ci95": "1.45%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "-0.17%",
+          "verdict": "better (both candidate boots; window tok/s +6.79% \u00b11.30%)"
+        },
+        {
+          "change": "+6.79%",
+          "ci95": "1.30%",
+          "metric": "c8: output tok/s",
+          "repeat": "-0.14%",
+          "verdict": "better"
+        },
+        {
+          "change": "+0.06%",
+          "ci95": "19.51%",
+          "metric": "poisson: output tok/s",
+          "repeat": "+0.03%",
+          "verdict": "same"
+        },
+        {
+          "change": "+14.93%",
+          "ci95": "2.05%",
+          "metric": "stall-3: prefill 131,072 tok/s under decode",
+          "repeat": "+0.52%",
+          "verdict": "better"
+        },
+        {
+          "change": "+11.88%",
+          "ci95": "0.95%",
+          "metric": "stall-11: prefill 131,072 tok/s under decode",
+          "repeat": "+0.46%",
+          "verdict": "better"
+        },
+        {
+          "change": "+14.05%",
+          "ci95": "3.93%",
+          "metric": "stall-15: prefill 131,072 tok/s under decode",
+          "repeat": "-0.13%",
+          "verdict": "better"
+        },
+        {
+          "change": "+12.96%",
+          "ci95": "1.53%",
+          "metric": "prefill: prefill 32,768 tok/s",
+          "repeat": "-0.74%",
+          "verdict": "better"
+        },
+        {
+          "change": "+16.66%",
+          "ci95": "0.94%",
+          "metric": "prefill: prefill 131,072 tok/s",
+          "repeat": "-0.15%",
+          "verdict": "better"
+        },
+        {
+          "change": "+21.49%",
+          "ci95": "1.12%",
+          "metric": "prefill: prefill 262,144 tok/s",
+          "repeat": "+0.09%",
+          "verdict": "better"
+        },
+        {
+          "change": "+31.78%",
+          "ci95": "0.72%",
+          "metric": "prefill: prefill 524,288 tok/s",
+          "repeat": "-0.29%",
+          "verdict": "better"
+        },
+        {
+          "change": "+56.02%",
+          "ci95": "0.75%",
+          "metric": "prefill: prefill 1,000,000 tok/s",
+          "repeat": "+0.02%",
+          "verdict": "better"
+        },
+        {
+          "change": "+9.39%",
+          "ci95": "1.07%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "-0.08%",
+          "verdict": "better (both candidate boots; window tok/s +11.47% \u00b14.44%)"
+        },
+        {
+          "change": "+11.47%",
+          "ci95": "4.44%",
+          "metric": "c1: output tok/s",
+          "repeat": "-0.16%",
+          "verdict": "better"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-20",
+      "grid": {
+        "geomean_ms": 17.597,
+        "shape_count": 20,
+        "shapes": [
+          {
+            "ci95_pct": 1.04,
+            "context_len": 4096,
+            "label": "decode 1x2 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 2,
+            "step_ms": 10.085
+          },
+          {
+            "ci95_pct": 0.9,
+            "context_len": 4096,
+            "label": "decode 4x8 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 8,
+            "step_ms": 12.218
+          },
+          {
+            "ci95_pct": 0.72,
+            "context_len": 4096,
+            "label": "decode 8x16 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 16,
+            "step_ms": 15.181
+          },
+          {
+            "ci95_pct": 0.43,
+            "context_len": 4096,
+            "label": "decode 16x32 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 32,
+            "step_ms": 24.023
+          },
+          {
+            "ci95_pct": 0.85,
+            "context_len": 4096,
+            "label": "decode 1x3 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 10.508
+          },
+          {
+            "ci95_pct": 0.62,
+            "context_len": 4096,
+            "label": "decode 4x12 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 12,
+            "step_ms": 13.22
+          },
+          {
+            "ci95_pct": 0.74,
+            "context_len": 4096,
+            "label": "decode 8x24 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 19.699
+          },
+          {
+            "ci95_pct": 0.6,
+            "context_len": 4096,
+            "label": "decode 16x48 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 29.954
+          },
+          {
+            "ci95_pct": 0.56,
+            "context_len": 4096,
+            "label": "decode 1x6 rows @4K",
+            "num_reqs": 1,
+            "num_tokens": 6,
+            "step_ms": 11.398
+          },
+          {
+            "ci95_pct": 0.8,
+            "context_len": 4096,
+            "label": "decode 2x12 rows @4K",
+            "num_reqs": 2,
+            "num_tokens": 12,
+            "step_ms": 12.935
+          },
+          {
+            "ci95_pct": 0.54,
+            "context_len": 4096,
+            "label": "decode 4x24 rows @4K",
+            "num_reqs": 4,
+            "num_tokens": 24,
+            "step_ms": 19.072
+          },
+          {
+            "ci95_pct": 0.39,
+            "context_len": 4096,
+            "label": "decode 8x48 rows @4K",
+            "num_reqs": 8,
+            "num_tokens": 48,
+            "step_ms": 28.201
+          },
+          {
+            "ci95_pct": 0.42,
+            "context_len": 4096,
+            "label": "decode 12x72 rows @4K",
+            "num_reqs": 12,
+            "num_tokens": 72,
+            "step_ms": 41.522
+          },
+          {
+            "ci95_pct": 0.24,
+            "context_len": 4096,
+            "label": "decode 16x96 rows @4K",
+            "num_reqs": 16,
+            "num_tokens": 96,
+            "step_ms": 49.479
+          },
+          {
+            "ci95_pct": 0.75,
+            "context_len": 65536,
+            "label": "decode 1x3 rows @64K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 10.619
+          },
+          {
+            "ci95_pct": 0.61,
+            "context_len": 65536,
+            "label": "decode 8x24 rows @64K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 19.658
+          },
+          {
+            "ci95_pct": 0.55,
+            "context_len": 65536,
+            "label": "decode 16x48 rows @64K",
+            "num_reqs": 16,
+            "num_tokens": 48,
+            "step_ms": 29.735
+          },
+          {
+            "ci95_pct": 0.59,
+            "context_len": 262144,
+            "label": "decode 1x3 rows @256K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 10.49
+          },
+          {
+            "ci95_pct": 0.49,
+            "context_len": 262144,
+            "label": "decode 8x24 rows @256K",
+            "num_reqs": 8,
+            "num_tokens": 24,
+            "step_ms": 19.653
+          },
+          {
+            "ci95_pct": 0.8,
+            "context_len": 1040384,
+            "label": "decode 1x3 rows @1016K",
+            "num_reqs": 1,
+            "num_tokens": 3,
+            "step_ms": 10.558
+          }
+        ]
+      },
+      "id": "2026-11-20-spark-ds41f-1120-tp8-switched",
+      "image": "spark-ds41f:candidate-61-r2",
+      "path": "manifests/suites/2026-11-20-spark-ds41f-1120-tp8-switched",
+      "prefill": [
+        {
+          "ci95_pct": 1.67,
+          "prompt_tokens": 32761,
+          "size": 32768,
+          "tps": 11845.7
+        },
+        {
+          "ci95_pct": 0.52,
+          "prompt_tokens": 131900,
+          "size": 131072,
+          "tps": 12429.0
+        },
+        {
+          "ci95_pct": 0.2,
+          "prompt_tokens": 262554,
+          "size": 262144,
+          "tps": 12382.5
+        },
+        {
+          "ci95_pct": 0.34,
+          "prompt_tokens": 522774,
+          "size": 524288,
+          "tps": 12206.3
+        },
+        {
+          "ci95_pct": 0.6,
+          "prompt_tokens": 994697,
+          "size": 1000000,
+          "tps": 11806.0
+        }
+      ],
+      "release": "spark-ds41f-1120",
+      "runs": {
+        "c1": {
+          "accepted_per_draft": 1.476,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.766,
+            0.462,
+            0.258,
+            0.149
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.43,
+          "output_tps": 129.43,
+          "output_tps_ci95_pct": 2.15,
+          "per_user_tps_p50": 130.02,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.62,
+          "slo_attainment_pct": null,
+          "steps_per_s": 53.29,
+          "survival": [
+            0.682,
+            0.4,
+            0.213,
+            0.115,
+            0.067
+          ],
+          "tpot_p50_ms": 7.69,
+          "tpot_p99_ms": 9.38,
+          "tps_by_style": {
+            "code": {
+              "requests": 21,
+              "tps": 174.6
+            },
+            "prose": {
+              "requests": 118,
+              "tps": 122.6
+            }
+          },
+          "ttft_p50_s": 0.078,
+          "ttft_p99_s": 0.095
+        },
+        "c16": {
+          "accepted_per_draft": 1.433,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.652,
+            0.336,
+            0.174,
+            0.093
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 35.454,
+          "output_tps": 395.4,
+          "output_tps_ci95_pct": 0.73,
+          "per_user_tps_p50": 24.74,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 38.31,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.15,
+          "survival": [
+            0.715,
+            0.384,
+            0.185,
+            0.097,
+            0.052
+          ],
+          "tpot_p50_ms": 40.42,
+          "tpot_p99_ms": 53.12,
+          "tps_by_style": {
+            "code": {
+              "requests": 53,
+              "tps": 38.2
+            },
+            "prose": {
+              "requests": 371,
+              "tps": 23.3
+            }
+          },
+          "ttft_p50_s": 0.285,
+          "ttft_p99_s": 0.333
+        },
+        "c8": {
+          "accepted_per_draft": 1.415,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.689,
+            0.372,
+            0.188,
+            0.098
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 18.005,
+          "output_tps": 312.94,
+          "output_tps_ci95_pct": 1.12,
+          "per_user_tps_p50": 39.12,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 19.44,
+          "slo_attainment_pct": null,
+          "steps_per_s": 17.39,
+          "survival": [
+            0.702,
+            0.38,
+            0.186,
+            0.096,
+            0.052
+          ],
+          "tpot_p50_ms": 25.55,
+          "tpot_p99_ms": 33.47,
+          "tps_by_style": {
+            "code": {
+              "requests": 43,
+              "tps": 58.6
+            },
+            "prose": {
+              "requests": 295,
+              "tps": 36.9
+            }
+          },
+          "ttft_p50_s": 0.189,
+          "ttft_p99_s": 0.217
+        },
+        "poisson": {
+          "accepted_per_draft": 1.4,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.731,
+            0.405,
+            0.201,
+            0.097
+          ],
+          "goodput_rps": 0.707,
+          "mode": "poisson",
+          "output_tokens_per_step": 5.888,
+          "output_tps": 179.72,
+          "output_tps_ci95_pct": 15.92,
+          "per_user_tps_p50": 74.95,
+          "rate": 0.7,
+          "scheduled_tokens_per_step": 6.35,
+          "slo_attainment_pct": 100.0,
+          "steps_per_s": 32.0,
+          "survival": [
+            0.683,
+            0.381,
+            0.192,
+            0.096,
+            0.048
+          ],
+          "tpot_p50_ms": 13.22,
+          "tpot_p99_ms": 32.01,
+          "tps_by_style": {
+            "code": {
+              "requests": 25,
+              "tps": 94.6
+            },
+            "prose": {
+              "requests": 171,
+              "tps": 61.0
+            }
+          },
+          "ttft_p50_s": 0.119,
+          "ttft_p99_s": 0.245
+        }
+      },
+      "sampled": {
+        "c1": {
+          "accepted_per_draft": 1.374,
+          "concurrency": 1,
+          "coverage": [
+            1.0,
+            0.735,
+            0.433,
+            0.237,
+            0.134
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 2.334,
+          "output_tps": 125.29,
+          "output_tps_ci95_pct": 1.79,
+          "per_user_tps_p50": 125.58,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 2.52,
+          "slo_attainment_pct": null,
+          "steps_per_s": 53.7,
+          "survival": [
+            0.656,
+            0.367,
+            0.192,
+            0.102,
+            0.057
+          ],
+          "tpot_p50_ms": 7.96,
+          "tpot_p99_ms": 9.84,
+          "tps_by_style": {
+            "code": {
+              "requests": 20,
+              "tps": 159.9
+            },
+            "prose": {
+              "requests": 115,
+              "tps": 119.8
+            }
+          },
+          "ttft_p50_s": 0.077,
+          "ttft_p99_s": 0.091
+        },
+        "c16": {
+          "accepted_per_draft": 1.358,
+          "concurrency": 16,
+          "coverage": [
+            1.0,
+            0.64,
+            0.322,
+            0.162,
+            0.088
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 34.571,
+          "output_tps": 387.49,
+          "output_tps_ci95_pct": 0.31,
+          "per_user_tps_p50": 24.55,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 37.34,
+          "slo_attainment_pct": null,
+          "steps_per_s": 11.21,
+          "survival": [
+            0.696,
+            0.359,
+            0.169,
+            0.085,
+            0.048
+          ],
+          "tpot_p50_ms": 40.69,
+          "tpot_p99_ms": 54.38,
+          "tps_by_style": {
+            "code": {
+              "requests": 52,
+              "tps": 35.4
+            },
+            "prose": {
+              "requests": 360,
+              "tps": 23.0
+            }
+          },
+          "ttft_p50_s": 0.283,
+          "ttft_p99_s": 0.331
+        },
+        "c8": {
+          "accepted_per_draft": 1.349,
+          "concurrency": 8,
+          "coverage": [
+            1.0,
+            0.684,
+            0.359,
+            0.18,
+            0.092
+          ],
+          "goodput_rps": null,
+          "mode": "closed",
+          "output_tokens_per_step": 17.549,
+          "output_tps": 306.8,
+          "output_tps_ci95_pct": 0.84,
+          "per_user_tps_p50": 38.44,
+          "rate": 1.0,
+          "scheduled_tokens_per_step": 18.95,
+          "slo_attainment_pct": null,
+          "steps_per_s": 17.49,
+          "survival": [
+            0.681,
+            0.362,
+            0.173,
+            0.088,
+            0.046
+          ],
+          "tpot_p50_ms": 26.01,
+          "tpot_p99_ms": 33.7,
+          "tps_by_style": {
+            "code": {
+              "requests": 42,
+              "tps": 55.2
+            },
+            "prose": {
+              "requests": 288,
+              "tps": 36.4
+            }
+          },
+          "ttft_p50_s": 0.19,
+          "ttft_p99_s": 0.224
+        }
+      },
+      "stalls": {
+        "stall-11": {
+          "during_mean_s": 0.88,
+          "during_p90_s": 2.793,
+          "during_p99_s": 2.857,
+          "prefill_tps": 10105.3,
+          "probe_ttft_max_s": 2.966,
+          "probe_ttft_p50_s": 1.518,
+          "size": 131072,
+          "streams": 11
+        },
+        "stall-15": {
+          "during_mean_s": 0.988,
+          "during_p90_s": 2.771,
+          "during_p99_s": 2.794,
+          "prefill_tps": 10785.5,
+          "probe_ttft_max_s": 0.0,
+          "probe_ttft_p50_s": 0.0,
+          "size": 131072,
+          "streams": 15
+        },
+        "stall-3": {
+          "during_mean_s": 0.795,
+          "during_p90_s": 2.737,
+          "during_p99_s": 2.755,
+          "prefill_tps": 10409.9,
+          "probe_ttft_max_s": 2.589,
+          "probe_ttft_p50_s": 1.379,
+          "size": 131072,
+          "streams": 3
+        }
+      },
+      "started_utc": "2026-11-20T03:09:27+00:00",
+      "suite_version": 3,
+      "topology": "TP8-SWITCHED",
+      "transport": "oneshot-switched",
+      "verdicts": [
+        {
+          "change": "-9.92%",
+          "ci95": "0.11%",
+          "metric": "grid: decode geometric mean (20)",
+          "repeat": "+0.03%",
+          "verdict": "better (both candidate boots; recorded A/A floor)"
+        },
+        {
+          "change": "+6.81%",
+          "ci95": "0.94%",
+          "metric": "c16: decode tok/s, paired",
+          "repeat": "+0.02%",
+          "verdict": "better (both candidate boots; window tok/s +6.70% \u00b10.99%)"
+        },
+        {
+          "change": "+6.70%",
+          "ci95": "0.99%",
+          "metric": "c16: output tok/s",
+          "repeat": "-0.03%",
+          "verdict": "better"
+        },
+        {
+          "change": "+7.35%",
+          "ci95": "0.99%",
+          "metric": "c8: decode tok/s, paired",
+          "repeat": "-0.02%",
+          "verdict": "better (both candidate boots; window tok/s +7.97% \u00b11.29%)"
+        },
+        {
+          "change": "+7.97%",
+          "ci95": "1.29%",
+          "metric": "c8: output tok/s",
+          "repeat": "-0.06%",
+          "verdict": "better"
+        },
+        {
+          "change": "+0.05%",
+          "ci95": "21.07%",
+          "metric": "poisson: output tok/s",
+          "repeat": "-0.01%",
+          "verdict": "same"
+        },
+        {
+          "change": "+10.25%",
+          "ci95": "9.03%",
+          "metric": "stall-3: prefill 131,072 tok/s under decode",
+          "repeat": "-0.81%",
+          "verdict": "better"
+        },
+        {
+          "change": "+17.17%",
+          "ci95": "8.28%",
+          "metric": "stall-11: prefill 131,072 tok/s under decode",
+          "repeat": "+0.13%",
+          "verdict": "better"
+        },
+        {
+          "change": "+16.39%",
+          "ci95": "5.29%",
+          "metric": "stall-15: prefill 131,072 tok/s under decode",
+          "repeat": "-1.04%",
+          "verdict": "better"
+        },
+        {
+          "change": "+5.99%",
+          "ci95": "1.47%",
+          "metric": "prefill: prefill 32,768 tok/s",
+          "repeat": "+0.24%",
+          "verdict": "better"
+        },
+        {
+          "change": "+9.32%",
+          "ci95": "0.48%",
+          "metric": "prefill: prefill 131,072 tok/s",
+          "repeat": "-0.16%",
+          "verdict": "better"
+        },
+        {
+          "change": "+12.11%",
+          "ci95": "0.21%",
+          "metric": "prefill: prefill 262,144 tok/s",
+          "repeat": "+0.00%",
+          "verdict": "better"
+        },
+        {
+          "change": "+18.89%",
+          "ci95": "0.34%",
+          "metric": "prefill: prefill 524,288 tok/s",
+          "repeat": "-0.26%",
+          "verdict": "better"
+        },
+        {
+          "change": "+34.92%",
+          "ci95": "0.67%",
+          "metric": "prefill: prefill 1,000,000 tok/s",
+          "repeat": "-0.08%",
+          "verdict": "better"
+        },
+        {
+          "change": "+11.74%",
+          "ci95": "2.38%",
+          "metric": "c1: decode tok/s, paired",
+          "repeat": "-0.31%",
+          "verdict": "better (both candidate boots; window tok/s +12.09% \u00b12.89%)"
+        },
+        {
+          "change": "+12.09%",
+          "ci95": "2.89%",
+          "metric": "c1: output tok/s",
+          "repeat": "-0.14%",
+          "verdict": "better"
+        }
+      ]
     }
   ],
   "timeline": [
+    {
+      "benchmark_reference": "manifests/suites/2026-11-20-spark-ds41f-1120-tp4",
+      "captured_at": "20261120T114500Z",
+      "change_from_previous": "spark-ds41f-1107 plus vLLM 0762-0829 (702 active vLLM patches), TileLang 0014 (device-compiler cache key), SparkNet 0001-0003 (big-core RoCE proxy, pipelined multi-stage collectives, PDL collective chaining), and CUDA 13.5.37 (#974): full B12X retirement (#1096, 0802); 32-stream concurrency and 1-192 CUDA graph capture across TP4..TP8 with expanded KV pools (13.00-25.50 GiB/rank); single-node tp1, tp2-direct, tp2-switched (with zero-copy io_uring expert slot cache, 0822), and 4 KiB-page tp3-triangle-4k shapes; RM nvidiactl display carve-out on TP2/TP3 (#1225, 0821); UMA buddy sponge across post-load (0800); hardware e2m1x2 indexer quantize (0777), 64K globaltimer-paced L2 prefetch (0781), sliced SP Engram row exchange (0779), MoE combine shared-row post-PDL race fix (0799), Clock-Pro Engram shield (0815), grid-40 persistent vocab refine (0819), DSpark margin confidence head and piecewise TP3 curve (0820), MoE down PDL preload (0822), GLP Spec v3 native fold (0805), strictly default-off FP8 group-32 LSA upgrade (0828), and Python/API/parser fixes 0823-0827/0829",
+      "date": "2026-11-20",
+      "evidence_summary": "Qualified across all 12 hardware shapes (`tp4-ring`, `tp3-triangle`, `tp3-triangle-4k`, `tp2-direct`, `tp2-switched` through `tp8-switched`, and `tp1`) per the rc12->rc14 carry-over precedent (vLLM 0823-0829 keep VLLM_DS41_LSA unset by default with jit_new_files=0 and identical kernels/weights). In-image release-tests gate (`candidate-62`): 12,023 passed, 356 skipped, 0 failed across 169 files (including 106 parser tests across test_deepseek_v41.py and test_deepseek_v41_structural_closers.py); 2-boot c62 verification passed on tp3-triangle (`dgx1..dgx3`: min MemAvail 8.27/8.28 GiB head, 10.11..10.34 GiB workers, 0 swap growth; wide determinism 7/7 and greedy 7/7 identical; live smoke issues #1036/#943/#944/#945/#969 pass) and tp1 (`dgx4`: min MemAvail 14.09/14.60 GiB, 0 swap growth; greedy 6/6 identical). Two-boot Sonar comparison against spark-ds41f-1107: on `tp4-ring` (manifests/suites/2026-11-20-spark-ds41f-1120-tp4): decode grid -7.73% (19.36 ms vs 21.05 ms, better); paired c16 +3.07% (output 280.43 tok/s), c8 +2.70% (213.57 tok/s), single-stream c1 +7.30% (89.06 tok/s); sampled c16/c8/c1 +3.23%/+3.01%/+8.61% (276.58/210.02/87.07 tok/s); prefill +12.91%/+16.51%/+21.60%/+31.78%/+56.31% at 32K..1M (9,615/10,109/10,056/9,833/9,397 tok/s, all better); stall-3/11/15 prefill +13.67%/+12.44%/+13.73% (TTFT p50 0.73 s / 1.14 s). On `tp3-triangle` (`...-1120-tp3`): paired c8 +5.99% (170.68 tok/s), c4 +6.26% (131.59 tok/s), single-stream c1 +10.39% (70.36 tok/s), sampled c16/c8/c1 +6.47%/+6.52%/+7.75% (167.22/167.59/68.27 tok/s), prefill +12.17%..+55.69% (7,270/7,502/7,445/7,259/6,922 tok/s); 1x* dummy-padding engine grid shapes higher (25.52 ms vs 21.27 ms, +20.20%) while multi-req shapes improved -3.1%..-12.7%. On `tp3-switched` (`...-1120-tp3-switched`): paired c8 +6.87% (168.92 tok/s), c4 +7.05% (130.01 tok/s), single-stream c1 +12.54% (69.26 tok/s), sampled +6.65%/+6.62%/+10.89% (165.74/165.56/67.36 tok/s), prefill 7,197..6,853 tok/s. On `tp4-switched` (`...-1120-tp4-switched`): grid -9.83% (19.05 ms vs 21.14 ms), paired c16 +6.51% (280.51 tok/s), c8 +6.82% (213.06 tok/s), single-stream c1 +9.39% (88.97 tok/s), sampled +6.64%/+6.68%/+10.90% (276.44/209.60/87.31 tok/s), prefill +12.96%..+56.02% (9,569..9,308 tok/s). On `tp8-switched` (`...-1120-tp8-switched`): grid -9.92% (17.60 ms vs 19.54 ms), paired c16 +6.81% (395.40 tok/s), c8 +7.35% (312.94 tok/s), single-stream c1 +11.74% (129.43 tok/s), sampled +6.53%/+7.21%/+11.19% (387.49/306.80/125.29 tok/s), prefill +5.99%/+9.32%/+12.11%/+18.89%/+34.92% (11,846/12,429/12,383/12,206/11,806 tok/s); stall-3/11/15 prefill +10.25%/+17.17%/+16.39%. All 12 `bin/spark bench` references (`manifests/benchmarks/2026-11-20-spark-ds41f-1120-*.json`) passed 5/5 quality checks, collectives, and the >5.0 GiB startup MemAvailable floor with 0.0 GiB swap growth (tp5..tp7 prefill up to 11,206 tok/s; tp2-direct/tp2-switched 256K context 52.96/53.59 prose-c4 tok/s; tp1 256K 10.94/11.36 tok/s).",
+      "experiments": [
+        "experiments/2026-10-26-spark-ds41f-candidate/",
+        "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/",
+        "experiments/2026-11-16-c61-decode/"
+      ],
+      "image_id": "sha256:5c12472565a7",
+      "image_tag": "spark-ds41f:1120",
+      "is_promoted": true,
+      "previous_baseline": "2026-11-07-spark-ds41f-1107",
+      "shape": "tp4-ring",
+      "short_name": "spark-ds41f-1120",
+      "status": "promoted-baseline",
+      "stem": "2026-11-20-spark-ds41f-1120",
+      "vllm_patch_head": "9b251a18",
+      "vllm_tree": "8fc99ca7"
+    },
     {
       "benchmark_reference": "manifests/suites/2026-11-07-spark-ds41f-1107-tp4",
       "captured_at": "20261107T193500Z",
@@ -9094,7 +12508,7 @@ bin/spark --cluster-config config/cluster.json \
       ],
       "image_id": "sha256:3f32a962ce04",
       "image_tag": "spark-ds41f:1107",
-      "is_promoted": true,
+      "is_promoted": false,
       "previous_baseline": "2026-10-30-spark-ds41f-1030",
       "shape": "tp4-ring",
       "short_name": "spark-ds41f-1107",
@@ -9863,12 +13277,12 @@ bin/spark --cluster-config config/cluster.json \
     {
       "kind": "git",
       "name": "vllm",
-      "patch_count": 641,
-      "patch_head": "2756478b60b90700b9918b457aeb38657da637b5",
-      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series",
+      "patch_count": 8,
+      "patch_head": "9b251a1860e7e9e123aaf718d15f499a2beb6738",
+      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/vllm/series",
       "revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
       "role": "serving source: Local Inference Lab's DS4.1 integration branch, used unchanged; canonical vllm-project/vllm main is parked",
-      "tree": "ed1bdb7a7684da33d403a055521ac0c4dd7ca670",
+      "tree": "8fc99ca7546c5c538f0fe64e7c82954f1d2d7ae0",
       "upstream": "https://github.com/local-inference-lab/vllm.git",
       "version": null
     },
@@ -9883,18 +13297,6 @@ bin/spark --cluster-config config/cluster.json \
       "tree": null,
       "upstream": "docker.io/vllm/vllm-openai",
       "version": "nightly-af1c01499b289be555c475669ba50a88e96d846e"
-    },
-    {
-      "kind": "git",
-      "name": "b12x",
-      "patch_count": 11,
-      "patch_head": "69e5795e2141fbb5fa2b3af096d51e754939bb41",
-      "patch_series": "experiments/2026-10-08-lil-rebase/b12x/series",
-      "revision": "236ddff04a5f5064084b46464800b70b34ec7d8c",
-      "role": "modules vLLM still imports (the DS4.1 Engram module's preparation types among them); candidate 7 loads with --load-format direct (vLLM 0499, B12X's bounce-mode loader ported into vLLM), so B12X's own loader is not used, and no B12X kernel runs in serving. The repository is archived and continues in FlashInfer (flashinfer/experimental/b12x), and this is its last commit",
-      "tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
-      "upstream": "https://github.com/local-inference-lab/b12x.git",
-      "version": null
     },
     {
       "kind": "git",
@@ -9945,6 +13347,18 @@ bin/spark --cluster-config config/cluster.json \
       "version": "4.7.1"
     },
     {
+      "kind": "deb",
+      "name": "cuda_toolkit",
+      "patch_count": null,
+      "patch_head": null,
+      "patch_series": null,
+      "revision": null,
+      "role": "CUDA 13.5 toolchain and math libraries over the base image's CUDA 13.0.2: nvcc/ptxas 13.5.37, libcudart 13.5.37, libcublas/libcublasLt 13.10.0.20 (#974)",
+      "tree": null,
+      "upstream": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa",
+      "version": "13.5.37"
+    },
+    {
       "kind": "huggingface",
       "name": "model",
       "patch_count": null,
@@ -9959,12 +13373,12 @@ bin/spark --cluster-config config/cluster.json \
     {
       "kind": "git",
       "name": "tilelang",
-      "patch_count": 13,
-      "patch_head": "92a1d3a0eba72b440297d4090bbfc498a47b0eb6",
-      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/1107/tilelang/series",
+      "patch_count": 14,
+      "patch_head": "444b0447a201e24982099abfd10f67fd8b6104df",
+      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tilelang/series",
       "revision": "2123e412ce2217b324c50c4ec967213906456ac5",
-      "role": "TileLang compiler refresh (2123e412ce22) with local SM120/SM121 features and correctness fixes (#875, #879-#883, C45 0001..0013)",
-      "tree": "e2b001828fd4e38e6a2eee61f818d5083cb1335f",
+      "role": "TileLang compiler refresh (2123e412ce22) with local SM120/SM121 features and correctness fixes (#875, #879-#883, C45 0001..0012), and the kernel cache keyed by the CUDA device compiler (0014)",
+      "tree": "741806c7357102130a149cdcae2a5f22678eab67",
       "upstream": "https://github.com/tile-ai/tilelang.git",
       "version": "0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464"
     },
@@ -9983,12 +13397,12 @@ bin/spark --cluster-config config/cluster.json \
     {
       "kind": "git",
       "name": "sparknet",
-      "patch_count": null,
-      "patch_head": "1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
-      "patch_series": null,
+      "patch_count": 3,
+      "patch_head": "1fdf8dc72bf92e21ca5813ad8f0b63c52af3ad9e",
+      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/sparknet/series",
       "revision": "1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
-      "role": "sparknet: one-shot RoCE collectives (TileLang kernels only, timed waits that stop the GPU, API 2) and fabric profiles, for the TileLang family's TP collectives; release 0.5.0 plus single-slot transfer cap (<= _slot_bytes) so large SP prefill chunks use PyNCCL",
-      "tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0",
+      "role": "sparknet: one-shot RoCE collectives (TileLang kernels only, timed waits that stop the GPU, API 2) and fabric profiles, for the TileLang family's TP collectives; release 0.5.0: a data phase of one pack a thread with one poller after the doorbell, the all-gather in one round trip (TP3 serving A/B on r6x 2026-10-20: decode step about 1.6 percent lower, outputs identical)",
+      "tree": "e06f6a0675cb66638231d2c68948a2b315b69b07",
       "upstream": "https://github.com/christopherowen/dgx-spark-networking.git",
       "version": "0.5.0"
     }
@@ -10068,13 +13482,15 @@ bin/spark --cluster-config config/cluster.json \
     SHAPES.forEach(s => { const k = s.fabric + s.nodes; if (!DIAGRAM[k]) DIAGRAM[k] = s; });
     const counts = f => SHAPES.filter(s => s.fabric === f).map(s => s.nodes).filter((n, i, a) => a.indexOf(n) === i).sort((a, b) => a - b);
     const HOW = {
+      "local": "single-node, no interconnect",
       "oneshot-ring4": "each Spark cabled to its two neighbours",
       "oneshot-direct": "every Spark cabled to both of the others",
       "oneshot-switched": "one cable each, into a switch"
     };
 
     function geometry(fabric, n, cx, cy, R) {
-      const off = fabric === "switched" || n % 2 ? -90 : -90 - 180 / n;
+      if (n === 1) return { pts: [[cx, cy]], edges: [] };
+      const off = (fabric === "switched" && n !== 2) || n % 2 ? -90 : -90 - 180 / n;
       const pts = [];
       for (let i = 0; i < n; i++) {
         const a = (off + i * 360 / n) * Math.PI / 180;
@@ -10082,6 +13498,7 @@ bin/spark --cluster-config config/cluster.json \
       }
       let edges;
       if (fabric === "switched") edges = pts.map(p => `M${p[0]},${p[1]} L${cx},${cy}`);
+      else if (n === 2) edges = [`M${pts[0][0]},${pts[0][1]} L${pts[1][0]},${pts[1][1]}`];
       else if (n === 3) edges = pts.map((p, i) => `M${p[0]},${p[1]} L${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
       else edges = pts.map((p, i) => `M${p[0]},${p[1]} A${R},${R} 0 0 1 ${pts[(i + 1) % n][0]},${pts[(i + 1) % n][1]}`);
       return { pts, edges };
@@ -10117,7 +13534,7 @@ bin/spark --cluster-config config/cluster.json \
       }
       if (fabric === "switched") {
         out += `<g class="hub"><rect x="${cx - 37}" y="${cy - 17}" width="74" height="34" rx="17"/><text x="${cx}" y="${cy + 4}">switch*</text></g>`;
-      } else {
+      } else if (n > 2) {
         out += `<circle class="hub-ghost" cx="${cx}" cy="${cy}" r="34"/><text class="hub-label" x="${cx}" y="${cy + 4}">no switch</text>`;
       }
       // A Spark, drawn as its own low slab: plain lid and flank, a foam front with a grip at each end.
@@ -10167,7 +13584,10 @@ bin/spark --cluster-config config/cluster.json \
         `<button type="button" data-n="${n}" aria-pressed="${n === state.nodes}">${n}</button>`).join("");
       drawFabric();
       $("#fabric-name").textContent = s.name;
-      $("#fabric-how").textContent = `${cap(word(s.nodes))} Sparks, ${HOW[s.transport] || s.transport}`;
+      const how = s.transport === "oneshot-direct" && s.nodes === 2
+        ? "cabled directly to each other"
+        : (HOW[s.transport] || s.transport);
+      $("#fabric-how").textContent = `${cap(word(s.nodes))} ${s.nodes === 1 ? "Spark" : "Sparks"}, ${how}`;
 
       const kv = s.kv_capacity;
       tween($("#t-ctx"), s.max_model_len, int);
@@ -10175,7 +13595,7 @@ bin/spark --cluster-config config/cluster.json \
       tween($("#t-seq"), s.max_num_seqs, int);
       $("#t-seq-d").textContent = `at once, ${int(kv.every_sequence_tokens)} tokens each with every seat full`;
       tween($("#t-kv"), kv.vllm_capacity_tokens / 1e6, v => v.toFixed(1) + "M");
-      $("#t-kv-d").textContent = `tokens of KV kept warm: ${word(kv.full_contexts)} full contexts`;
+      $("#t-kv-d").textContent = `tokens of KV kept warm: ${word(kv.full_contexts)} full context${kv.full_contexts === 1 ? "" : "s"}`;
 
       const suite = suiteFor(s);
       const tiles = $("#perf-tiles"), none = $("#perf-none");
@@ -10424,15 +13844,16 @@ bin/spark --cluster-config config/cluster.json \
     candSel.addEventListener("change", drawNumbers);
 
     /* ---------- shapes table ---------- */
+    const shapeKind = s => s.nodes === 1 ? "local" : s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : s.nodes === 2 ? "direct" : "ring";
     $("#shape-rows").innerHTML = SHAPES.map(s => {
       const kv = s.kv_capacity, m = s.memory;
       return `<tr>
         <td>${glyph(s.fabric, s.nodes)}</td>
         <td class="lead nw"><code>${esc(s.name)}</code>${s.default ? '<span class="pill">default</span>' : ""}</td>
-        <td class="nw">${cap(word(s.nodes))} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}${s.page_size_bytes < 65536 ? " · stock 4 KiB kernel" : ""}</td>
+        <td class="nw">${cap(word(s.nodes))} ${s.nodes === 1 ? "Spark" : "Sparks"}, ${shapeKind(s)}${s.page_size_bytes < 65536 ? " · stock 4 KiB kernel" : ""}</td>
         <td class="n">${int(s.max_model_len)}</td>
         <td class="n">${s.max_num_seqs}</td>
-        <td class="n">${kv.full_contexts} full contexts</td>
+        <td class="n">${kv.full_contexts} full context${kv.full_contexts === 1 ? "" : "s"}</td>
         <td class="n">${m ? m.head_min_available_gib.toFixed(1) + " GiB" : "–"}</td>
         <td>${s.qualified_release ? esc(shortRel(s.qualified_release)) : '<span class="flat">not yet</span>'}</td>
       </tr>`;
@@ -10482,7 +13903,7 @@ bin/spark --cluster-config config/cluster.json \
     if (CARD) {
       const s = SHAPES.find(x => x.name === DATA.default_shape) || SHAPES[0], suite = suiteFor(s);
       const top = suite && suite.runs.c16 ? 16 : 8, run = suite && suite.runs["c" + top];
-      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} Sparks, ${s.fabric === "switched" ? "switched" : s.nodes === 3 ? "triangle" : "ring"}`;
+      $("#og-rel").textContent = `release ${shortRel(DATA.promoted_short)} · ${s.nodes} ${s.nodes === 1 ? "Spark" : "Sparks"}, ${shapeKind(s)}`;
       $("#og-ctx").textContent = s.max_model_len >= 1e6 ? Math.floor(s.max_model_len / 1e6) + "M" : Math.round(s.max_model_len / 1024) + "K";
       $("#og-seq").textContent = s.max_num_seqs;
       // One stream splits into prose and code when the run's request table allows it; sixteen streams

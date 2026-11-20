@@ -13,11 +13,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import kv_capacity  # noqa: E402
 
 RECIPE = json.loads((ROOT / "config/cluster.json").read_text())
+RECIPE_1107 = json.loads((ROOT / "releases/spark-ds41f-1107/cluster.json").read_text())
 MODEL = json.loads((ROOT / "state/config.json").read_text())["text_config"]
 
 
-def row(shape: str, **sizing) -> dict:
-    cluster = copy.deepcopy(RECIPE)
+def row(shape: str, base_recipe: dict = RECIPE_1107, **sizing) -> dict:
+    cluster = copy.deepcopy(base_recipe)
     cluster["shapes"][shape].setdefault("sizing", {}).update(sizing)
     return kv_capacity.report(cluster, MODEL, [shape])[shape]
 
@@ -91,8 +92,18 @@ class CapacityTest(unittest.TestCase):
         self.assertEqual(row("tp3-triangle", max_num_batched_tokens=4096)["vllm_capacity_tokens"], 5_609_861)
 
     def test_budget_override(self):
-        rows = kv_capacity.report(RECIPE, MODEL, ["tp4-ring"], budget=16384)
-        self.assertEqual(rows["tp4-ring"]["reported_tokens"], 6_512_700)
+        rows_1107 = kv_capacity.report(RECIPE_1107, MODEL, ["tp4-ring"], budget=16384)
+        self.assertEqual(rows_1107["tp4-ring"]["reported_tokens"], 6_512_700)
+        # Promoted 1120 tp4-ring: 16.50 GiB KV pool and 32 concurrent streams.
+        ring_1120 = row("tp4-ring", RECIPE)
+        self.assertEqual(ring_1120["pool_blocks"], 77_759)
+        self.assertEqual(ring_1120["reported_tokens"], 10_234_243)
+        self.assertEqual(ring_1120["full_contexts"], 17)
+        self.assertEqual(ring_1120["every_sequence_tokens"], 579_840)
+        self.assertEqual(ring_1120["vllm_capacity_tokens"], 18_711_942)
+        self.assertAlmostEqual(ring_1120["vllm_capacity_contexts"], 17.85, 2)
+        rows_1120 = kv_capacity.report(RECIPE, MODEL, ["tp4-ring"], budget=16384)
+        self.assertEqual(rows_1120["tp4-ring"]["reported_tokens"], 10_234_243)
 
 
 if __name__ == "__main__":

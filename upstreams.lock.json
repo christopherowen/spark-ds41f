@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
-  "generated_from_baseline": "2026-11-07-spark-ds41f-1107",
+  "captured_at": "2026-11-20",
+  "generated_from_baseline": "2026-11-20-spark-ds41f-1120",
   "sources": {
     "vllm": {
       "kind": "git",
@@ -10,11 +11,15 @@
       "revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
       "revision_url": "https://github.com/local-inference-lab/vllm/commit/19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
       "role": "serving source: Local Inference Lab's DS4.1 integration branch, used unchanged; canonical vllm-project/vllm main is parked",
-      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/1107/vllm/series",
+      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-62/vllm/series",
       "canonical_base": {
         "upstream": "https://github.com/vllm-project/vllm.git",
         "revision": "0f8fa53acf43a9a6a7a1f7e6b196950c78cd6d7a"
-      }
+      },
+      "patch_head": "9b251a1860e7e9e123aaf718d15f499a2beb6738",
+      "expected_tree": "8fc99ca7546c5c538f0fe64e7c82954f1d2d7ae0",
+      "patchset_sha256": "800e726dc8e772596e3e4cce20e264e92921510264cf628c7bdc4bd4fcb8d906",
+      "patch_count": 702
     },
     "vllm_base_image": {
       "kind": "oci",
@@ -23,17 +28,6 @@
       "source_revision": "af1c01499b289be555c475669ba50a88e96d846e",
       "recorded_base_digest": "sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
       "role": "CUDA 13.0.2 and vLLM runtime base"
-    },
-    "b12x": {
-      "kind": "git",
-      "upstream": "https://github.com/local-inference-lab/b12x.git",
-      "contribution_remote": null,
-      "tracking_ref": "refs/heads/integration/karmic-kraken-beta",
-      "revision": "236ddff04a5f5064084b46464800b70b34ec7d8c",
-      "revision_url": "https://github.com/local-inference-lab/b12x/commit/236ddff04a5f5064084b46464800b70b34ec7d8c",
-      "applied_upstream_commits": [],
-      "role": "modules vLLM still imports (the DS4.1 Engram module's preparation types among them); candidate 7 loads with --load-format direct (vLLM 0499, B12X's bounce-mode loader ported into vLLM), so B12X's own loader is not used, and no B12X kernel runs in serving. The repository is archived and continues in FlashInfer (flashinfer/experimental/b12x), and this is its last commit",
-      "patch_series": "experiments/2026-10-08-lil-rebase/b12x/series"
     },
     "nccl": {
       "kind": "git",
@@ -72,6 +66,13 @@
       "lockfile": "requirements/cutlass-dsl-aarch64.txt",
       "role": "CuTe DSL compiler and CUDA 12/13 runtime libraries; required at 4.7.1 by vLLM and at >=4.7 by quack-kernels, used by B12X (pin moved by patch 0002), FlashInfer and the cuDNN frontend"
     },
+    "cuda_toolkit": {
+      "kind": "deb",
+      "upstream": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa",
+      "version": "13.5.37",
+      "lockfile": "requirements/cuda-13-5-sbsa.txt",
+      "role": "CUDA 13.5 toolchain and math libraries over the base image's CUDA 13.0.2: nvcc/ptxas 13.5.37, libcudart 13.5.37, libcublas/libcublasLt 13.10.0.20 (#974)"
+    },
     "model": {
       "kind": "huggingface",
       "upstream": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash",
@@ -92,8 +93,8 @@
       "revision_url": "https://github.com/tile-ai/tilelang/commit/2123e412ce2217b324c50c4ec967213906456ac5",
       "version": "0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464",
       "submodules": true,
-      "role": "TileLang compiler refresh (2123e412ce22) with local SM120/SM121 features and correctness fixes (#875, #879-#883, C45 0001..0013)",
-      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/1107/tilelang/series"
+      "role": "TileLang compiler refresh (2123e412ce22) with local SM120/SM121 features and correctness fixes (#875, #879-#883, C45 0001..0012), and the kernel cache keyed by the CUDA device compiler (0014)",
+      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/tilelang/series"
     },
     "tile_kernels": {
       "kind": "git",
@@ -114,7 +115,13 @@
       "revision": "1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
       "revision_url": "https://github.com/christopherowen/dgx-spark-networking/commit/1fd6a1fbd8dc4884057046d1ebd93d585c9e4bcf",
       "version": "0.5.0",
-      "role": "sparknet: one-shot RoCE collectives (TileLang kernels only, timed waits that stop the GPU, API 2) and fabric profiles, for the TileLang family's TP collectives; release 0.5.0 plus single-slot transfer cap (<= _slot_bytes) so large SP prefill chunks use PyNCCL"
+      "role": "sparknet: one-shot RoCE collectives (TileLang kernels only, timed waits that stop the GPU, API 2) and fabric profiles, for the TileLang family's TP collectives; release 0.5.0: a data phase of one pack a thread with one poller after the doorbell, the all-gather in one round trip (TP3 serving A/B on r6x 2026-10-20: decode step about 1.6 percent lower, outputs identical)",
+      "tree": "8cc28a5cd3e683c1f114ed843453e3ce34f323e0",
+      "subject": "perf(vllm): restrict SparknetOneShotAllReduce to single-slot transfers (<= _slot_bytes) so large SP prefill chunks use PyNCCL",
+      "patch_series": "experiments/2026-10-26-spark-ds41f-candidate/candidate-55/sparknet/series",
+      "patch_head": "1fdf8dc72bf92e21ca5813ad8f0b63c52af3ad9e",
+      "expected_tree": "e06f6a0675cb66638231d2c68948a2b315b69b07",
+      "patchset_sha256": "60bb194276394ef8049b627e78ac3b8d880e8503b9ab77a8dea1bfc5dcd7666f"
     }
   },
   "references": {
@@ -417,5 +424,6 @@
       "role": "NVIDIA's CuTe DSL MegaMoE (also in FlashInfer moe_ep, NVFP4/MXFP8 expert-parallel MoE with communication fused) and TRT-LLM sparse attention; design reference only"
     }
   },
-  "source_manifest": "manifests/sources/2026-11-07-spark-ds41f-1107-source.json"
+  "source_manifest": "manifests/sources/2026-11-20-spark-ds41f-1120-source.json",
+  "updated_at": "2026-11-20"
 }

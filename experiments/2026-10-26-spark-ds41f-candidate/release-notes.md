@@ -1,3 +1,43 @@
+# spark-ds41f-1120: release notes
+
+`spark-ds41f-1120` ([manifests/baselines/2026-11-20-spark-ds41f-1120.json](../../manifests/baselines/2026-11-20-spark-ds41f-1120.json),
+[releases/spark-ds41f-1120/](../../releases/spark-ds41f-1120/)) is `candidate-62`, promoted on 2026-11-20.
+The model is DeepSeek-V4.1-Flash-1017, DeepSeek's checkpoint, with native weights.
+
+It advances `spark-ds41f-1107` onto CUDA `13.5.37` (hash-locked over the base image's CUDA `13.0.2`), retires
+B12X completely (`0802`), updates vLLM to `702` active patches through `0829`
+([candidate-62/vllm/series](candidate-62/vllm/series); `patch_head` `9b251a18`, `expected_tree` `8fc99ca7`),
+TileLang to `14` patches (`expected_tree` `741806c7`), and `sparknet` to `3` patches (`expected_tree`
+`e06f6a06`). Image `spark-ds41f:1120` (built on `dgx4` as `spark-ds41f:candidate-62`,
+`sha256:5c12472565a708518ec0566b6653b5bd324e06881a34b90f69d6b8210a386d08`), distributed identically across all
+12 nodes (`dgx1..dgx4` and `sp1..sp8`).
+
+The release expands qualification from 8 to all **12 topologies**:
+- **Switchless (`dgx1..dgx4`):** `tp4-ring` (`1M`, `32` seqs, `16.50 GiB` KV), `tp3-triangle` (`1M`, `8` seqs, `4.90625 GiB`), `tp3-triangle-4k` (`256K`, `8` seqs, `2.20 GiB`, stock 4 KiB pages without memory-saver), and `tp2-direct` (`256K`, `4` seqs, `8.00 GiB`).
+- **Switched (`sp1..sp8`):** `tp2-switched` (`256K`, `4` seqs, `8.00 GiB`), `tp3-switched` (`1M`, `8` seqs, `4.90625 GiB`), `tp4-switched` (`16.50 GiB`), `tp5-switched` (`24.00 GiB`), `tp6-switched` (`13.00 GiB`), `tp7-switched` (`16.00 GiB`), and `tp8-switched` (`25.50 GiB`, all `TP4..TP8` at `1M` and `32` seqs).
+- **Local (`dgx4`):** `tp1` (`256K`, `4` seqs, `8.00 GiB`, `uni` executor without RDMA).
+
+Per the `rc12 -> rc14` carry-over precedent, `candidate-62` leaves `VLLM_DS41_LSA` unset by default (`0` new kernels, `jit_new_files = 0`) and carries over the 2-boot `candidate-61` / `candidate-61-r2` Sonar suites and `bin/spark bench` matrices alongside its own `12,023`-test in-image gate and 2-boot `tp3-triangle` & `tp1` verification.
+
+## Highlights (`spark-ds41f-1120` vs `spark-ds41f-1107`)
+
+- **Faster decode & prefill across switchless and switched topologies:**
+  - **`tp4-ring` ([manifests/suites/2026-11-20-spark-ds41f-1120-tp4](../../manifests/suites/2026-11-20-spark-ds41f-1120-tp4/)):** paired decode `+3.07%` at `c16` (`280.43 tok/s`), `+2.70%` at `c8` (`213.57 tok/s`), `+7.30%` at `single-stream c1` (`89.06 tok/s`); engine decode grid `-7.73%` geometric mean (`19.36 ms` vs `21.05 ms`, `20/20` shapes faster); prefill `+12.91% / +16.51% / +21.60% / +31.78% / +56.31%` across `32K..1M` (`9,615 / 10,109 / 10,056 / 9,833 / 9,397 tok/s`); sampled decode `+3.23% / +3.01% / +8.61%` (`276.58 / 210.02 / 87.07 tok/s`); stall `131K` prefill `+12.44%..+13.73%` (`TTFT p50` `0.73 s / 1.14 s` vs `1.02 s / 1.44 s`).
+  - **`tp3-triangle` ([manifests/suites/2026-11-20-spark-ds41f-1120-tp3](../../manifests/suites/2026-11-20-spark-ds41f-1120-tp3/)):** paired decode `+5.99%` at `c8` (`170.68 tok/s`), `+6.26%` at `c4` (`131.59 tok/s`), `+10.39%` at `single-stream c1` (`70.36 tok/s`); sampled `+6.47% / +6.52% / +7.75%` (`167.22 / 167.59 / 68.27 tok/s`); prefill `+12.17%..+55.69%` (`7,270 / 7,502 / 7,445 / 7,259 / 6,922 tok/s`); stall-3/6/7 prefill `+12.64% / +13.19% / +14.31%`; multi-request engine grid shapes improved `-3.10%..-12.69%`, while `1x*` dummy-padding grid rows moved the 15-shape geomean to `25.52 ms` (`+20.20%`) without affecting live single-stream `c1` (`+10.39%`).
+  - **`tp4-switched` ([manifests/suites/2026-11-20-spark-ds41f-1120-tp4-switched](../../manifests/suites/2026-11-20-spark-ds41f-1120-tp4-switched/)):** grid `-9.83%` (`19.05 ms` vs `21.14 ms`), paired `c16` `+6.51%` (`280.51 tok/s`), `c8` `+6.82%` (`213.06 tok/s`), `single-stream c1` `+9.39%` (`88.97 tok/s`), sampled `+6.64% / +6.68% / +10.90%` (`276.44 / 209.60 / 87.31 tok/s`), prefill `+12.96%..+56.02%` (`9,569..9,308 tok/s`), stall prefill `+11.88%..+14.93%`.
+  - **`tp8-switched` ([manifests/suites/2026-11-20-spark-ds41f-1120-tp8-switched](../../manifests/suites/2026-11-20-spark-ds41f-1120-tp8-switched/)):** grid `-9.92%` (`17.60 ms` vs `19.54 ms`), paired `c16` `+6.81%` (`395.40 tok/s`), `c8` `+7.35%` (`312.94 tok/s`), `single-stream c1` `+11.74%` (`129.43 tok/s`), sampled `+6.53% / +7.21% / +11.19%` (`387.49 / 306.80 / 125.29 tok/s`), prefill `+5.99% / +9.32% / +12.11% / +18.89% / +34.92%` (`11,846 / 12,429 / 12,383 / 12,206 / 11,806 tok/s`), stall prefill `+10.25% / +17.17% / +16.39%`.
+  - **`tp3-switched` ([manifests/suites/2026-11-20-spark-ds41f-1120-tp3-switched](../../manifests/suites/2026-11-20-spark-ds41f-1120-tp3-switched/)):** paired `c8` `+6.87%` (`168.92 tok/s`), `c4` `+7.05%` (`130.01 tok/s`), `single-stream c1` `+12.54%` (`69.26 tok/s`), sampled `+6.65% / +6.62% / +10.89%` (`165.74 / 165.56 / 67.36 tok/s`), prefill `7,197 / 7,428 / 7,373 / 7,195 / 6,853 tok/s`.
+- **Expanded `TP4..TP8` concurrency (`32` streams, `192`-row CG) & KV capacity:** raises `--max-num-seqs` from `16` to `32` (`--max-cudagraph-capture-size 192`) and expands per-rank KV pools across `TP4..TP8` (`16.50 GiB` / `17.86x` 1M contexts on `tp4-*`, `24.00 GiB` on `tp5`, `13.00 GiB` on `tp6`, `16.00 GiB` on `tp7`, `25.50 GiB` / `27.17x` on `tp8`).
+- **Four new topologies (`tp1`, `tp2-direct`, `tp2-switched`, `tp3-triangle-4k`):** adds single-node and two-node `256K` serving backed by the zero-copy `io_uring` expert slot cache (`0822`) and `RM` `nvidiactl` display scanout carve-out (`0821`), plus a `4 KiB`-page `tp3-triangle-4k` profile (`256K` ctx, `2.20 GiB` KV) without Memory Saver.
+- **API, structured output, parser, and release-gate hardening (`0823..0829`):** fixes `StructuredOutputManager` bitmask row sizing (`0823`), `TOOL_ARGS` DSML closers and incomplete parameter-tag streaming holdback (`0824`, `0829`), SSE keep-alive per-wait callback races (`0825`), `CustomTool` / OpenResponses normalization (`0826`), quantization `ignored_layers` checkpoint mapping (`0827`), and adds opt-in `VLLM_DS41_LSA=1` FP8 group-32 dominance summaries (`0828`, off by default).
+- **Release Gate & Startup Memory Across All 12 Shapes:**
+  - `candidate-62` release-tests gate: `12,023 passed, 356 skipped, 0 failed` (`169` files, including `106` parser tests across `test_deepseek_v41.py` and `test_deepseek_v41_structural_closers.py`).
+  - `candidate-62` 2-boot `tp3-triangle`: `8.27 / 8.28 GiB` min head `MemAvailable`, `0.0` swap growth, `7/7` wide determinism & greedy identical, live smoke pass.
+  - `candidate-62` 2-boot `tp1`: `14.09 / 14.60 GiB` min `MemAvailable`, `0.0` swap growth, `6/6` greedy identical.
+  - All 12 `manifests/benchmarks/2026-11-20-spark-ds41f-1120-*.json` runs passed `5/5` quality checks, collectives, and `> 5.0 GiB` head/worker `MemAvailable` with `0.0 GiB` swap growth (`tp5..tp7-switched` prefill up to `11,206 tok/s`, `tp2-direct/tp2-switched` `52.96 / 53.59` `prose-c4`, `tp1` `10.94 / 11.36` `c4`).
+
+---
+
 # spark-ds41f-1107: release notes
 
 `spark-ds41f-1107` ([manifests/baselines/2026-11-07-spark-ds41f-1107.json](../../manifests/baselines/2026-11-07-spark-ds41f-1107.json),

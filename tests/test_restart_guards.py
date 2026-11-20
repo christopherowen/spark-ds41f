@@ -427,14 +427,22 @@ class UnqualifiedShapeTest(unittest.TestCase):
         return "started"
 
     def test_an_unqualified_shape_is_refused_unless_overridden(self) -> None:
-        # The 4 KiB-page triangle was not benched with spark-ds41f-1025's image (the triangle was,
-        # 2026-10-25, and is qualified below).
-        for shape in ("tp3-triangle-4k",):
-            unqualified = spark.cluster_recipe.resolve(spark.read_json("config/cluster.json"), shape)
-            self.assertNotIn("benchmark_reference", unqualified)
-            self.assertIn(f"no release benchmark qualifies this recipe's image on {shape}", self.start(unqualified))
-            self.assertEqual(self.start(unqualified, unqualified_shape=True), "preflight reached")
-        for shape in ("tp4-ring", "tp3-triangle"):
+        # In releases/spark-ds41f-1107, tp3-triangle-4k had no benchmark_reference; in promoted
+        # config/cluster.json, any shape without benchmark_reference is likewise refused unless
+        # overridden with --unqualified-shape.
+        unqualified_1107 = spark.cluster_recipe.resolve(
+            spark.read_json("releases/spark-ds41f-1107/cluster.json"), "tp3-triangle-4k"
+        )
+        self.assertNotIn("benchmark_reference", unqualified_1107)
+        self.assertIn("no release benchmark qualifies this recipe's image on tp3-triangle-4k", self.start(unqualified_1107))
+        self.assertEqual(self.start(unqualified_1107, unqualified_shape=True), "preflight reached")
+
+        stripped = spark.cluster_recipe.resolve(spark.read_json("config/cluster.json"), "tp3-triangle-4k")
+        stripped.pop("benchmark_reference", None)
+        self.assertIn("no release benchmark qualifies this recipe's image on tp3-triangle-4k", self.start(stripped))
+        self.assertEqual(self.start(stripped, unqualified_shape=True), "preflight reached")
+
+        for shape in ("tp4-ring", "tp3-triangle", "tp3-triangle-4k"):
             qualified = spark.cluster_recipe.resolve(spark.read_json("config/cluster.json"), shape)
             self.assertEqual(self.start(qualified), "preflight reached", shape)
         # The frozen r6n recipe still starts the ring it was released on.

@@ -1,0 +1,396 @@
+verdicts: 2026-11-07-spark-ds41f-1107-tp8-switched (recorded) -> c61-r2, against the run's own repeat (c61-r2 -> c61-r2-again)
+metric                                 change    ±95%   repeat   floor  margin  verdict
+grid: decode geometric mean (20)       -9.92%   0.11%   +0.03%   0.37%   0.39%  better (both candidate boots; recorded A/A floor)
+c16: decode tok/s, paired              +6.81%   0.94%   +0.02%   0.37%   1.01%  better (both candidate boots; window tok/s +6.70% ±0.99%)
+c16: output tok/s                      +6.70%   0.99%   -0.03%       -   1.02%  better
+c8: decode tok/s, paired               +7.35%   0.99%   -0.02%   0.34%   1.04%  better (both candidate boots; window tok/s +7.97% ±1.29%)
+c8: output tok/s                       +7.97%   1.29%   -0.06%       -   1.35%  better
+poisson: output tok/s                  +0.05%  21.07%   -0.01%       -  21.08%  same
+stall-3: prefill 131,072 tok/s under decode  +10.25%   9.03%   -0.81%       -   9.83%  better
+stall-11: prefill 131,072 tok/s under decode  +17.17%   8.28%   +0.13%       -   8.41%  better
+stall-15: prefill 131,072 tok/s under decode  +16.39%   5.29%   -1.04%       -   6.33%  better
+prefill: prefill 32,768 tok/s          +5.99%   1.47%   +0.24%       -   1.70%  better
+prefill: prefill 131,072 tok/s         +9.32%   0.48%   -0.16%       -   0.64%  better
+prefill: prefill 262,144 tok/s        +12.11%   0.21%   +0.00%       -   0.21%  better
+prefill: prefill 524,288 tok/s        +18.89%   0.34%   -0.26%       -   0.60%  better
+prefill: prefill 1,000,000 tok/s      +34.92%   0.67%   -0.08%       -   0.75%  better
+floors (tp8-switched, release): grid default 0.43%; c16 default 0.43%; c8 default 0.39%; the recorded defaults
+paired rows: margin = ±95% (over requests) and floor in quadrature, where floor is the boot term of the boots averaged, each boot bounded by the recorded A/A bound or its repeat when larger (the grid's geometric mean likewise when it has a recorded floor); other rows: ±95% + |repeat|
+
+rows a step (window means; survival = accepted at k a draft, coverage = verified at k a draft)
+step     arm                                                  tokens requests   rows  yield  wasted  by position (survival/coverage)
+c16      c61-r2                                               35.454    14.57  47.43  0.747   11.98  0:0.715/1.000 1:0.384/0.652 2:0.185/0.336 3:0.097/0.174 4:0.052/0.093 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.715/0.715 1:0.537/0.588 2:0.482/0.550 3:0.527/0.560 4:0.537/0.564]
+c16      2026-11-07-spark-ds41f-1107-tp8-switched (recorded)  34.471    14.44  45.00  0.766   10.53  0:0.717/1.000 1:0.361/0.590 2:0.173/0.295 3:0.089/0.151 4:0.048/0.081 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.717/0.717 1:0.504/0.612 2:0.479/0.587 3:0.513/0.587 4:0.537/0.591]
+c16      c61-r2-again                                         35.486    14.62  47.44  0.748   11.95  0:0.715/1.000 1:0.382/0.650 2:0.184/0.335 3:0.094/0.169 4:0.052/0.091 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.715/0.715 1:0.534/0.588 2:0.482/0.549 3:0.513/0.560 4:0.549/0.569]
+c8       c61-r2                                               18.005     7.46  24.96  0.721    6.95  0:0.702/1.000 1:0.380/0.689 2:0.186/0.372 3:0.096/0.188 4:0.052/0.098 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.702/0.702 1:0.541/0.552 2:0.490/0.500 3:0.513/0.508 4:0.540/0.527]
+c8       2026-11-07-spark-ds41f-1107-tp8-switched (recorded)  18.100     7.63  26.05  0.695    7.95  0:0.674/1.000 1:0.366/0.711 2:0.185/0.393 3:0.096/0.203 4:0.052/0.108 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.674/0.674 1:0.544/0.515 2:0.506/0.472 3:0.515/0.470 4:0.543/0.478]
+c8       c61-r2-again                                         18.039     7.47  25.05  0.720    7.01  0:0.700/1.000 1:0.382/0.693 2:0.187/0.373 3:0.095/0.189 4:0.051/0.099 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.700/0.700 1:0.546/0.551 2:0.490/0.502 3:0.510/0.505 4:0.538/0.518]
+poisson  c61-r2                                                5.888     2.45   8.43  0.699    2.54  0:0.683/1.000 1:0.381/0.731 2:0.192/0.405 3:0.096/0.201 4:0.048/0.097 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.683/0.683 1:0.558/0.521 2:0.503/0.473 3:0.501/0.478 4:0.505/0.499]
+poisson  2026-11-07-spark-ds41f-1107-tp8-switched (recorded)   6.528     2.74   9.72  0.672    3.19  0:0.671/1.000 1:0.376/0.776 2:0.189/0.437 3:0.099/0.226 4:0.051/0.112 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.671/0.671 1:0.560/0.484 2:0.504/0.433 3:0.522/0.437 4:0.512/0.450]
+poisson  c61-r2-again                                          5.917     2.46   8.47  0.698    2.56  0:0.685/1.000 1:0.380/0.729 2:0.193/0.410 3:0.098/0.205 4:0.050/0.102 5:0.000/0.000 6:0.000/0.000 7:0.000/0.000 8:0.000/0.000 9:0.000/0.000 10:0.000/0.000 11:0.000/0.000 12:0.000/0.000 13:0.000/0.000 14:0.000/0.000 15:0.000/0.000 [cond/yield 0:0.685/0.685 1:0.555/0.522 2:0.508/0.471 3:0.506/0.476 4:0.516/0.492]
+
+######## 2026-11-07-spark-ds41f-1107-tp8-switched (recorded) -> c61-r2
+suite release (2c1698722faf): 1107 -> c61-r2
+
+== model
+skipped: not kept: /home/chris/projects/spark-ds41f/manifests/suites/2026-11-07-spark-ds41f-1107-tp8-switched/model.json.gz, /home/chris/projects/spark-ds41f/results/private/suites/c61-r2-release-tp8-switched/c61-r2/model.json.gz
+
+== grid
+metric                             1107       c61-r2   change    ±95%  verdict
+decode 1x2 rows @4K              11.595       10.085  -13.03%   0.58%  better
+decode 4x8 rows @4K              14.059       12.218  -13.10%   0.47%  better
+decode 8x16 rows @4K             18.233       15.181  -16.74%   0.73%  better
+decode 16x32 rows @4K            25.180       24.023   -4.60%   0.72%  better
+decode 1x3 rows @4K              11.845       10.508  -11.29%   0.79%  better
+decode 4x12 rows @4K             15.982       13.220  -17.28%   0.66%  better
+decode 8x24 rows @4K             21.527       19.699   -8.49%   0.68%  better
+decode 16x48 rows @4K            31.451       29.954   -4.76%   0.71%  better
+decode 1x6 rows @4K              12.404       11.398   -8.11%   0.81%  better
+decode 2x12 rows @4K             14.436       12.935  -10.40%   1.06%  better
+decode 4x24 rows @4K             21.810       19.072  -12.55%   1.13%  better
+decode 8x48 rows @4K             31.719       28.201  -11.09%   0.56%  better
+decode 12x72 rows @4K            43.471       41.522   -4.48%   0.52%  better
+decode 16x96 rows @4K            50.825       49.479   -2.65%   0.48%  better
+decode 1x3 rows @64K             12.007       10.619  -11.56%   1.19%  better
+decode 8x24 rows @64K            21.581       19.658   -8.91%   0.69%  better
+decode 16x48 rows @64K           31.550       29.735   -5.75%   0.55%  better
+decode 1x3 rows @256K            11.878       10.490  -11.69%   0.81%  better
+decode 8x24 rows @256K           21.582       19.653   -8.94%   0.66%  better
+decode 1x3 rows @1016K           11.954       10.558  -11.67%   1.08%  better
+decode geometric mean (20)                             -9.94%   0.11%  better
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 359
+
+== c16
+metric                         1107       c61-r2   change    ±95%  verdict
+output tok/s                370.580      395.403   +6.70%   0.99%  better
+decode tok/s, paired         23.124       24.465   +6.81%   1.11%  better
+engine steps/s               10.753       11.153   +3.72%   1.23%  better
+output tokens/step           34.471       35.454   +2.85%   1.69%  better
+accepted/draft                1.387        1.433   +3.33%   3.21%  better
+TTFT p50 s                    0.301        0.285   -5.09%          better (no interval)
+TTFT p99 s                    0.359        0.333   -7.46%          better (no interval)
+TTFT, paired                  0.301        0.285   -4.78%   0.91%  better
+TPOT p50 ms                  42.822       40.421   -5.61%          better (no interval)
+TPOT p99 ms                  57.899       53.121   -8.25%          better (no interval)
+per-user tok/s p50           23.306       24.740   +6.15%          better (no interval)
+paired: 430 requests in both windows, each the same prompt on both builds; 16 streamed in as many chunks on both
+speculative log-tps: total +6.68% (1+tau +1.93%, steps/s +3.72%, reqs/step +0.90%; rows/step +5.40%, row yield -2.42%)
+
+== c8
+metric                         1107       c61-r2   change    ±95%  verdict
+output tok/s                289.843      312.943   +7.97%   1.29%  better
+decode tok/s, paired         36.352       38.897   +7.68%   0.90%  better
+engine steps/s               16.017       17.387   +8.55%   1.65%  better
+output tokens/step           18.100       18.005   -0.53%   2.42%  same
+accepted/draft                1.373        1.415   +3.03%   4.60%  same
+TTFT p50 s                    0.209        0.189   -9.51%          better (no interval)
+TTFT p99 s                    0.261        0.217  -16.91%          better (no interval)
+TTFT, paired                  0.209        0.189   -9.38%   1.03%  better
+TPOT p50 ms                  27.284       25.546   -6.37%          better (no interval)
+TPOT p99 ms                  36.606       33.474   -8.56%          better (no interval)
+per-user tok/s p50           36.652       39.118   +6.73%          better (no interval)
+paired: 335 requests in both windows, each the same prompt on both builds; 15 streamed in as many chunks on both
+speculative log-tps: total +7.98% (1+tau +1.76%, steps/s +8.55%, reqs/step -2.24%; rows/step -4.21%, row yield +3.85%)
+
+== poisson
+metric                         1107       c61-r2   change    ±95%  verdict
+output tok/s                179.627      179.717   +0.05%  21.07%  same
+decode tok/s, paired         63.622       74.564  +14.02%   1.93%  better
+engine steps/s               29.153       32.000   +9.76%  14.21%  same
+output tokens/step            6.528        5.888   -9.80%  38.95%  same
+accepted/draft                1.386        1.400   +1.01%   5.70%  same
+TTFT p50 s                    0.139        0.119  -13.99%          better (no interval)
+TTFT p99 s                    0.267        0.245   -7.93%          better (no interval)
+TTFT, paired                  0.139        0.120  -11.45%   1.69%  better
+TPOT p50 ms                  15.537       13.217  -14.93%          better (no interval)
+TPOT p99 ms                  37.922       32.011  -15.59%          better (no interval)
+per-user tok/s p50           63.870       74.947  +17.34%          better (no interval)
+goodput req/s                 0.707        0.707   +0.00%          same (no interval)
+paired: 212 requests in both windows, each the same prompt on both builds; 12 streamed in as many chunks on both
+speculative log-tps: total -0.99% (1+tau +0.59%, steps/s +9.76%, reqs/step -10.33%; rows/step -13.29%, row yield +4.02%)
+
+== stall-3
+metric                                                            1107       c61-r2   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     1.486        2.755  +85.36%   2.06%  worse
+decode step p99 during 131,072 prefill (s)                       1.486        2.755  +85.36%   2.06%  worse
+decode step mean during 131,072 prefill (s)                      0.451        0.795  +76.13%  76.58%  same
+decode before 131,072 prefill's first chunk (s)                  0.432        0.236  -45.48%  14.63%  better
+decode step p90 during 131,072 prefill (s)                       1.452        2.737  +88.56%   1.88%  worse
+share of decode steps a chunk held during 131,072 prefill        0.437        0.765  +75.30%  16.68%  worse
+prefill 131,072 tok/s under decode                            9441.881    10409.868  +10.25%   9.03%  better
+short request TTFT p50 during 131,072 prefill (s)                0.642        1.379 +114.76%  34.50%  worse
+short request TTFT max during 131,072 prefill (s)                1.632        2.589  +58.61% 196.67%  same
+
+== stall-11
+metric                                                            1107       c61-r2   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     1.567        2.868  +83.07%   3.79%  worse
+decode step p99 during 131,072 prefill (s)                       1.520        2.857  +87.92%   1.90%  worse
+decode step mean during 131,072 prefill (s)                      0.490        0.880  +79.68%  55.52%  worse
+decode before 131,072 prefill's first chunk (s)                  0.477        0.078  -83.71%   6.96%  better
+decode step p90 during 131,072 prefill (s)                       1.479        2.793  +88.86%   2.92%  worse
+share of decode steps a chunk held during 131,072 prefill        0.466        0.598  +28.28%  15.03%  worse
+prefill 131,072 tok/s under decode                            8624.400    10105.305  +17.17%   8.28%  better
+short request TTFT p50 during 131,072 prefill (s)                0.977        1.518  +55.35%  32.32%  worse
+short request TTFT max during 131,072 prefill (s)                1.604        2.966  +84.94% 196.40%  same
+
+== stall-15
+metric                                                            1107       c61-r2   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     1.591        2.878  +80.93%   9.27%  worse
+decode step p99 during 131,072 prefill (s)                       1.532        2.794  +82.42%   3.16%  worse
+decode step mean during 131,072 prefill (s)                      0.541        0.988  +82.55%  75.62%  worse
+decode before 131,072 prefill's first chunk (s)                  0.466        0.119  -74.52%  20.45%  better
+decode step p90 during 131,072 prefill (s)                       1.487        2.771  +86.37%   6.40%  worse
+share of decode steps a chunk held during 131,072 prefill        0.363        0.378   +3.87%  14.34%  same
+prefill 131,072 tok/s under decode                            9266.781    10785.547  +16.39%   5.29%  better
+
+== prefill
+metric                          1107       c61-r2   change    ±95%  verdict
+prefill 32,768 tok/s       11176.283    11845.734   +5.99%   1.47%  better
+prefill 131,072 tok/s      11369.325    12429.016   +9.32%   0.48%  better
+prefill 262,144 tok/s      11044.479    12382.484  +12.11%   0.21%  better
+prefill 524,288 tok/s      10267.219    12206.282  +18.89%   0.34%  better
+prefill 1,000,000 tok/s     8750.493    11805.950  +34.92%   0.67%  better
+
+######## 2026-11-07-spark-ds41f-1107-tp8-switched (recorded) -> c61-r2-again
+suite release (2c1698722faf): 1107 -> c61-r2-again
+
+== model
+skipped: not kept: /home/chris/projects/spark-ds41f/manifests/suites/2026-11-07-spark-ds41f-1107-tp8-switched/model.json.gz, /home/chris/projects/spark-ds41f/results/private/suites/c61-r2-release-tp8-switched/c61-r2-again/model.json.gz
+
+== grid
+metric                             1107 c61-r2-again   change    ±95%  verdict
+decode 1x2 rows @4K              11.595       10.123  -12.69%   0.76%  better
+decode 4x8 rows @4K              14.059       12.220  -13.08%   0.48%  better
+decode 8x16 rows @4K             18.233       15.136  -16.98%   0.69%  better
+decode 16x32 rows @4K            25.180       24.188   -3.94%   0.76%  better
+decode 1x3 rows @4K              11.845       10.498  -11.37%   0.80%  better
+decode 4x12 rows @4K             15.982       13.268  -16.98%   0.73%  better
+decode 8x24 rows @4K             21.527       19.611   -8.90%   0.60%  better
+decode 16x48 rows @4K            31.451       29.675   -5.65%   0.44%  better
+decode 1x6 rows @4K              12.404       11.351   -8.49%   0.76%  better
+decode 2x12 rows @4K             14.436       13.111   -9.18%   1.25%  better
+decode 4x24 rows @4K             21.810       19.041  -12.69%   1.11%  better
+decode 8x48 rows @4K             31.719       28.170  -11.19%   0.54%  better
+decode 12x72 rows @4K            43.471       41.454   -4.64%   0.46%  better
+decode 16x96 rows @4K            50.825       49.574   -2.46%   0.53%  better
+decode 1x3 rows @64K             12.007       10.573  -11.94%   1.15%  better
+decode 8x24 rows @64K            21.581       19.650   -8.95%   0.67%  better
+decode 16x48 rows @64K           31.550       29.890   -5.26%   0.69%  better
+decode 1x3 rows @256K            11.878       10.566  -11.05%   0.92%  better
+decode 8x24 rows @256K           21.582       19.623   -9.08%   0.64%  better
+decode 1x3 rows @1016K           11.954       10.524  -11.96%   1.08%  better
+decode geometric mean (20)                             -9.91%   0.11%  better
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 346
+
+== c16
+metric                         1107 c61-r2-again   change    ±95%  verdict
+output tok/s                370.580      395.290   +6.67%   0.99%  better
+decode tok/s, paired         23.124       24.394   +6.82%   0.94%  better
+engine steps/s               10.753       11.140   +3.60%   1.20%  better
+output tokens/step           34.471       35.486   +2.95%   1.66%  better
+accepted/draft                1.387        1.428   +2.92%   3.11%  same
+TTFT p50 s                    0.301        0.287   -4.65%          better (no interval)
+TTFT p99 s                    0.359        0.330   -8.10%          better (no interval)
+TTFT, paired                  0.301        0.287   -4.45%   0.53%  better
+TPOT p50 ms                  42.822       40.622   -5.14%          better (no interval)
+TPOT p99 ms                  57.899       53.954   -6.81%          better (no interval)
+per-user tok/s p50           23.306       24.617   +5.62%          better (no interval)
+paired: 430 requests in both windows, each the same prompt on both builds; 24 streamed in as many chunks on both
+speculative log-tps: total +6.65% (1+tau +1.69%, steps/s +3.60%, reqs/step +1.23%; rows/step +5.41%, row yield -2.34%)
+
+== c8
+metric                         1107 c61-r2-again   change    ±95%  verdict
+output tok/s                289.843      312.750   +7.90%   1.14%  better
+decode tok/s, paired         36.416       38.793   +7.02%   1.31%  better
+engine steps/s               16.017       17.343   +8.28%   1.61%  better
+output tokens/step           18.100       18.039   -0.34%   2.35%  same
+accepted/draft                1.373        1.415   +3.06%   4.38%  same
+TTFT p50 s                    0.209        0.192   -8.04%          better (no interval)
+TTFT p99 s                    0.261        0.236   -9.44%          better (no interval)
+TTFT, paired                  0.209        0.191   -8.56%   1.17%  better
+TPOT p50 ms                  27.284       25.485   -6.59%          better (no interval)
+TPOT p99 ms                  36.606       33.169   -9.39%          better (no interval)
+per-user tok/s p50           36.652       39.239   +7.06%          better (no interval)
+paired: 334 requests in both windows, each the same prompt on both builds; 25 streamed in as many chunks on both
+speculative log-tps: total +7.92% (1+tau +1.77%, steps/s +8.28%, reqs/step -2.08%; rows/step -3.85%, row yield +3.65%)
+
+== poisson
+metric                         1107 c61-r2-again   change    ±95%  verdict
+output tok/s                179.627      179.697   +0.04%  21.07%  same
+decode tok/s, paired         63.622       74.487  +14.34%   1.26%  better
+engine steps/s               29.153       31.930   +9.52%  14.29%  same
+output tokens/step            6.528        5.917   -9.36%  39.48%  same
+accepted/draft                1.386        1.407   +1.51%   5.74%  same
+TTFT p50 s                    0.139        0.119  -13.87%          better (no interval)
+TTFT p99 s                    0.267        0.239  -10.24%          better (no interval)
+TTFT, paired                  0.139        0.119  -12.17%   1.78%  better
+TPOT p50 ms                  15.537       13.198  -15.06%          better (no interval)
+TPOT p99 ms                  37.922       33.375  -11.99%          better (no interval)
+per-user tok/s p50           63.870       75.271  +17.85%          better (no interval)
+goodput req/s                 0.707        0.707   +0.00%          same (no interval)
+paired: 212 requests in both windows, each the same prompt on both builds; 16 streamed in as many chunks on both
+speculative log-tps: total -0.72% (1+tau +0.87%, steps/s +9.52%, reqs/step -10.14%; rows/step -12.80%, row yield +3.95%)
+
+== stall-3
+metric                                                            1107 c61-r2-again   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     1.486        2.843  +91.32%   7.04%  worse
+decode step p99 during 131,072 prefill (s)                       1.486        2.843  +91.32%   7.04%  worse
+decode step mean during 131,072 prefill (s)                      0.451        0.763  +69.25% 101.04%  same
+decode before 131,072 prefill's first chunk (s)                  0.432        0.173  -60.02%  85.84%  same
+decode step p90 during 131,072 prefill (s)                       1.452        2.734  +88.36%   2.17%  worse
+share of decode steps a chunk held during 131,072 prefill        0.437        0.689  +57.80%  76.70%  same
+prefill 131,072 tok/s under decode                            9441.881    10326.058   +9.36%   8.56%  better
+short request TTFT p50 during 131,072 prefill (s)                0.642        1.393 +116.95%  37.08%  worse
+short request TTFT max during 131,072 prefill (s)                1.632        2.691  +64.84% 197.59%  same
+
+== stall-11
+metric                                                            1107 c61-r2-again   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     1.567        2.890  +84.43%  27.94%  worse
+decode step p99 during 131,072 prefill (s)                       1.520        2.814  +85.09%   8.01%  worse
+decode step mean during 131,072 prefill (s)                      0.490        0.892  +82.20%  73.28%  worse
+decode before 131,072 prefill's first chunk (s)                  0.477        0.114  -75.99%   6.71%  better
+decode step p90 during 131,072 prefill (s)                       1.479        2.791  +88.75%   5.76%  worse
+share of decode steps a chunk held during 131,072 prefill        0.466        0.571  +22.40%  13.34%  worse
+prefill 131,072 tok/s under decode                            8624.400    10118.604  +17.33%   8.12%  better
+short request TTFT p50 during 131,072 prefill (s)                0.977        1.511  +54.64%  38.46%  worse
+short request TTFT max during 131,072 prefill (s)                1.604        2.950  +83.91% 198.35%  same
+
+== stall-15
+metric                                                            1107 c61-r2-again   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     1.591        2.916  +83.31%   7.25%  worse
+decode step p99 during 131,072 prefill (s)                       1.532        2.845  +85.72%   3.00%  worse
+decode step mean during 131,072 prefill (s)                      0.541        0.978  +80.72%  48.29%  worse
+decode before 131,072 prefill's first chunk (s)                  0.466        0.096  -79.44%  19.03%  better
+decode step p90 during 131,072 prefill (s)                       1.487        2.799  +88.26%   1.49%  worse
+share of decode steps a chunk held during 131,072 prefill        0.363        0.373   +2.72%   4.01%  same
+prefill 131,072 tok/s under decode                            9266.781    10673.326  +15.18%   4.43%  better
+
+== prefill
+metric                          1107 c61-r2-again   change    ±95%  verdict
+prefill 32,768 tok/s       11176.283    11873.592   +6.24%   3.40%  better
+prefill 131,072 tok/s      11369.325    12409.154   +9.15%   0.22%  better
+prefill 262,144 tok/s      11044.479    12382.764  +12.12%   0.38%  better
+prefill 524,288 tok/s      10267.219    12174.813  +18.58%   0.26%  better
+prefill 1,000,000 tok/s     8750.493    11796.067  +34.80%   0.45%  better
+
+######## c61-r2 -> c61-r2-again
+suite release (2c1698722faf): c61-r2 -> c61-r2-again
+
+== model
+skipped: not kept: /home/chris/projects/spark-ds41f/results/private/suites/c61-r2-release-tp8-switched/c61-r2/model.json.gz, /home/chris/projects/spark-ds41f/results/private/suites/c61-r2-release-tp8-switched/c61-r2-again/model.json.gz
+
+== grid
+metric                           c61-r2 c61-r2-again   change    ±95%  verdict
+decode 1x2 rows @4K              10.085       10.123   +0.38%   0.93%  same
+decode 4x8 rows @4K              12.218       12.220   +0.02%   0.59%  same
+decode 8x16 rows @4K             15.181       15.136   -0.29%   0.68%  same
+decode 16x32 rows @4K            24.023       24.188   +0.69%   0.63%  worse
+decode 1x3 rows @4K              10.508       10.498   -0.09%   0.76%  same
+decode 4x12 rows @4K             13.220       13.268   +0.36%   0.66%  same
+decode 8x24 rows @4K             19.699       19.611   -0.44%   0.43%  better
+decode 16x48 rows @4K            29.954       29.675   -0.93%   0.80%  better
+decode 1x6 rows @4K              11.398       11.351   -0.42%   0.89%  same
+decode 2x12 rows @4K             12.935       13.111   +1.36%   1.15%  worse
+decode 4x24 rows @4K             19.072       19.041   -0.16%   0.67%  same
+decode 8x48 rows @4K             28.201       28.170   -0.11%   0.36%  same
+decode 12x72 rows @4K            41.522       41.454   -0.16%   0.51%  same
+decode 16x96 rows @4K            49.479       49.574   +0.19%   0.52%  same
+decode 1x3 rows @64K             10.619       10.573   -0.44%   0.95%  same
+decode 8x24 rows @64K            19.658       19.650   -0.04%   0.39%  same
+decode 16x48 rows @64K           29.735       29.890   +0.52%   0.77%  same
+decode 1x3 rows @256K            10.490       10.566   +0.73%   0.78%  same
+decode 8x24 rows @256K           19.653       19.623   -0.15%   0.36%  same
+decode 1x3 rows @1016K           10.558       10.524   -0.32%   0.90%  same
+decode geometric mean (20)                             +0.03%   0.10%  same
+intervals hold for all 20 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 427
+
+== c16
+metric                       c61-r2 c61-r2-again   change    ±95%  verdict
+output tok/s                395.403      395.290   -0.03%   0.96%  same
+decode tok/s, paired         24.553       24.546   +0.02%   0.30%  same
+engine steps/s               11.153       11.140   -0.12%   0.87%  same
+output tokens/step           35.454       35.486   +0.09%   1.23%  same
+accepted/draft                1.433        1.428   -0.40%   2.54%  same
+TTFT p50 s                    0.285        0.287   +0.47%          same (no interval)
+TTFT p99 s                    0.333        0.330   -0.70%          same (no interval)
+TTFT, paired                  0.285        0.286   -0.17%   0.87%  same
+TPOT p50 ms                  40.421       40.622   +0.50%          same (no interval)
+TPOT p99 ms                  53.121       53.954   +1.57%          same (no interval)
+per-user tok/s p50           24.740       24.617   -0.50%          same (no interval)
+paired: 465 requests in both windows, each the same prompt on both builds; 59 streamed in as many chunks on both
+speculative log-tps: total -0.03% (1+tau -0.23%, steps/s -0.12%, reqs/step +0.32%; rows/step +0.01%, row yield +0.08%)
+
+== c8
+metric                       c61-r2 c61-r2-again   change    ±95%  verdict
+output tok/s                312.943      312.750   -0.06%   1.37%  same
+decode tok/s, paired         39.052       39.021   -0.02%   0.64%  same
+engine steps/s               17.387       17.343   -0.25%   1.44%  same
+output tokens/step           18.005       18.039   +0.19%   2.55%  same
+accepted/draft                1.415        1.415   +0.03%   4.73%  same
+TTFT p50 s                    0.189        0.192   +1.63%          same (no interval)
+TTFT p99 s                    0.217        0.236   +8.98%          worse (no interval)
+TTFT, paired                  0.189        0.192   +1.24%   1.08%  worse
+TPOT p50 ms                  25.546       25.485   -0.24%          same (no interval)
+TPOT p99 ms                  33.474       33.169   -0.91%          same (no interval)
+per-user tok/s p50           39.118       39.239   +0.31%          same (no interval)
+paired: 367 requests in both windows, each the same prompt on both builds; 29 streamed in as many chunks on both
+speculative log-tps: total -0.06% (1+tau +0.02%, steps/s -0.25%, reqs/step +0.17%; rows/step +0.37%, row yield -0.19%)
+
+== poisson
+metric                       c61-r2 c61-r2-again   change    ±95%  verdict
+output tok/s                179.717      179.697   -0.01%  20.92%  same
+decode tok/s, paired         74.564       74.487   -0.19%   0.40%  same
+engine steps/s               32.000       31.930   -0.22%  13.05%  same
+output tokens/step            5.888        5.917   +0.49%  40.10%  same
+accepted/draft                1.400        1.407   +0.49%   5.58%  same
+TTFT p50 s                    0.119        0.119   +0.13%          same (no interval)
+TTFT p99 s                    0.245        0.239   -2.51%          same (no interval)
+TTFT, paired                  0.120        0.119   -0.50%   1.59%  same
+TPOT p50 ms                  13.217       13.198   -0.15%          same (no interval)
+TPOT p99 ms                  32.011       33.375   +4.26%          worse (no interval)
+per-user tok/s p50           74.947       75.271   +0.43%          same (no interval)
+goodput req/s                 0.707        0.707   +0.00%          same (no interval)
+paired: 212 requests in both windows, each the same prompt on both builds; 38 streamed in as many chunks on both
+speculative log-tps: total +0.27% (1+tau +0.29%, steps/s -0.22%, reqs/step +0.21%; rows/step +0.57%, row yield -0.07%)
+
+== stall-3
+metric                                                          c61-r2 c61-r2-again   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     2.755        2.843   +3.22%   3.71%  same
+decode step p99 during 131,072 prefill (s)                       2.755        2.843   +3.22%   3.71%  same
+decode step mean during 131,072 prefill (s)                      0.795        0.763   -3.90%  47.93%  same
+decode before 131,072 prefill's first chunk (s)                  0.236        0.173  -26.67% 154.18%  same
+decode step p90 during 131,072 prefill (s)                       2.737        2.734   -0.11%   1.10%  same
+share of decode steps a chunk held during 131,072 prefill        0.765        0.689   -9.98%  41.74%  same
+prefill 131,072 tok/s under decode                           10409.868    10326.058   -0.81%   7.49%  same
+short request TTFT p50 during 131,072 prefill (s)                1.379        1.393   +1.02%  18.47%  same
+short request TTFT max during 131,072 prefill (s)                2.589        2.691   +3.93% 113.53%  same
+
+== stall-11
+metric                                                          c61-r2 c61-r2-again   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     2.868        2.890   +0.74%  15.14%  same
+decode step p99 during 131,072 prefill (s)                       2.857        2.814   -1.51%   4.26%  same
+decode step mean during 131,072 prefill (s)                      0.880        0.892   +1.40%  34.56%  same
+decode before 131,072 prefill's first chunk (s)                  0.078        0.114  +47.39%  36.89%  worse
+decode step p90 during 131,072 prefill (s)                       2.793        2.791   -0.06%   2.88%  same
+share of decode steps a chunk held during 131,072 prefill        0.598        0.571   -4.59%  12.21%  same
+prefill 131,072 tok/s under decode                           10105.305    10118.604   +0.13%   6.49%  same
+short request TTFT p50 during 131,072 prefill (s)                1.518        1.511   -0.46%  12.62%  same
+short request TTFT max during 131,072 prefill (s)                2.966        2.950   -0.56% 102.41%  same
+
+== stall-15
+metric                                                          c61-r2 c61-r2-again   change    ±95%  verdict
+worst decode wait during 131,072 prefill (s)                     2.878        2.916   +1.31%   4.42%  same
+decode step p99 during 131,072 prefill (s)                       2.794        2.845   +1.81%   1.86%  same
+decode step mean during 131,072 prefill (s)                      0.988        0.978   -1.00%  34.23%  same
+decode before 131,072 prefill's first chunk (s)                  0.119        0.096  -19.31%  55.52%  same
+decode step p90 during 131,072 prefill (s)                       2.771        2.799   +1.01%   3.25%  same
+share of decode steps a chunk held during 131,072 prefill        0.378        0.373   -1.11%  13.03%  same
+prefill 131,072 tok/s under decode                           10785.547    10673.326   -1.04%   4.59%  same
+
+== prefill
+metric                        c61-r2 c61-r2-again   change    ±95%  verdict
+prefill 32,768 tok/s       11845.734    11873.592   +0.24%   2.90%  same
+prefill 131,072 tok/s      12429.016    12409.154   -0.16%   0.46%  same
+prefill 262,144 tok/s      12382.484    12382.764   +0.00%   0.29%  same
+prefill 524,288 tok/s      12206.282    12174.813   -0.26%   0.29%  same
+prefill 1,000,000 tok/s    11805.950    11796.067   -0.08%   0.49%  same
