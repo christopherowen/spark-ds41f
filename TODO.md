@@ -704,10 +704,11 @@ Open levers:
     single-pass `W_q` (`rm_HYBRID`: `lm_head(M=6) = 718.02 us` vs `card0_WQ_ONLY = 716.46 us`
     and `cudaMalloc = 767.20 us`), and `rm_hybrid` (`776 MiB` carve-out) reclaims
     **`+868.92 MiB`** host `MemAvailable` over `cudaMalloc` (`rm_wq_only`: `+128.67 MiB`).
-    Still open once promoted to `config/cluster.json`: remove the `/dev/dri/card0`
-    bind-mount and `c 226:* rw` rule from `config/cluster.json` (lines 54–55) and
-    `scripts/lab` carveout helper, and test VMM-stitching (`cuMemMap`) any
-    remaining scanout capacity onto the KV cache or other read-once/cached tables.
+    The `/dev/dri/card0` bind-mount and `c 226:* rw` rule have been removed from
+    `config/cluster.json` and `spark_ds41f/lab.py` (with `doctor` downgrading
+    missing `modeset`/`drm_card` to warnings when `/dev/dri/card0` is not
+    mounted). Still open: test VMM-stitching (`cuMemMap`) any remaining scanout
+    capacity onto the KV cache or other read-once/cached tables.
   - **DMA-BUF VMM range export (`CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD`) and Arm64 Write-Combining / mixed-mapping barrier discipline:**
     (1) when exporting `cuMemCreate` VMM ranges for CPU `mmap` access or
     ConnectX-7 RDMA registration (`ibv_reg_dmabuf_mr`), use

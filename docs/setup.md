@@ -172,9 +172,10 @@ services as warnings; serving still starts, with less memory margin.
 ### Kernel mode setting
 
 DGX OS ships `nvidia-drm-options-modeset0`, which turns `nvidia-drm` mode
-setting off. The promoted profiles load the embedding and output head into
-the GB10 display carve-out (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`), which needs
-mode setting, and a display attached after boot stays dark without it:
+setting off. Without mode setting, a display attached after boot stays dark (and
+legacy pre-1120 rollback profiles that mount `/dev/dri/card0` for the display
+carve-out refuse to start; `spark-ds41f-1120` allocates the carve-out directly
+through NVIDIA RM on `/dev/nvidiactl`):
 
 ```sh
 sudo apt-get purge nvidia-drm-options-modeset0
@@ -182,8 +183,9 @@ sudo update-initramfs -u -k all
 sudo reboot   # with the service stopped
 ```
 
-Revert: `sudo apt-get install nvidia-drm-options-modeset0` and reboot; the
-carve-out profiles will then refuse to start.
+Revert: `sudo apt-get install nvidia-drm-options-modeset0` and reboot; an
+attached display after boot will stay dark, and legacy pre-1120 DRM carve-out
+profiles will refuse to start.
 
 ### Memory accounting
 
