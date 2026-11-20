@@ -8,7 +8,17 @@ owner.
 
 ## Recent candidate decisions
 
-- **Candidate `61` (in progress)** ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)) stacks on `candidate-60` with decode and infrastructure improvements verified through integrated margin confidence (`9649db2dc` / `45f67d1b4`: 2-boot **`c1 = 86.07 / 86.39` [`86.23 mean`]**, **`c16 = 273.96 / 274.30` [`274.13 mean`]**, `0` diffs) and `c61-r20` (`ad23a0e17`: `mhc.py` `_sinkhorn_stream` shares `aux_stream()`, **`c1 = 86.27 ± 5.69% tok/s`**, **`tpot_p50 = 11.24 ms`**, **`c16 = 273.39 ± 1.13% tok/s`**, `0` greedy diffs, `0` `/dev/dri/card0`) on `tp4-ring` (`dgx1..dgx4`). (`c61-r21` `_WO_A_TILES[16]` `block_K=64` test: **`c1 = 85.78 ± 5.80%`**, `c16 = 274.61 ± 0.91%`, `0` diffs, but engine grid regressed `+0.111..+0.238 ms/step` on `1x` and `+0.297 ms` on `16x16`, so reverted to `c61-r20` `95f23ef91` / `block_K=256`):
+- **Candidate `62`, promoted 2026-11-20 as `spark-ds41f-1120`**
+  ([`candidate-62`](experiments/2026-10-26-spark-ds41f-candidate/candidate-62/README.md)):
+  `candidate-61-r2`'s series (vLLM `0001..0822`) plus the Python fixes
+  `0823..0827` and `0829` and the opt-in LSA upgrade `0828` (`VLLM_DS41_LSA`
+  unset by default), `--max-num-seqs 32` on `TP4..TP8`, and four new shapes
+  (`tp1`, `tp2-direct`, `tp2-switched`, `tp3-triangle-4k`). Its benchmarks are
+  carried over from the two-boot `candidate-61` / `candidate-61-r2` runs; the
+  `candidate-62` image itself ran the release tests (`12,023 passed, 356
+  skipped, 0 failed`) and two-boot checks on `tp3-triangle` and `tp1`. What it
+  leaves open is under [Next release](#next-release).
+- **Candidate `61` (shipped in `spark-ds41f-1120` as `candidate-62`'s base)** ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)) stacks on `candidate-60` with decode and infrastructure improvements verified through integrated margin confidence (`9649db2dc` / `45f67d1b4`: 2-boot **`c1 = 86.07 / 86.39` [`86.23 mean`]**, **`c16 = 273.96 / 274.30` [`274.13 mean`]**, `0` diffs) and `c61-r20` (`ad23a0e17`: `mhc.py` `_sinkhorn_stream` shares `aux_stream()`, **`c1 = 86.27 ± 5.69% tok/s`**, **`tpot_p50 = 11.24 ms`**, **`c16 = 273.39 ± 1.13% tok/s`**, `0` greedy diffs, `0` `/dev/dri/card0`) on `tp4-ring` (`dgx1..dgx4`). (`c61-r21` `_WO_A_TILES[16]` `block_K=64` test: **`c1 = 85.78 ± 5.80%`**, `c16 = 274.61 ± 0.91%`, `0` diffs, but engine grid regressed `+0.111..+0.238 ms/step` on `1x` and `+0.297 ms` on `16x16`, so reverted to `c61-r20` `95f23ef91` / `block_K=256`):
   - Integrated certified 2-pass `W_q` Markov vocab screening + per-row $\ell_2$ scale search + extreme-outlier sign-clamping (`Rank 2`), BF16 compressor replication up to `TP<=4` (`Rank 5`), `PR #1225` (`0817..0819`) + `pipe` + `<2>` dense `indexer_score_v41` + gated `_decode_index_split` (`Rank 6`; also supersedes `PR #1086`), grouped 3-layer DSpark `context_kv` + strided `front.py` (`Rank 10`), `PR #995` CopyDrafter guards/gentle ramp (`Rank 13`), fixed `PR #1072` `shm_broadcast.py` 2 ms post-wakeup spin anchor (`Rank 14`: eliminated 5s stalls, `ttft_p99 = 0.133s`), `PR #1081` shard-local sampled verification + `PR #988` sparse top-k Markov (`Rank 15`), `PR #1078` 48-row decode projection tile (`Rank 16A`), `PR #984` UMA allocator hygiene (`Rank 17`), `PR #987` 128-row `WO-B` / `_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16` / `all_reduce_rank_order`, `Decode #3` (`wo_b`, `shared_up`, and `dspark.main_proj` `tile_contiguous=True` + `linear.py` `split_override` unpacking guard), `Decode #5` (`aux_stream` priority `-3` + `_PriorityCUDAGraphExec` `UseNodePriority=0x08` + `MoERunner._forward_impl` `M<=16` `_post_gate_hook` deferral fix), `Decode #6` (`moe_down` PDL prologue weight preload + `LayerChain` fix), `c61-r10` host-vs-GPU $p_k^2$ coverage-squaring elimination (`adaptive_verification.py`), `c61-r12` `SparseMlaV41Plan` `"split"` `skip_inactive=True` (`sparse_mla.py`), `c61-r13` device-side `is_padding` dead-row masking (`metadata.py` + `attention.py`), `c61-r15` hybrid `WQ_ONLY` + 1-warp/ping-pong `vocab.py` refine + `context_kv_front_3layer` + `gemm.py` `M=32/48` retune, `c61-r16`/`r17` `mhc` strict `pdl.chain()`-first + split `finalize_norm`/`finalize_sinkhorn` (`-0.20..-0.23 ms/step`), `c61-r20` `_sinkhorn_stream` sharing `aux_stream()`, `wo.py` `_WO_A_TILES` (`16: split=True, block_K=256`; `64/96/128` restored to `split=True` in `c61-r17`), `/dev/nvidiactl` RM scanout carve-out replacing `/dev/dri/card0`, `c61-r18` `grid_x=40` persistent loop in `refine_vocab_greedy_partials` (`vocab.py`, `4,040 -> 40` CTAs for Target `lm_head` + DSpark Markov), top-2 margin confidence calibration (`confidence.py`, `9649db2dc`), `tilelang_rejection.py` `initcheck` uninitialized-read guard (`705 passed, 0 errors`), `qwen3_dspark.py` `apply_bias_topk` deduplication, and `PR #1222`/`#1223` lab fixes (`124 passed` in `test_lab.py` + `test_source_locks.py`). (`PR #967` `sparse_mla.py` TIRx compiler fixes verified byte-identical in `candidate-60` across all 6 routes.)
   - Screened `c61-r13` (`179fd3b75`: **`c1 = 84.78 ± 6.11% tok/s`**, `28.00 ms/step`, **`c16 = 271.66 ± 1.05% tok/s`**, `0` diffs), `c61-r14` (`00306d1ef`: `c1 = 83.62 tok/s`, `c16 = 269.91 tok/s`, `0` diffs), `c61-r15` (`d0a111fa2`: `c1 = 84.11 tok/s`, `c16 = 271.23 tok/s`, `0` diffs), `c61-r16` (`99808dbd5`: `697 passed, 6 skipped`, `984` kernels / `0` PDL viol with `-v /dev/null:/dev/dri/card0`; ready `+132.1 s`, `MemAvailable 117.2–118.0 GiB`, `0` `/dev/dri/card0` mounts; **`c1 = 85.16 ± 5.85% tok/s`** [`27.89 ms/step`, `tpot_p50 = 11.68 ms`, `ttft_p50 = 0.1116 s`, `prose 81.15 / 83.79 dec`, `code 115.56 / 121.51 dec`, `#00 = 76.23 dec`], `c16 = 269.88 tok/s`, `0` diffs), `c61-r17` (`8bcf2b7ea`: `wo.py` `64/96/128` restored to `split=True`; ready `+114.6 s`, `jit_new_files = 0`, **`c1 = 85.45 ± 5.94% tok/s`** [`27.83 ms/step`, **`tpot_p50 = 11.63 ms`**, `ttft_p50 = 0.1117 s`, `prose 81.37 / 84.00 dec`, `code 115.50 / 121.44 dec`, `#00 = 76.22 dec`; **`2-boot mean = 85.30 tok/s`**, `+2.07` vs `c60-base`], **`c16 = 270.80 ± 1.38% tok/s`**, `0` greedy diffs), `c61-r18` (`8a51b5ac0`: `grid_x=40` persistent `refine_vocab_greedy_partials`; `97 passed, 6 skipped`, `0` PDL viol; ready `+129.0 s`, `+34` JIT files, **`c1 = 85.03 ± 5.87% tok/s`** [`27.91 ms/step`, `tpot_p50 = 11.68 ms`, `prose 81.03 / 83.66 dec`, `code 115.54 / 121.51 dec`], `c16 = 269.84 ± 1.33% tok/s`, `0` greedy diffs; `c61_r18_engine_grid.json` `1x` `dft_ms` **`-13.2 us` mean** vs `r17`, `gap_ms` `1.314–1.338 ms`), `c61-r19` (`777822915`: `MoERunner._forward_impl` `M<=16` `_post_gate_hook` deferral fix; `114 passed`, `0` PDL viol; ready `+116.7 s`, `jit_new_files = 0`, **`c1 = 85.28 ± 5.86% tok/s`** [`27.84 ms/step`, `tpot_p50 = 11.62 ms`, `ttft_p50 = 0.1116 s`, `prose 81.32 / 83.95 dec`, `code 115.22 / 121.13 dec`], **`c16 = 270.31 ± 1.14% tok/s`** [`tpot_p50 = 56.82 ms`], `0` greedy diffs; `c61_r19_engine_grid.json` `1x` `-301.8 us` mean vs `r13`, `1x2` `-16.9..-39.4 us` & `multi M<=16` `-10.1 us` vs `r18`), integrated `c61-margin` (`9649db2dc` / `45f67d1b4`: 2-boot **`c1 = 86.07 / 86.39` [`86.23 mean`]**, `tpot_p50 = 11.23 / 11.21 ms`, **`c16 = 273.96 / 274.30` [`274.13 mean`]**, `0` greedy diffs), and `c61-r20` (`ad23a0e17`: `mhc.py` `_sinkhorn_stream` shares `aux_stream()`; `197 passed`, `0` PDL viol; ready `+115.8 s`, `jit_new_files = 0`, `MemAvailable 117.3–118.0 GiB`, **`c1 = 86.27 ± 5.69% tok/s`** [`27.56 ms/step`, `tpot_p50 = 11.24 ms`, `ttft_p50 = 0.1109 s`, `prose 81.80 / 84.48 dec`, `code 116.10 / 122.03 dec`], **`c16 = 273.39 ± 1.13% tok/s`** [`tpot_p50 = 57.04 ms`], `0` greedy diffs; `c61_r20_engine_grid.json` vs `c61-margin`: `1x` `-13.3 us` step / `-19.5 us` fwd, `multi M<=16` `-33.5 us` step / `-72.8 us` fwd, `multi M>16` `+106.7 us` step). Rejected both the `+2,045/-325`-line `step_gate` flat-graph early-exit prototype (`/tmp/rework_dspark/final.patch`) as a bad complexity/trade-off (`+1,118` net production lines across 7 entangled files, 6 duplicated `@T.prim_func` paths, all 4 RoCE `all_gather`s still run, and `+11.33 us/step` `ALL-ALIVE` regression for only `-80.04 us/step` weighted `c1` / `-55.02 us/step` beyond `grid_x=40`) and the `dspark_context` fused MXFP8 cast prototype (`+0.19..+1.15 us` standalone and `+1.23..+3.95 us` end-to-end with `main_proj` across `cap=1..96`).
 - **Candidate `60`** ([`experiments/2026-11-16-c60-prefill`](experiments/2026-11-16-c60-prefill/README.md)) builds on `candidate-59` (via `#1218` / `#1219`) in three gated steps across switched TP4 (`sp1..sp4`) and switched TP3 (`sp5..sp7`):
@@ -79,16 +89,45 @@ before tuning anything on this basis.
 Production is **spark-ds41f-1120** (`manifests/baselines/2026-11-20-spark-ds41f-1120.json`, image `spark-ds41f:1120`), promoted 2026-11-20 across all 12 shapes: `tp4-ring` ([suite reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/)), `tp3-triangle` ([suite reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/)), `tp3-triangle-4k`, `tp2-direct`, `tp1`, and `tp2-switched`..`tp8-switched` ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md)).
 <!-- END GENERATED: next-release-status -->
 
-Before promoting `1107`:
-1. **Build and qualify `spark-ds41f:1107`** across the full release,
-   single-stream, and sampled suites on `tp4-ring` and `tp3-triangle` against
-   `spark-ds41f-1030`.
-2. **Verify `dgx1` memory headroom and native-depth graph capture (`0728`)**:
-   record startup and steady-state `MemAvailable` during 1M cold prefill and
-   under the widened `max_decode_rows` (`59` on TP3, `107` on TP4) plus 69
-   target CUDA graphs on TP3 (`60 -> 69`), confirming headroom stays comfortably
-   above the 5 GiB startup and 3 GiB steady-state guards.
-3. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
+Open after `1120`:
+1. **XID 43 engine deaths ([#1036](https://github.com/christopherowen/spark-ds41f/issues/1036)),
+   site-reported and not reproduced here.** Sites report the whole engine dying
+   with XID 43 and `CUDA error: unspecified launch failure` on
+   `spark-ds41f:1107`: on `tp4-ring` with 4 KiB pages and on the qualified
+   64 KiB kernel, on a `1030`-derived stack, on frozen `candidate-54`, and
+   (2026-11-18) on an eight-node TP8 deployment in the Engram row gather, with
+   tool-heavy prompts and with a 1,024-token generation. One site has a
+   repro that dies in 60–70 s: two concurrent chat requests, each about 2K
+   text tokens plus 10 images. Its bisection: still dies with speculative
+   decoding off, with a 4,096 batched-token budget, with `--enforce-eager` and
+   with PDL disabled; no crash with `CUDA_LAUNCH_BLOCKING=1` and
+   `--enforce-eager`. `candidate-62`'s record lists a live smoke pass for it on
+   `tp3-triangle`; no experiment here reproduces the fault or shows `1120`
+   clear of it. Run the two-request ten-image repro and the TP8 triggers on
+   `1120` (`tp4-ring` or `tp4-switched`, and `tp8-switched`), record the
+   outcome under `experiments/`, and answer the issue.
+2. **`tp3-triangle`'s decode grid reads `worse` in the `1120` reference**
+   ([release table](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/release-table.txt)):
+   geometric mean `+20.20%` (`21.27 -> 25.52 ms`). The six one-request shapes
+   take `33.2–33.7 ms` against `18.5–19.7 ms` on `1107` (`+71%..+79%`), while
+   the multi-request shapes improved `3.10–12.69%` and live single-stream `c1`
+   improved `10.39%`. The release notes attribute it to the one-request shapes'
+   dummy padding rows; `tp4-ring`'s grid improved on all 20 shapes. Confirm the
+   cause on the triangle, then decide whether the release grid moves to rows
+   that route and read context
+   ([`experiments/2026-11-17-indexer-decode-share`](experiments/2026-11-17-indexer-decode-share/README.md):
+   the fixed step's dummy rows are flagged as padding, skip the routed MoE and
+   see no compressed context). A changed suite is a new suite; the recorded
+   references stay.
+3. **`tp3-triangle` short-request TTFT beside six streams.** In the same
+   reference, a short request's TTFT p50 during a 131K prefill beside six
+   streams reads `1.76 s` against `1.18 s` on `1107` (`+48.88% ±16.13%`,
+   `worse`) and `1.44 s` on the repeat boot (`+21.58% ±52.47%`, `same`), while
+   beside three streams it improved (`1.07 -> 0.80 s`) and the prefill beside
+   six streams is `13.19%` faster. Unexplained and not in the release notes:
+   check the prefill yield and admission on the triangle's 6,144 budget before
+   the next release.
+4. **Retire the measurement matrix** (`bin/spark bench` without `--suite`, now
    Sonar's `matrix`) once no active workflow references it; the suites in
    `config/suites/`, run by Sonar (`docs/release-benchmark.md`), are the release
    benchmark authority.
@@ -224,6 +263,13 @@ evictions, or large new tool outputs.
 - **Idle streams during long cold prefills.** A 1M cold prefill takes ~3 minutes
   and sends nothing before its first token. Check whether clients or gateways
   cut idle streams during 1M prefills; if so, send SSE keep-alives.
+- **Atomic admission for the buffered chat batch endpoint
+  ([#1141](https://github.com/christopherowen/spark-ds41f/pull/1141), open,
+  contributor).** An opt-in header sends a batch's prepared prompts to the
+  engine in one message, so an idle engine does not start decoding before the
+  batch is complete. Ranked last in `candidate-61`'s backlog (multi-stream
+  waves only, no single-stream effect) and not evaluated in a round; `1120`
+  does not carry it.
 
 ## Decode
 
@@ -232,9 +278,14 @@ eight streams), followed by dense FP8 projections, MLA attention/indexer,
 collectives, and DSpark drafting.
 
 1. **Routed MoE continuous `FC1 -> SwiGLU -> FC2 -> Combine` persistent kernel**
-   (~2.4–3.5% decode ceiling). TileLang's `swiglu_forward_and_per_token_cast`
-   takes 23–30 µs per layer (~3% of a decode step) and runs serially between the
-   two grouped GEMMs. Keeping routed tiles resident across `FC1 -> SwiGLU -> FC2`
+   (about 0.6% decode ceiling, down from the 2.4–3.5% first written here). That
+   estimate priced TileLang's `swiglu_forward_and_per_token_cast` at 23–30 µs
+   per layer; on `candidate-61`'s base `moe_swiglu_cast` takes `4.1 us` of a
+   `564.3 us` routed-MoE graph at `M=6` on `sp8` (about 0.16 ms over 40 layers
+   of a 27.8 ms step), three pipeline stages beat two stages with
+   `fuse_swiglu`, and `c61-r16` reverted `c61-r14`'s `fuse_swiglu` change
+   ([`experiments/2026-11-16-c61-decode`](experiments/2026-11-16-c61-decode/README.md)).
+   The cast runs serially between the two grouped GEMMs. Keeping routed tiles resident across `FC1 -> SwiGLU -> FC2`
    (or fusing the SwiGLU + MXFP8 requantization epilogue over live tiles) avoids
    the global intermediate round-trip and extra kernel launch per layer. On
    `sp8` (`H=5120, I=576`, `E=384, topk=6`), `fuse_swiglu=True` at
@@ -271,11 +322,10 @@ collectives, and DSpark drafting.
    bit-exact; `17 passed`, `0` PDL violations across `test_deepseek_v41_tilelang_dspark_context.py`
    and `test_deepseek_v41_tilelang_linear.py`).
 4. **Vocabulary head (`128`-row token tile and per-tile epilogue summary).**
-   - **A 128-row token tile:** a head call with 65–128 rows on TP4 `c16` runs a
-     second 64-row tile that re-reads and unpacks the 248 MB shard from DRAM.
-     A 128-row tile fits in ~96 KB of shared memory with two activation stages
-     and four weight stages, keeping the same K accumulation order (~1% ceiling
-     at sixteen streams on TP4).
+   - **A 128-row token tile: shipped.** `TILE_CONFIGS[128]` and the certified
+     screen's `SCREEN_TILE_CONFIGS[128]` serve wide head calls on a 128-row
+     tile, on a matched two-stage pipeline since `0784` (#1001, in `1120`;
+     86,016 B of shared memory, bit-identical at every `M=1..128`).
    - **Sampled top-$k$/LSE summary in the head epilogue:** greedy argmax in the
      head epilogue is active; emit a compact per-tile summary (top-$k$
      values/indices plus tile max and log-sum-exp) so sampled (`temp=1.0`)
@@ -390,9 +440,16 @@ collectives, and DSpark drafting.
     head (`num_key_value_heads = 1`), differing only in their causal mask over
     `[pos0, pos0 + V)`. Grouping a request's verification rows inside one CTA
     amortizes the 576 B/token SWA KV loads from LPDDR5X across all $V$ rows.
-11. **All-reduce arrival skew and RoCE proxy core affinity.** Rank 0 also runs
-    the API server, and `sparknet` proxy threads run without explicit CPU core
-    affinity on GB10's mixed core types; test pinning them to fast cores.
+11. **One-shot all-reduce latency per call (proxy core affinity shipped).**
+    `1120` pins the `sparknet` proxy, the worker main thread, the engine core
+    and rank 0's API server to disjoint fast cores by L3 cluster (vLLM `0801`,
+    `sparknet` `0001`; #1134, #1008). Still open: the per-call time itself. The
+    last isolated timing is 2026-10-03, before `sparknet` 0.5.0 and its three
+    patches (`experiments/2026-10-03-collective-policy`: 16–19 µs at 10 KiB and
+    about 29 µs at 60 KiB), and every decode layer pays it. Time one call on
+    `1120` at the one-row and six-row sizes on `tp4-switched` and `tp4-ring`,
+    split into wire, proxy and GPU-side signalling, and measure rank arrival
+    skew, before sizing any change to how shares and flags reach the peers.
 12. **A RoCE one-shot broadcast for adaptive verification.** Adaptive
     verification broadcasts rank 0's confidence snapshot every decode step
     through NCCL (`adaptive_verification.py`). Bound its share of the step from
@@ -420,6 +477,12 @@ collectives, and DSpark drafting.
     hides misses. If evictions are material, raise the size until they reach
     about zero, and weigh the gain against 16-stream decode and dgx1 headroom at
     1M context. Confirm at the first boot that the switch reaches the reader.
+15. **Router share of a single-stream step.** No record sizes the per-layer
+    router (the 384-expert gate projection, scoring and top-6 selection) on its
+    own. Profile it on `1120` at one stream: its time per layer, its achieved
+    read rate, and whether the gate is replicated or sharded across ranks.
+    Only if it is material, screen one launch for projection, scoring and
+    selection with the same order and tie rule.
 
 ## Speculative decoding
 
@@ -587,6 +650,10 @@ Open levers:
   (`test_prefix_cache_retention_probe.py`) and inline `tool_reference` schema injection
   (`defer_loading: true`) shipped in `candidate-60`; confirm live 64–100K prefix-cache
   retention on production agent traffic.
+- **Follow-up-turn TTFT is not measured.** The suites time cold prefill and
+  short requests beside one; none times the second turn of a conversation whose
+  prefix is cached (256-token blocks). Time a follow-up turn on a 4K and a 900K
+  conversation on `1120` and record it beside the release references.
 
 ## Boot
 
@@ -694,10 +761,11 @@ Open levers:
   `CopyDrafter` / DSpark acceptance when callers pass `repetition_penalty > 1.0`.
   Screen restricting `repetition_penalty` to generated output tokens (or a
   bounded trailing answer window).
-- **Opt-in Latent Sparse Attention (`VLLM_DS41_LSA`, `0741` in `1107`):** ships
-  disabled by default (`VLLM_DS41_LSA=0`) with full runtime plumbing and unit
-  tests; any future enablement requires an independent long-context answer
-  quality evaluation.
+- **Opt-in Latent Sparse Attention (`VLLM_DS41_LSA`, `0741` in `1107`, `0828`
+  in `1120`):** ships disabled by default (`VLLM_DS41_LSA` unset) with full
+  runtime plumbing and unit tests; `0828` moves the opt-in path to FP8 group-32
+  dominance summaries and declares no LSA kernel when unset. Any future
+  enablement requires an independent long-context answer quality evaluation.
 - **BF16 sparse attention** (patch `0023`, off in configuration): measure its
   fidelity with a teacher-forced comparison against
   `VLLM_DS41_ATTENTION_COMPUTE=reference` on long agent transcripts before
@@ -726,14 +794,25 @@ Open levers:
 The TileLang runtime migration is complete in `1030` and `1107`: no B12X kernel
 runs in serving (`--load-format direct` and all model, drafter, sampler,
 rank-reduction, gather-store, scoring, vision-tower, L2-prefetch, and collective
-paths run on TileLang + `sparknet`; retiring the remaining `b12x` build input
-from `upstreams.lock.json` and `docker/Dockerfile` can follow after `1107`).
+paths run on TileLang + `sparknet`). `1120` retires B12X completely (`0802`,
+#1096).
 
 Remaining kernel-level investigations:
 - **TMA stage releases outside DS4.1's active kernel set**
   (`experiments/2026-09-30-proxy-fence-audit`): all serving kernels are fenced
   (and enforced in the compiler via `tilelang/0001..0013` in `1107`); keep the
   compiler barrier tests in the release gate whenever TileLang is refreshed.
+- **Two TileLang pull requests are open since 2026-11-08 and not in `1120`:**
+  [#1015](https://github.com/christopherowen/spark-ds41f/pull/1015) (audit of
+  upstream TileLang commits since the `1107` pin, staging six patches under
+  its own numbering) and
+  [#967](https://github.com/christopherowen/spark-ds41f/pull/967) (vectorized
+  `reinterpret` and merged read-state branches in `sparse_mla`;
+  `candidate-61`'s record notes its `sparse_mla.py` fixes as verified
+  byte-identical in `candidate-60` across all 6 routes). #1015's 2-split
+  round-to-nearest TF32 for `mhc.project_streams` moved `reference_sha256` in
+  `c61-r2` and was reverted, so that part needs the owner's decision; the rest
+  of both has not been screened in a candidate.
 
 ## Upstream and hygiene
 
@@ -744,6 +823,15 @@ Remaining kernel-level investigations:
 - The one-read `fill_defaults` fix (`0019`) is still needed on PyTorch main.
 - The NCCL IB send-path fence patch should be dropped once upstream releases the
   fix.
+- **Records of incorporated pull requests live only on their branches.** 58
+  experiment folders (`experiments/2026-11-06-*` to `2026-11-12-*`, most of
+  them the records of pull requests closed as incorporated into
+  `candidate-50..61`) are on unmerged pull-request branches and not on `main`
+  (counted 2026-11-20). Bring them to `main`, or keep those branches: pruning
+  one drops its record.
+- **Closing notes of #956 and #957 cite patches `0792`, `0795` and `0796`,
+  which no series on `main` has.** Their changes ship in `1120` inside the
+  consolidated `0813`, `0814` and `0816`.
 
 ## Tried and not adopted
 
