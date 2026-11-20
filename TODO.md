@@ -808,6 +808,42 @@ Open levers:
   per-slot survival budget (`assign_draft_budget`) plus per-step verify length
   against ranking candidate draft slots across the whole batch by marginal
   expected accepted tokens per marginal millisecond of step cost at 8–16 streams.
+- **End-of-turn drafter learning with the learned table drafting (stage 4, not
+  run).** [`experiments/2026-11-17-dspark-turn-learning`](experiments/2026-11-17-dspark-turn-learning/README.md)
+  ran its first three stages: observe, the offline study and shadow. Offline,
+  an hour of AgentX traffic raises teacher-forced accepted tokens by about
+  `1.5%` with the full-vocabulary rule and `0.9%` with the rule serving can
+  run, both still rising; that is an upper bound on what verification
+  realizes. Shadow costs the grid's decode forward `0.43%` with its
+  communicator made at the first exchange. Stage 4, drafts read from the
+  learned table while it wins over a window and reset when it loses, was not
+  run, so no serving speed has been measured with learned drafts and the
+  entry under "Tried and not adopted" records the shadow's cost only. Run it
+  on AgentX traffic over two boots and weigh the result against that cost.
+- **Per-position calibration alone (the arm #1002 did not run).**
+  [`experiments/2026-11-08-online-dspark-adaptation`](experiments/2026-11-08-online-dspark-adaptation/README.md)
+  measured calibration, W1 and confidence-head updates together and lost. Its
+  record names the arm that would separate them:
+  `VLLM_DSPARK_ONLINE_CALIBRATION=1` against off, to say whether the
+  per-position calibrator alone shortens `0504`'s budgets. The code is in that
+  experiment's patch only.
+- **`log p_max` beside the top-2 margin, and a margin for sampled requests.**
+  `1120` ships the margin, sized at `+1.3` to `+1.8%` at single-stream row
+  costs; adding `log p_max` sized at `+1.7` to `+2.3%` but needs a sum over
+  the vocabulary that the certified screen avoids
+  ([`experiments/2026-11-17-draft-calibration-sizing`](experiments/2026-11-17-draft-calibration-sizing/README.md)).
+  Sampled requests' draft steps measure no margin and calibrate as before.
+  The screen ran two workloads on `tp4-ring` only: no AgentX run, no other
+  shape and no soak. Open: a `log p_max` the screened head can return without
+  the full sum, a margin on sampled draft steps, and the AgentX run.
+- **#953 at the sizes it was written for.**
+  [`experiments/2026-11-08-cohort-sync-verification`](experiments/2026-11-08-cohort-sync-verification/README.md)
+  starts from identical-prompt prose `c16` falling from `1030` to `1107` at
+  `TP6` (`-9.6%`), `TP7` (`-9.6%`) and `TP8` (`-13.5%`) while `TP4` and `TP5`
+  rose. Its change was served only on `tp4-ring`, together with #986, and
+  reverted there (under "Tried and not adopted"). The drop has not been read
+  again on `1120`. Read prose `c16` on `tp6..tp8-switched` first; if it is
+  still there, screen the burst coalescing alone on `tp8-switched`.
 
 ## Prefill and first token
 
