@@ -23,6 +23,7 @@ NODES_FILE = "config/nodes.json"
 EXAMPLES = {
     NODES_FILE: "config/nodes.example.json",
     "config/nodes-direct2.local.json": "config/examples/nodes-direct2.json",
+    "config/nodes-pp2-tp2.local.json": "config/examples/nodes-pp2-tp2.json",
     "config/nodes-ring4.local.json": "config/examples/nodes-ring4.json",
     "config/nodes-switched.local.json": "config/examples/nodes-switched.json",
     "config/nodes-switched2.local.json": "config/examples/nodes-switched2.json",
@@ -48,7 +49,7 @@ def main() -> int:
     if missing:
         raise SystemExit(f"no example for {', '.join(missing)}: add one to EXAMPLES in {Path(__file__).name}")
     address = cluster["distributed"]["master_addr"]
-    for name in maps:
+    for name in sorted(set(maps) | set(EXAMPLES)):
         target = ROOT / name
         if target.exists():
             print(f"kept {name} (this site's own)")
