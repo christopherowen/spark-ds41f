@@ -187,6 +187,31 @@ Open after `1120`:
    `config/suites/`, run by Sonar (`docs/release-benchmark.md`), are the release
    benchmark authority.
 
+### Candidate 61 review follow-up
+
+1. **Reset the prefix cache after a failed Sonar grid run (P1).** A worker can
+   write profiling KV before the RPC raises or returns an empty result. Attempt
+   cleanup on every exit after dispatch. Fail the run if the reset fails and
+   preserve the original error. Test a worker failure after a write, an empty
+   reply, and a failed reset. Verify a subsequent request with the same prefix
+   produces the same token IDs as a cold request after successful cleanup.
+   [Sonar wrapper](spark_ds41f/sonar.py)
+2. **Isolate writable KV in the real-row profiler (P2).** Give each concurrent
+   request its own writable ring blocks. Initialize the history for each
+   requested depth and preserve it when a repeat sets `fill_real_context=False`.
+   Compare two requests with distinct histories at different depths against
+   their individual runs, then reverse the order and repeat.
+   [Grid implementation](experiments/2026-11-16-c61-decode/vllm/0820-perf-spec-decode-optimize-DSpark-margin-confidence-h.patch)
+3. **Check the batched DSpark runner-up against the full vocabulary (P2).**
+   The dense path discards the winner's entire 2,048-token partition. Test
+   logits with the top two in the same partition, in different partitions, and
+   tied. Measure how often the approximation changes verification decisions on
+   held-out traffic. Screen an exact top-two reduction at one and 16 streams
+   against the shipped calibration, which already gained 1.2% and 1.3%.
+   [Reduction](experiments/2026-11-16-c61-decode/vllm/0819-perf-dsv41-tune-vocab-head-grid-width-and-packed-BF1.patch) · [Calibration A/B](experiments/2026-11-17-draft-calibration-sizing/README.md)
+
+After the two profiler fixes, prioritize the [eight-session replay](#mixed-prefill-and-decode).
+
 ## Current reference
 
 <!-- BEGIN GENERATED: current-reference -->
@@ -311,6 +336,16 @@ prompts avoid most of it (98–99% prefix-cache hit rate in live agent traffic),
 so the cost falls on cold prompts: the first request of a scan, cache
 evictions, or large new tool outputs.
 
+- **Replay eight real AgentX sessions while a cold 131K prompt arrives.** Fix
+  the arrival trace, tool turns and cache state across candidate arms. Timestamp
+  arrival, tokenization, queue admission, prefill, first token and completion.
+  Report short-turn p50/p99 TTFT, active-stream p99 inter-token gaps, and the
+  long request's completion time. Use this replay to compare the chunk policy
+  below with scheduling by deadline at chunk boundaries, increasing priority
+  with wait time so long requests finish. On TP4 also run the 32-seat suite
+  on the next candidate and report per-session latency and SLO goodput at
+  saturation. The published TP4 throughput comparison reaches 16 streams.
+  [Mixed-load reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/release-table.txt) · [32-seat suite](config/suites/c32.json)
 - **In `1107` (`0751`)**: deep-context scheduler interleave (`VLLM_DS41_DEEP_PREFILL_INTERLEAVE=1`
   above 16K context) and `block_M=32` long-context sparse-MLA staging reduce
   32K–64K mixed-decode ITL stalls by 23–27% while keeping pure 131K prefill
@@ -318,6 +353,24 @@ evictions, or large new tool outputs.
 - **Idle streams during long cold prefills.** A 1M cold prefill takes ~3 minutes
   and sends nothing before its first token. Check whether clients or gateways
   cut idle streams during 1M prefills; if so, send SSE keep-alives.
+- **Concurrency-aware dynamic prefill chunk stepping under active decode streams.**
+  Static `SPARK_DS41F_PREFILL_MIX_CHUNK` (`#1150`) was retired, and the full
+  `16,384` (`tp4`) / `32,768` (`tp5..tp8`) batch budget maximizes solo cold
+  prefill throughput (`10,108–12,429 tok/s` at `131K`), but holds sibling
+  decoding streams for `~1.8–2.1 s` per mixed step (`stall-3 / stall-11`).
+  Screen dynamically stepping the scheduler's per-step prefill chunk cap down to
+  `2,048–4,096` tokens whenever `num_running_decode_reqs > 0` (keeping the full
+  `16K/32K` chunk when `active_decodes == 0`), and letting queued short delta
+  prefills (`<= 512–1,024` uncached tokens) preempt at the next sub-chunk
+  boundary rather than waiting behind `--prefill-yield-limit-s 10`.
+- **Token-budget-gated parallel short-delta prefills (`<= 512–1,024` combined
+  uncached tokens).** Global `--max-parallel-prefills 8` regressed four-`64K`
+  cold prefills because batching multiple long prompts defeats CED's
+  single-request `128`-row window. Screen keeping `--max-parallel-prefills 1`
+  for any request with `> 1,024` uncached tokens while allowing the scheduler to
+  coalesce multiple short cached-delta turns (`<= 256–512` uncached tokens each,
+  combined uncached budget `<= 1,024` tokens) into one step when concurrent
+  subagents return tool outputs or fork simultaneously.
 - **Atomic admission for the buffered chat batch endpoint
   ([#1141](https://github.com/christopherowen/spark-ds41f/pull/1141), open,
   contributor).** An opt-in header sends a batch's prepared prompts to the
@@ -331,6 +384,14 @@ evictions, or large new tool outputs.
 Routed MoE is the largest share of decode compute (~50% at one stream, ~62% at
 eight streams), followed by dense FP8 projections, MLA attention/indexer,
 collectives, and DSpark drafting.
+
+**Target 100 tok/s on single-stream prose** from the two-boot 84.91 tok/s
+reference. The measured bandwidth accounts for 24.42 ms of a 27.53 ms step.
+Trace actual expert IDs and weight bytes read per committed token across
+successive steps. Use the observed reuse to screen keeping frequently reused
+routed weights resident with identical target outputs. Report bytes per
+committed token, step time and serving tok/s alongside the kernel timings.
+[Bandwidth measurements](experiments/2026-11-17-c1-floor-now/README.md) · [Two-boot prose results](experiments/2026-11-16-c61-decode/over-under-1107-vs-candidate-61.md)
 
 1. **Routed MoE continuous `FC1 -> SwiGLU -> FC2 -> Combine` persistent kernel**
    (about 0.6% decode ceiling, down from the 2.4–3.5% first written here). That
@@ -558,6 +619,14 @@ exit (`0744`), expected-yield gating against DSpark (`0745`), native-depth CUDA
 graph retention (`0728`), fused single-rank Markov drafting (`0717`), and
 device-side `prepare_inputs` folding (`0754`) are all active.
 
+**Improve the first two DSpark draft positions (without training).** Check
+drafter parity on identically formatted prompts; we are not training a custom
+drafter. Explore input-driven drafting improvements only where they do not hurt
+decode step time or throughput. Measure acceptance by position, verification
+cost, tokens committed per step and serving tok/s on prose, code and agent turns
+with exact target verification.
+[First-miss measurements](experiments/2026-11-18-draft-accuracy-sizing/README.md)
+
 Open levers:
 - **Single-stream (`c1`) cold-L2 routed-MoE marginal row cost and `DEAD_ROWS_TAU` break-even calibration.** On `sp8` across distinct layer weights (`>2 GiB`, cold L2 matching real serving), 39-layer `MoeExpertsV41Plan` at `M_pad=6` scales with `live_rows = 1..6` (`6 -> 12 -> 18 -> 24 -> 29 -> 34` unique experts/layer) as `4.66 -> 8.76 (+4.10) -> 13.08 (+4.32) -> 17.02 (+3.94) -> 20.57 (+3.55) -> 24.08 (+3.51) ms` (`s3/2` beats `s2/2` across warmed `live=3, 4, 16, 38, 64` at `159.1 vs 160.8`, `192.7 vs 194.6`, `622.8 vs 623.9`, `1423.5 vs 1427.4`, `2369.4 vs 2377.9 us`). Live `dgx1` `c61-r5` `prose-c1` telemetry (`4,701` steady decode steps) shows `36.3%` commit 1 token (`med 25.30 ms`), `30.0%` commit 2 (`25.60 ms`), `21.1%` commit 3 (`26.70 ms`), `8.1%` commit 4 (`28.70 ms`), `3.2%` commit 5 (`30.90 ms`), `1.2%` commit 6 (`33.50 ms`). `c61-r6` (`e0436c584`) tested IRLS warm-start priors (`_WARM_CONFIDENCE_HEAD_INTERCEPTS` + zero-preservation) + `SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` (`tau_c1 = 0.1386`) on `dgx1..dgx4`: warmup req `#00` improved `71.66 -> 73.13 dec tok/s` (`ttft` `0.283s -> 0.163s`), `code-c1` improved `114.25 -> 115.04 dec tok/s` (`med_dt 31.50 -> 29.90 ms`), and `c16` (`271.38`) + determinism (`0` diffs) held, but `prose-c1` shifted `-1.83 ms/step` (`26.58 -> 24.75 ms` mean) against `-0.163 commits/step` (`2.144 -> 1.981`, `81.38 -> 80.72 dec tok/s`), showing the pruned `pos 2..4` tail tokens earned `89.1 tok/s` marginal rate (conditional acceptance > independent confidence product). Keep warm-start priors and drop `scale = 2.5` back to `1.0` in `c61-r7`. In `c61-r9` (`60caa95be`, `tau = 0.06335`), `cov = [1.0, 0.861, 0.482, 0.225, 0.100]` (`2.667`) vs un-squared `sqrt_cov = [1.0, 0.928, 0.694, 0.474, 0.316]` (`3.412`), whereas `c61-r6` (`tau = 0.1386`) raised conditional acceptance `surv/cov` to `[0.662, 0.507, 0.509, 0.543, 0.557]` while squaring `cov` down to `[1.0, 0.619, 0.262, 0.111, 0.056]` (`2.048`) vs un-squared `2.869`: root cause was async `_stale_confidences` ($C_{t-1}$) on the host (`get_num_tokens` / `reallocate_drafts`) intersecting current `_confidence_probs` ($C_t$) on the device (`DeadRows`), squaring per-step survival coverage to $p_k^2$. `c61-r10` restores `SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5` (`tau_c1 = 0.1386`) for device `DeadRows` while admitting all `<=5` single-tile DSpark slots on the host (`64 passed, 1 skipped` in `test_adaptive_verification.py` + `test_acceptance_estimator.py`). On `tp4-ring` (`c61-r10`, `2f9eaee88`), `c1` reached **`84.03 ± 6.13% tok/s`** (`code = 112.99 e2e / 118.71 dec`, `prose = 80.06 e2e / 82.64 dec`, `acc/draft = 1.4042` vs `1.3443` in `r9`, `c16 = 271.23 ± 0.87%`, `0` greedy diffs). `c61-r11` (`4cd801eb2`) kept `dspark.main_proj` `TILE_CONTIGUOUS_FP8` (`c16 = 271.31 tok/s`, `tpot_p50 = 11.74 ms`, `0` diffs) while `scale = 1.75` (`tau ~ 0.1035`) measured `c1 = 83.90 tok/s` (`+0.205` rows/step at `+0.42 ms/step` = `2.03 ms/row` for only `+0.0181` accepted tokens/draft = `8.84%` marginal survival, `43.5 tok/s` < `84.03`), so `c61-r12` restores `scale = 2.5`). `c61-r12` (`fcced2855`, `SparseMlaV41Plan` `"split"` `skip_inactive=True`, `-8.10..-13.66 us/L` at `idx_len=16`, `-5.87..-11.81 us/L` at `idx_len=512`, `0` new JIT files) measured **`c1 = 84.75 tok/s`** (`35.707 steps/s`, `prose = 80.78/83.39`, `code = 113.59/119.36`, `c16 = 271.60`, `0` greedy diffs). `c61-r13` (`179fd3b75`, `metadata.py` + `attention.py` `is_padding` dead-row masking, `153 passed, 0 PDL violations`, `IndexerCand -23.09..-28.11 us/L`) measured **`c1 = 84.78 tok/s`** (`35.720 steps/s`, `c16 = 271.66 tok/s`, `0` greedy diffs). (`PR #1002` `VLLM_DSPARK_ONLINE_ADAPT=1` measured `+0.03%` on held-out `c1` (`87.11 -> 87.14`) and `+0.10%` on coding (`160.91 -> 161.07`) in `c57-adapt`; it is not in `1120`: `VLLM_DSPARK_ONLINE_ADAPT` exists only in the patches of `experiments/2026-11-08-online-dspark-adaptation`, merged as a record.)
 - **Bounded or indexed CopyDrafter history match, forward-locality cursor, and
@@ -706,11 +775,37 @@ Open levers:
   - **Already measured:** vectorized key loads (vLLM 0819) took only 0.5-2% off score and
     select, because the read itself bounds it.
   - Evidence: `experiments/2026-11-16-indexer-prefill-exact`.
+  - Compare the fused candidate's selected indices and tie handling against
+    the exact reference. Measure cold 131K and 1M prefill on two boots against
+    the published 1120 ring runs (about 10.1K and 9.39K tok/s respectively).
+    [Cold-prefill reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/prefill.json)
 - **Rank-offset CTA remapping for sequence-parallel all-gather overlap.** `_sp_front` /
   `finish_front` (`defer_q`) already hides `q_all_gather` in attention; if new fused
   SP consumers are introduced later, remap consumer row-tile coordinates by rank offset
   (`pid_m = (raw_pid_m + rank * tiles_per_rank) % total_tiles`) so every rank
   starts computing on its local shard at $t = 0$ while peer shards arrive over RoCE.
+- **Fast-pathing or graph-capturing the constant `128`-row CED decoder tail
+  (`Layers 20..60`) on short cached-delta prefills (`128..1,024` uncached
+  tokens).** With `--enable-prefix-caching` and `--block-size 256`, interactive
+  chat and multi-turn agent steps typically prefill a `256–512` token uncached
+  delta (`c1` `TTFT p50 = 109 ms` on `tp4-ring`). Because CED trims every
+  prefill `>= 128` tokens to `M = 128` rows at Layer 20 (`ced_keep_tokens =
+  128`), all 41 decoder layers (`Layers 20..60`) execute at an invariant
+  `M = 128` shape where single-wave `128`-row decode tiles (`WO-A`, `WO-B` in
+  `0762`, `fused_wqa_wkv`, `shared_expert`, `vocab`) and `sparknet` one-shot
+  RoCE all-reduce (`128` rows `= 1.84 MiB < 2 MiB`) apply. Screen capturing or
+  piecewise-graphing the fixed `128`-row non-attention blocks across Layers
+  `20..60` (and routing `M = 128` CED tails through the `128`-row decode tile
+  set) to remove eager launch overhead on short prefills.
+- **`256`-token block-boundary prefix sealing for multi-agent forks.** Under
+  `--block-size 256`, when a coordinator forks $N$ subagents from a shared
+  prompt or transcript of $256k + r$ tokens ($0 < r < 256$), only the $k$
+  complete `256`-token blocks hit the prefix cache; the trailing $r$ shared
+  tokens sit in an unsealed block and are re-prefilled and stored $N$ times.
+  Screen sealing the shared trunk across all $N$ children (either by warming
+  the longest common prefix once before fanning out the $N$ short suffixes or
+  by aligning the shared system/context boundary to a `256`-token block
+  multiple).
 - **NVMe interrupt coalescing stays off** on every node by the owner's decision
   (2026-10-02; prefill measured 0.7–1.6% slower with it on in
   `experiments/2026-10-02-nvme-coalescing`).
@@ -719,6 +814,10 @@ Open levers:
   (`test_prefix_cache_retention_probe.py`) and inline `tool_reference` schema injection
   (`defer_loading: true`) shipped in `candidate-60`; confirm live 64–100K prefix-cache
   retention on production agent traffic.
+  Screen warming the exact token prefixes shared by repository context,
+  documents and tool schemas. Compare first use, warm reuse and reuse after
+  cache pressure. Record warmup cost, retained KV bytes, cache-hit tokens,
+  TTFT and token parity with cold execution.
 - **Follow-up-turn TTFT is not measured.** The suites time cold prefill and
   short requests beside one; none times the second turn of a conversation whose
   prefix is cached (256-token blocks). Time a follow-up turn on a 4K and a 900K
@@ -808,6 +907,15 @@ Open levers:
 
 - **Temperature 0 is deterministic** alone and in mixed batches
   (`token_determinism.py --wide`). Run it on every candidate.
+- **Qualify sampled schemas, tool calls and agent task completion.** The 1120
+  gate covers grammar-bitmask sizing and quoted DSML closers in tool arguments.
+  Its two-boot TP4 reference matched 256/256 greedy token sequences. Retain
+  the native token-ID check with logprobs disabled. Add fixed-seed sampled
+  cases for schema validity and streamed tool names and arguments, including
+  quoted closers. Score held-out agent tasks through natural completion under
+  a fixed tool policy. Report correct completions per wall-clock hour, with
+  failures, truncations and timeouts counted in the workload.
+  [Parser and grammar fixes](experiments/2026-10-26-spark-ds41f-candidate/candidate-62/README.md) · [Greedy token comparison](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/release-table.txt)
 - **Loop containment ([#864](https://github.com/christopherowen/spark-ds41f/issues/864)):**
   `1107` carries the v2 loop detector (`0679`/`0684`). Complete the long-context
   83K max-effort canary soak on `1107` during release qualification, and verify
