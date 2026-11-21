@@ -1,0 +1,717 @@
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -790,6 +790,195 @@
+     }
+   }
+ }
++
++__device__ __forceinline__ void vllm_vocab_partials_top2_reduce(
++    const float* __restrict__ partial_vals,
++    const int* __restrict__ partial_idxs,
++    float* __restrict__ smem_v,
++    int* __restrict__ smem_i,
++    float* __restrict__ smem_v2,
++    int* __restrict__ smem_i2,
++    int* __restrict__ smem_win_bx,
++    int row,
++    int num_tiles,
++    int rescore_BN,
++    int rescore_tiles,
++    int tx) {
++  const int base = row * num_tiles;
++  float b1_v = -CUDART_INF_F;
++  int b1_i = 2147483647;
++  float b2_v = -CUDART_INF_F;
++  int b2_i = 2147483647;
++  for (int t = tx; t < num_tiles; t += 128) {
++    const float v = partial_vals[base + t];
++    const int idx = partial_idxs[base + t];
++    if (vllm_vocab_first_argmax_keep(v, idx, b1_v, b1_i)) {
++      b2_v = b1_v;
++      b2_i = b1_i;
++      b1_v = v;
++      b1_i = idx;
++    } else if (vllm_vocab_first_argmax_keep(v, idx, b2_v, b2_i)) {
++      b2_v = v;
++      b2_i = idx;
++    }
++  }
++  const int lane = tx & 31;
++  const int warp = tx >> 5;
++  #pragma unroll
++  for (int off = 16; off > 0; off >>= 1) {
++    const float o1_v = __shfl_xor_sync(0xffffffffu, b1_v, off);
++    const int o1_i = __shfl_xor_sync(0xffffffffu, b1_i, off);
++    const float o2_v = __shfl_xor_sync(0xffffffffu, b2_v, off);
++    const int o2_i = __shfl_xor_sync(0xffffffffu, b2_i, off);
++    if (vllm_vocab_first_argmax_keep(o1_v, o1_i, b1_v, b1_i)) {
++      const float old_v = b1_v;
++      const int old_i = b1_i;
++      b1_v = o1_v;
++      b1_i = o1_i;
++      if (vllm_vocab_first_argmax_keep(old_v, old_i, o2_v, o2_i)) {
++        b2_v = old_v;
++        b2_i = old_i;
++      } else {
++        b2_v = o2_v;
++        b2_i = o2_i;
++      }
++    } else if (vllm_vocab_first_argmax_keep(o1_v, o1_i, b2_v, b2_i)) {
++      b2_v = o1_v;
++      b2_i = o1_i;
++    }
++  }
++  if (lane == 0) {
++    smem_v[warp] = b1_v;
++    smem_i[warp] = b1_i;
++    smem_v2[warp] = b2_v;
++    smem_i2[warp] = b2_i;
++  }
++  __syncthreads();
++  if (tx == 0) {
++    float g1_v = smem_v[0];
++    int g1_i = smem_i[0];
++    float g2_v = smem_v2[0];
++    int g2_i = smem_i2[0];
++    #pragma unroll
++    for (int w = 1; w < 4; ++w) {
++      const float w1_v = smem_v[w];
++      const int w1_i = smem_i[w];
++      const float w2_v = smem_v2[w];
++      const int w2_i = smem_i2[w];
++      if (vllm_vocab_first_argmax_keep(w1_v, w1_i, g1_v, g1_i)) {
++        const float old_v = g1_v;
++        const int old_i = g1_i;
++        g1_v = w1_v;
++        g1_i = w1_i;
++        if (vllm_vocab_first_argmax_keep(old_v, old_i, w2_v, w2_i)) {
++          g2_v = old_v;
++          g2_i = old_i;
++        } else {
++          g2_v = w2_v;
++          g2_i = w2_i;
++        }
++      } else if (vllm_vocab_first_argmax_keep(w1_v, w1_i, g2_v, g2_i)) {
++        g2_v = w1_v;
++        g2_i = w1_i;
++      }
++    }
++    smem_v[0] = g1_v;
++    smem_i[0] = g1_i;
++    smem_v2[0] = g2_v;
++    smem_i2[0] = g2_i;
++    int win_bx = (g1_i >= 0 && g1_i < 2147483647) ? (g1_i / rescore_BN) : 0;
++    if (win_bx >= rescore_tiles) win_bx = rescore_tiles - 1;
++    smem_win_bx[0] = win_bx;
++  }
++  __syncthreads();
++}
++
++template <int BN>
++__device__ __forceinline__ void vllm_vocab_tile_second_from_clocal(
++    const float* __restrict__ c_frag,
++    float* __restrict__ smem_v,
++    int* __restrict__ smem_i,
++    float* __restrict__ smem_v2,
++    int* __restrict__ smem_i2,
++    float* __restrict__ pairs,
++    int row,
++    int win_bx,
++    int vocab,
++    int vocab_start,
++    long long pair_stride,
++    int tx) {
++  constexpr int WARPS_N = 4;
++  constexpr int MMA_N = BN / (WARPS_N * 8);
++  const int warp_id = tx >> 5;
++  const int lane = tx & 31;
++  const int lane_row = lane >> 2;
++  const int lane_col = (lane & 3) * 2;
++  const int best_i = smem_i[0];
++  float sec_v = -CUDART_INF_F;
++  int sec_i = 2147483647;
++  if (lane_row == 0) {
++    const int base_col = win_bx * BN + warp_id * (MMA_N * 8) + lane_col;
++    #pragma unroll
++    for (int n_tile = 0; n_tile < MMA_N; ++n_tile) {
++      const int col0 = base_col + n_tile * 8;
++      const int idx0 = n_tile * 4;
++      if (col0 < vocab && col0 != best_i) {
++        const float v0 = c_frag[idx0];
++        if (vllm_vocab_first_argmax_keep(v0, col0, sec_v, sec_i)) {
++          sec_v = v0;
++          sec_i = col0;
++        }
++      }
++      const int col1 = col0 + 1;
++      if (col1 < vocab && col1 != best_i) {
++        const float v1 = c_frag[idx0 + 1];
++        if (vllm_vocab_first_argmax_keep(v1, col1, sec_v, sec_i)) {
++          sec_v = v1;
++          sec_i = col1;
++        }
++      }
++    }
++  }
++  #pragma unroll
++  for (int off = 2; off > 0; off >>= 1) {
++    const float ov = __shfl_xor_sync(0xffffffffu, sec_v, off);
++    const int oi = __shfl_xor_sync(0xffffffffu, sec_i, off);
++    if (lane_row == 0 && vllm_vocab_first_argmax_keep(ov, oi, sec_v, sec_i)) {
++      sec_v = ov;
++      sec_i = oi;
++    }
++  }
++  __syncthreads();
++  if (lane == 0) {
++    smem_v[4 + warp_id] = sec_v;
++    smem_i[4 + warp_id] = sec_i;
++  }
++  __syncthreads();
++  if (tx == 0) {
++    const float g1_v = smem_v[0];
++    const int g1_i = smem_i[0];
++    float g2_v = smem_v2[0];
++    int g2_i = smem_i2[0];
++    #pragma unroll
++    for (int w = 0; w < 4; ++w) {
++      const float wv = smem_v[4 + w];
++      const int wi = smem_i[4 + w];
++      if (wi < 2147483647 && vllm_vocab_first_argmax_keep(wv, wi, g2_v, g2_i)) {
++        g2_v = wv;
++        g2_i = wi;
++      }
++    }
++    const long long out_off = (long long)row * pair_stride;
++    pairs[out_off] = g1_v;
++    pairs[out_off + 1] = (g1_i < 2147483647) ? (float)(vocab_start + g1_i) : (float)(1 << 30);
++    pairs[out_off + 2] = (g2_i < 2147483647) ? g2_v : -CUDART_INF_F;
++    pairs[out_off + 3] = (g2_i < 2147483647) ? (float)(vocab_start + g2_i) : (float)(1 << 30);
++  }
++}
++
++#define vllm_vocab_tile_second_clocal(BN, smem_v, smem_i, smem_v2, smem_i2, pairs, row, win_bx, vocab, vocab_start, pair_stride, tx) \
++  vllm_vocab_tile_second_from_clocal<BN>(C_local, smem_v, smem_i, smem_v2, smem_i2, pairs, row, win_bx, vocab, vocab_start, pair_stride, tx)
++
+ #define vllm_vocab_tile_argmax_clocal(BM, BN, THREADS, smem_v, smem_i, pvals, pidxs, by, bx, M, vocab, num_tiles, tx) \
+   vllm_vocab_tile_argmax<BM, BN, THREADS>(C_local, smem_v, smem_i, pvals, pidxs, by, bx, M, vocab, num_tiles, tx)
+ 
+@@ -2683,6 +2872,293 @@
+     return vocab_greedy_finish
+ 
+ 
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    }
++)
++def finish_packed_markov_top2_exact(
++    N: int,
++    K: int,
++    exponent_base: int,
++    num_tiles: int,
++    block_N: int,
++    step_groups: int = 1,
++    out_dtype: T.dtype = T.bfloat16,
++):
++    """Exact full-vocabulary top-2 finish for packed BF16 Markov heads.
++
++    Reduces ``[M, num_tiles]`` partials to find the global winner and best
++    other-tile runner-up, then rescores only the single winning ``rescore_BN``
++    tile using the exact same ``T.gemm`` and exception accumulation as
++    ``packed_vocab_markov_greedy_partials``, guaranteeing bit-exact
++    full-vocabulary top-2 in both ``bfloat16`` and ``float32``.
++    """
++    rescore_BN = max(block_N, 32)
++    rescore_tiles = (N + rescore_BN - 1) // rescore_BN
++    assert K % (GROUP * step_groups) == 0
++    steps = K // (GROUP * step_groups)
++    STEP = GROUP * step_groups
++    row_bytes = K + K // 2
++    base_minus_one = exponent_base - 1
++    slices = HALF // VEC
++    items = rescore_BN * step_groups * slices
++    threads = 128
++    M = T.dynamic("M")
++    E = T.dynamic("E")
++    base_stride = T.dynamic("base_stride", "int64")
++    pair_width = T.dynamic("pair_width")
++    pair_stride = T.dynamic("pair_stride", "int64")
++
++    @T.prim_func
++    def finish_packed_markov_top2_exact_kernel(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((N, row_bytes), T.uint8),
++        exception_rows: T.Tensor((E,), T.int32),
++        exception_entries: T.Tensor((E,), T.int32),
++        row_offsets: T.Tensor((N + 1,), T.int32),
++        Base: T.StridedTensor((M, N), (base_stride, 1), out_dtype),
++        partial_vals: T.Tensor((M, num_tiles), T.float32),
++        partial_idxs: T.Tensor((M, num_tiles), T.int32),
++        pairs: T.StridedTensor((M, pair_width), (pair_stride, 1), T.float32),
++        vocab: T.int32,
++        vocab_start: T.int32,
++    ):
++        with T.Kernel(M, threads=threads) as row:
++            pdl.chain()
++            T.import_source(_GREEDY_HEADER)
++            A_shared = T.alloc_shared((16, STEP), T.bfloat16)
++            low_shared = T.alloc_shared((rescore_BN, STEP), T.uint8)
++            code_shared = T.alloc_shared((rescore_BN, STEP // 2), T.uint8)
++            B_shared = T.alloc_shared((rescore_BN, STEP), T.bfloat16)
++            smem_v = T.alloc_shared((8,), T.float32)
++            smem_i = T.alloc_shared((8,), T.int32)
++            smem_v2 = T.alloc_shared((4,), T.float32)
++            smem_i2 = T.alloc_shared((4,), T.int32)
++            smem_win_bx = T.alloc_shared((1,), T.int32)
++            C_local = T.alloc_fragment((16, rescore_BN), T.float32)
++            C_round = T.alloc_fragment((16, rescore_BN), out_dtype)
++            low_a = T.alloc_local((VEC,), T.uint8)
++            low_b = T.alloc_local((VEC,), T.uint8)
++            codes = T.alloc_local((VEC,), T.uint8)
++            out_a = T.alloc_local((VEC,), T.bfloat16)
++            out_b = T.alloc_local((VEC,), T.bfloat16)
++            tx = T.get_thread_binding()
++
++            T.call_extern(
++                "handle",
++                "vllm_vocab_partials_top2_reduce",
++                T.address_of(partial_vals[0, 0]),
++                T.address_of(partial_idxs[0, 0]),
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
++                T.address_of(smem_v2[0]),
++                T.address_of(smem_i2[0]),
++                T.address_of(smem_win_bx[0]),
++                row,
++                num_tiles,
++                rescore_BN,
++                rescore_tiles,
++                tx,
++            )
++            win_bx = smem_win_bx[0]
++            T.clear(C_local)
++            for s in T.serial(steps):
++                for i, k in T.Parallel(16, STEP):
++                    A_shared[i, k] = A[row, s * STEP + k]
++                for j, k in T.Parallel(rescore_BN, STEP):
++                    col = T.min(win_bx * rescore_BN + j, N - 1)
++                    low_shared[j, k] = W[col, s * STEP + k]
++                for j, k in T.Parallel(rescore_BN, STEP // 2):
++                    col = T.min(win_bx * rescore_BN + j, N - 1)
++                    code_shared[j, k] = W[col, K + s * (STEP // 2) + k]
++                for step in T.serial(T.ceildiv(items, threads)):
++                    item = step * threads + tx
++                    if items % threads == 0 or item < items:
++                        j = item // (step_groups * slices)
++                        rem = item % (step_groups * slices)
++                        g = rem // slices
++                        c = (rem % slices) * VEC
++                        for v in T.vectorized(VEC):
++                            low_a[v] = low_shared[j, g * GROUP + c + v]
++                        for v in T.vectorized(VEC):
++                            low_b[v] = low_shared[j, g * GROUP + HALF + c + v]
++                        for v in T.vectorized(VEC):
++                            codes[v] = code_shared[j, g * HALF + c + v]
++                        T.call_extern(
++                            "handle",
++                            f"vllm_vocab_decode_vec16<{base_minus_one}>",
++                            T.address_of(low_a[0]),
++                            T.address_of(low_b[0]),
++                            T.address_of(codes[0]),
++                            T.address_of(out_a[0]),
++                            T.address_of(out_b[0]),
++                        )
++                        for v in T.vectorized(VEC):
++                            B_shared[j, g * GROUP + c + v] = out_a[v]
++                        for v in T.vectorized(VEC):
++                            B_shared[j, g * GROUP + HALF + c + v] = out_b[v]
++                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            T.call_extern(
++                "handle",
++                "vllm_vocab_apply_row_exceptions_clocal",
++                16,
++                rescore_BN,
++                threads,
++                N,
++                K,
++                T.address_of(A[row, 0]),
++                T.address_of(exception_rows[0]),
++                T.address_of(exception_entries[0]),
++                T.address_of(row_offsets[0]),
++                0,
++                win_bx,
++                1,
++                E,
++                tx,
++            )
++            if out_dtype != T.float32:
++                T.copy(C_local, C_round)
++                T.copy(C_round, C_local)
++            for i, j in T.Parallel(16, rescore_BN):
++                col = T.min(win_bx * rescore_BN + j, N - 1)
++                C_local[i, j] = T.Cast(T.float32, Base[row, col]) + C_local[i, j]
++            if out_dtype != T.float32:
++                T.copy(C_local, C_round)
++                T.copy(C_round, C_local)
++            T.call_extern(
++                "handle",
++                "vllm_vocab_tile_second_clocal",
++                rescore_BN,
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
++                T.address_of(smem_v2[0]),
++                T.address_of(smem_i2[0]),
++                T.address_of(pairs[0, 0]),
++                row,
++                win_bx,
++                vocab,
++                vocab_start,
++                pair_stride,
++                tx,
++            )
++
++    return finish_packed_markov_top2_exact_kernel
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    }
++)
++def finish_bf16_markov_top2_exact(
++    N: int,
++    K: int,
++    num_tiles: int,
++    block_N: int,
++    block_K: int = 256,
++    out_dtype: T.dtype = T.bfloat16,
++):
++    """Exact full-vocabulary top-2 finish for BF16 Markov heads.
++
++    Uses the exact same ``T.gemm`` over the single winning ``rescore_BN`` tile
++    as ``bf16_vocab_markov_greedy_partials``, guaranteeing bit-exact
++    full-vocabulary top-2 in both ``bfloat16`` and ``float32``.
++    """
++    rescore_BN = max(block_N, 32)
++    rescore_tiles = (N + rescore_BN - 1) // rescore_BN
++    k_blocks = tilelang.cdiv(K, block_K)
++    threads = 128
++    M = T.dynamic("M")
++    base_stride = T.dynamic("base_stride", "int64")
++    pair_width = T.dynamic("pair_width")
++    pair_stride = T.dynamic("pair_stride", "int64")
++
++    @T.prim_func
++    def finish_bf16_markov_top2_exact_kernel(
++        A: T.Tensor((M, K), T.bfloat16),
++        B: T.Tensor((N, K), T.bfloat16),
++        Base: T.StridedTensor((M, N), (base_stride, 1), out_dtype),
++        partial_vals: T.Tensor((M, num_tiles), T.float32),
++        partial_idxs: T.Tensor((M, num_tiles), T.int32),
++        pairs: T.StridedTensor((M, pair_width), (pair_stride, 1), T.float32),
++        vocab: T.int32,
++        vocab_start: T.int32,
++    ):
++        with T.Kernel(M, threads=threads) as row:
++            pdl.chain()
++            T.import_source(_GREEDY_HEADER)
++            A_shared = T.alloc_shared((16, block_K), T.bfloat16)
++            B_shared = T.alloc_shared((rescore_BN, block_K), T.bfloat16)
++            smem_v = T.alloc_shared((8,), T.float32)
++            smem_i = T.alloc_shared((8,), T.int32)
++            smem_v2 = T.alloc_shared((4,), T.float32)
++            smem_i2 = T.alloc_shared((4,), T.int32)
++            smem_win_bx = T.alloc_shared((1,), T.int32)
++            C_local = T.alloc_fragment((16, rescore_BN), T.float32)
++            C_round = T.alloc_fragment((16, rescore_BN), out_dtype)
++            tx = T.get_thread_binding()
++
++            T.call_extern(
++                "handle",
++                "vllm_vocab_partials_top2_reduce",
++                T.address_of(partial_vals[0, 0]),
++                T.address_of(partial_idxs[0, 0]),
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
++                T.address_of(smem_v2[0]),
++                T.address_of(smem_i2[0]),
++                T.address_of(smem_win_bx[0]),
++                row,
++                num_tiles,
++                rescore_BN,
++                rescore_tiles,
++                tx,
++            )
++            win_bx = smem_win_bx[0]
++            T.clear(C_local)
++            for ko in T.serial(k_blocks):
++                for i, k in T.Parallel(16, block_K):
++                    kk = ko * block_K + k
++                    A_shared[i, k] = T.if_then_else(
++                        kk < K, A[row, T.min(kk, K - 1)], T.Cast(T.bfloat16, 0)
++                    )
++                for j, k in T.Parallel(rescore_BN, block_K):
++                    col = T.min(win_bx * rescore_BN + j, N - 1)
++                    kk = ko * block_K + k
++                    B_shared[j, k] = T.if_then_else(
++                        kk < K, B[col, T.min(kk, K - 1)], T.Cast(T.bfloat16, 0)
++                    )
++                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            if out_dtype != T.float32:
++                T.copy(C_local, C_round)
++                T.copy(C_round, C_local)
++            for i, j in T.Parallel(16, rescore_BN):
++                col = T.min(win_bx * rescore_BN + j, N - 1)
++                C_local[i, j] = T.Cast(T.float32, Base[row, col]) + C_local[i, j]
++            if out_dtype != T.float32:
++                T.copy(C_local, C_round)
++                T.copy(C_round, C_local)
++            T.call_extern(
++                "handle",
++                "vllm_vocab_tile_second_clocal",
++                rescore_BN,
++                T.address_of(smem_v[0]),
++                T.address_of(smem_i[0]),
++                T.address_of(smem_v2[0]),
++                T.address_of(smem_i2[0]),
++                T.address_of(pairs[0, 0]),
++                row,
++                win_bx,
++                vocab,
++                vocab_start,
++                pair_stride,
++                tx,
++            )
++
++    return finish_bf16_markov_top2_exact_kernel
++
++
+ @tilelang.jit
+ def nvfp4_vocab_projection(
+     N: int,
+@@ -3947,7 +4423,23 @@
+             out_dtype=_OUT[out_dtype],
+             **config,
+         )
+-        _markov_greedy_finishes(finishes, tiles[block_M])
++        num_tiles = tiles[block_M]
++        finishes.setdefault(
++            (num_tiles, False), prepare.call(finish_vocab_greedy_pairs, num_tiles)
++        )
++        finishes.setdefault(
++            (num_tiles, True),
++            prepare.call(
++                finish_packed_markov_top2_exact,
++                n,
++                k,
++                layer.packed_bf16_exponent_base,
++                num_tiles,
++                config["block_N"],
++                step_groups=config["step_groups"],
++                out_dtype=_OUT[out_dtype],
++            ),
++        )
+     scr_cfg = tile_config(16, k)
+     scr_cfg["block_N"] = 32
+     scr_cfg["threads"] = 128
+@@ -3990,7 +4482,22 @@
+             out_dtype=_OUT[out_dtype],
+             **config,
+         )
+-        _markov_greedy_finishes(finishes, tiles[block_M])
++        num_tiles = tiles[block_M]
++        finishes.setdefault(
++            (num_tiles, False), prepare.call(finish_vocab_greedy_pairs, num_tiles)
++        )
++        finishes.setdefault(
++            (num_tiles, True),
++            prepare.call(
++                finish_bf16_markov_top2_exact,
++                n,
++                k,
++                num_tiles,
++                config["block_N"],
++                block_K=config["block_K"],
++                out_dtype=_OUT[out_dtype],
++            ),
++        )
+     scr_cfg = dict(BF16_HEAD_CONFIGS[16])
+     scr_cfg["block_N"] = 32
+     if k % scr_cfg["block_K"]:
+@@ -4698,9 +5205,34 @@
+             partial_idxs,
+             vocab,
+         )
+-    (finish_top2_kernel if top2 else finish_kernel)(
+-        partial_vals, partial_idxs, pairs, vocab_start
+-    )
++    if top2:
++        if hasattr(layer, "packed_bf16_exponent_base"):
++            finish_top2_kernel(
++                x,
++                layer.weight,
++                layer.weight_exception_rows,
++                layer.weight_exception_entries,
++                layer.weight_row_offsets,
++                base_logits,
++                partial_vals,
++                partial_idxs,
++                pairs,
++                vocab,
++                vocab_start,
++            )
++        else:
++            finish_top2_kernel(
++                x,
++                layer.weight,
++                base_logits,
++                partial_vals,
++                partial_idxs,
++                pairs,
++                vocab,
++                vocab_start,
++            )
++    else:
++        finish_kernel(partial_vals, partial_idxs, pairs, vocab_start)
+     return pairs
+ 
+ 
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -2314,6 +2314,7 @@
+ # Parts a lane of the finish reads: ``ceil(parts / 32)``, declared for each value here
+ # (vocabularies of up to 32 * 2 * GREEDY_BLOCK columns).
+ _FINISH_LANES = (1, 2)
++_FINISH_LANES_TOP2 = (1, 2, 4)
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+@@ -2805,13 +2806,17 @@
+ 
+ 
+ def partial_argmax_key(
+-    base_dtype: torch.dtype, bias_dtype: torch.dtype | None, vector: bool
++    base_dtype: torch.dtype,
++    bias_dtype: torch.dtype | None,
++    vector: bool,
++    top2: bool = False,
+ ) -> tuple:
+-    return (
++    key = (
+         _DTYPES[base_dtype],
+         _DTYPES[bias_dtype] if bias_dtype is not None else None,
+         vector,
+     )
++    return (*key, _THREADS, True) if top2 else key
+ 
+ 
+ def _partial_argmax(
+@@ -2819,6 +2824,8 @@
+     bias: torch.Tensor | None,
+     partial_values: torch.Tensor,
+     partial_indices: torch.Tensor,
++    *,
++    top2: bool = False,
+ ) -> None:
+     rows, vocab = base.shape
+     if rows == 0:
+@@ -2826,7 +2833,9 @@
+     vector = _vector_rows(base) if bias is None else _vector_rows(base, bias)
+     kernel = _kernel(
+         partial_argmax_kernel,
+-        *partial_argmax_key(base.dtype, None if bias is None else bias.dtype, vector),
++        *partial_argmax_key(
++            base.dtype, None if bias is None else bias.dtype, vector, top2=top2
++        ),
+     )
+     kernel(
+         base,
+@@ -2849,7 +2858,7 @@
+     if rows == 0:
+         return
+     top2 = output == "pair_top2"
+-    lanes = _FINISH_LANES
++    lanes = _FINISH_LANES_TOP2 if top2 else _FINISH_LANES
+     per_lane = -(-parts // 32)
+     if per_lane not in lanes:
+         raise ValueError(
+@@ -2888,16 +2897,19 @@
+     if vocab_start + vocab > 1 << 24:
+         raise ValueError("vocabulary indices must stay exact in FP32")
+     parts = -(-vocab // GREEDY_BLOCK)
+-    needed = rows * parts
++    slots = parts * (2 if top2 else 1)
++    needed = rows * slots
+     if min(partial_values.numel(), partial_indices.numel()) < needed:
+         raise ValueError("DSpark greedy scratch is smaller than the logits require")
+-    _partial_argmax(base_logits, markov_bias, partial_values, partial_indices)
++    _partial_argmax(
++        base_logits, markov_bias, partial_values, partial_indices, top2=top2
++    )
+     _finish(
+         partial_values,
+         partial_indices,
+         pairs.view(-1),
+         rows,
+-        parts,
++        slots,
+         pairs.stride(0),
+         vocab_start,
+         "pair_top2" if top2 else "pair",
+@@ -4310,6 +4322,13 @@
+             calls.append(
+                 _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
+             )
++            if top2:
++                calls.append(
++                    _call(
++                        partial_argmax_kernel,
++                        *partial_argmax_key(base, bias, vector, top2=True),
++                    )
++                )
+ 
+     for item in logits:
+         if isinstance(item, tuple):
+@@ -4327,7 +4346,7 @@
+         if top2:
+             calls += [
+                 _call(finish_argmax_kernel, "pair_top2", lanes)
+-                for lanes in _FINISH_LANES
++                for lanes in _FINISH_LANES_TOP2
+             ]
+     calls += [
+         _call(finish_argmax_kernel, _DTYPES[dtype], lanes)
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -181,7 +181,7 @@
+ 
+ 
+ def scratch_shape(max_requests: int, vocabulary_size: int, *, top2: bool = False) -> tuple[int, int]:
+-    return max_requests, cdiv(vocabulary_size, _BLOCK)
++    return max_requests, cdiv(vocabulary_size, _BLOCK) * (2 if top2 else 1)
+ 
+ 
+ def sample_greedy_markov(
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -191,7 +191,7 @@
+     def materialized(markov_embed, base_logits, pairs, *, top2):
+         """The reduction before the fusion: the shard's bias, then its pairs."""
+         bias = vocab.project_head(head, markov_embed)
+-        shape = scratch_shape(pairs.shape[0], shard_vocab)
++        shape = scratch_shape(pairs.shape[0], shard_vocab, top2=top2)
+         greedy_markov_shard_pair(
+             base_logits[:, :shard_vocab],
+             bias[:, :shard_vocab],
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -557,7 +557,7 @@
+             base_step = base_3d[:rows, 2]
+             bias = project_head(layer, part)
+             expected = torch.full((rows, 4), -7.0, dtype=torch.float32, device=DEVICE)
+-            shape = scratch_shape(rows, vocab)
++            shape = scratch_shape(rows, vocab, top2=top2)
+             greedy_markov_shard_pair(
+                 base_step[:, :vocab],
+                 bias[:, :vocab],
