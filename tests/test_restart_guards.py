@@ -477,11 +477,14 @@ class BuddyDefragmentationBeforeLaunchTest(unittest.TestCase):
                     "-c",
                     "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; "
                     "if [ -w /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages ]; then "
+                    "for _pass in 1 2; do "
                     "o13=$(awk '/Node 0, zone[[:space:]]+Normal/{print $NF}' /proc/buddyinfo 2>/dev/null); "
                     "if [ -n \"$o13\" ] && [ \"$o13\" -gt 0 ] 2>/dev/null; then "
                     "echo \"$o13\" > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
                     "echo 0 > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
-                    "fi; fi",
+                    "fi; "
+                    "if [ \"$_pass\" -eq 1 ]; then echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true; fi; "
+                    "done; fi",
                 ),
             )
 
