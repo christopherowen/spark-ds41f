@@ -705,12 +705,19 @@ committed token, step time and serving tok/s alongside the kernel timings.
       sends. Read sampled `c1`, `c8` and `c16` with `top_p=0.95`, then with
       `top_k` and a penalty added, against the `1120` sampled reference. This
       needs a new suite: the recorded ones are not edited.
-    - **Choose the fused path per row.**
-      `any_non_temperature_logits_processing` is an `any` over the step's
-      rows, so one request with a control moves every row of that step to the
-      copy path. Screen a per-row flag that keeps temperature-only rows on the
-      raw-logit kernel while the other rows take the copy. Each row's tokens
-      must match its tokens today at a fixed seed.
+    - **Choose the fused path per row.** **Implemented & verified** in
+      [`experiments/2026-11-21-per-row-mixed-sampling-split`](experiments/2026-11-21-per-row-mixed-sampling-split/README.md)
+      (`model_runner.py` `_samples_split_from_shards` / `_sample_split_from_shards`,
+      zero D2H sync, guarded by `_cu_num_logits_np_exact`): partitions mixed
+      batches per request so greedy/temperature-only requests stay on
+      shard-local verification/sampling (zero full-vocab RoCE all-gather, zero
+      FP32 copy) while only non-temperature control rows all-gather and run
+      `apply_sampling_params` / `apply_top_k_top_p` (also giving `top_p` full SM
+      split parallelism sized to active rows). Verified `5/5` passed on `dgx4`
+      (`100% torch.equal` fixed-seed parity across interleaved greedy/temp/top_p/
+      top_k/rep_penalty/dead_row_cut + `TP=3` selective gather check); GPU
+      compute `-418.0 us` (`-47.3%`) on `8x6 (1/8 ctrl)` and `-539.6 us`
+      (`-43.7%`) on `16x6 (1/16 ctrl)` plus `4×–16×` less RoCE all-gather.
     - **One tile pass for the controls.** Apply the per-token controls
       (penalties, bias, temperature) in the tile kernel's prologue and reduce
       each vocabulary tile to its top-$k$ candidates with the tile max and
