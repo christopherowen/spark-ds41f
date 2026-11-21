@@ -587,24 +587,23 @@ committed token, step time and serving tok/s alongside the kernel timings.
    writes to `wkv`'s newly projected KV rows concurrently with `wq_b`,
    eliminating 61 separate KV-RoPE launches per step.
 9. **Intra-request multi-row `KPool` reuse in decode `indexer_score_v41` (and
-   deep-context TP row split).** Under speculative verification, all $V$
-   verification rows of a request share the identical `PageTable` and `KPool`
-   prefix up to `pos0`, yet `indexer_score_v41` (`0029`) launches an independent
-   CTA per query row that streams the full 64K–1M `KPool` prefix from LPDDR5X $V$
-   times per rank (and $V \times \text{TP}$ times across the cluster, since
-   `0025` splits indexer rows across TP ranks only in SP prefill). Loading each
-   shared prefix tile `K_shared [64, 128]` and `SFK_shared` once per request and
-   scoring all $V$ verification rows of that request against it before advancing
-   `p0` cuts decode `KPool` traffic by $V\times$. Inside the fused multi-row
-   CTA, keep all $V$ verification rows' query slices (`q` across heads)
-   permanently in registers across the `KPool` key-block loop (avoiding repeated
-   shared-memory `LDS.128` reloads per key block and query row) and reduce
-   per-lane dot products across 4 indexer heads simultaneously with a 6-shuffle
-   butterfly scatter-reduce (`xor 16, 8` leaving one head per lane, then
-   `4, 2, 1`, preserving exact pairwise FP32 addition order for bit-identity)
-   instead of 20 shuffles per `(key_block, query_row)`. Above ~64K context this
-   can pair with a TP row split and one-shot `sparknet` RoCE gather of
-   `topk_indices_buffer[:rows]` (`2 KiB` per row).
+   deep-context TP row split).** Implemented and kernel-verified in
+   [`experiments/2026-11-21-decode-indexer-multirow-kpool`](experiments/2026-11-21-decode-indexer-multirow-kpool/README.md)
+   (pending Round 4 two-boot live screen on `tp3-triangle`): replaces the
+   merged `<2>/<4>` kernel in `IndexerV41Plan` with dedicated decode
+   (`row_group=3`, `rows <= 96`, `158` regs, `0` spills, `3 CTAs/SM`,
+   wave-aligned `max_ctas = 144` through `256K` and `288` above `256K`) and
+   prefill (`row_group=4`, `rows > 96`) kernels, removes dead `w_reg`, enables
+   odd-`R` software-pipelined `same_k`, and adds `loaded_page` reuse in
+   `!same_k` (`107 passed, 1 skipped`, `15/15` PDL incl. `layer_chain`;
+   `dgx4` disjoint Cold-L2 across `6L` dense layers: `8x6 @ 256K` `-17.1%`
+   [`-0.98 ms/step`], `16x6 @ 256K` `-9.7%` [`-0.99 ms/step`], `1x6 @ 1M`
+   `-19.1%` [`-0.68 ms/step`], `4x6 @ 1M` `-24.4%` [`-3.16 ms/step`],
+   `8x6 @ 1M` `-27.4%` [`-7.04 ms/step`], `16x6 @ 1M` `-24.2%`
+   [`-12.11 ms/step`], `adapt8 @ 1M` `-11.6%` [`-2.43 ms/step`]; `SMEM-Q`
+   `R=6/12/16` and register `R=6` rejected as slower). Still open for a
+   separate follow-up: multi-request TP row split above `64K` with one-shot
+   `sparknet` RoCE gather of `topk_indices_buffer[:rows]` (`2 KiB/row`).
 10. **Same-request multi-row SWA KV reuse in decode `sparse_mla_fwd_v41`.** On
     SWA-only layers (`idx_width = 0`, `swa_width = 128`, `segments = 1`) and in
     the SWA chunk of sparse-MLA layers (`0740`), each CTA currently handles a
