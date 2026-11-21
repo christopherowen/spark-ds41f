@@ -58,7 +58,17 @@ All 3 patched files mounted at their exact imported container paths (`vllm/model
 
 Total overhead across all 5 draft steps is `-13 us` to `+51 us` (`<= 0.1%` of a `c8`/`c16` step; `+0.00 us` on `c1` which uses `screened_markov`).
 
-## Pre-Run Live Prediction & Screening Status
+## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-- **Prediction**: `model` 100% bit-exact (`0` greedy diffs); `grid` strictly neutral (`|delta| <= 0.1%`, since adaptive verification is off); `c1` neutral (`screened_markov` already exact); `c8` (`tp3-triangle`) and `c16` (`tp4-ring`) slightly improve throughput (`~+0.2%..+0.5%`) and lower wasted verified rows by removing the 22–77% Partition-0 margin-inflation bias on common-token branches.
-- **Status**: Queued for 2-boot live `screen-tp3` + `single-stream` confirmation on `tp3-triangle` (`experiments/2026-11-21-dspark-exact-top2/tp3-dev.json`) after Round 3 finishes.
+Tested inside lab window `dgx1-1795263633` on `spark-ds41f:candidate-63-r5` (`experiments/2026-11-21-dspark-exact-top2/tp3-dev.json`) against 2-boot `ctrl-b1/b2` (`candidate-63/tp3-dev.json`), `0` failed requests on all runs:
+
+| Arm | `model` (`128` prompts) | `model` `acceptance_length` | Grid `mad5` / `fl25` vs `ctrl` | `c8` tok/s (`tpot_p50`, `tok/step`) | `c1` tok/s (`tpot_p50`) | Prefill `32K` / `262K` |
+| --- | --- | ---: | --- | --- | --- | --- |
+| `ctrl-b1/b2` mean | `128/128` (`b795e6d4...`, `r1=1.0`) | `2.3035` | `0.000% / 0.000%` | `169.53` (`46.96 ms`) | `69.69` (`14.44 ms`) | `7,259 / 7,437` |
+| `top2-b1` | `128/128` (`b795e6d4...`, `r1=1.0`, `ppl=1.3160824`) | **`2.32004`** (`+0.72%`) | `+0.025% / +0.138%` | **`169.76`** (`46.33 ms`, `17.391`) | `69.72` (`14.40 ms`) | `7,257 / 7,455` |
+| `top2-b2` | `128/128` (`b795e6d4...`, `r1=1.0`, `ppl=1.3160824`) | **`2.32004`** (`+0.72%`) | `+0.157% / +0.399%` | **`169.60`** (`46.92 ms`, `17.426`) | `69.52` (`14.48 ms`) | `7,195 / 7,389` |
+| **2-boot mean** | **100% bit-exact** | **`2.32004` (`+0.72%`)** | **`+0.091% / +0.268%`** | **`169.68` (`46.63 ms`, `+0.15 tok/s`, `-0.33 ms` `tpot_p50`)** | **`69.62` (`14.44 ms`)** | **`7,226 / 7,422`** |
+
+### Conclusion
+
+- **2-boot live verified win & exactness fix:** Removing the Partition-0 margin-inflation bias raised `model` `acceptance_length` identically on both boots from **`2.3035 -> 2.32004` (`+0.72%`)**, improved steady-state `c8` on both boots (**`169.68` vs `169.53 tok/s`**, **`tpot_p50 = 46.63` vs `46.96 ms`**), and kept `c1` (`69.62` vs `69.69`), `grid` (`+0.09%` `mad5`), and `128/128` greedy outputs (`b795e6d4...`, `KL = 0`, `ppl = 1.3160824`) strictly bit-exact. Ready for **`candidate-64`**.

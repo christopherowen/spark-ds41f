@@ -55,6 +55,20 @@ Results:
 - **Unpatched**: `test_async_inflight_prefill_does_not_mistake_55ms_decode_wait_for_chunk_time` **FAILED**, reproducing the exact double-queued chunk 2 (`{'d0': 1, ..., 'd5': 1, 'long': 1016}`) after a `55 ms` decode wait.
 - **Patched**: **`15 passed, 0 failed in 8.45s`** (13/13 existing `test_prefill_yield.py` + 2/2 new async attribution tests).
 
-## Live Screening Status
+## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-Pending 2-boot `stall-3` / `stall-6` / `stall-7` screen on `tp3-triangle` (`experiments/2026-11-21-async-prefill-stall-attribution/tp3-dev.json`) once Round 3 completes.
+Tested inside lab window `dgx1-1795263633` on `spark-ds41f:candidate-63-r5` (`experiments/2026-11-21-async-prefill-stall-attribution/tp3-dev.json`) against `ctrl-stall-b1` (`candidate-63/tp3-dev.json`), `0` failed requests on all runs:
+
+- **`model` bit-exactness (`stall-fix-b1`)**: **`128/128` bit-exact** (`outputs_sha256 = b795e6d4c813815a475ab1516faf277a90a86b73614c38f4700189484a8c532d`, `rank1_fraction = 1.0`, `perplexity = 1.3160824`, `failed = 0`).
+
+| Arm | `stall-3` `p90` / `mean` / `probe_p50` (s) | `stall-6` `p90` / `mean` / `long` / `tps` | `stall-6` `probe_ttft_p50` (3 repeats, s) | `stall-6` `probe_max` (s) | `stall-7` `p90` / `long` / `tps` |
+| --- | --- | --- | --- | --- | --- |
+| `ctrl-stall-b1` | `0.9035 / 0.3546 / 0.684` | `0.9227 / 0.3798 / 0.390 / 4,953` | `1.568` (`1.206 / 1.676 / 1.821`) | `2.129` | `0.9240 / 0.3432 / 5,296` |
+| `stall-fix-b1` | `0.8917 / 0.3533 / 0.757` | `0.9105 / 0.3762 / 0.394 / 5,025` | `1.816` (`1.611 / 1.816 / 2.020`) | `2.684` | `0.9111 / 0.3447 / 5,352` |
+| `stall-fix-b2` | `0.8988 / 0.3524 / 0.670` | `0.9206 / 0.3814 / 0.395 / 4,980` | `1.699` (`1.187 / 2.118 / 1.790`) | `2.314` | `0.9219 / 0.3463 / 5,314` |
+| **2-boot mean** | **`0.8953 / 0.3529 / 0.713`** | **`0.9156 / 0.3788 / 0.395 / 5,003`** | **`1.757`** | **`2.499`** | **`0.9165 / 0.3455 / 5,333`** |
+
+### Conclusion
+
+- **Prediction falsified on `tp3-triangle` `stall-6`:** `stall-6` `probe_ttft_p50` remained bimodal at **`1.757 s`** (vs `1.568 s` `ctrl`, `1.761 s` `1120`). `stall-7`'s exact `long_share = 0.3432` (`22` chunks / `64` steps) proves `K = 2` interleave was already firing on every chunk on `tp3-triangle` (`T_decode ~ 25 ms < 50 ms`). The `1107 -> 1120` `stall-6` regression is instead a **`max_num_seqs = 8` slot-8 occupancy cascade** (6 background streams + 1 long prefill leave 1 slot for probes spaced `3.0 s` apart; `1120`'s higher `adaptive_verification_row_cost = 0.049` trims drafts during prefill-interleaved decode steps, pushing 16-token probe completion past `3.0 s` so Probe `i` holds slot 8 when Probe `i+1` arrives).
+- **Retained as a defensive scheduler correctness fix:** The patch is strictly neutral on `tp3-triangle` (`stall-3/6/7` `during_mean_s` and `p90` neutral-to-slightly-faster, `128/128` bit-exact) while eliminating the unit-proven async in-flight stall undercounting bug on high-concurrency / deep-context shapes where `T_decode >= 50 ms` (such as `tp4-ring` `stall-11` and `TP4..TP8` 32-stream profiles). Ready for `candidate-64`; `tp3-triangle` `stall-6` interleaved-draft budget remains an open follow-up.
