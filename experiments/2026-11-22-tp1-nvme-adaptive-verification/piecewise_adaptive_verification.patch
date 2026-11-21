@@ -1,0 +1,35 @@
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -88,7 +88,8 @@
+     mode: CUDAGraphMode, *, piecewise_capture_available: bool
+ ) -> CUDAGraphMode:
+     """Select a separate decode route for variable-length verification."""
+-    assert mode.has_full_cudagraphs()
++    if not mode.has_full_cudagraphs():
++        return mode
+     if mode == CUDAGraphMode.FULL_DECODE_ONLY or not piecewise_capture_available:
+         return CUDAGraphMode.FULL_DECODE_ONLY
+     return CUDAGraphMode.FULL_AND_PIECEWISE
+--- a/vllm/models/deepseek_v4_1/expert_slots/cache.py
++++ b/vllm/models/deepseek_v4_1/expert_slots/cache.py
+@@ -1878,7 +1878,19 @@
+ 
+         if next_lookahead is not None and lookahead_hidden is not None and not is_prefill:
+             predictor, next_cache = next_lookahead
+-            pred_experts = predictor.predict_experts(lookahead_hidden)
++            live_mask = (topk_ids_np >= 0).any(axis=-1)
++            if not live_mask.all():
++                live_idx = torch.as_tensor(
++                    np.flatnonzero(live_mask),
++                    dtype=torch.long,
++                    device=lookahead_hidden.device,
++                )
++                lookahead_input = lookahead_hidden.reshape(
++                    -1, lookahead_hidden.shape[-1]
++                ).index_select(0, live_idx)
++            else:
++                lookahead_input = lookahead_hidden
++            pred_experts = predictor.predict_experts(lookahead_input)
+             if pred_experts:
+                 next_cache.prefetch_async(pred_experts)
+ 
