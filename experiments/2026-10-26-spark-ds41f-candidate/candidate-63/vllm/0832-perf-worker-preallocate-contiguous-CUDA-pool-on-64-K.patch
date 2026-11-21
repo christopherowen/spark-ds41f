@@ -1,7 +1,8 @@
-From 1722ac4bc39ee602990d582dd764df43ad8fd448 Mon Sep 17 00:00:00 2001
+From b82de41063fc95523ea4bbefd55bf9c12b8df4ab Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 21 Nov 2026 08:47:42 +0100
-Subject: [PATCH] perf(worker): preallocate contiguous CUDA pool on 64 KiB UMA
+Date: Sat, 21 Nov 2026 10:24:13 +0100
+Subject: [PATCH] perf(worker): preallocate weight CUDA pool with Unmovable
+ sub-O13 soak on 64 KiB UMA
 
 On ARM64 64 KiB unified-memory hosts with iommu.passthrough=0, hundreds
 of separate cudaMalloc or 2 MiB cuMemCreate allocations interleave
@@ -10,39 +11,42 @@ converted MIGRATE_UNMOVABLE 512 MiB buddy pageblocks, permanently
 shattering order-13 contiguity after a single boot.
 
 Pre-reserve one 512 MiB-aligned contiguous CUDA caching-allocator
-segment in Worker.init_device when native cudaMalloc caching is active
-on a 64 KiB host with >= 32 GiB of order-13 blocks free, pin it with a
-2 MiB large-pool anchor so empty_cache() does not release it before
-weights bind, bypass _scoped_allocator_max_split(20) during load_model,
-and skip redundant buddy soaking in direct_loader.bind_weight_arena
-while placing the dense weight arena at the aligned front of the pool.
+segment sized to requested_memory minus explicit kv_cache_memory_bytes
+in Worker.init_device when native cudaMalloc caching is active on a
+64 KiB host with >= 32 GiB of order-13 blocks free. Soak any Zone Normal
+MIGRATE_UNMOVABLE sub-order-13 blocks beforehand with a single transient
+cudaMalloc (released immediately after anchoring the pool with a 2 MiB
+large-pool tensor) so the entire weight pool draws from 512 MiB order-13
+blocks starting at offset 0 while KV cache allocates its own single
+contiguous segment without allocator-tail slack. Bypass
+_scoped_allocator_max_split(20) during load_model while anchored, and
+skip redundant buddy soaking in direct_loader.bind_weight_arena.
 
 Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
 Quality: no numerical or algorithmic change; memory placement only.
 Tests: pytest tests/v1/worker/test_contiguous_cuda_pool.py
        tests/model_executor/model_loader/test_direct_loader.py
        tests/model_executor/model_loader/test_direct_loader_cuda.py
-       tests/v1/worker/test_engine_grid_sync.py (100 passed).
+       tests/v1/worker/test_engine_grid_sync.py (101 passed).
 Upstream-status: local candidate-63 patch.
 ---
- tests/v1/worker/test_contiguous_cuda_pool.py  | 198 ++++++++++++++++++
- .../model_loader/direct_loader.py             | 124 +++++++----
- vllm/v1/worker/gpu_worker.py                  | 154 +++++++++++++-
- 3 files changed, 436 insertions(+), 40 deletions(-)
+ tests/v1/worker/test_contiguous_cuda_pool.py  | 233 ++++++++++++++++++
+ .../model_loader/direct_loader.py             | 129 +++++++---
+ vllm/v1/worker/gpu_worker.py                  | 209 +++++++++++++++-
+ 3 files changed, 531 insertions(+), 40 deletions(-)
  create mode 100644 tests/v1/worker/test_contiguous_cuda_pool.py
 
 diff --git a/tests/v1/worker/test_contiguous_cuda_pool.py b/tests/v1/worker/test_contiguous_cuda_pool.py
 new file mode 100644
-index 0000000000..29af6485a0
+index 0000000000..b35ddeee58
 --- /dev/null
 +++ b/tests/v1/worker/test_contiguous_cuda_pool.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,233 @@
 +# SPDX-License-Identifier: Apache-2.0
 +from __future__ import annotations
 +
 +from pathlib import Path
 +from types import SimpleNamespace
-+from unittest import mock
 +
 +import pytest
 +import torch
@@ -51,10 +55,13 @@ index 0000000000..29af6485a0
 +from vllm.v1.worker.gpu_worker import Worker
 +
 +
-+def _make_worker(*, requested_gib: float = 101.5) -> Worker:
++def _make_worker(*, requested_gib: float = 101.5, kv_gib: float = 4.90625) -> Worker:
 +    worker = Worker.__new__(Worker)
 +    worker.device = torch.device("cuda:0")
 +    worker.requested_memory = int(requested_gib * (1024**3))
++    worker.cache_config = SimpleNamespace(
++        kv_cache_memory_bytes=int(kv_gib * (1024**3)) if kv_gib > 0 else None
++    )
 +    worker._contiguous_pool_anchor = None
 +    worker._contiguous_pool_bytes = 0
 +    return worker
@@ -64,6 +71,15 @@ index 0000000000..29af6485a0
 +    return (
 +        "Node 0, zone      DMA      4   4   4   4   4   4   4   4   0   0   0   0   0   0\n"
 +        f"Node 0, zone   Normal     10  10  10  10  10  10  10  10  10  10  10  10  10 {o13_count}\n"
++    )
++
++
++def _pagetypeinfo_unmov_sub(o12_count: int, o13_movable: int) -> str:
++    # Each order-12 block on 64 KiB kernel is 256 MiB
++    return (
++        "Page block order: 13\n"
++        f"Node    0, zone   Normal, type    Unmovable      0 0 0 0 0 0 0 0 0 0 0 0 {o12_count} 0\n"
++        f"Node    0, zone   Normal, type      Movable      0 0 0 0 0 0 0 0 0 0 0 0 0 {o13_movable}\n"
 +    )
 +
 +
@@ -105,7 +121,7 @@ index 0000000000..29af6485a0
 +    assert worker._preallocate_contiguous_cuda_pool() == 0
 +
 +
-+def test_preallocate_skips_when_order13_low(monkeypatch, tmp_path):
++def test_preallocate_skips_when_order13_low(monkeypatch):
 +    worker = _make_worker()
 +    monkeypatch.delenv("VLLM_CUDA_PREALLOC_POOL_MIB", raising=False)
 +    monkeypatch.setattr("vllm.v1.worker.gpu_worker.current_platform.is_cuda", lambda: True)
@@ -120,17 +136,19 @@ index 0000000000..29af6485a0
 +
 +    def fake_read_text(self: Path, *args, **kwargs):
 +        if str(self) == "/proc/buddyinfo":
-+            return _buddyinfo_o13(20)  # 10 GiB < 32 GiB threshold
++            return _buddyinfo_o13(20)
 +        if str(self) == "/proc/meminfo":
 +            return _meminfo_avail_gib(118.0)
++        if str(self) == "/proc/pagetypeinfo":
++            return _pagetypeinfo_unmov_sub(4, 20)
 +        return orig_read_text(self, *args, **kwargs)
 +
 +    monkeypatch.setattr(Path, "read_text", fake_read_text)
 +    assert worker._preallocate_contiguous_cuda_pool() == 0
 +
 +
-+def test_preallocate_sizes_and_anchors_single_segment(monkeypatch):
-+    worker = _make_worker(requested_gib=101.5)
++def test_preallocate_excludes_kv_and_soaks_unmovable_sub_o13(monkeypatch):
++    worker = _make_worker(requested_gib=101.5, kv_gib=4.90625)
 +    monkeypatch.delenv("VLLM_CUDA_PREALLOC_POOL_MIB", raising=False)
 +    monkeypatch.setattr("vllm.v1.worker.gpu_worker.current_platform.is_cuda", lambda: True)
 +    monkeypatch.setattr(
@@ -144,27 +162,83 @@ index 0000000000..29af6485a0
 +
 +    def fake_read_text(self: Path, *args, **kwargs):
 +        if str(self) == "/proc/buddyinfo":
-+            return _buddyinfo_o13(233)  # 116.5 GiB
++            return _buddyinfo_o13(205)
 +        if str(self) == "/proc/meminfo":
-+            return _meminfo_avail_gib(118.5)
++            return _meminfo_avail_gib(115.5)
++        if str(self) == "/proc/pagetypeinfo":
++            # 32 x 256 MiB = 8.0 GiB Unmovable sub-O13
++            return _pagetypeinfo_unmov_sub(32, 205)
 +        return orig_read_text(self, *args, **kwargs)
 +
 +    monkeypatch.setattr(Path, "read_text", fake_read_text)
 +
 +    alloc_sizes: list[int] = []
 +
++    class FakeBuf:
++        def __getitem__(self, _idx):
++            return self
++        def zero_(self):
++            return self
++
 +    def fake_empty(shape, *, dtype=None, device=None):
 +        alloc_sizes.append(int(shape[0]))
-+        return torch.zeros((1,), dtype=torch.uint8)
++        return FakeBuf()
 +
 +    monkeypatch.setattr(torch, "empty", fake_empty)
-+    got = worker._preallocate_contiguous_cuda_pool()
-+    expected = (int(101.5 * (1024**3)) // (512 * 1024**2)) * (512 * 1024**2)
-+    assert got == expected
-+    assert alloc_sizes == [expected, 2 * 1024 * 1024]
-+    assert worker._contiguous_pool_anchor is not None
++    monkeypatch.setattr("vllm.v1.worker.gpu_worker.torch.accelerator.empty_cache", lambda: None)
 +    try:
-+        assert worker._contiguous_pool_bytes == expected
++        got = worker._preallocate_contiguous_cuda_pool()
++        expected_pool = int(96.5 * (1024**3))  # (101.5 - 4.90625) aligned down to 512 MiB
++        expected_soak = int(8.0 * (1024**3))
++        assert got == expected_pool
++        assert alloc_sizes == [expected_soak, expected_pool, 2 * 1024 * 1024]
++        assert worker._contiguous_pool_anchor is not None
++        assert direct_loader._PREALLOCATED_CUDA_POOL_BYTES == expected_pool
++        assert direct_loader._PREALLOCATED_CUDA_POOL_FRONT_CLEAN is True
++    finally:
++        direct_loader.set_preallocated_cuda_pool_bytes(0)
++
++
++def test_preallocate_caps_soak_and_marks_front_dirty_when_unmov_large(monkeypatch):
++    worker = _make_worker(requested_gib=101.5, kv_gib=4.90625)
++    monkeypatch.delenv("VLLM_CUDA_PREALLOC_POOL_MIB", raising=False)
++    monkeypatch.setattr("vllm.v1.worker.gpu_worker.current_platform.is_cuda", lambda: True)
++    monkeypatch.setattr(
++        torch._C,
++        "_accelerator_getAllocatorSettings",
++        lambda: "garbage_collection_threshold:0.6",
++    )
++    monkeypatch.setattr("os.sysconf", lambda _name: 65536)
++
++    orig_read_text = Path.read_text
++
++    def fake_read_text(self: Path, *args, **kwargs):
++        if str(self) == "/proc/buddyinfo":
++            return _buddyinfo_o13(190)
++        if str(self) == "/proc/meminfo":
++            return _meminfo_avail_gib(113.5)
++        if str(self) == "/proc/pagetypeinfo":
++            # 60 x 256 MiB = 15.0 GiB Unmovable sub-O13 > max_soak (9.0 GiB)
++            return _pagetypeinfo_unmov_sub(60, 190)
++        return orig_read_text(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "read_text", fake_read_text)
++    alloc_sizes: list[int] = []
++
++    class FakeBuf:
++        def __getitem__(self, _idx):
++            return self
++        def zero_(self):
++            return self
++
++    monkeypatch.setattr(torch, "empty", lambda shape, **kw: (alloc_sizes.append(int(shape[0])) or FakeBuf()))
++    monkeypatch.setattr("vllm.v1.worker.gpu_worker.torch.accelerator.empty_cache", lambda: None)
++    try:
++        got = worker._preallocate_contiguous_cuda_pool()
++        assert got == int(96.5 * (1024**3))
++        # max_soak = 113.5 - 96.5 - 8.0 = 9.0 GiB
++        assert alloc_sizes[0] == int(9.0 * (1024**3))
++        assert direct_loader._PREALLOCATED_CUDA_POOL_FRONT_CLEAN is False
 +    finally:
 +        direct_loader.set_preallocated_cuda_pool_bytes(0)
 +
@@ -176,12 +250,12 @@ index 0000000000..29af6485a0
 +            self.dense = torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32))
 +            self.experts_w = torch.nn.Parameter(torch.empty((1024, 1024), dtype=torch.float32))
 +
-+    model = TinyModel()
-+    # Pretend cached_free covers weights on CPU/fake CUDA check
-+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++    model = TinyModel().to("cuda")
 +    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _dev=None: 64 * 1024**2)
 +    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _dev=None: 2 * 1024**2)
-+    direct_loader.set_preallocated_cuda_pool_bytes(64 * 1024**2)
++    direct_loader.set_preallocated_cuda_pool_bytes(64 * 1024**2, front_clean=True)
 +
 +    sponge_called = False
 +
@@ -191,70 +265,40 @@ index 0000000000..29af6485a0
 +        return []
 +
 +    monkeypatch.setattr(direct_loader, "_allocate_order13_sponge", fail_sponge)
-+
-+    # Exercise on CUDA if available (on dgx4 it is!), else skip
-+    if not torch.cuda.is_available():
-+        pytest.skip("CUDA required")
-+    model = model.to("cuda")
-+    arena = direct_loader.bind_weight_arena(
-+        model,
-+        device=torch.device("cuda:0"),
-+        sponge_min_model_bytes=1024,
-+    )
 +    try:
++        arena = direct_loader.bind_weight_arena(
++            model,
++            device=torch.device("cuda:0"),
++            sponge_min_model_bytes=1024,
++        )
 +        assert arena is not None
 +        assert not sponge_called
 +    finally:
 +        direct_loader.set_preallocated_cuda_pool_bytes(0)
-+
-+
-+def test_kv_pool_placeholder_releases_before_kv_cache_init(monkeypatch):
-+    worker = _make_worker()
-+    worker._contiguous_pool_anchor = torch.zeros((1,), dtype=torch.uint8)
-+    worker._kv_pool_placeholder = torch.zeros((16,), dtype=torch.uint8)
-+    worker.cache_config = SimpleNamespace(num_gpu_blocks=None)
-+    worker.vllm_config = SimpleNamespace(
-+        model_config=SimpleNamespace(multimodal_config=None),
-+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
-+    )
-+    released_before_init = []
-+
-+    def fake_init_kv(_cfg):
-+        released_before_init.append(worker._kv_pool_placeholder is None)
-+
-+    worker.model_runner = SimpleNamespace(
-+        initialize_kv_cache=fake_init_kv,
-+        kv_cache_config=None,
-+    )
-+    monkeypatch.setattr("vllm.v1.worker.gpu_worker.torch.accelerator.synchronize", lambda: None)
-+    monkeypatch.setattr("vllm.v1.worker.gpu_worker.torch.accelerator.empty_cache", lambda: None)
-+    monkeypatch.setattr("vllm.v1.worker.gpu_worker.trim_host_heap", lambda: None)
-+    # Only verify placeholder is released before kv cache init
-+    try:
-+        worker.initialize_from_config(SimpleNamespace(num_blocks=64, kv_cache_groups=[]))
-+    except Exception:
-+        pass
-+    assert worker._kv_pool_placeholder is None
 diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
-index 66dfc925d5..34d1acbc70 100644
+index 66dfc925d5..b596defd1e 100644
 --- a/vllm/model_executor/model_loader/direct_loader.py
 +++ b/vllm/model_executor/model_loader/direct_loader.py
-@@ -81,6 +81,14 @@ _NVIDIA_MIN_SYS_ALLOC_BYTES = 65536
+@@ -81,6 +81,18 @@ _NVIDIA_MIN_SYS_ALLOC_BYTES = 65536
  _GPU_HUGEPAGE_BYTES = 1 << 21
  _HIGH_ORDER_SPONGE_TARGETS_64K = tuple(65536 << order for order in range(13, 5, -1))
  _HELD_SPONGE_STACK: list[list[torch.nn.Module]] = []
 +_PREALLOCATED_CUDA_POOL_BYTES: int = 0
++_PREALLOCATED_CUDA_POOL_FRONT_CLEAN: bool = True
 +
 +
-+def set_preallocated_cuda_pool_bytes(num_bytes: int) -> None:
++def set_preallocated_cuda_pool_bytes(
++    num_bytes: int, *, front_clean: bool = True
++) -> None:
 +    """Record whether Worker.init_device pre-allocated a single contiguous CUDA
 +    caching-allocator segment so bind_weight_arena skips redundant buddy soaking."""
-+    global _PREALLOCATED_CUDA_POOL_BYTES
++    global _PREALLOCATED_CUDA_POOL_BYTES, _PREALLOCATED_CUDA_POOL_FRONT_CLEAN
 +    _PREALLOCATED_CUDA_POOL_BYTES = max(0, int(num_bytes))
++    _PREALLOCATED_CUDA_POOL_FRONT_CLEAN = bool(front_clean)
  
  
  def _align_up(value: int, alignment: int) -> int:
-@@ -695,7 +703,24 @@ def bind_weight_arena(
+@@ -695,7 +707,24 @@ def bind_weight_arena(
                  for param, _, _, _, _ in views:
                      param.set_(empty_storage, 0, (0,), (1,))
          _refresh_module_weight_views(model)
@@ -280,7 +324,7 @@ index 66dfc925d5..34d1acbc70 100644
  
      max_moe_bytes = max((nbytes for nbytes, _ in moe_groups.values()), default=0)
      post_load_allowance = max_moe_bytes + min(
-@@ -715,55 +740,49 @@ def bind_weight_arena(
+@@ -715,55 +744,50 @@ def bind_weight_arena(
          total_bytes + post_load_allowance if can_retain_post_load else total_bytes
      )
      sponge_target_bsz = 0
@@ -291,9 +335,10 @@ index 66dfc925d5..34d1acbc70 100644
 +    if use_preallocated_pool:
 +        logger.info(
 +            "Pre-allocated CUDA pool has %.1f MiB cached free for %.1f MiB of "
-+            "weights; skipping buddy sponge",
++            "weights; skipping buddy sponge (front_clean=%s)",
 +            cached_free_bytes / (1 << 20),
 +            total_bytes / (1 << 20),
++            _PREALLOCATED_CUDA_POOL_FRONT_CLEAN,
 +        )
 +        sponge: list[torch.Tensor] = []
 +    else:
@@ -367,7 +412,7 @@ index 66dfc925d5..34d1acbc70 100644
                      for param, elem_size, orig_offset, shape, stride in views:
                          param.set_(
                              arena_storage,
-@@ -772,7 +791,34 @@ def bind_weight_arena(
+@@ -772,7 +796,34 @@ def bind_weight_arena(
                              stride,
                          )
                      offset += _align_up(nbytes, _ARENA_ALIGN_BYTES)
@@ -389,22 +434,22 @@ index 66dfc925d5..34d1acbc70 100644
 +                        param.set_(moe_storage, orig_offset, shape, stride)
 +                    del moe_buf, moe_storage
 +
-+            if use_preallocated_pool:
-+                # Inside one pre-allocated contiguous segment, place the dense
-+                # weight arena at the aligned front, followed by MoE groups.
++            if use_preallocated_pool and _PREALLOCATED_CUDA_POOL_FRONT_CLEAN:
++                # Front of the pre-allocated segment is pure 512 MiB order-13
++                # blocks: place the dense arena at the aligned front first.
 +                arena = _alloc_arena()
 +                _alloc_moe()
 +            else:
-+                # Fallback without pre-allocated pool: allocate temporary
-+                # pre-tile MoE storages before the permanent dense arena so
-+                # dense weights draw the highest remaining buddy orders.
++                # Either no pre-allocated pool or unsoaked Unmovable sub-O13
++                # remains at offset 0: place temporary pre-tile MoE storages
++                # first so the permanent dense arena lands in the 512 MiB band.
 +                _alloc_moe()
 +                arena = _alloc_arena()
  
              _refresh_module_weight_views(model)
  
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index c67205aefd..daacc91ad4 100644
+index c67205aefd..d51ac5ac65 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -1,3 +1,4 @@
@@ -412,10 +457,26 @@ index c67205aefd..daacc91ad4 100644
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  """A GPU worker class."""
-@@ -429,6 +430,129 @@ class Worker(WorkerBase):
+@@ -429,6 +430,205 @@ class Worker(WorkerBase):
          finally:
              torch._C._accelerator_setAllocatorSettings(conf)
  
++    @staticmethod
++    def _parse_unmovable_sub_order13_bytes(pagetypeinfo_text: str) -> int:
++        """Sum free bytes in Zone Normal MIGRATE_UNMOVABLE orders < 13 (64 KiB pages)."""
++        total = 0
++        for line in pagetypeinfo_text.splitlines():
++            if "Normal" in line and "Unmovable" in line and "type" in line:
++                parts = line.split()
++                try:
++                    idx = parts.index("Unmovable")
++                    counts = [int(x) for x in parts[idx + 1 :]]
++                except (ValueError, IndexError):
++                    continue
++                if len(counts) >= 14:
++                    total += sum(c * (65536 << order) for order, c in enumerate(counts[:-1]))
++        return total
++
 +    def _preallocate_contiguous_cuda_pool(self) -> int:
 +        """Pre-allocate one contiguous PyTorch CUDA caching-allocator segment on
 +        64 KiB UMA hosts when native cudaMalloc caching is active.
@@ -424,11 +485,14 @@ index c67205aefd..daacc91ad4 100644
 +        hundreds of separate ``cudaMalloc`` or ``cuMemCreate`` calls interleave
 +        immortal ARM SMMU L3 page-table pages (``SecPageTables``) inside freshly
 +        converted ``MIGRATE_UNMOVABLE`` 512 MiB buddy pageblocks, permanently
-+        shattering order-13 contiguity after a single boot. Pre-reserving one
-+        contiguous segment before model load and anchoring it with a 2 MiB
-+        large-pool tensor keeps weights, draft weights, KV cache, and workspace
-+        inside a single ``cudaMalloc`` segment and preserves order-13 blocks
-+        across boots.
++        shattering order-13 contiguity after a single boot.
++
++        Pre-reserving one weight-sized contiguous segment before model load
++        (excluding ``kv_cache_memory_bytes`` when configured, so KV cache claims
++        its own single contiguous segment without allocator-tail slack) and
++        soaking ``MIGRATE_UNMOVABLE`` sub-order-13 blocks beforehand with a
++        single transient ``cudaMalloc`` ensures both dense and MoE weights draw
++        100% from 512 MiB order-13 blocks across every boot without rebooting.
 +        """
 +        self._contiguous_pool_anchor: torch.Tensor | None = None
 +        self._contiguous_pool_bytes = 0
@@ -467,6 +531,7 @@ index c67205aefd..daacc91ad4 100644
 +        block_bytes = 512 * 1024 * 1024
 +        o13_bytes = 0
 +        avail_bytes = 0
++        unmov_sub_bytes = 0
 +        try:
 +            from vllm.model_executor.model_loader.direct_loader import (
 +                parse_buddyinfo_order13,
@@ -485,6 +550,12 @@ index c67205aefd..daacc91ad4 100644
 +                    break
 +        except (OSError, ValueError, IndexError):
 +            avail_bytes = 0
++        try:
++            unmov_sub_bytes = self._parse_unmovable_sub_order13_bytes(
++                Path("/proc/pagetypeinfo").read_text(encoding="utf-8")
++            )
++        except OSError:
++            unmov_sub_bytes = 0
 +
 +        if override_mib is not None:
 +            pool_bytes = (override_mib * 1024 * 1024 // block_bytes) * block_bytes
@@ -495,30 +566,76 @@ index c67205aefd..daacc91ad4 100644
 +            # on an already-fragmented host, let direct_loader's buddy sponge run.
 +            if o13_bytes < 32 * 1024**3:
 +                return 0
++            # Exclude explicit kv_cache_memory_bytes from the weight pool so
++            # weights + draft + workspace fit tightly in Segment #1 and KV cache
++            # takes one clean contiguous Segment #2 with zero slack spill.
++            kv_bytes = int(getattr(self.cache_config, "kv_cache_memory_bytes", 0) or 0)
++            req_bytes = int(self.requested_memory)
++            if kv_bytes > 0 and req_bytes > kv_bytes + 16 * 1024**3:
++                req_bytes -= kv_bytes
 +            headroom_bytes = 12 * 1024**3
-+            cap_bytes = max(0, avail_bytes - headroom_bytes) if avail_bytes > 0 else self.requested_memory
-+            target_bytes = min(int(self.requested_memory), cap_bytes)
++            cap_bytes = (
++                max(0, avail_bytes - headroom_bytes)
++                if avail_bytes > 0
++                else req_bytes
++            )
++            target_bytes = min(req_bytes, cap_bytes)
 +            pool_bytes = (target_bytes // block_bytes) * block_bytes
 +            if pool_bytes < 16 * 1024**3:
 +                return 0
 +
++        # One-shot soak of MIGRATE_UNMOVABLE sub-order-13 blocks so nvidia.ko
++        # draws the entire weight pool from pure 512 MiB order-13 blocks starting
++        # at offset 0. Keep >= 8 GiB MemAvailable above startup memguard.
++        soak_headroom_bytes = 8 * 1024**3
++        soak_align = 2 * 1024 * 1024
++        max_soak = (
++            max(0, avail_bytes - pool_bytes - soak_headroom_bytes)
++            if avail_bytes > 0
++            else 0
++        )
++        soak_bytes = (
++            (min(unmov_sub_bytes, max_soak) // soak_align) * soak_align
++            if unmov_sub_bytes >= block_bytes and max_soak >= block_bytes
++            else 0
++        )
++
 +        t0 = time.perf_counter()
++        soak: torch.Tensor | None = None
 +        try:
++            if soak_bytes > 0:
++                try:
++                    soak = torch.empty(
++                        (soak_bytes,), dtype=torch.uint8, device=self.device
++                    )
++                    soak[::65536].zero_()
++                except torch.OutOfMemoryError:
++                    soak = None
++                    soak_bytes = 0
++                    torch.accelerator.empty_cache()
++
 +            pool = torch.empty((pool_bytes,), dtype=torch.uint8, device=self.device)
 +            del pool
 +            # A >= 2 MiB allocation lands in PyTorch's large_pool and splits off
-+            # the front of the pre-allocated segment, preventing empty_cache()
-+            # from releasing the segment back to cudaFree before weights bind.
++            # the front of the pre-allocated segment (while soak is still live),
++            # preventing empty_cache() from freeing the pool when soak is released.
 +            self._contiguous_pool_anchor = torch.empty(
 +                (2 * 1024 * 1024,), dtype=torch.uint8, device=self.device
 +            )
 +            self._contiguous_pool_bytes = pool_bytes
++            if soak is not None:
++                del soak
++                soak = None
++                torch.accelerator.empty_cache()
++            front_clean = (unmov_sub_bytes - soak_bytes) < (1024**3)
 +            from vllm.model_executor.model_loader.direct_loader import (
 +                set_preallocated_cuda_pool_bytes,
 +            )
 +
-+            set_preallocated_cuda_pool_bytes(pool_bytes)
++            set_preallocated_cuda_pool_bytes(pool_bytes, front_clean=front_clean)
 +        except torch.OutOfMemoryError:
++            if soak is not None:
++                del soak
 +            self._contiguous_pool_anchor = None
 +            self._contiguous_pool_bytes = 0
 +            torch.accelerator.empty_cache()
@@ -531,18 +648,22 @@ index c67205aefd..daacc91ad4 100644
 +
 +        logger.info(
 +            "Pre-allocated %.1f GiB single contiguous CUDA pool in %.2f s "
-+            "(order-13 free was %.1f GiB, MemAvailable was %.1f GiB)",
++            "(soaked %.2f/%.2f GiB Unmovable sub-O13, order-13 free was %.1f GiB, "
++            "MemAvailable was %.1f GiB, front_clean=%s)",
 +            pool_bytes / (1024**3),
 +            time.perf_counter() - t0,
++            soak_bytes / (1024**3),
++            unmov_sub_bytes / (1024**3),
 +            o13_bytes / (1024**3),
 +            avail_bytes / (1024**3),
++            front_clean,
 +        )
 +        return pool_bytes
 +
      @instrument(span_name="Init device")
      def init_device(self):
          if envs.VLLM_DS41_IKET:
-@@ -552,6 +676,7 @@ class Worker(WorkerBase):
+@@ -552,6 +752,7 @@ class Worker(WorkerBase):
              logger.debug(
                  "worker requested memory: %sGiB", format_gib(self.requested_memory)
              )
@@ -550,7 +671,7 @@ index c67205aefd..daacc91ad4 100644
          else:
              raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
  
-@@ -607,7 +732,13 @@ class Worker(WorkerBase):
+@@ -607,7 +808,13 @@ class Worker(WorkerBase):
              self._maybe_get_memory_pool_context(tag="weights"),
              set_current_vllm_config(self.vllm_config),
              # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
@@ -565,41 +686,6 @@ index c67205aefd..daacc91ad4 100644
          ):
              self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
  
-@@ -621,6 +752,21 @@ class Worker(WorkerBase):
-                 self.device,
-                 self.model_runner.get_model(),
-             )
-+        self._kv_pool_placeholder: torch.Tensor | None = None
-+        kv_bytes = int(self.cache_config.kv_cache_memory_bytes or 0)
-+        if getattr(self, "_contiguous_pool_anchor", None) is not None and kv_bytes > 0:
-+            cached_free = max(
-+                0,
-+                int(torch.cuda.memory_reserved(self.device))
-+                - int(torch.cuda.memory_allocated(self.device)),
-+            )
-+            if cached_free >= kv_bytes:
-+                try:
-+                    self._kv_pool_placeholder = torch.empty(
-+                        (kv_bytes,), dtype=torch.uint8, device=self.device
-+                    )
-+                except torch.OutOfMemoryError:
-+                    self._kv_pool_placeholder = None
-         apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
- 
-     def update_config(self, overrides: dict[str, Any]) -> None:
-@@ -960,6 +1106,12 @@ class Worker(WorkerBase):
-         torch.accelerator.empty_cache()
-         trim_host_heap()
- 
-+        # Hand the reserved KV slot inside the pre-allocated contiguous pool
-+        # directly to initialize_kv_cache so profiling temporaries cannot split
-+        # the tail of the single segment and spill KV cache into a second one.
-+        if getattr(self, "_kv_pool_placeholder", None) is not None:
-+            self._kv_pool_placeholder = None
-+
-         # Update local config with adjusted num blocks after profiling,
-         # so that it's available to the warmup stage.
-         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 -- 
 2.43.0
 
