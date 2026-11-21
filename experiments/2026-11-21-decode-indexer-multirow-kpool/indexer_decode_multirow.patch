@@ -1,0 +1,302 @@
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -69,8 +69,38 @@
+     return function(*args, **kwargs)
+ 
+ 
++_DECODE_SCORE_MAX_ROWS = 96
++_DECODE_SCORE_ROW_GROUP = 3
++_PREFILL_SCORE_ROW_GROUP = 4
++
++
++def _decode_score_max_ctas(width: int) -> int:
++    # Wave-aligned CTA cap for SM121 (48 SMs x 3 CTAs/SM = 144 concurrent CTAs/wave):
++    # 144 (1 wave) through 256K context and 288 (2 waves) above 256K (e.g. 1M).
++    return 288 if width > 262144 else 144
++
++
+ def _score_call(width, page_size, candidates):
+-    return prepare.call(indexer_score_v41, width, page_size, candidates)
++    if candidates:
++        return prepare.call(indexer_score_v41, width, page_size, True)
++    return prepare.call(
++        indexer_score_v41,
++        width,
++        page_size,
++        False,
++        row_group=_PREFILL_SCORE_ROW_GROUP,
++    )
++
++
++def _score_decode_call(width, page_size):
++    return prepare.call(
++        indexer_score_v41,
++        width,
++        page_size,
++        False,
++        max_ctas=_decode_score_max_ctas(width),
++        row_group=_DECODE_SCORE_ROW_GROUP,
++    )
+ 
+ 
+ def quantize_call(
+@@ -389,7 +419,6 @@
+ 
+     fp4_e2_2_t B_reg[R][2][16];
+     uint32_t sfq_reg[R][2];
+-    float2 w_reg[R][2];
+     __nv_bfloat162 w2_reg[R][2];
+ 
+     int smem_q_off = (((tx >> 2) * 64) + ((((((tx & 31) >> 4) + ((tx & 3) >> 1)) & 1) * 32)) + ((((((tx & 15) >> 3) + (tx & 1)) & 1) * 16)));
+@@ -416,14 +445,11 @@
+             #pragma unroll
+             for (int w_i = 0; w_i < 2; ++w_i) {
+                 int h0 = ((tx >> 6) * 16) + (w_i * 8) + ((tx & 3) * 2);
+-                w_reg[r][w_i] = make_float2((float)wptr[h0], (float)wptr[h0 + 1]);
+                 w2_reg[r][w_i] = *reinterpret_cast<const __nv_bfloat162*>(wptr + h0);
+             }
+         } else {
+             sfq_reg[r][0] = 0;
+             sfq_reg[r][1] = 0;
+-            w_reg[r][0] = make_float2(0.0f, 0.0f);
+-            w_reg[r][1] = make_float2(0.0f, 0.0f);
+             w2_reg[r][0] = __float2bfloat162_rn(0.0f);
+             w2_reg[r][1] = __float2bfloat162_rn(0.0f);
+         }
+@@ -453,7 +479,7 @@
+         fp4_e2_2_t A_reg[2][32];
+         uint32_t sfk_reg[2];
+ 
+-        if (same_k && (R > 1) && ((R & 1) == 0)) {
++        if (same_k && (R > 1)) {
+             if (pre_p0 == p0) {
+                 __tl_store_k_shared(K_shared, SFK_shared, pre_v, pre_s);
+             } else {
+@@ -486,7 +512,7 @@
+             }
+ 
+             #pragma unroll
+-            for (int rp = 0; rp < R; rp += 2) {
++            for (int rp = 0; rp < (R & ~1); rp += 2) {
+                 if (rp > 0) __syncthreads();
+                 #pragma unroll
+                 for (int sub = 0; sub < 2; ++sub) {
+@@ -560,33 +586,82 @@
+                     Scores[(int64_t)row * width + j] = (bfloat16_t)s;
+                 }
+             }
+-            continue;
+-        }
++            if constexpr ((R & 1) != 0) {
++                constexpr int r = R - 1;
++                __syncthreads();
++                float acc[16];
++                #pragma unroll
++                for (int z = 0; z < 16; ++z) acc[z] = 0.0f;
+ 
+-        if (same_k) {
+-            __tl_load_k_shared_dense(
+-                KPool, KScale, PageTable, K_shared, SFK_shared,
+-                row0, p0, max_ext, page_size, table_width,
+-                pool_pages, pool_stride, scale_stride, scale_word0
+-            );
+-            #pragma unroll
+-            for (int ki = 0; ki < 2; ++ki) {
+                 #pragma unroll
+-                for (int i_2 = 0; i_2 < 2; ++i_2) {
+-                    int ld_k_off = (((tx & 63) >> 5) * 2048) + (i_2 * 1024) + ((tx & 15) * 64) + (((((tx & 7) >> 2) + ki) & 1) * 32) + (((((tx & 31) >> 4) + ((tx & 3) >> 1)) & 1) * 16);
+-                    tl::ptx_ldmatrix_x4(&(((fp4_e2_t*)K_shared)[ld_k_off]), &(A_reg[ki][i_2 * 16]));
++                for (int ki = 0; ki < 2; ++ki) {
++                    #pragma unroll
++                    for (int i_3 = 0; i_3 < 2; ++i_3) {
++                        tl::sm120_mma_sync_blockscaled<tl::SM120MmaBlockScaledKind::kMxf4nvf4, 2, tl::SM120MmaScaleType::kUE8M0>(
++                            acc + (i_3 * 8),
++                            reinterpret_cast<const uint32_t*>(A_reg[ki] + (i_3 * 16)),
++                            reinterpret_cast<const uint32_t*>(B_reg[r][ki] + 0),
++                            acc + (i_3 * 8),
++                            sfk_reg[i_3],
++                            sfq_reg[r][0],
++                            static_cast<uint16_t>(ki * 2), 0, static_cast<uint16_t>(ki * 2), 0
++                        );
++                        tl::sm120_mma_sync_blockscaled<tl::SM120MmaBlockScaledKind::kMxf4nvf4, 2, tl::SM120MmaScaleType::kUE8M0>(
++                            acc + (i_3 * 8 + 4),
++                            reinterpret_cast<const uint32_t*>(A_reg[ki] + (i_3 * 16)),
++                            reinterpret_cast<const uint32_t*>(B_reg[r][ki] + 8),
++                            acc + (i_3 * 8 + 4),
++                            sfk_reg[i_3],
++                            sfq_reg[r][1],
++                            static_cast<uint16_t>(ki * 2), 0, static_cast<uint16_t>(ki * 2), 0
++                        );
++                    }
++                }
++                #pragma unroll
++                for (int i_4 = 0; i_4 < 8; ++i_4) {
++                    float2 v_ = *(float2*)(acc + (i_4 * 2));
++                    __nv_bfloat162 __m = __hmax2_nan(__float22bfloat162_rn(v_), __float2bfloat162_rn(0.0f));
++                    uint1 __2;
++                    (reinterpret_cast<__nv_bfloat162*>(&__2))[0] = __hmul2(__m, w2_reg[r][(i_4 & 3) >> 1]);
++                    int p_row = (((tx & 63) >> 5) * 32) + ((i_4 >> 2) * 16) + ((i_4 & 1) * 8) + ((tx & 31) >> 2);
++                    int h_col = ((tx >> 6) * 16) + (((i_4 & 3) >> 1) * 8) + ((tx & 3) * 2);
++                    int swz_col = h_col ^ ((p_row & 15) << 1);
++                    bfloat16_t* contrib_bf16 = reinterpret_cast<bfloat16_t*>(contrib);
++                    *(uint1*)(contrib_bf16 + (p_row * 32 + swz_col)) = __2;
++                }
++                __syncthreads();
++                if (tx < 64) {
++                    int j = p0 + tx;
++                    if (j < width) {
++                        asm volatile("" ::: "memory");
++                        float s = 0.0f;
++                        const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + tx * 32;
++                        const uint32_t* c_pair = reinterpret_cast<const uint32_t*>(c_row);
++                        int pmask = (tx & 15);
++                        #pragma unroll
++                        for (int h2 = 0; h2 < 16; ++h2) {
++                            uint32_t two = c_pair[h2 ^ pmask];
++                            float2 f = tl::__tl_cvt_bf16x2_to_f32x2(*reinterpret_cast<__nv_bfloat162*>(&two));
++                            s += f.x;
++                            s += f.y;
++                        }
++                        Scores[(int64_t)(row0 + r) * width + j] = (bfloat16_t)s;
++                    }
+                 }
+             }
+-            sfk_reg[0] = ((const uint*)SFK_shared)[sfk_base];
+-            sfk_reg[1] = ((const uint*)SFK_shared)[sfk_base + 16];
++            continue;
+         }
+ 
++        int loaded_page = -2;
++        bool full_tile_ok = ((p0 % page_size) + 64 <= page_size);
+         #pragma unroll
+         for (int r = 0; r < R; ++r) {
+             int row = row0 + r;
+             int ext = exts[r];
+             if (p0 < ext) {
+-                if (!same_k) {
++                bool is_full = full_tile_ok && (p0 + 64 <= ext);
++                int cur_p = (table_width >= 1) ? PageTable[(int64_t)row * table_width + lpage] : 0;
++                if (!is_full || cur_p != loaded_page) {
+                     __syncthreads();
+                     __tl_load_k_shared_dense(
+                         KPool, KScale, PageTable, K_shared, SFK_shared,
+@@ -603,6 +678,7 @@
+                     }
+                     sfk_reg[0] = ((const uint*)SFK_shared)[sfk_base];
+                     sfk_reg[1] = ((const uint*)SFK_shared)[sfk_base + 16];
++                    loaded_page = is_full ? cur_p : -2;
+                 }
+ 
+                 float acc[16];
+@@ -634,7 +710,7 @@
+                     }
+                 }
+ 
+-                if (r > 0 || !same_k) __syncthreads();
++                if (r > 0) __syncthreads();
+                 #pragma unroll
+                 for (int i_4 = 0; i_4 < 8; ++i_4) {
+                     float2 v_ = *(float2*)(acc + (i_4 * 2));
+@@ -829,6 +905,7 @@
+     block_P: int = 64,
+     threads: int = 128,
+     max_ctas: int = 128,
++    row_group: int = 0,
+ ):
+     """Build the score kernel. Inputs:
+ 
+@@ -1072,6 +1149,64 @@
+         use_vec128 and block_P == 64 and D == 128 and threads == 128 and heads == 32
+     )
+     scale_word0 = page_size * D // 2 // 4
++    if not candidates and fast_vec128 and row_group > 0:
++        row_blocks = T.ceildiv(rows, row_group)
++
++        @T.prim_func
++        def indexer_score(
++            Q: T.Tensor([rows, heads, D], fp4),
++            QScale: T.Tensor([rows, heads], T.uint32),
++            Weights: T.Tensor([rows, heads], T.bfloat16),
++            KPool: T.StridedTensor([pool_pages, page_words * 8], [pool_stride, 1], fp4),
++            KScale: T.StridedTensor(
++                [pool_pages, page_words], [scale_stride, 1], T.uint32
++            ),
++            PageTable: T.Tensor([rows, table_width], T.int32),
++            Lengths: T.Tensor([rows], T.int32),
++            Active: T.Tensor([1], T.int32),
++            Scores: T.Tensor([rows, width], T.bfloat16),
++        ):
++            with T.Kernel(ctas, row_blocks, threads=threads) as (bx, by):
++                T.import_source(_SCORE_LOAD_HEADER)
++                pdl.chain()
++                linear_block = by * ctas + bx
++                cta = linear_block // row_blocks
++                rb = linear_block % row_blocks
++                K_shared = T.alloc_shared([block_P, D], fp4)
++                SFK_shared = T.alloc_shared([block_P, 1], T.uint32)
++                Q_shared = T.alloc_shared([heads, D], fp4)
++                contrib = T.alloc_shared([block_P, heads], T.float32)
++                T.call_extern(
++                    "handle",
++                    f"__tl_score_rows_dense_fast<{row_group}>",
++                    T.address_of(Q[0, 0, 0]),
++                    T.address_of(QScale[0, 0]),
++                    T.address_of(Weights[0, 0]),
++                    T.address_of(KPool[0, 0]),
++                    T.address_of(KScale[0, 0]),
++                    T.address_of(PageTable[0, 0]),
++                    T.address_of(Lengths[0]),
++                    T.address_of(Active[0]),
++                    T.address_of(Scores[0, 0]),
++                    T.address_of(K_shared[0, 0]),
++                    T.address_of(SFK_shared[0, 0]),
++                    T.address_of(Q_shared[0, 0]),
++                    T.address_of(contrib[0, 0]),
++                    rb * row_group,
++                    cta,
++                    ctas,
++                    rows,
++                    width,
++                    page_size,
++                    table_width,
++                    pool_pages,
++                    pool_stride,
++                    scale_stride,
++                    scale_word0,
++                )
++
++        return indexer_score
++
+     if not candidates and fast_vec128:
+         row_blocks = T.if_then_else(rows >= 64, T.ceildiv(rows, 4), T.ceildiv(rows, 2))
+ 
+@@ -2816,6 +2951,9 @@
+         self.width, self.page_size, self.topk = width, page_size, topk
+         self.candidates, self.candidate_blocks = candidates, candidate_blocks
+         self.score = _make(_score_call(width, page_size, candidates))
++        self.score_decode = (
++            None if candidates else _make(_score_decode_call(width, page_size))
++        )
+         gather_scores = self._gather_from_blocks(width, topk, candidate_blocks)
+         self.select = IndexerTopK(
+             width, topk, 1, candidates, gather_scores=gather_scores
+@@ -2841,6 +2979,7 @@
+         )
+         calls = [
+             _score_call(width, page_size, candidates),
++            *([] if candidates else [_score_decode_call(width, page_size)]),
+             *IndexerTopK.calls(
+                 width, topk, 1, candidates, gather_scores=gather_scores
+             ),
+@@ -2918,7 +3057,10 @@
+                 scratch=select_buffers,
+             )
+             return out, scores
+-        self.score(*args, scores)
++        if self.score_decode is not None and rows <= _DECODE_SCORE_MAX_ROWS:
++            self.score_decode(*args, scores)
++        else:
++            self.score(*args, scores)
+         if self.select_blocks is not None:
+             block_values, *block_buffers = buffers[2 + select_scratch :]
+             self.select_blocks.run(
