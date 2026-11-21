@@ -9,6 +9,8 @@ set -euo pipefail
 : "${MEMGUARD_WARN_GIB:=0}"
 : "${READY_FILE:=}"
 : "${MEMGUARD_EVIDENCE_DIR:=/var/log/spark-memguard}"
+: "${MEMGUARD_PROC_DIR:=/proc}"
+: "${MEMGUARD_MEMINFO_FILE:=$MEMGUARD_PROC_DIR/meminfo}"
 
 if ! [[ "$THRESHOLD_GIB" =~ ^[1-9][0-9]*$ ]]; then
   echo "THRESHOLD_GIB must be a positive integer" >&2
@@ -40,6 +42,36 @@ ready=false
 warned=false
 previous_kib=
 previous_at=
+container_pid=
+container_starttime=
+
+# Read field 22 (starttime) from /proc/<pid>/stat with pure bash builtins (no forks).
+read_pid_starttime() {
+  local pid=$1 stat_line after_comm
+  local -a fields
+  pid_starttime=
+  [[ -r "$MEMGUARD_PROC_DIR/$pid/stat" ]] || return 1
+  IFS= read -r stat_line <"$MEMGUARD_PROC_DIR/$pid/stat" 2>/dev/null || return 1
+  after_comm=${stat_line##*) }
+  [[ "$after_comm" != "$stat_line" ]] || return 1
+  read -r -a fields <<<"$after_comm"
+  [[ -n "${fields[19]:-}" ]] || return 1
+  pid_starttime=${fields[19]}
+}
+
+# Read MemAvailable (KiB) directly from /proc/meminfo with pure bash builtins (no forks).
+read_mem_available_kib() {
+  local key value rest
+  available_kib=
+  [[ -r "$MEMGUARD_MEMINFO_FILE" ]] || return 1
+  while read -r key value rest; do
+    if [[ "$key" == "MemAvailable:" ]]; then
+      available_kib=$value
+      return 0
+    fi
+  done <"$MEMGUARD_MEMINFO_FILE"
+  return 0
+}
 
 # After a kill, what `docker rm -f` would otherwise destroy: the breach's meminfo, the
 # largest host processes, the container's state and its log. Never delays the kill.
@@ -66,9 +98,23 @@ save_evidence() {
 
 while true; do
   inspectable=true
-  if ! running=$(docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null); then
-    inspectable=false
-    running=
+  running=
+  if [[ -n "$container_pid" ]] && read_pid_starttime "$container_pid" && [[ "$pid_starttime" == "$container_starttime" ]]; then
+    running=true
+  else
+    container_pid=
+    container_starttime=
+    if ! inspect_out=$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' "$CONTAINER_NAME" 2>/dev/null); then
+      inspectable=false
+      running=
+    else
+      inspected_pid=
+      read -r running inspected_pid <<<"$inspect_out"
+      if [[ "$running" == "true" && "$inspected_pid" =~ ^[1-9][0-9]*$ ]] && read_pid_starttime "$inspected_pid"; then
+        container_pid=$inspected_pid
+        container_starttime=$pid_starttime
+      fi
+    fi
   fi
   if [[ "$inspectable" == "false" && "$observed_running" == "true" ]]; then
     logger -t spark-memguard \
@@ -86,8 +132,8 @@ while true; do
     exit 1
   fi
 
-  available_kib=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)
-  if [[ -z "$available_kib" ]]; then
+  read_mem_available_kib || available_kib=
+  if [[ -z "$available_kib" || ! "$available_kib" =~ ^[0-9]+$ ]]; then
     logger -t spark-memguard \
       "cannot read MemAvailable during $MEMGUARD_PHASE; failing closed"
     if [[ "$running" == "true" ]]; then
@@ -114,7 +160,7 @@ while true; do
       fi
     fi
     if [[ "$running" == "true" ]]; then
-      { meminfo=$(</proc/meminfo); } 2>/dev/null || meminfo=
+      { meminfo=$(<"$MEMGUARD_MEMINFO_FILE"); } 2>/dev/null || meminfo=
       logger -t spark-memguard "killing $CONTAINER_NAME during $MEMGUARD_PHASE: $breach"
       docker kill --signal KILL "$CONTAINER_NAME" >/dev/null
       save_evidence "$meminfo"
