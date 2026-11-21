@@ -1,0 +1,78 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -538,6 +538,7 @@
+         self._prefill_stall_accum_s: float = 0.0
+         self._last_prefill_step_at: float | None = None
+         self._last_prefill_step_est_s: float = 0.0
++        self._last_prefill_output_id: int | None = None
+ 
+         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+@@ -1295,14 +1296,29 @@
+         yield_now = time.monotonic() if self.prefill_yield else 0.0
+         if self.prefill_yield and self._last_prefill_step_at is not None:
+             wall_dt = max(0.0, yield_now - self._last_prefill_step_at)
++            # Under async scheduling (batch_queue_size >= 2), the next
++            # schedule() runs as soon as the preceding step (typically a
++            # decode step taking >50 ms at 6+ streams) finishes, while this
++            # prefill chunk is still in flight on the GPU. Measuring that
++            # decode wait as the prefill chunk's duration undercounts the
++            # stall and queues a second full chunk back-to-back ahead of
++            # interleaved decodes and waiting short probes.
++            prefill_still_in_flight = (
++                self.scheduler_config.async_scheduling
++                and self._last_prefill_output_id is not None
++            )
+             step_stall_s = (
+                 wall_dt
+-                if wall_dt >= self._PREFILL_WALL_CLOCK_MIN_S
+-                else self._last_prefill_step_est_s
++                if (
++                    not prefill_still_in_flight
++                    and wall_dt >= self._PREFILL_WALL_CLOCK_MIN_S
++                )
++                else max(wall_dt, self._last_prefill_step_est_s)
+             )
+             self._prefill_stall_accum_s += step_stall_s
+             self._last_prefill_step_at = None
+             self._last_prefill_step_est_s = 0.0
++            self._last_prefill_output_id = None
+             if self._prefill_stall_accum_s >= self._PREFILL_DECODE_STALL_THRESHOLD_S:
+                 self._prefill_decode_interleave_remaining = (
+                     self._PREFILL_DECODE_INTERLEAVE_STEPS
+@@ -1314,6 +1330,7 @@
+         if not has_eligible_decode or not has_inflight_multi_chunk_prefill:
+             self._prefill_decode_interleave_remaining = 0
+             self._prefill_stall_accum_s = 0.0
++            self._last_prefill_output_id = None
+         interleave_decode_due = (
+             self.prefill_yield
+             and has_eligible_decode
+@@ -3136,12 +3153,14 @@
+                 self._last_prefill_step_est_s = self._estimate_prefill_step_s(
+                     scheduled_prefill_tokens, max_prefill_computed_before
+                 )
++                self._last_prefill_output_id = id(scheduler_output)
+             elif has_scheduled_decode and not has_continuing_prefill_chunk:
+                 if self._prefill_decode_interleave_remaining > 0:
+                     self._prefill_decode_interleave_remaining -= 1
+                 self._prefill_stall_accum_s = 0.0
+                 self._last_prefill_step_at = None
+                 self._last_prefill_step_est_s = 0.0
++                self._last_prefill_output_id = None
+ 
+         # Snapshot block IDs for routed experts before forward starts.
+         # A concurrent schedule() may preempt requests and free blocks
+@@ -3555,6 +3574,12 @@
+ 
+         # Every GPU write enqueued by this and earlier steps has completed, so it is
+         # safe to return deferred-free blocks to the pool.
++        if (
++            self._last_prefill_output_id is not None
++            and id(scheduler_output) == self._last_prefill_output_id
++        ):
++            self._last_prefill_output_id = None
++
+         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+             self.processed_step_seq += 1
+             self._drain_deferred_frees()
