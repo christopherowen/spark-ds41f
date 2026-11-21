@@ -604,14 +604,20 @@ committed token, step time and serving tok/s alongside the kernel timings.
    `R=6/12/16` and register `R=6` rejected as slower). Still open for a
    separate follow-up: multi-request TP row split above `64K` with one-shot
    `sparknet` RoCE gather of `topk_indices_buffer[:rows]` (`2 KiB/row`).
-10. **Same-request multi-row SWA KV reuse in decode `sparse_mla_fwd_v41`.** On
-    SWA-only layers (`idx_width = 0`, `swa_width = 128`, `segments = 1`) and in
-    the SWA chunk of sparse-MLA layers (`0740`), each CTA currently handles a
-    single query row even though all $V$ verification rows of a request attend to
-    the identical 128-token SWA prefix (`pos < pos0`) from the single shared KV
-    head (`num_key_value_heads = 1`), differing only in their causal mask over
-    `[pos0, pos0 + V)`. Grouping a request's verification rows inside one CTA
-    amortizes the 576 B/token SWA KV loads from LPDDR5X across all $V$ rows.
+10. **Same-request multi-row SWA KV reuse in decode `sparse_mla_fwd_v41`.**
+    **Audited & bounded; single-segment `extend` route landed** in
+    [`experiments/2026-11-21-swa-single-segment-extend`](experiments/2026-11-21-swa-single-segment-extend/README.md).
+    Cold-L2 profiling on `dgx4` (`198 MiB` rotating SWA pools) showed unique
+    SWA KV per layer is only `67 KiB` (`1x3`) to `1.07 MiB` (`16x6`) — `0.3%–4.5%`
+    of GB10's `24 MiB` L2 — and single-kernel `extend` runs at a flat
+    `14.59–15.62 us/L` across `rows = 1..48` (`0.00 us` DRAM bandwidth scaling),
+    bounding multi-row SWA KV DRAM reuse. The audit caught that `SparseMlaV41Plan.routes()`
+    still routed 1-segment SWA-only layers (`segments == 1`) through the
+    two-kernel `split`/`decode` + `merge` path (writing FP32 `Partial` to DRAM
+    for 1 segment); routing `segments <= 1` directly to `"extend"` is `100%`
+    `uint16` bit-exact (`38/38` passed incl. `15/15` PDL), wins `16/16` shapes
+    (`-1.06..-4.06 us/L` across `rows = 1..96` on `H=16/24`), removes `2`
+    compiled kernels per SWA-only shape, and drops SWA `Partial` scratch to `0`.
 11. **One-shot all-reduce latency per call (proxy core affinity shipped).**
     `1120` pins the `sparknet` proxy, the worker main thread, the engine core
     and rank 0's API server to disjoint fast cores by L3 cluster (vLLM `0801`,
