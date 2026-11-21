@@ -1,0 +1,1041 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:52:01 +0100
+Subject: [PATCH] perf(dsv41): exact BlockMax-32 two-stage pruning for
+ wide prefill indexers
+
+
+Add exact BlockMax-32 two-stage superblock pruning for wide prefill dense
+and source indexers using hardware redux.sync.max.u32, reading only the
+exact top-K superblocks and pruning 93-97% of global Scores DRAM traffic.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Accelerate long-context cold prefill (+2.11% at 1M to 7,064 tok/s,
+           +1.39% at 500K, +0.89% at 262K across 2 live tp3 boots).
+Quality: Strictly exact top-K indices and tie handling (128/128 bit-exact).
+Tests: pytest tests/kernels/test_deepseek_v41_tilelang.py + PDL gate
+       + 2-boot live tp3-triangle prefill/screen (PR #1265).
+Upstream-status: Local DeepSeek-V4.1 TileLang indexer optimization.
+---
+ vllm/models/deepseek_v4_1/tilelang/indexer.py | 829 +++++++++++++++++-
+ 1 file changed, 819 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index c9f488804..45345a3bb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -56,6 +56,15 @@ CANDIDATE_BLOCKS = 2048
+ CANDIDATE_BLOCK = 8
+ # Order-preserving uint16 key of BF16 -inf: entries at or below it are never selected.
+ _KEY_NEG_INF = 0x007F
++# BlockMax-32 exact two-stage pruning for wide prefill dense/source indexers:
++# each warp emits one 32-position superblock max via hardware redux.sync.max.u32
++# (coalesced in 16-tile / 64-byte chunks). Selecting the top-K superblocks
++# mathematically contains 100% of the exact top-K positions (or 8-token candidate
++# blocks), pruning 93-97% of the global Scores reads with zero approximation.
++_BLOCKMAX_BLOCK = 32
++_BLOCKMAX_CHUNK_SHIFT = 4
++_BLOCKMAX_MAX_CTAS = 64
++_BLOCKMAX_MIN_ROWS = 64
+ 
+ 
+ def page_bytes(page_size: int) -> int:
+@@ -111,15 +120,19 @@ def norm_quantize_call(
+     )
+ 
+ 
+-def _row_extent(Lengths, Active, row, width):
++def _row_extent(Lengths, Active, row, width, extent_div: int = 1):
+     """Positions a row selects from: ``min(Lengths, Active, width)``, at least zero.
+ 
+     Candidate rows have no ``Active`` cap: their length counts candidates.
++    When ``extent_div > 1``, ``width`` is counted in superblocks of
++    ``extent_div`` positions and the clamped position extent is divided upward.
+     """
++    raw_cap = width * extent_div if extent_div > 1 else width
+     extent = T.max(Lengths[row], 0)
+     if Active is not None:
+         extent = T.min(extent, T.max(Active[0], 0))
+-    return T.min(extent, width)
++    extent = T.min(extent, raw_cap)
++    return T.ceildiv(extent, extent_div) if extent_div > 1 else extent
+ 
+ 
+ def _candidate_block(Candidates, row, j):
+@@ -1304,6 +1317,276 @@ def indexer_score_v41(
+     return indexer_score
+ 
+ 
++def _build_score_blockmax_header() -> str:
++    """Derive ``__tl_score_rows_dense_blockmax`` from ``__tl_score_rows_dense_fast``.
++
++    Keeps the exact same MMA, ReLU, weight multiply, and BF16 score reduction
++    as ``__tl_score_rows_dense_fast``, while striping in ``2**CHUNK_SHIFT``
++    contiguous tiles and emitting one 32-position superblock max per warp via
++    hardware ``__reduce_max_sync`` into a coalesced SMEM flush.
++    """
++    i0 = _SCORE_LOAD_HEADER.index(
++        "template <int R>\n__device__ __forceinline__ void __tl_score_rows_dense_fast("
++    )
++    i1 = _SCORE_LOAD_HEADER.index(
++        "__device__ __forceinline__ void __tl_score_row_candidates_fast("
++    )
++    fn = _SCORE_LOAD_HEADER[i0:i1]
++    fn = (
++        fn.replace(
++            "template <int R>\n__device__ __forceinline__ void __tl_score_rows_dense_fast(",
++            "template <int R, int CHUNK_SHIFT, bool FORCE_LAST>\n"
++            "__device__ __forceinline__ void __tl_score_rows_dense_blockmax(",
++            1,
++        )
++        .replace(
++            "    bfloat16_t* __restrict__ Scores,",
++            "    bfloat16_t* __restrict__ Scores,\n"
++            "    bfloat16_t* __restrict__ BlockMax,",
++            1,
++        )
++        .replace(
++            "    float* __restrict__ contrib,",
++            "    float* __restrict__ contrib,\n"
++            "    uint16_t* __restrict__ bmax_smem,",
++            1,
++        )
++    )
++    old_loop_head = (
++        "    int num_iters = ((max(((max_ext + 63) >> 6) - cta, 0)) + ctas - 1) / ctas;\n"
++        "    int sfk_base = (((tx & 63) >> 5) * 32) + ((tx & 1) * 8) + ((tx & 31) >> 2);\n\n"
++        "    uint4 pre_v[2];\n"
++        "    uint pre_s = 0;\n"
++        "    int pre_p0 = -1;\n"
++        "    for (int i = 0; i < num_iters; ++i) {\n"
++        "        int p0 = (cta + i * ctas) * 64;"
++    )
++    new_loop_head = (
++        "    constexpr int CHUNK_T = 1 << CHUNK_SHIFT;\n"
++        "    constexpr int CHUNK_B = CHUNK_T * 2;\n"
++        "    int total_tiles = (max_ext + 63) >> 6;\n"
++        "    int total_chunks = (total_tiles + CHUNK_T - 1) >> CHUNK_SHIFT;\n"
++        "    int num_chunks = ((max(total_chunks - cta, 0)) + ctas - 1) / ctas;\n"
++        "    int sfk_base = (((tx & 63) >> 5) * 32) + ((tx & 1) * 8) + ((tx & 31) >> 2);\n\n"
++        "    uint4 pre_v[2];\n"
++        "    uint pre_s = 0;\n"
++        "    int pre_p0 = -1;\n"
++        "    for (int ch = 0; ch < num_chunks; ++ch) {\n"
++        "        int t_chunk0 = (cta + ch * ctas) << CHUNK_SHIFT;\n"
++        "        int n_st = min(CHUNK_T, total_tiles - t_chunk0);\n"
++        "        for (int st = 0; st < n_st; ++st) {\n"
++        "            int p0 = (t_chunk0 + st) * 64;"
++    )
++    assert old_loop_head in fn
++    fn = fn.replace(old_loop_head, new_loop_head, 1)
++
++    old_pref = (
++        "            if (i + 1 < num_iters) {\n"
++        "                int p0n = (cta + (i + 1) * ctas) * 64;"
++    )
++    new_pref = (
++        "            int p0n = -1;\n"
++        "            if (st + 1 < n_st) {\n"
++        "                p0n = (t_chunk0 + st + 1) * 64;\n"
++        "            } else if (ch + 1 < num_chunks) {\n"
++        "                p0n = ((cta + (ch + 1) * ctas) << CHUNK_SHIFT) * 64;\n"
++        "            }\n"
++        "            if (p0n >= 0) {"
++    )
++    assert old_pref in fn
++    fn = fn.replace(old_pref, new_pref, 1)
++
++    old_fast = "\n                    Scores[(int64_t)row * width + j] = (bfloat16_t)s;\n"
++    new_fast = (
++        "\n                    bfloat16_t bs = (bfloat16_t)s;\n"
++        "                    Scores[(int64_t)row * width + j] = bs;\n"
++        "                    uint16_t bits = *reinterpret_cast<const uint16_t*>(&bs);\n"
++        "                    uint32_t ok = (bits >= 0x8000u) ? (uint32_t)(bits ^ 0xFFFFu) : (uint32_t)(bits | 0x8000u);\n"
++        "                    uint32_t mx = __reduce_max_sync(0xffffffffu, ok);\n"
++        "                    if ((tx & 31) == 0) {\n"
++        "                        bmax_smem[r * CHUNK_B + st * 2 + ((tx >> 5) & 1)] = (uint16_t)mx;\n"
++        "                    }\n"
++    )
++    assert fn.count(old_fast) == 1
++    fn = fn.replace(old_fast, new_fast, 1)
++
++    old_slow = (
++        "                if (tx < 64) {\n"
++        "                    int j = p0 + tx;\n"
++        "                    if (j < ext && j < width) {\n"
++        '                        asm volatile("" ::: "memory");\n'
++        "                        float s = 0.0f;\n"
++        "                        const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + tx * 32;\n"
++        "                        const uint32_t* c_pair = reinterpret_cast<const uint32_t*>(c_row);\n"
++        "                        int pmask = (tx & 15);\n"
++        "                        #pragma unroll\n"
++        "                        for (int h2 = 0; h2 < 16; ++h2) {\n"
++        "                            uint32_t two = c_pair[h2 ^ pmask];\n"
++        "                            float2 f = tl::__tl_cvt_bf16x2_to_f32x2(*reinterpret_cast<__nv_bfloat162*>(&two));\n"
++        "                            s += f.x;\n"
++        "                            s += f.y;\n"
++        "                        }\n"
++        "                        Scores[(int64_t)row * width + j] = (bfloat16_t)s;\n"
++        "                    }\n"
++        "                }"
++    )
++    new_slow = (
++        "                if (tx < 64) {\n"
++        "                    int j = p0 + tx;\n"
++        "                    uint32_t ok = 0u;\n"
++        "                    if (j < ext && j < width) {\n"
++        '                        asm volatile("" ::: "memory");\n'
++        "                        float s = 0.0f;\n"
++        "                        const bfloat16_t* c_row = reinterpret_cast<const bfloat16_t*>(contrib) + tx * 32;\n"
++        "                        const uint32_t* c_pair = reinterpret_cast<const uint32_t*>(c_row);\n"
++        "                        int pmask = (tx & 15);\n"
++        "                        #pragma unroll\n"
++        "                        for (int h2 = 0; h2 < 16; ++h2) {\n"
++        "                            uint32_t two = c_pair[h2 ^ pmask];\n"
++        "                            float2 f = tl::__tl_cvt_bf16x2_to_f32x2(*reinterpret_cast<__nv_bfloat162*>(&two));\n"
++        "                            s += f.x;\n"
++        "                            s += f.y;\n"
++        "                        }\n"
++        "                        bfloat16_t bs = (bfloat16_t)s;\n"
++        "                        Scores[(int64_t)row * width + j] = bs;\n"
++        "                        uint16_t bits = *reinterpret_cast<const uint16_t*>(&bs);\n"
++        "                        ok = (bits >= 0x8000u) ? (uint32_t)(bits ^ 0xFFFFu) : (uint32_t)(bits | 0x8000u);\n"
++        "                    }\n"
++        "                    uint32_t mx = __reduce_max_sync(0xffffffffu, ok);\n"
++        "                    if ((tx & 31) == 0 && (p0 + tx) < ext && (p0 + tx) < width) {\n"
++        "                        bmax_smem[r * CHUNK_B + st * 2 + ((tx >> 5) & 1)] = (uint16_t)mx;\n"
++        "                    }\n"
++        "                }"
++    )
++    assert old_slow in fn
++    fn = fn.replace(old_slow, new_slow, 1)
++
++    old_end = "        __syncthreads();\n    }\n}"
++    new_end = (
++        "        __syncthreads();\n"
++        "        }\n"
++        "        __syncthreads();\n"
++        "        for (int idx = tx; idx < R * CHUNK_B; idx += 128) {\n"
++        "            int fr = idx / CHUNK_B;\n"
++        "            int fb = idx - fr * CHUNK_B;\n"
++        "            int frow = row0 + fr;\n"
++        "            int blk_id = t_chunk0 * 2 + fb;\n"
++        "            int ext_r = exts[fr];\n"
++        "            if (frow < rows && blk_id < ((ext_r + 31) >> 5)) {\n"
++        "                uint16_t mx = bmax_smem[idx];\n"
++        "                if constexpr (FORCE_LAST) {\n"
++        "                    if (blk_id == ((ext_r - 1) >> 5) && mx < 0xFF80u) mx = 0xFF80u;\n"
++        "                }\n"
++        "                uint16_t mb = (mx >= 0x8000u) ? (uint16_t)(mx ^ 0x8000u) : (uint16_t)(mx ^ 0xFFFFu);\n"
++        "                BlockMax[(int64_t)frow * (width >> 5) + blk_id] = *reinterpret_cast<const bfloat16_t*>(&mb);\n"
++        "            }\n"
++        "        }\n"
++        "        __syncthreads();\n"
++        "    }\n"
++        "}"
++    )
++    assert old_end in fn
++    fn = fn.replace(old_end, new_end, 1)
++    return _SCORE_LOAD_HEADER + "\n" + fn
++
++
++_SCORE_BLOCKMAX_HEADER = _build_score_blockmax_header()
++
++
++@tilelang.jit
++def indexer_score_blockmax_v41(
++    width: int,
++    page_size: int,
++    force_last_block: bool = False,
++    heads: int = INDEX_HEADS,
++    block_P: int = 64,
++    threads: int = 128,
++    max_ctas: int = _BLOCKMAX_MAX_CTAS,
++):
++    """Dense prefill score kernel emitting both ``Scores`` and 32-position ``BlockMax``.
++
++    Bit-identical to ``indexer_score_v41`` on every live position while writing
++    one exact ``_key16``-ordered maximum per 32-position superblock.
++    """
++    assert page_size % block_P == 0, "dense tiles must not straddle a page"
++    assert width % _BLOCKMAX_BLOCK == 0, "width must be a multiple of 32"
++    D = INDEX_DIM
++    fp4 = T.float4_e2m1fn
++    page_words = page_bytes(page_size) // 4
++    scale_word0 = page_size * D // 2 // 4
++    ctas = min(tilelang.cdiv(width, block_P), max_ctas)
++    n_blocks = width // _BLOCKMAX_BLOCK
++    chunk_b = (1 << _BLOCKMAX_CHUNK_SHIFT) * 2
++    force_lit = "true" if force_last_block else "false"
++
++    rows = T.dynamic("rows")
++    table_width = T.dynamic("table_width")
++    pool_pages = T.dynamic("pool_pages")
++    pool_stride = T.dynamic("pool_stride")
++    scale_stride = T.dynamic("scale_stride")
++    row_blocks = T.ceildiv(rows, 4)
++
++    @T.prim_func
++    def indexer_score_blockmax(
++        Q: T.Tensor([rows, heads, D], fp4),
++        QScale: T.Tensor([rows, heads], T.uint32),
++        Weights: T.Tensor([rows, heads], T.bfloat16),
++        KPool: T.StridedTensor([pool_pages, page_words * 8], [pool_stride, 1], fp4),
++        KScale: T.StridedTensor(
++            [pool_pages, page_words], [scale_stride, 1], T.uint32
++        ),
++        PageTable: T.Tensor([rows, table_width], T.int32),
++        Lengths: T.Tensor([rows], T.int32),
++        Active: T.Tensor([1], T.int32),
++        Scores: T.Tensor([rows, width], T.bfloat16),
++        BlockMax: T.Tensor([rows, n_blocks], T.bfloat16),
++    ):
++        with T.Kernel(ctas, row_blocks, threads=threads) as (bx, by):
++            T.annotate_min_blocks_per_sm(3)
++            T.import_source(_SCORE_BLOCKMAX_HEADER)
++            pdl.chain()
++            linear_block = by * ctas + bx
++            cta = linear_block // row_blocks
++            rb = linear_block % row_blocks
++            K_shared = T.alloc_shared([block_P, D], fp4)
++            SFK_shared = T.alloc_shared([block_P, 1], T.uint32)
++            Q_shared = T.alloc_shared([heads, D], fp4)
++            contrib = T.alloc_shared([block_P, heads], T.float32)
++            bmax_smem = T.alloc_shared([4, chunk_b], T.uint16)
++            T.call_extern(
++                "handle",
++                f"__tl_score_rows_dense_blockmax<4, {_BLOCKMAX_CHUNK_SHIFT}, {force_lit}>",
++                T.address_of(Q[0, 0, 0]),
++                T.address_of(QScale[0, 0]),
++                T.address_of(Weights[0, 0]),
++                T.address_of(KPool[0, 0]),
++                T.address_of(KScale[0, 0]),
++                T.address_of(PageTable[0, 0]),
++                T.address_of(Lengths[0]),
++                T.address_of(Active[0]),
++                T.address_of(Scores[0, 0]),
++                T.address_of(BlockMax[0, 0]),
++                T.address_of(K_shared[0, 0]),
++                T.address_of(SFK_shared[0, 0]),
++                T.address_of(Q_shared[0, 0]),
++                T.address_of(contrib[0, 0]),
++                T.address_of(bmax_smem[0, 0]),
++                rb * 4,
++                cta,
++                ctas,
++                rows,
++                width,
++                page_size,
++                table_width,
++                pool_pages,
++                pool_stride,
++                scale_stride,
++                scale_word0,
++            )
++
++    return indexer_score_blockmax
++
++
+ def _mxfp4_word(vals, first, scale):
+     """Eight scaled values ``vals[first : first + 8]`` packed as four E2M1 bytes."""
+     return T.call_extern(
+@@ -2082,6 +2365,166 @@ __device__ __forceinline__ void __tl_load_keys16(
+ """
+ 
+ 
++_GATHER_LOAD_HEADER = r"""
++// Vectorized 16-byte (8 BF16) gather loaders for block-max and candidate-block top-k.
++__device__ __forceinline__ uint32_t __tl_bf16_bits_to_key16(uint32_t bits) {
++    return (bits >= 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
++}
++
++template <int THREADS>
++__device__ __forceinline__ void __tl_load_gather_keys16(
++    const bfloat16_t* __restrict__ row_scores,
++    const int* __restrict__ row_gather,
++    uint16_t* __restrict__ keys,
++    int seg_start,
++    int n_active,
++    int width
++) {
++    int tx = threadIdx.x;
++    const uint16_t* src = reinterpret_cast<const uint16_t*>(row_scores);
++    bool aligned = ((reinterpret_cast<uintptr_t>(src) & 15) == 0) && ((width & 7) == 0);
++    int n_blks = (n_active + 7) >> 3;
++    int g0 = seg_start >> 3;
++    for (int b = tx; b < n_blks; b += THREADS) {
++        int blk = row_gather[g0 + b];
++        int j0 = b << 3;
++        if (blk >= 0) {
++            int pos0 = blk << 3;
++            if (aligned && (pos0 + 8) <= width) {
++                uint4 v = *reinterpret_cast<const uint4*>(src + pos0);
++                uint32_t w[4] = {v.x, v.y, v.z, v.w};
++                #pragma unroll
++                for (int k = 0; k < 8; ++k) {
++                    int idx = j0 + k;
++                    if (idx < n_active) {
++                        uint32_t bits = (w[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu;
++                        keys[idx ^ ((idx >> 5) & 31)] = (uint16_t)__tl_bf16_bits_to_key16(bits);
++                    }
++                }
++            } else {
++                #pragma unroll
++                for (int k = 0; k < 8; ++k) {
++                    int idx = j0 + k;
++                    if (idx < n_active) {
++                        int p = pos0 + k;
++                        if (p >= width) p = width - 1;
++                        keys[idx ^ ((idx >> 5) & 31)] = (uint16_t)__tl_bf16_bits_to_key16(src[p]);
++                    }
++                }
++            }
++        } else {
++            #pragma unroll
++            for (int k = 0; k < 8; ++k) {
++                int idx = j0 + k;
++                if (idx < n_active) keys[idx ^ ((idx >> 5) & 31)] = 0u;
++            }
++        }
++    }
++}
++
++template <int THREADS>
++__device__ __forceinline__ void __tl_load_gather32_group1(
++    const bfloat16_t* __restrict__ row_scores,
++    const int* __restrict__ row_super,
++    uint16_t* __restrict__ keys,
++    int n_super,
++    int extent,
++    int width
++) {
++    int tx = threadIdx.x;
++    const uint16_t* src = reinterpret_cast<const uint16_t*>(row_scores);
++    bool aligned = ((reinterpret_cast<uintptr_t>(src) & 15) == 0) && ((width & 7) == 0);
++    int n_chunks = n_super << 2;
++    for (int c = tx; c < n_chunks; c += THREADS) {
++        int sb = row_super[c >> 2];
++        int base = (sb << 5) + ((c & 3) << 3);
++        int j0 = c << 3;
++        if (sb >= 0 && base < extent) {
++            if (aligned && (base + 8) <= width) {
++                uint4 v = *reinterpret_cast<const uint4*>(src + base);
++                uint32_t w[4] = {v.x, v.y, v.z, v.w};
++                #pragma unroll
++                for (int k = 0; k < 8; ++k) {
++                    int idx = j0 + k;
++                    uint32_t key = 0u;
++                    if (base + k < extent) {
++                        uint32_t bits = (w[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu;
++                        key = __tl_bf16_bits_to_key16(bits);
++                    }
++                    keys[idx ^ ((idx >> 5) & 31)] = (uint16_t)key;
++                }
++            } else {
++                #pragma unroll
++                for (int k = 0; k < 8; ++k) {
++                    int idx = j0 + k;
++                    uint32_t key = 0u;
++                    if (base + k < extent) {
++                        int p = base + k;
++                        if (p >= width) p = width - 1;
++                        key = __tl_bf16_bits_to_key16(src[p]);
++                    }
++                    keys[idx ^ ((idx >> 5) & 31)] = (uint16_t)key;
++                }
++            }
++        } else {
++            #pragma unroll
++            for (int k = 0; k < 8; ++k) {
++                int idx = j0 + k;
++                keys[idx ^ ((idx >> 5) & 31)] = 0u;
++            }
++        }
++    }
++}
++
++template <int THREADS>
++__device__ __forceinline__ void __tl_load_gather32_group8(
++    const bfloat16_t* __restrict__ row_scores,
++    const int* __restrict__ row_super,
++    uint16_t* __restrict__ keys,
++    int n_super,
++    int extent,
++    int width
++) {
++    int tx = threadIdx.x;
++    const uint16_t* src = reinterpret_cast<const uint16_t*>(row_scores);
++    bool aligned = ((reinterpret_cast<uintptr_t>(src) & 15) == 0) && ((width & 7) == 0);
++    int n_active = n_super << 2;
++    int last_blk = (extent - 1) >> 3;
++    for (int j = tx; j < n_active; j += THREADS) {
++        int sb = row_super[j >> 2];
++        int blk = (sb << 2) + (j & 3);
++        int base = blk << 3;
++        uint32_t best = 0u;
++        if (sb >= 0 && base < extent) {
++            if (blk == last_blk) {
++                best = 0xFF80u;
++            } else if (aligned && (base + 8) <= width) {
++                uint4 v = *reinterpret_cast<const uint4*>(src + base);
++                uint32_t w[4] = {v.x, v.y, v.z, v.w};
++                #pragma unroll
++                for (int k = 0; k < 8; ++k) {
++                    uint32_t bits = (w[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu;
++                    uint32_t key = __tl_bf16_bits_to_key16(bits);
++                    if (key > best) best = key;
++                }
++            } else {
++                #pragma unroll
++                for (int k = 0; k < 8; ++k) {
++                    if (base + k < extent) {
++                        int p = base + k;
++                        if (p >= width) p = width - 1;
++                        uint32_t key = __tl_bf16_bits_to_key16(src[p]);
++                        if (key > best) best = key;
++                    }
++                }
++            }
++        }
++        keys[j ^ ((j >> 5) & 31)] = (uint16_t)best;
++    }
++}
++"""
++
++
+ @tilelang.jit(
+     pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
+ )
+@@ -2093,6 +2536,7 @@ def indexer_topk_segment_v41(
+     candidates: bool = False,
+     threads: int = _TOPK_THREADS,
+     gather_scores: bool = False,
++    extent_div: int = 1,
+ ):
+     """Stage 1: the exact top-``topk`` of each segment of a row.
+ 
+@@ -2129,6 +2573,14 @@ def indexer_topk_segment_v41(
+     per = segment // threads
+     # Dense uint16 keys load eight scores a thread at a time (``__tl_load_keys16``).
+     vector_keys = group == 1 and not gather_scores and swizzle
++    vector_gather_keys = (
++        gather_scores
++        and group == 1
++        and swizzle
++        and CANDIDATE_BLOCK == 8
++        and width % CANDIDATE_BLOCK == 0
++        and segment % CANDIDATE_BLOCK == 0
++    )
+     threshold, compact = _select_macros(threads, topk, swizzle)
+     write_final, write_empty_final = _final_writer(threads, topk, group)
+ 
+@@ -2149,6 +2601,17 @@ def indexer_topk_segment_v41(
+                 seg * segment,
+                 n_active,
+             )
++        elif vector_gather_keys:
++            T.call_extern(
++                "handle",
++                f"__tl_load_gather_keys16<{threads}>",
++                T.address_of(Scores[row, 0]),
++                T.address_of(Gather[row, 0]),
++                T.address_of(keys[0]),
++                seg * segment,
++                n_active,
++                width,
++            )
+         else:
+             for i in T.serial(T.ceildiv(n_active, threads)):
+                 j = i * threads + tx
+@@ -2201,6 +2664,8 @@ def indexer_topk_segment_v41(
+         with T.Kernel(segments, rows, threads=threads) as (seg, row):
+             if vector_keys:
+                 T.import_source(_KEY_LOAD_HEADER)
++            elif vector_gather_keys:
++                T.import_source(_GATHER_LOAD_HEADER)
+             pdl.chain()
+             tx = T.get_thread_binding()
+             keys = T.alloc_shared([segment], key_dtype)
+@@ -2210,7 +2675,11 @@ def indexer_topk_segment_v41(
+             sel_idx = T.alloc_shared([topk], T.int32)
+             sel_key = T.alloc_shared([topk], key_dtype)
+             extent = _row_extent(
+-                Lengths, Active, row, entries if gather_scores else width
++                Lengths,
++                Active,
++                row,
++                entries if gather_scores else width,
++                extent_div=extent_div,
+             )
+             if final:
+                 if extent > 0:
+@@ -2367,6 +2836,7 @@ def indexer_topk_merge_v41(
+     fan_in: int = 16,
+     candidates: bool = False,
+     threads: int = _TOPK_THREADS,
++    extent_div: int = 1,
+ ):
+     """Merge winner lists: the exact top-``topk`` of every ``fan_in`` lists.
+ 
+@@ -2407,7 +2877,7 @@ def indexer_topk_merge_v41(
+             params = T.alloc_shared([4], T.int32)
+             sel_idx = T.alloc_shared([topk], T.int32)
+             sel_key = T.alloc_shared([topk], key_dtype)
+-            extent = _row_extent(Lengths, Active, row, width)
++            extent = _row_extent(Lengths, Active, row, width, extent_div=extent_div)
+             live = T.min(
+                 T.ceildiv(T.ceildiv(extent, group), span), lists
+             )  # input lists with entries
+@@ -2589,6 +3059,192 @@ def indexer_topk_merge_v41(
+     return indexer_topk_merge
+ 
+ 
++@tilelang.jit(
++    pass_configs={tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True}
++)
++def indexer_topk_gather32_v41(
++    width: int,
++    topk: int = INDEX_TOPK,
++    group: int = 1,
++    super_size: int = _BLOCKMAX_BLOCK,
++    threads: int = _TOPK_THREADS,
++):
++    """Exact single-pass top-``topk`` gathered from ``topk`` ``super_size``-position blocks.
++
++    For ``group == 1`` (dense layers), selects the exact top-``topk`` token
++    positions across ``SuperBlocks`` (``[rows, topk]`` ascending superblock ids)
++    and writes ``Indices`` and ``Values``. For ``group > 1`` (source layers,
++    ``group = CANDIDATE_BLOCK``), selects the exact top-``topk`` ``group``-sized
++    candidate blocks (with the last visible block always ranking first) and
++    writes ``CandOut``, ``CandVals``, and ``CandCounts``.
++    """
++    assert super_size % group == 0
++    sub_per_super = super_size // group
++    entries = topk * sub_per_super
++    assert entries <= _LONG_SEGMENT_ENTRIES
++    assert entries % threads == 0
++    per = entries // threads
++    key_dtype = T.uint16
++    swizzle = True
++    rows = T.dynamic("rows")
++    threshold, compact = _select_macros(threads, topk, swizzle)
++
++    vector_gather32 = super_size == 32 and group in (1, 8) and width % 8 == 0
++
++    @T.macro
++    def body(Scores, SuperBlocks, Lengths, Active, Indices, Values, Counts):
++        with T.Kernel(1, rows, threads=threads) as (_, row):
++            if vector_gather32:
++                T.import_source(_GATHER_LOAD_HEADER)
++            pdl.chain()
++            tx = T.get_thread_binding()
++            keys = T.alloc_shared([entries], key_dtype)
++            hist = T.alloc_shared([257], T.int32)
++            scan = T.alloc_shared([threads], T.int32)
++            params = T.alloc_shared([4], T.int32)
++            sel_idx = T.alloc_shared([topk], T.int32)
++            sel_key = T.alloc_shared([topk], key_dtype)
++            extent = _row_extent(Lengths, Active, row, width)
++            if extent > 0:
++                n_super = T.min(T.ceildiv(extent, super_size), topk)
++                n_active = n_super * sub_per_super
++                last_blk = (extent - 1) // group
++                if vector_gather32 and group == 1:
++                    T.call_extern(
++                        "handle",
++                        f"__tl_load_gather32_group1<{threads}>",
++                        T.address_of(Scores[row, 0]),
++                        T.address_of(SuperBlocks[row, 0]),
++                        T.address_of(keys[0]),
++                        n_super,
++                        extent,
++                        width,
++                    )
++                elif vector_gather32 and group == 8:
++                    T.call_extern(
++                        "handle",
++                        f"__tl_load_gather32_group8<{threads}>",
++                        T.address_of(Scores[row, 0]),
++                        T.address_of(SuperBlocks[row, 0]),
++                        T.address_of(keys[0]),
++                        n_super,
++                        extent,
++                        width,
++                    )
++                else:
++                    for i in T.serial(T.ceildiv(n_active, threads)):
++                        j = i * threads + tx
++                        if j < n_active:
++                            sb = SuperBlocks[row, j // sub_per_super]
++                            blk = sb * sub_per_super + (j % sub_per_super)
++                            base_pos = blk * group
++                            if sb >= 0 and base_pos < extent:
++                                if group == 1:
++                                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                                        _key16(Scores[row, T.min(base_pos, width - 1)]),
++                                        key_dtype,
++                                    )
++                                elif blk == last_blk:
++                                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                                        0xFF80, key_dtype
++                                    )
++                                else:
++                                    best = T.alloc_var(T.int32)
++                                    best = 0
++                                    for o in T.serial(group):
++                                        if base_pos + o < extent:
++                                            best = T.max(
++                                                best,
++                                                _key16(
++                                                    Scores[
++                                                        row,
++                                                        T.min(base_pos + o, width - 1),
++                                                    ]
++                                                ),
++                                            )
++                                    keys[_swizzle_key_idx(j, swizzle)] = T.cast(
++                                        best, key_dtype
++                                    )
++                            else:
++                                keys[_swizzle_key_idx(j, swizzle)] = T.cast(0, key_dtype)
++                T.sync_threads()
++                threshold(keys, n_active, tx, hist, scan, params)
++                compact(
++                    keys,
++                    per,
++                    tx,
++                    scan,
++                    params,
++                    sel_idx,
++                    sel_key,
++                    n_active,
++                    warp_sums=hist,
++                )
++                total = scan[threads - 1]
++                pos_cnt = T.alloc_var(T.int32)
++                pos_cnt = 0
++                for i in T.serial(T.ceildiv(topk, threads)):
++                    s = i * threads + tx
++                    if s < topk:
++                        if s < total:
++                            j = sel_idx[s]
++                            sb = SuperBlocks[row, j // sub_per_super]
++                            blk = sb * sub_per_super + (j % sub_per_super)
++                            Indices[row, s] = blk
++                            Values[row, s] = _value16(T.cast(sel_key[s], T.int32))
++                            if Counts is not None:
++                                pos_cnt += T.min(group, T.max(extent - blk * group, 0))
++                        else:
++                            Indices[row, s] = -1
++                            Values[row, s] = -T.infinity(T.bfloat16)
++                if Counts is not None:
++                    scan[tx] = pos_cnt
++                    T.sync_threads()
++                    for s_off in (256, 128, 64, 32, 16, 8, 4, 2, 1):
++                        if tx < s_off:
++                            scan[tx] = scan[tx] + scan[tx + s_off]
++                        T.sync_threads()
++                    if tx == 0:
++                        Counts[row] = scan[0]
++            else:
++                for i in T.serial(T.ceildiv(topk, threads)):
++                    s = i * threads + tx
++                    if s < topk:
++                        Indices[row, s] = -1
++                        Values[row, s] = -T.infinity(T.bfloat16)
++                if Counts is not None and tx == 0:
++                    Counts[row] = 0
++
++    if group > 1:
++
++        @T.prim_func
++        def indexer_topk_gather32(
++            Scores: T.Tensor([rows, width], T.bfloat16),
++            SuperBlocks: T.Tensor([rows, topk], T.int32),
++            Lengths: T.Tensor([rows], T.int32),
++            Active: T.Tensor([1], T.int32),
++            Indices: T.Tensor([rows, topk], T.int32),
++            Values: T.Tensor([rows, topk], T.bfloat16),
++            Counts: T.Tensor([rows], T.int32),
++        ):
++            body(Scores, SuperBlocks, Lengths, Active, Indices, Values, Counts)
++
++        return indexer_topk_gather32
++
++    @T.prim_func
++    def indexer_topk_gather32(
++        Scores: T.Tensor([rows, width], T.bfloat16),
++        SuperBlocks: T.Tensor([rows, topk], T.int32),
++        Lengths: T.Tensor([rows], T.int32),
++        Active: T.Tensor([1], T.int32),
++        Indices: T.Tensor([rows, topk], T.int32),
++        Values: T.Tensor([rows, topk], T.bfloat16),
++    ):
++        body(Scores, SuperBlocks, Lengths, Active, Indices, Values, None)
++
++    return indexer_topk_gather32
++
++
+ _MERGE_KEYS = 8192  # keys one merge CTA holds in shared memory (32 KiB)
+ _LONG_MERGE_KEYS = 16384  # uint16 keys one merge CTA holds in shared memory (32 KiB)
+ 
+@@ -2630,11 +3286,18 @@ class IndexerTopK:
+         candidates=False,
+         *,
+         gather_scores=False,
++        extent_div=1,
+     ):
+         self.topk, self.group, self.candidates = topk, group, candidates
+         self.gather_scores = gather_scores
++        self.extent_div = extent_div
+         self.segments, first, levels = self.routes(
+-            width, topk, group, candidates, gather_scores=gather_scores
++            width,
++            topk,
++            group,
++            candidates,
++            gather_scores=gather_scores,
++            extent_div=extent_div,
+         )
+         if self.segments == 1:
+             self.single = _make(first)
+@@ -2651,11 +3314,13 @@ class IndexerTopK:
+         candidates=False,
+         *,
+         gather_scores=False,
++        extent_div=1,
+     ):
+         """``(segments, first, levels)``: the segment count, the first kernel (the
+         final segment kernel of a one-segment row, else stage 1) and the merge
+         levels ``(kernel, input lists, output lists)``, kernels as
+         ``prepare.call``s."""
++        div_kw = {"extent_div": extent_div} if extent_div != 1 else {}
+         if gather_scores:
+             first = prepare.call(
+                 indexer_topk_segment_v41,
+@@ -2666,6 +3331,7 @@ class IndexerTopK:
+                 candidates,
+                 _TOPK_THREADS,
+                 True,
++                **div_kw,
+             )
+             return 1, first, []
+         entries = tilelang.cdiv(width, group)
+@@ -2674,11 +3340,23 @@ class IndexerTopK:
+         levels = []
+         if segments == 1:
+             first = prepare.call(
+-                indexer_topk_segment_v41, width, topk, group, True, candidates
++                indexer_topk_segment_v41,
++                width,
++                topk,
++                group,
++                True,
++                candidates,
++                **div_kw,
+             )
+             return segments, first, levels
+         first = prepare.call(
+-            indexer_topk_segment_v41, width, topk, group, False, candidates
++            indexer_topk_segment_v41,
++            width,
++            topk,
++            group,
++            False,
++            candidates,
++            **div_kw,
+         )
+         fan_in = max(2, _merge_keys(topk) // topk)
+         lists, span = segments, seg_entries
+@@ -2697,6 +3375,7 @@ class IndexerTopK:
+                 span,
+                 fan_in,
+                 candidates,
++                **div_kw,
+             )
+             levels.append((kernel, lists, outputs))
+             if outputs == 1:
+@@ -2713,10 +3392,16 @@ class IndexerTopK:
+         candidates=False,
+         *,
+         gather_scores=False,
++        extent_div=1,
+     ) -> list:
+         """The kernel calls ``IndexerTopK(width, topk, group, candidates)`` makes."""
+         _, first, levels = cls.routes(
+-            width, topk, group, candidates, gather_scores=gather_scores
++            width,
++            topk,
++            group,
++            candidates,
++            gather_scores=gather_scores,
++            extent_div=extent_div,
+         )
+         return [first, *(kernel for kernel, _, _ in levels)]
+ 
+@@ -2801,6 +3486,29 @@ class IndexerV41Plan:
+             and topk < CANDIDATE_BLOCKS
+         )
+ 
++    @classmethod
++    def _use_blockmax(
++        cls, width, page_size, topk, candidates, candidate_blocks
++    ) -> bool:
++        if (
++            candidates
++            or width <= _LONG_SEGMENT_ENTRIES
++            or width % _BLOCKMAX_BLOCK != 0
++            or page_size % 64 != 0
++        ):
++            return False
++        if candidate_blocks:
++            return (
++                CANDIDATE_BLOCKS <= _LONG_TOPK_MAX
++                and CANDIDATE_BLOCKS * (_BLOCKMAX_BLOCK // CANDIDATE_BLOCK)
++                <= _LONG_SEGMENT_ENTRIES
++                and cls._gather_from_blocks(width, topk, candidate_blocks)
++            )
++        return (
++            topk <= _LONG_TOPK_MAX
++            and topk * _BLOCKMAX_BLOCK <= _LONG_SEGMENT_ENTRIES
++        )
++
+     def __init__(
+         self,
+         width,
+@@ -2825,6 +3533,34 @@ class IndexerV41Plan:
+             if candidate_blocks
+             else None
+         )
++        self._blockmax = self._use_blockmax(
++            width, page_size, topk, candidates, candidate_blocks
++        )
++        if self._blockmax:
++            bm_topk = CANDIDATE_BLOCKS if candidate_blocks else topk
++            bm_group = CANDIDATE_BLOCK if candidate_blocks else 1
++            self._bm_topk = bm_topk
++            self._bm_score = _make(
++                prepare.call(
++                    indexer_score_blockmax_v41, width, page_size, candidate_blocks
++                )
++            )
++            self._bm_select = IndexerTopK(
++                width // _BLOCKMAX_BLOCK,
++                bm_topk,
++                1,
++                extent_div=_BLOCKMAX_BLOCK,
++            )
++            self._bm_gather = _make(
++                prepare.call(
++                    indexer_topk_gather32_v41, width, bm_topk, bm_group
++                )
++            )
++        else:
++            self._bm_topk = 0
++            self._bm_score = None
++            self._bm_select = None
++            self._bm_gather = None
+ 
+     @staticmethod
+     def calls(
+@@ -2847,9 +3583,46 @@ class IndexerV41Plan:
+         ]
+         if candidate_blocks:
+             calls.extend(IndexerTopK.calls(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK))
++        if IndexerV41Plan._use_blockmax(
++            width, page_size, topk, candidates, candidate_blocks
++        ):
++            bm_topk = CANDIDATE_BLOCKS if candidate_blocks else topk
++            bm_group = CANDIDATE_BLOCK if candidate_blocks else 1
++            calls.extend(
++                [
++                    prepare.call(
++                        indexer_score_blockmax_v41,
++                        width,
++                        page_size,
++                        candidate_blocks,
++                    ),
++                    *IndexerTopK.calls(
++                        width // _BLOCKMAX_BLOCK,
++                        bm_topk,
++                        1,
++                        extent_div=_BLOCKMAX_BLOCK,
++                    ),
++                    prepare.call(
++                        indexer_topk_gather32_v41, width, bm_topk, bm_group
++                    ),
++                ]
++            )
+         return calls
+ 
+     def scratch_specs(self, rows):
++        if self._blockmax and rows >= _BLOCKMAX_MIN_ROWS:
++            specs = [
++                ((rows, self.width), torch.bfloat16),  # scores
++                ((rows, self.topk), torch.bfloat16),  # selected values
++                ((rows, self.width // _BLOCKMAX_BLOCK), torch.bfloat16),  # block_max
++                ((rows, self._bm_topk), torch.int32),  # superblock ids
++                ((rows, self._bm_topk), torch.bfloat16),  # superblock values
++                *self._bm_select.scratch_specs(rows),
++            ]
++            if self.select_blocks is not None:
++                specs.append(((rows, CANDIDATE_BLOCKS), torch.bfloat16))
++                specs.extend(self.select.scratch_specs(rows))
++            return tuple(specs)
+         specs = [
+             ((rows, self.width), torch.bfloat16),  # scores
+             ((rows, self.topk), torch.bfloat16),  # selected values
+@@ -2888,8 +3661,6 @@ class IndexerV41Plan:
+         rows = q_packed.shape[0]
+         buffers = _take(scratch, self.scratch_specs(rows))
+         scores, values = buffers[:2]
+-        select_scratch = len(self.select.scratch_specs(rows))
+-        select_buffers = buffers[2 : 2 + select_scratch]
+         if out is None:
+             out = torch.empty(
+                 (rows, self.topk), dtype=torch.int32, device=q_packed.device
+@@ -2906,6 +3677,44 @@ class IndexerV41Plan:
+             lengths,
+             active,
+         )
++        if self._blockmax and rows >= _BLOCKMAX_MIN_ROWS:
++            block_max, super_blocks, super_values = buffers[2:5]
++            bm_sel_n = len(self._bm_select.scratch_specs(rows))
++            bm_sel_buffers = buffers[5 : 5 + bm_sel_n]
++            self._bm_score(*args, scores, block_max)
++            self._bm_select.run(
++                block_max,
++                lengths,
++                active,
++                super_blocks,
++                super_values,
++                scratch=bm_sel_buffers,
++            )
++            if self.select_blocks is not None:
++                block_values, *select_buffers = buffers[5 + bm_sel_n :]
++                self._bm_gather(
++                    scores,
++                    super_blocks,
++                    lengths,
++                    active,
++                    candidate_out,
++                    block_values,
++                    candidate_out_lengths,
++                )
++                self.select.run(
++                    scores,
++                    candidate_out_lengths,
++                    None,
++                    out,
++                    values,
++                    gather=candidate_out,
++                    scratch=select_buffers,
++                )
++                return out, scores
++            self._bm_gather(scores, super_blocks, lengths, active, out, values)
++            return out, scores
++        select_scratch = len(self.select.scratch_specs(rows))
++        select_buffers = buffers[2 : 2 + select_scratch]
+         if self.candidates:
+             self.score(*args, candidates, candidate_lengths, scores)
+             self.select.run(
