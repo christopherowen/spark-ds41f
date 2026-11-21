@@ -13,4 +13,14 @@
 
 ## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-*(Pending 2-boot screening inside coordinated lab window.)*
+All runs cooled `< 49 C` on `spark-ds41f:candidate-63-r5` inside lab window `dgx1-1795263633` (`results/private/lab/2026-11-21-campaign/`). Both arms passed `model` `128/128` greedy bit-exact (`outputs_sha256 = b795e6d4c813815a475ab1516faf277a90a86b73614c38f4700189484a8c532d`, `rank1_fraction = 1.0`, `perplexity = 1.3160824`, `failed = 0`).
+
+| Arm | `grid` `mad5` GM vs `ctrl` | `grid` `fl25` GM vs `ctrl` | `1x3 @4K` (ms) | `8x24 @4K` (ms) | `8x48 @4K` (ms) | `c1` (tok/s) | `c8` (tok/s) | `262K` prefill |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ctrl` (2-boot mean) | `0.000%` | `0.000%` | `16.907` | `22.622` | `27.567` | `69.69` | `169.53` | `7,437` |
+| `noband-b1` (`WO_BANDS=""`) | `-0.045%` | `-0.017%` | `16.892` | `22.715` | `27.406` | `69.58 ±3.76%` | `169.39 ±1.14%` | `7,462` |
+| `next15-b1` (`NEXT_MB=15`) | `-0.012%` | `-0.035%` | `16.845` | `22.686` | `27.705` | `69.66 ±3.81%` | `169.45 ±0.86%` | `7,427` |
+
+### Conclusion
+
+Both `WO_BANDS=""` (`-0.045%` `mad5` / `-0.017%` `fl25`) and `NEXT_MB=15` (`-0.012%` `mad5` / `-0.035%` `fl25`) are **statistically neutral within `±0.09%` boot noise** on `tp3-triangle`. Neither merits Boot 2 or a config change; keep existing TP3 prefetch defaults.

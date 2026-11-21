@@ -70,4 +70,16 @@ Combined at `910K` (`3 × Dense-r2 + 1 × Source-r1`): **`-4.73 ms` per 256-row 
 
 ## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-*(Pending 2-boot screening inside coordinated lab window.)*
+All runs cooled `< 49 C` on `spark-ds41f:candidate-63-r5` inside lab window `dgx1-1795263633` (`results/private/lab/2026-11-21-campaign/`). Both boots passed `model` `128/128` greedy bit-exact (`outputs_sha256 = b795e6d4c813815a475ab1516faf277a90a86b73614c38f4700189484a8c532d`, `rank1_fraction = 1.0`, `perplexity = 1.3160824`, `failed = 0`).
+
+| Arm | `grid` `mad5` GM vs `ctrl` | `c8` (tok/s) | `32K` (tok/s) | `131K` (tok/s) | `262K` (tok/s) | `500K` (tok/s) | `1M` (tok/s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ctrl-b1` | `+0.085%` | `169.52 ±1.03%` | `7,280` | `7,480` | `7,455` | `7,291` | `6,932` |
+| `ctrl-b2` | `-0.085%` | `169.54 ±0.81%` | `7,238` | `7,459` | `7,419` | `7,262` | `6,903` |
+| **`blockmax-b1`** | `+0.241%` | `169.08 ±0.85%` | `7,265` | **`7,499`** | **`7,460`** | **`7,345`** | **`7,038`** |
+| **`blockmax-b2`** | `-0.017%` | `169.57 ±0.76%` | `7,321` | **`7,572`** | **`7,545`** | **`7,410`** | **`7,089`** |
+| **2-boot delta (`blockmax` vs `ctrl`)** | `+0.112%` (neutral) | `-0.12%` (neutral) | `+0.47%` | **`+0.88%`** | **`+0.89%`** | **`+1.39%`** | **`+2.11%` (`+146 tok/s`)** |
+
+### Conclusion
+
+**2-boot verified win**: breaks `7,000 tok/s` at `1M` cold prefill on `tp3-triangle` (`6,918 -> 7,064 tok/s`, `+2.11%`) while keeping decode neutral and outputs `100%` bit-exact. Ready for `candidate-64`.

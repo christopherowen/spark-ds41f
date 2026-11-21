@@ -61,4 +61,15 @@ Because `fp8w_bf16_gemm_partials` and `fp8w_bf16_gemm_cast` both sum `K = 4096` 
 
 ## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-*(Pending 2-boot screening inside coordinated lab window.)*
+All runs cooled `< 49 C` on `spark-ds41f:candidate-63-r5` inside lab window `dgx1-1795263633` (`results/private/lab/2026-11-21-campaign/`). Both boots passed `model` `128/128` greedy bit-exact (`outputs_sha256 = b795e6d4c813815a475ab1516faf277a90a86b73614c38f4700189484a8c532d`, `rank1_fraction = 1.0`, `perplexity = 1.3160824`, `failed = 0`).
+
+| Arm | `grid` `mad5` GM vs `ctrl` | `grid` `fl25` GM vs `ctrl` | `1x3 @4K` (ms) | `8x24 @4K` (ms) | `8x48 @4K` (ms) | `c1` (tok/s) | `c8` (tok/s) | `262K` prefill |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ctrl-b1` | `+0.085%` | `+0.088%` | `16.890` | `22.619` | `27.557` | `69.65 ±3.82%` | `169.52 ±1.03%` | `7,455` |
+| `ctrl-b2` | `-0.085%` | `-0.088%` | `16.923` | `22.625` | `27.576` | `69.73 ±3.79%` | `169.54 ±0.81%` | `7,419` |
+| **`wo-a-wide-b1`** | **`-0.134%`** | `-0.043%` | `16.963` | **`22.539`** | **`27.116`** | `69.61 ±3.74%` | `169.28 ±0.99%` | `7,470` |
+| **`wo-a-wide-b2`** | **`-0.156%`** | **`-0.087%`** | `16.915` | **`22.517`** | **`27.198`** | `69.56 ±3.80%` | `169.15 ±0.93%` | `7,448` |
+
+### Conclusion
+
+**2-boot verified wide-decode win**: `8x48 @4K` improves **`-0.410 ms/step` (`-1.49%`, `27.567 -> 27.157 ms`)** and `8x24 @4K` improves `-0.094 ms/step`, with zero `1x3` regression and `100%` bit-exactness (`c1`/`c8` remain within noise because `c8` averages `~17` verified rows/step). Ready for `candidate-64`.
