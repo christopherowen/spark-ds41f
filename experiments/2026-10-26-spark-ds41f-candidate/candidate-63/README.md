@@ -4,9 +4,9 @@ Base commit: `a45b79195` (`spark-ds41f-1120` / `candidate-62`).
 Final candidate commit: `a57cb9f55` (image `spark-ds41f:candidate-63-r5`, universal auto-sized pool across `tp1..tp8` + `4k`).
 vLLM base revision: `19f2c20ed4d64ae22bd009ceacadd85e2a81e354`.
 vLLM patch series: [`vllm/series`](vllm/series) (`705` active patches, `0001..0832`).
-vLLM patch head: `8e6b7cd2ce3ba430f1fd2660126c9b57a1e05bb1`.
+vLLM patch head: `0867138e79f279a33327b53aaf44585fab22509e`.
 vLLM expected tree: `5f16a050bb283d3d964ab831de4cdf6fca74dea7`.
-Patchset SHA-256: `0b640524aec60f2b61a9d0648095dc95adf88b176b2f36e04c6bce12dd21af0a`.
+Patchset SHA-256: `c07bd676664eac191a5ff7d3b618222662634bccaa1a5d906110c02ce9e4ee7d`.
 
 TileLang, TileKernels, SparkNet, NCCL, CUDA toolkit, and model weights are unchanged from `candidate-62` (`jit_new_files = 0`).
 
@@ -25,7 +25,7 @@ Six targeted fixes eliminate the physical-memory, allocator, thermal, and measur
 
 ## Verification (`candidate-63-r5`)
 
-- **Patch series & build:** Applied all `705` active vLLM patches cleanly (`patch_head = 8e6b7cd2ce3ba430f1fd2660126c9b57a1e05bb1`, `expected_tree = 5f16a050bb283d3d964ab831de4cdf6fca74dea7`). `bin/spark build prepare`, `bin/spark build check`, `bin/spark doctor`, and `git diff --check` all passed.
+- **Patch series & build:** Applied all `705` active vLLM patches cleanly (`patch_head = 0867138e79f279a33327b53aaf44585fab22509e`, `expected_tree = 5f16a050bb283d3d964ab831de4cdf6fca74dea7`). `bin/spark build prepare`, `bin/spark build check`, `bin/spark doctor`, and `git diff --check` all passed.
 - **Unit tests:** `114 passed` GPU/loader pytest (`test_contiguous_cuda_pool.py`, `test_direct_loader.py`, `test_direct_loader_cuda.py`, `test_engine_grid_sync.py`; covers `tp1..tp8`, `4K`, discrete GPU `is_integrated=False`, `tp3` zero-resize fast path, pool-range tensor evacuation/restore); `906 passed` Linux deployment unit tests (`28.0 s`).
 - **Live `tp1` (`VLLM_DS41_EXPERT_SLOTS=96`, `8.0 GiB` KV) validation on standalone `dgx4`:** auto-resized `93.5 -> 20.5 GiB` for `10.1 GiB` target + `7.57 GiB` draft weights (`+0.56 GiB` evacuated, freeing `73.0 GiB` for the `80.5 GiB` expert-slot cache, soaking `41.10/41.11 GiB` Unmovable sub-O13, `front_clean=True`), `torch_reserved = 30.01 GiB`, `free_memory = 17.16 GiB`, inference OK.
 - **Live `tp3-triangle` 3-boot validation (Phase 6, `dgx1..dgx3` after reboot):**
