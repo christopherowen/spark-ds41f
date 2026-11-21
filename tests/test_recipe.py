@@ -837,6 +837,32 @@ class GLPTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "glp lacks sha256"):
             self.resolved(lambda candidate: candidate["glp"].pop("sha256"))
 
+    def test_an_alpha_in_the_block_renders_the_override(self):
+        cluster = self.resolved(lambda candidate: candidate["glp"].update(alpha=2.0))
+        self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_ALPHA"], "2.0")
+
+    def test_no_alpha_renders_no_override(self):
+        cluster = self.resolved()
+        self.assertNotIn("WEIGHTLESS_STEER_ALPHA", cluster["environment"])
+
+    def test_an_alpha_that_is_not_a_positive_number_is_refused(self):
+        for bad in ("2.0", 0, -1, True):
+            with self.assertRaisesRegex(SystemExit, "glp alpha"):
+                self.resolved(lambda candidate, bad=bad: candidate["glp"].update(alpha=bad))
+
+    def test_an_alpha_written_by_hand_beside_the_block_is_refused(self):
+        def by_hand(candidate):
+            candidate["environment"]["WEIGHTLESS_STEER_ALPHA"] = "2.0"
+        with self.assertRaisesRegex(SystemExit, "does not set them itself"):
+            self.resolved(by_hand)
+
+    def test_an_arm_sets_and_unsets_the_alpha_with_the_block(self):
+        base = self.resolved()
+        dosed = recipe.overlay({"extends": {}, "set": {"glp": {"alpha": 1.5}}}, base)
+        self.assertEqual(dosed["environment"]["WEIGHTLESS_STEER_ALPHA"], "1.5")
+        off = recipe.overlay({"extends": {}, "unset": ["glp"]}, dosed)
+        self.assertNotIn("WEIGHTLESS_STEER_ALPHA", off["environment"])
+
     def test_an_arm_renames_unsets_or_keeps_the_steering(self):
         base = self.resolved()
         renamed = recipe.overlay({"extends": {}, "set": {"glp": {"served_model_name": "other"}}}, base)
@@ -898,6 +924,27 @@ class GLPTest(unittest.TestCase):
                 [recipe.glp_file(cluster), "/glp/vector.gguf", "ro"],
                 cluster["container"]["mounts"],
             )
+
+    def test_the_glp27_alpha_2_arm_resolves(self):
+        spark = load_spark()
+        cluster = spark.read_cluster(
+            "experiments/2026-11-20-glp27-dose-recalibration/glp27-tp4-a2.0.json")
+        self.assertEqual(
+            cluster["glp"]["file"],
+            "glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf",
+        )
+        self.assertEqual(
+            cluster["glp"]["sha256"],
+            "24e97d41a9a4f77adad78ff4cb888cb4e339eb62151dbf37a7fcd3ea30eb442e",
+        )
+        self.assertEqual(cluster["glp"]["alpha"], 2.0)
+        self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_PATH"], "/glp/vector.gguf")
+        self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_MODEL"], self.STEERED)
+        self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_ALPHA"], "2.0")
+        self.assertIn(
+            [recipe.glp_file(cluster), "/glp/vector.gguf", "ro"],
+            cluster["container"]["mounts"],
+        )
 
 
 if __name__ == "__main__":
