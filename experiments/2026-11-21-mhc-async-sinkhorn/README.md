@@ -49,4 +49,17 @@ CUPTI durations at `M = 6` (16 cold weight copies):
 
 ## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-*(Pending execution inside coordinated lab window.)*
+All runs cooled `< 49 C` on `spark-ds41f:candidate-63-r5` inside lab window `dgx1-1795263633` (`results/private/lab/2026-11-21-campaign/`). Every arm passed `model` `128/128` greedy bit-exact (`outputs_sha256 = b795e6d4c813815a475ab1516faf277a90a86b73614c38f4700189484a8c532d`, `rank1_fraction = 1.0`, `perplexity = 1.3160824`, `failed = 0`). Live CUPTI confirmed `0` `mhc_finalize_kernel` calls.
+
+| Arm | `grid` `mad5` GM vs `ctrl` | `grid` `fl25` GM vs `ctrl` | `1x3 @4K` (ms) | `8x24 @4K` (ms) | `8x48 @4K` (ms) | `c1` (tok/s) | `c1` `tpot_p50` (ms) | `c8` (tok/s) | `c8` `tpot_p50` (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ctrl-b1` | `+0.085%` | `+0.088%` | `16.890` | `22.619` | `27.557` | `69.65 ±3.82%` | `14.46` | `169.52 ±1.03%` | `47.21` |
+| `ctrl-b2` | `-0.085%` | `-0.088%` | `16.923` | `22.625` | `27.576` | `69.73 ±3.79%` | `14.42` | `169.54 ±0.81%` | `46.70` |
+| **`mhc-b1`** | **`-1.007%`** | **`-0.803%`** | **`16.773`** | **`22.473`** | `27.622` | **`70.07 ±3.67%`** | **`14.06`** | **`169.93 ±0.90%`** | **`46.77`** |
+| **`mhc-b2`** | **`-0.994%`** | **`-0.867%`** | **`16.786`** | **`22.454`** | **`27.472`** | **`69.92 ±3.71%`** | **`14.14`** | `169.48 ±0.93%` | **`46.65`** |
+| `pynccl-b1` (`Decode #17`) | `-0.043%` | `-0.044%` | `16.928` | `22.559` | `27.795` | `69.79 ±3.85%` | `14.44` | `169.62 ±0.95%` | `46.97` |
+
+### Conclusion
+
+- **`mhc` `async_sinkhorn` (`PR #1264`)**: **2-boot verified win (`-1.00%` `mad5` / `-0.835%` `fl25` grid GM, `14/15` cells faster, `c1 tpot_p50` `14.44 -> 14.10 ms` [`-2.35%`], `c1` `69.69 -> 70.00 tok/s`, 100% bit-exact).** Ready for `candidate-64`.
+- **`VLLM_SHARE_PYNCCL_COMMS=1` (`Decode #17`)**: Neutral on Boot 1 (`-0.043%` grid, `c1`/`c8` within noise); dropped after Boot 1.
