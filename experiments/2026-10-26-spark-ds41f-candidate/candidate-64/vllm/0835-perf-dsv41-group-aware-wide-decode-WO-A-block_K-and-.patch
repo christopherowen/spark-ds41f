@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:52:01 +0100
+Subject: [PATCH] perf(dsv41): group-aware wide-decode WO-A block_K and
+ in-kernel shards
+
+
+Adopt group-aware wide-decode WO-A block_K=256/128 schedules and in-kernel
+shards for M=96..128 while preserving narrow 1x3..8x16 decode schedules.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Speed up wide decode steps (-0.410 ms / -1.49% on 8x48 @4K across
+           2 live tp3 boots) with zero regression on 1x3..8x16.
+Quality: Bit-exact (uint16 identity, 128/128 greedy match, KL=0).
+Tests: pytest tests/kernels/test_deepseek_v41_tilelang.py + PDL gate
+       + 2-boot live tp3-triangle screen (PR #1267).
+Upstream-status: Local DeepSeek-V4.1 TileLang WO-A schedule tuning.
+---
+ vllm/models/deepseek_v4_1/tilelang/wo.py | 40 ++++++++++++++++++++++--
+ 1 file changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index a228b6968..539460832 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -85,6 +85,36 @@ _WO_A_TILES = {
+ _WO_A_COMMON = dict(block_N=64, num_stages=2)
+ 
+ 
++def _wo_a_tile(bucket: int | None, groups: int, k: int) -> dict:
++    """Resolve the bit-exact WO-A tile for ``(bucket, groups, k)``.
++
++    Every path sums ``k`` in ``_WO_A_SHARDS`` shards in shard order, so all
++    buckets and group counts remain bit-identical across ``block_K`` and
++    split vs. in-kernel shard accumulation:
++    - ``groups == 1`` (TP8 / narrow ranks): 16 N-tiles need split-K occupancy;
++      only bucket 32 widens ``block_K`` to 128 (bucket 16 keeps 256).
++    - ``groups == 2`` (TP4): 32 N-tiles keep split-K across decode buckets,
++      widening ``block_K`` to 256 at bucket 32 and 128 at buckets 64/96/128.
++    - ``groups >= 3`` (TP3/TP2/TP1): ``>= 48`` N-tiles saturate all SMs at
++      buckets 96/128 without split-K partials, so buckets 96/128 run in-kernel
++      shard accumulation with ``block_K=128``; bucket 32 uses split-K
++      ``block_K=256`` and bucket 64 uses split-K ``block_K=128``.
++    - Prefill (``bucket is None``, ``rows > 128``) keeps 96x64x64 for 2 CTAs/SM.
++    """
++    tile = dict(_WO_A_TILES[bucket])
++    if bucket == 32:
++        if groups >= 2 and k % (256 * _WO_A_SHARDS) == 0:
++            tile["block_K"] = 256
++        elif k % (128 * _WO_A_SHARDS) == 0:
++            tile["block_K"] = 128
++    elif bucket in (64, 96, 128) and groups >= 2:
++        if k % (128 * _WO_A_SHARDS) == 0:
++            tile["block_K"] = 128
++        if bucket in (96, 128) and groups >= 3:
++            tile["split"] = False
++    return tile
++
++
+ class _Weight:
+     """A block-32 FP8 weight and its scales; weak-referenceable for the custom op."""
+ 
+@@ -144,6 +174,10 @@ class _GroupedBF16:
+         self.tilelang_weight_sf = layer.weight_scale_inv.detach().view(torch.uint8)
+         self.columns = self.weight.shape[0]
+         self.groups = groups
++        k = self.weight.shape[1]
++        self._tiles = {
++            bucket: _wo_a_tile(bucket, groups, k) for bucket in _WO_A_TILES
++        }
+ 
+     def _kernels(self) -> dict:
+         """Every kernel of WO-A, as calls: one per row bucket, and the split path's
+@@ -151,7 +185,7 @@ class _GroupedBF16:
+         n, k = self.weight.shape
+         groups = self.groups
+         kernels = {}
+-        for bucket, tile in _WO_A_TILES.items():
++        for bucket, tile in self._tiles.items():
+             cfg = {**_WO_A_COMMON, **{m: v for m, v in tile.items() if m != "split"}}
+             kernels[bucket] = (
+                 prepare.call(
+@@ -198,7 +232,7 @@ class _GroupedBF16:
+ 
+     def partial_specs(self, rows: int):
+         """The split path's FP32 partials (nothing for the in-kernel path)."""
+-        if self.columns == 0 or not _WO_A_TILES[self.bucket(rows)]["split"]:
++        if self.columns == 0 or not self._tiles[self.bucket(rows)]["split"]:
+             return ()
+         return (((_WO_A_SHARDS, rows, self.columns), torch.float32),)
+ 
+@@ -206,7 +240,7 @@ class _GroupedBF16:
+         """WO-A of ``x``, cast as the reference's ``act_quant`` into ``xq`` (E4M3) and
+         ``sf`` (UE8M0 bytes); ``partials`` from ``partial_specs`` on the split path."""
+         bucket = self.bucket(x.shape[0])
+-        if not _WO_A_TILES[bucket]["split"]:
++        if not self._tiles[bucket]["split"]:
+             self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, xq, sf)
+             return
+         self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, partials)

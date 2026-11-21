@@ -1,0 +1,553 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:52:01 +0100
+Subject: [PATCH] fix(profiler): isolate writable KV blocks in real-row
+ engine grid
+
+
+Isolate writable KV blocks per request during real-row profiling so
+concurrent synthetic profiling rows cannot corrupt shared KV cache pages.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Eliminate cross-request KV aliasing in real-row profiling.
+Quality: Exact order-independent torch.equal parity.
+Tests: 6/6 GPU isolation tests in PR #1270.
+Upstream-status: Local V1 profiler correctness fix.
+---
+ vllm/v1/worker/gpu/model_runner.py | 440 ++++++++++++++++++++++++-----
+ 1 file changed, 371 insertions(+), 69 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 9ea2494a2..02a2810b7 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -76,6 +76,7 @@ from vllm.multimodal.encoder_budget import (
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
++from vllm.utils.math_utils import cdiv
+ from vllm.utils.mem_utils import (
+     DeviceMemoryProfiler,
+     format_gib,
+@@ -1068,6 +1069,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         replays = int(spec.get("replays", 30))
+         warmup = int(spec.get("warmup", 2))
+         settle = int(spec.get("settle", 1))
++        fill_real_context = bool(spec.get("fill_real_context", True))
++        real_depths = sorted(
++            {
++                int(shape.get("context_len", 0))
++                for shape in shapes
++                if shape.get("real_rows")
++            }
++        )
++        if not fill_real_context and real_depths:
++            saved_depths = getattr(self, "_real_context_depths", set())
++            missing = [d for d in real_depths if d not in saved_depths]
++            if missing:
++                raise ValueError(
++                    "fill_real_context=False requires prior real-context "
++                    f"initialization for depths {missing}"
++                )
+         if (
+             getattr(self, "kv_block_zeroer", None) is not None
+             and getattr(self, "kv_cache_config", None) is not None
+@@ -1075,30 +1092,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         ):
+             # Zero null block and circular SWA dummy-block slices once so
+             # prior target traffic cannot leave NaN in dummy drafter blocks.
++            # Preserve saved per-depth ring snapshots when fill_real_context=False.
+             bt = self.block_tables
+             num_groups = len(bt.input_block_tables)
+             usable = self.kv_cache_config.num_blocks - 1
++            preserved: set[int] = set()
++            if not fill_real_context:
++                for group_snaps in getattr(
++                    self, "_real_context_ring_snapshots", {}
++                ).values():
++                    preserved.update(group_snaps.values())
+             ring_blocks: set[int] = {0}
+             if num_groups > 0 and usable >= 1:
+                 share = max(usable // num_groups, 1)
+                 for group, is_ring in enumerate(bt._slot_mapping_circular):
+                     if is_ring:
+                         for off in range(share):
+-                            ring_blocks.add((group * share + off) % usable + 1)
++                            bid = (group * share + off) % usable + 1
++                            if bid not in preserved:
++                                ring_blocks.add(bid)
+             self.kv_block_zeroer._fill_block_ids(sorted(ring_blocks), 0)
+-        if spec.get("fill_real_context", True):
+-            self._fill_real_context(
+-                max(
+-                    (
+-                        int(shape.get("context_len", 0))
+-                        for shape in shapes
+-                        if shape.get("real_rows")
+-                    ),
+-                    default=0,
+-                )
++        if fill_real_context:
++            if real_depths:
++                self._fill_real_context(max(real_depths), depths=real_depths)
++            else:
++                self._fill_real_context(0)
++
++        def prepare_ring(shape: dict) -> bool:
++            if not shape.get("real_rows"):
++                return False
++            prep = getattr(self, "_prepare_real_row_ring_blocks", None)
++            if prep is None:
++                return False
++            n_reqs = (
++                1
++                if shape.get("prefill")
++                else int(shape.get("num_reqs") or 1)
+             )
++            ctx = int(shape.get("context_len", 0))
++            prep([ctx] * n_reqs)
++            return True
+ 
+-        def run(shape: dict) -> None:
++        def run(shape: dict, *, ring_prepared: bool = False) -> None:
+             kwargs: dict[str, Any] = {
+                 "num_tokens": int(shape["num_tokens"]),
+                 "context_len": int(shape.get("context_len", 0)),
+@@ -1109,7 +1144,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 kwargs["profile_num_reqs"] = int(shape["num_reqs"])
+             if shape.get("real_rows"):
+                 kwargs["real_rows"] = True
+-            self._dummy_run(**kwargs)
++            if ring_prepared:
++                self._real_ring_prepared = True
++            try:
++                self._dummy_run(**kwargs)
++            finally:
++                if ring_prepared:
++                    self._real_ring_prepared = False
+ 
+         for shape in shapes:
+             for _ in range(warmup):
+@@ -1135,10 +1176,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     for index in indices if replay % 2 == 0 else reversed(indices):
+                         for _ in range(settle):
+                             run(shapes[index])
++                        ring_ready = prepare_ring(shapes[index])
+                         start = torch.cuda.Event(enable_timing=True)
+                         end = torch.cuda.Event(enable_timing=True)
+                         start.record()
+-                        run(shapes[index])
++                        run(shapes[index], ring_prepared=ring_ready)
+                         end.record()
+                         events.append((start, end))
+                         order.append(index)
+@@ -1183,85 +1225,335 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+     # blocks before the context's end are whole.
+     _REAL_CONTEXT_ALIGN = 4096
+ 
+-    def _fill_real_context(self, context_len: int) -> None:
+-        """Write ``context_len`` tokens of context for the engine grid's
+-        ``real_rows`` shapes: real-row prefill chunks of one dummy request, from
+-        position 0. A dummy request's blocks do not depend on its length
+-        (``assign_dummy_blocks``), so every shorter context is a prefix of this
+-        one, and ``_real_dummy_rows`` points the other requests of a step at it.
+-        Without it a real row would read whatever bytes its blocks hold, in another
+-        group's format after real traffic, and a non-finite value reaches the
+-        router's assert."""
+-        if context_len % self._REAL_CONTEXT_ALIGN:
++    def _real_context_pool_layout(self) -> tuple[int, int]:
++        bt = self.block_tables
++        num_groups = len(bt.input_block_tables)
++        usable = self.kv_cache_config.num_blocks - 1
++        if usable < 1 or num_groups < 1:
++            raise ValueError(
++                "real_rows requires at least one KV cache group and non-null block"
++            )
++        share = max(usable // num_groups, 1)
++        return usable, share
++
++    @staticmethod
++    def _real_context_pool_block(
++        group: int, off: int, usable: int, share: int
++    ) -> int:
++        if off < 0 or off >= share:
++            raise ValueError(
++                f"real_rows KV block offset {off} exceeds group {group} share {share}"
++            )
++        return (group * share + off) % usable + 1
++
++    def _snapshot_real_context_ring(self, depth: int) -> None:
++        bt = getattr(self, "block_tables", None)
++        if bt is None or getattr(self, "kv_cache_config", None) is None:
++            return
++        usable, share = self._real_context_pool_layout()
++        snapshots: dict[int, dict[int, int]] = getattr(
++            self, "_real_context_ring_snapshots", {}
++        )
++        offsets: dict[int, int] = getattr(self, "_real_context_ring_offsets", {})
++        if depth in offsets:
++            snap_off = offsets[depth]
++        else:
++            snap_off = 1 + len(offsets)
++            offsets[depth] = snap_off
++        group_map: dict[int, int] = {}
++        copies: list[tuple[int, int]] = []
++        for group, is_ring in enumerate(bt._slot_mapping_circular):
++            if not is_ring:
++                continue
++            src = self._real_context_pool_block(group, 0, usable, share)
++            dst = self._real_context_pool_block(group, snap_off, usable, share)
++            group_map[group] = dst
++            copies.append((src, dst))
++        if copies and getattr(self, "kv_caches", None):
++            copy_kv_cache_blocks_inplace(
++                self.kv_caches, self.kv_cache_config.num_blocks, copies
++            )
++        snapshots[depth] = group_map
++        self._real_context_ring_snapshots = snapshots
++        self._real_context_ring_offsets = offsets
++
++    def _prepare_real_row_ring_blocks(
++        self, depths: list[int] | tuple[int, ...]
++    ) -> None:
++        bt = getattr(self, "block_tables", None)
++        if bt is None or getattr(self, "kv_cache_config", None) is None:
++            return
++        snapshots: dict[int, dict[int, int]] = getattr(
++            self, "_real_context_ring_snapshots", {}
++        )
++        if not snapshots:
++            return
++        usable, share = self._real_context_pool_layout()
++        num_snapshots = len(snapshots)
++        copies: list[tuple[int, int]] = []
++        for group, is_ring in enumerate(bt._slot_mapping_circular):
++            if not is_ring:
++                continue
++            for req, depth in enumerate(depths):
++                snap = snapshots.get(int(depth), {}).get(group)
++                if snap is None:
++                    continue
++                dst = self._real_context_pool_block(
++                    group, 1 + num_snapshots + req, usable, share
++                )
++                copies.append((snap, dst))
++        if copies and getattr(self, "kv_caches", None):
++            copy_kv_cache_blocks_inplace(
++                self.kv_caches, self.kv_cache_config.num_blocks, copies
++            )
++
++    def _fill_real_context(
++        self,
++        context_len: int,
++        *,
++        depths: list[int] | tuple[int, ...] | None = None,
++    ) -> None:
++        """Write real-row prefix context up to ``context_len`` and snapshot ring
++        KV state at every requested depth in ``depths``.
++
++        Non-ring (paged) groups store immutable history in group offsets
++        ``0 .. history_kv_blocks - 1``. Circular ring groups fill into offset
++        ``0`` and snapshot each requested depth into its own read-only block
++        (offsets ``1 .. len(depths)``) so every subsequent decode/grid step
++        copies from the depth's immutable snapshot into per-request writable
++        ring blocks (offsets ``1 + len(depths) + req``)."""
++        target_depths = sorted(
++            {
++                int(d)
++                for d in (
++                    depths
++                    if depths is not None
++                    else ([context_len] if context_len > 0 else [])
++                )
++            }
++        )
++        if context_len < 0 or context_len % self._REAL_CONTEXT_ALIGN:
+             raise ValueError(
+                 f"real_rows needs a context of whole {self._REAL_CONTEXT_ALIGN}-token "
+                 f"blocks, not {context_len}"
+             )
+-        for offset in range(0, context_len, self._REAL_CONTEXT_CHUNK):
+-            self._dummy_run(
+-                num_tokens=min(self._REAL_CONTEXT_CHUNK, context_len - offset),
+-                context_len=offset,
+-                single_request_prefill=True,
+-                real_rows=True,
+-            )
++        for d in target_depths:
++            if d < 0 or d % self._REAL_CONTEXT_ALIGN:
++                raise ValueError(
++                    f"real_rows needs a context of whole {self._REAL_CONTEXT_ALIGN}-token "
++                    f"blocks, not {d}"
++                )
++        max_len = max([context_len, *target_depths], default=0)
++        self._real_context_max_len = max_len
++        self._real_context_depths = set(target_depths)
++        self._real_context_ring_snapshots = {}
++        self._real_context_ring_offsets = {}
++
++        if 0 in target_depths:
++            self._snapshot_real_context_ring(0)
++
++        offset = 0
++        self._filling_real_context = True
++        try:
++            while offset < max_len:
++                next_targets = [d for d in target_depths if d > offset]
++                stop = next_targets[0] if next_targets else max_len
++                step = min(self._REAL_CONTEXT_CHUNK, stop - offset)
++                self._dummy_run(
++                    num_tokens=step,
++                    context_len=offset,
++                    single_request_prefill=True,
++                    real_rows=True,
++                )
++                offset += step
++                if offset in target_depths:
++                    self._snapshot_real_context_ring(offset)
++        finally:
++            self._filling_real_context = False
+ 
+     def _real_dummy_rows(
+         self,
+         input_batch: InputBatch,
+         block_tables: tuple[torch.Tensor, ...],
+-        context_len: int,
++        context_len: int | list[int] | tuple[int, ...],
+     ) -> torch.Tensor:
+         """Make a dummy batch's rows real, for the engine grid's ``real_rows``
+         shapes, and return their slot mappings.
+ 
+-        ``InputBatch.make_dummy`` repeats token 0, marks every row as padding and
+-        leaves the slot mappings at ``PAD_SLOT_ID``. Here the rows take a fixed
+-        pseudo-random token sequence (the same on every rank, by position, so a
+-        context's tokens do not repeat), lose the padding flag, and take the slots
+-        the step's own kernel computes from the dummy block tables. Every request
+-        reads the first request's context blocks, which ``_fill_real_context``
+-        wrote, and its ring; its own rows go to its own blocks after the context.
+-        """
++        Every request reads its depth's immutable paged history (offsets
++        ``0 .. history_kv_blocks - 1``) and writes new tokens into strictly
++        disjoint per-request tail blocks (offsets ``>= history_kv_blocks``) and
++        its own isolated writable ring block (copied from the depth's snapshot),
++        so concurrent requests and mixed-depth steps never clobber each other or
++        corrupt saved history across ``fill_real_context=False`` repeats."""
+         if self.pcp_manager is not None:
+             raise ValueError("real_rows is not supported with context parallelism")
+         bt = self.block_tables
+         num_reqs = input_batch.num_reqs
+         num_tokens = input_batch.num_tokens
+-        query_len = input_batch.max_query_len or int(
+-            input_batch.num_scheduled_tokens.max()
+-        )
+-        context_len = max(min(context_len, self.max_model_len - query_len), 0)
+-        if context_len % self._REAL_CONTEXT_ALIGN:
+-            raise ValueError(
+-                f"real_rows needs a context of whole {self._REAL_CONTEXT_ALIGN}-token "
+-                f"blocks, not {context_len}"
+-            )
+-        if not context_len:
+-            # set_dummy_context leaves a batch without context alone: give it its
+-            # positions and its blocks.
++        query_lens = [int(x) for x in input_batch.num_scheduled_tokens[:num_reqs]]
++        query_len = input_batch.max_query_len or max(query_lens)
++        if isinstance(context_len, (list, tuple)):
++            if len(context_len) != num_reqs:
++                raise ValueError(
++                    f"context_len list length {len(context_len)} != num_reqs {num_reqs}"
++                )
++            req_depths = [
++                max(min(int(d), self.max_model_len - q), 0)
++                for d, q in zip(context_len, query_lens)
++            ]
++        else:
++            clamped = max(min(int(context_len), self.max_model_len - query_len), 0)
++            req_depths = [clamped] * num_reqs
++
++        for d in req_depths:
++            if d % self._REAL_CONTEXT_ALIGN:
++                raise ValueError(
++                    f"real_rows needs a context of whole {self._REAL_CONTEXT_ALIGN}-token "
++                    f"blocks, not {d}"
++                )
++
++        filling = bool(getattr(self, "_filling_real_context", False))
++        if not any(req_depths) or len(set(req_depths)) > 1:
+             local_pos = np.arange(num_tokens, dtype=np.int64) - np.repeat(
+                 input_batch.query_start_loc_np[:num_reqs],
+-                input_batch.num_scheduled_tokens,
++                input_batch.num_scheduled_tokens[:num_reqs],
+             )
+-            input_batch.positions.copy_(torch.from_numpy(local_pos))
+-            assign_dummy_blocks(
+-                bt, block_tables, num_reqs, query_len, self.kv_cache_config.num_blocks
++            depth_per_tok = np.repeat(
++                np.asarray(req_depths, dtype=np.int64),
++                input_batch.num_scheduled_tokens[:num_reqs],
+             )
+-        elif num_reqs > 1:
+-            for table, block_size, ring in zip(
+-                block_tables, bt.kernel_block_sizes, bt._slot_mapping_circular
++            input_batch.positions[:num_tokens].copy_(
++                torch.from_numpy(depth_per_tok + local_pos)
++            )
++
++        usable, share = self._real_context_pool_layout()
++        if filling:
++            assert num_reqs == 1
++            d0 = req_depths[0]
++            q0 = query_lens[0]
++            for group, (table, block_size, bpk, ring) in enumerate(
++                zip(
++                    block_tables,
++                    bt.kernel_block_sizes,
++                    bt.blocks_per_kv_block,
++                    bt._slot_mapping_circular,
++                )
+             ):
++                device = table.device
+                 if ring:
+-                    # A ring group's slots all come from its first block.
+-                    shared = 1
+-                elif context_len % block_size:
+-                    raise ValueError(
+-                        f"real_rows context {context_len} splits a {block_size}-token "
+-                        "block"
++                    pool_id = self._real_context_pool_block(group, 0, usable, share)
++                    k_ids = torch.arange(bpk, dtype=table.dtype, device=device) + (
++                        pool_id * bpk
++                    )
++                    cols = min(bpk, table.shape[1])
++                    table[0, :cols] = k_ids[:cols]
++                else:
++                    total_blocks = min(cdiv(d0 + q0, block_size), table.shape[1])
++                    kv_blocks = cdiv(total_blocks, bpk)
++                    if kv_blocks > share:
++                        raise ValueError(
++                            f"real_rows fill needs {kv_blocks} blocks > group {group} share {share}"
++                        )
++                    kv_ids = torch.tensor(
++                        [
++                            self._real_context_pool_block(group, off, usable, share)
++                            for off in range(kv_blocks)
++                        ],
++                        dtype=torch.int64,
++                        device=device,
+                     )
++                    kernel_ids = (
++                        kv_ids.unsqueeze(1) * bpk
++                        + torch.arange(bpk, dtype=torch.int64, device=device)
++                    ).reshape(-1)
++                    table[0, :total_blocks] = kernel_ids[:total_blocks].to(table.dtype)
++        else:
++            if not getattr(self, "_real_ring_prepared", False):
++                self._prepare_real_row_ring_blocks(req_depths)
++            num_snapshots = len(getattr(self, "_real_context_ring_snapshots", {}))
++            max_hist_len = max(
++                getattr(self, "_real_context_max_len", 0),
++                max(req_depths, default=0),
++            )
++            for group, (table, block_size, bpk, ring) in enumerate(
++                zip(
++                    block_tables,
++                    bt.kernel_block_sizes,
++                    bt.blocks_per_kv_block,
++                    bt._slot_mapping_circular,
++                )
++            ):
++                device = table.device
++                if ring:
++                    if 1 + num_snapshots + num_reqs > share:
++                        raise ValueError(
++                            f"real_rows needs {1 + num_snapshots + num_reqs} ring blocks "
++                            f"in group {group}, only {share} available"
++                        )
++                    cols = min(bpk, table.shape[1])
++                    for req in range(num_reqs):
++                        pool_id = self._real_context_pool_block(
++                            group, 1 + num_snapshots + req, usable, share
++                        )
++                        k_ids = torch.arange(bpk, dtype=table.dtype, device=device) + (
++                            pool_id * bpk
++                        )
++                        table[req, :cols] = k_ids[:cols]
+                 else:
+-                    shared = min(context_len // block_size, table.shape[1])
+-                table[1:num_reqs, :shared] = table[:1, :shared]
++                    hist_blocks = min(max_hist_len // block_size, table.shape[1])
++                    hist_kv_blocks = cdiv(hist_blocks, bpk)
++                    next_off = hist_kv_blocks
++                    for req, (d, q) in enumerate(zip(req_depths, query_lens)):
++                        if d % block_size:
++                            raise ValueError(
++                                f"real_rows context {d} splits a {block_size}-token block"
++                            )
++                        shared = min(d // block_size, table.shape[1])
++                        total_blocks = min(cdiv(d + q, block_size), table.shape[1])
++                        tail_blocks = max(total_blocks - shared, 0)
++                        if shared > 0:
++                            shared_kv = cdiv(shared, bpk)
++                            hist_ids = torch.tensor(
++                                [
++                                    self._real_context_pool_block(
++                                        group, off, usable, share
++                                    )
++                                    for off in range(shared_kv)
++                                ],
++                                dtype=torch.int64,
++                                device=device,
++                            )
++                            hist_k = (
++                                hist_ids.unsqueeze(1) * bpk
++                                + torch.arange(bpk, dtype=torch.int64, device=device)
++                            ).reshape(-1)
++                            table[req, :shared] = hist_k[:shared].to(table.dtype)
++                        if tail_blocks > 0:
++                            tail_kv = cdiv(tail_blocks, bpk)
++                            if next_off + tail_kv > share:
++                                raise ValueError(
++                                    f"real_rows needs {next_off + tail_kv} paged blocks "
++                                    f"in group {group}, only {share} available"
++                                )
++                            tail_ids = torch.tensor(
++                                [
++                                    self._real_context_pool_block(
++                                        group, next_off + k, usable, share
++                                    )
++                                    for k in range(tail_kv)
++                                ],
++                                dtype=torch.int64,
++                                device=device,
++                            )
++                            tail_k = (
++                                tail_ids.unsqueeze(1) * bpk
++                                + torch.arange(bpk, dtype=torch.int64, device=device)
++                            ).reshape(-1)
++                            table[req, shared : shared + tail_blocks] = tail_k[
++                                :tail_blocks
++                            ].to(table.dtype)
++                            next_off += tail_kv
+ 
+         ids = getattr(self, "_real_dummy_token_ids", None)
+         if ids is None:
+@@ -1280,8 +1572,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 dtype=torch.int32,
+                 device=self.device,
+             )
+-        start = context_len % (ids.shape[0] - self.input_buffers.input_ids.shape[0])
+-        input_batch.input_ids.copy_(ids[start : start + num_tokens])
++        max_span = ids.shape[0] - self.input_buffers.input_ids.shape[0]
++        if len(set(req_depths)) == 1 and num_reqs == 1:
++            start = req_depths[0] % max_span
++            input_batch.input_ids[:num_tokens].copy_(ids[start : start + num_tokens])
++        else:
++            q_starts = input_batch.query_start_loc_np
++            for req, (d, q) in enumerate(zip(req_depths, query_lens)):
++                s_dst = int(q_starts[req])
++                s_src = d % max_span
++                input_batch.input_ids[s_dst : s_dst + q].copy_(
++                    ids[s_src : s_src + q]
++                )
+         input_batch.is_padding.fill_(False)
+ 
+         tilelang_inputs.compute_slot_mappings(

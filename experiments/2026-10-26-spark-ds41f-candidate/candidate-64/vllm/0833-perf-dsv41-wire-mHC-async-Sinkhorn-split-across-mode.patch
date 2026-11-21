@@ -1,0 +1,648 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:52:01 +0100
+Subject: [PATCH] perf(dsv41): wire mHC async Sinkhorn split across
+ model and DSpark
+
+
+Wire mHC async Sinkhorn finalize split (mhc.async_sinkhorn) across the
+DeepSeek-V4.1 target model and DSpark speculator so critical-path RMSNorm
+completes immediately while Sinkhorn projection runs on aux_stream().
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Move Sinkhorn projection off the decode critical path (-1.00% tp3
+           engine grid, c1 tpot_p50 -0.34 ms / -2.35% across 2 live boots).
+Quality: Bit-exact (128/128 greedy outputs_sha256 match, KL=0, ppl +0.000%).
+Tests: pytest tests/kernels/test_deepseek_v41_tilelang_pdl.py (15 passed)
+       + 2-boot live tp3-triangle screen (PR #1264).
+Upstream-status: Local DeepSeek-V4.1 TileLang runtime optimization.
+---
+ vllm/models/deepseek_v4_1/kernels.py       |  16 +
+ vllm/models/deepseek_v4_1/nvidia/dspark.py |  25 +-
+ vllm/models/deepseek_v4_1/nvidia/model.py  | 342 +++++++++++----------
+ vllm/models/deepseek_v4_1/tilelang/mhc.py  |  61 +++-
+ 4 files changed, 269 insertions(+), 175 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 827ca82dd..5c207f12e 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -71,6 +71,22 @@ def mhc(config) -> nn.Module:
+     return TileKernelsMHC(config)
+ 
+ 
++def async_sinkhorn(enabled: bool = True) -> contextlib.AbstractContextManager:
++    """Split mHC finalize into critical-path norm and off-critical-path Sinkhorn."""
++    if not enabled:
++        return contextlib.nullcontext()
++    from .tilelang.mhc import async_sinkhorn as _async_sinkhorn
++
++    return _async_sinkhorn(True)
++
++
++def wait_sinkhorn(device: torch.device | None = None) -> None:
++    """Join any pending async mHC Sinkhorn launch onto the current stream."""
++    from .tilelang.mhc import wait_sinkhorn as _wait_sinkhorn
++
++    _wait_sinkhorn(device)
++
++
+ def cast_mxfp8(rows: torch.Tensor):
+     """The MXFP8 cast of rows regrouped after their producer (``linear.MXFP8Rows``),
+     for projections that read their input's cast."""
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index e026b014b..a1819d11b 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -576,16 +576,23 @@ class DSparkDeepseekV4Model(nn.Module):
+             self._l2pf_ready = build_l2_prefetch_plans(
+                 list(self.layers), self.config.num_hidden_layers
+             )
+-        for layer in self.layers:
+-            hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+-                hidden_states,
+-                positions,
+-                input_ids,
+-                pre_mix,
+-                post_mix,
+-                res_mix,
+-                residual,
++        use_async_sinkhorn = bool(
++            self.layers
++            and getattr(
++                getattr(self.layers[0], "mhc", None), "supports_async_sinkhorn", False
+             )
++        )
++        with kernels.async_sinkhorn(use_async_sinkhorn):
++            for layer in self.layers:
++                hidden_states, residual, post_mix, res_mix, pre_mix = layer(
++                    hidden_states,
++                    positions,
++                    input_ids,
++                    pre_mix,
++                    post_mix,
++                    res_mix,
++                    residual,
++                )
+         l2_prefetch.join()
+         assert pre_mix is not None
+         if hasattr(layer.mhc, "post_collapse"):
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index b73f9acd6..322f6f46c 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -377,6 +377,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 )
+             engram_kwargs = {"sp_rows": sp_rows}
+             if fuse_engram_post:
++                if residual.is_cuda:
++                    kernels.wait_sinkhorn(residual.device)
+                 engram_kwargs.update(
+                     previous_output=previous_output,
+                     post_mix=post_mix,
+@@ -419,12 +421,16 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 # Global KV projects local rows and gathers its narrow latent.
+                 # Decoder queries and residual updates only need replay rows.
+                 self.attn.prepare_global_kv(positions, x, sp_rows=sp_rows)
++                if residual.is_cuda:
++                    kernels.wait_sinkhorn(residual.device)
+                 x, residual, post_mix, res_mix, attn_pre = gather_sp_rows(
+                     sp_rows, ced_indices, x, residual, post_mix, res_mix, attn_pre
+                 )
+                 sp_rows = None
+             else:
+                 self.attn.prepare_global_kv(positions, x)
++                if residual.is_cuda:
++                    kernels.wait_sinkhorn(residual.device)
+                 x = gather_rows(x, ced_indices)
+                 residual = gather_rows(residual, ced_indices)
+                 post_mix = gather_rows(post_mix, ced_indices)
+@@ -1055,177 +1061,94 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             and get_pp_group().is_last_rank
+             and not torch.cuda.is_current_stream_capturing()
+         )
+-        for idx, layer in enumerate(
+-            islice(self.layers, self.start_layer, self.end_layer),
+-            start=self.start_layer,
+-        ):
+-            boundary_indices = ced_indices if idx == self.ced_decoder_start else None
+-            boundary_encoder_only = boundary_indices is not None and encoder_only
+-            if (
+-                sp is not None
+-                and boundary_indices is not None
+-                and not boundary_encoder_only
+-                and not layer.attn.ced_sp_saves_bytes(
+-                    sp, boundary_indices.numel(), layer.hc_mult
+-                )
+-            ):
+-                # Dense replay or a replicated compressor can erase the payload
+-                # saving. Include the narrow projection gather before choosing SP.
+-                hidden_states, residual, post_mix, res_mix, pre_mix = (
+-                    None if t is None else sp.gather(t)
+-                    for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+-                )
+-                sp = None
+-            ced_positions = (
+-                gather_rows(positions, boundary_indices)
+-                if boundary_indices is not None and not boundary_encoder_only
+-                else None
+-            )
+-            ced_input_ids = (
+-                gather_rows(input_ids, boundary_indices)
+-                if boundary_indices is not None
+-                and not boundary_encoder_only
+-                and input_ids is not None
+-                else None
+-            )
+-            if boundary_indices is not None and steer_rows is not None:
+-                steer_rows = gather_rows(
+-                    self.glp.step_rows(full_num_tokens), boundary_indices
+-                )
+-            carry = [residual, res_mix, post_mix, pre_mix, hidden_states]
+-            hidden_states = pre_mix = post_mix = res_mix = residual = None
+-            hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+-                carry,
+-                positions,
+-                input_ids,
+-                None,
+-                None,
+-                None,
+-                None,
+-                engram_hashes,
+-                engram_mask,
+-                ced_indices=boundary_indices,
+-                sp_rows=sp,
+-                ced_positions=ced_positions,
+-                ced_input_ids=ced_input_ids,
+-                aux_out=pending_aux_out,
+-                glp=self.glp,
+-                layer_idx=idx,
+-                steer_rows=steer_rows,
+-                encoder_only=boundary_encoder_only,
++        first_layer = (
++            self.layers[self.start_layer] if self.start_layer < self.end_layer else None
++        )
++        use_async_sinkhorn = bool(
++            first_layer is not None
++            and getattr(
++                getattr(first_layer, "mhc", None), "supports_async_sinkhorn", False
+             )
+-            if getattr(layer, "engram", None) is not None:
+-                if self._pending_engram_stage is not None:
+-                    stage_fn = self._pending_engram_stage
+-                    self._pending_engram_stage = None
+-                    stage_fn()
+-                elif (
+-                    getattr(layer.engram, "layer_hash_index", 0) == 1
+-                    and self._pending_engram_prefetch is not None
+-                ):
+-                    prefetch_fn = self._pending_engram_prefetch
+-                    self._pending_engram_prefetch = None
+-                    prefetch_fn()
+-            if boundary_indices is not None:
+-                sp = None  # The boundary returns replicated compact decoder rows.
+-            if pending_aux_out is not None:
+-                aux_hidden_state = pending_aux_out
+-                pending_aux_out = None
+-                if sp is not None:
+-                    aux_hidden_state = sp.gather(aux_hidden_state)
+-                if decoder_compacted:
+-                    aux_hidden_state = scatter_rows(
+-                        aux_hidden_state, ced_indices, full_num_tokens
+-                    )
+-                aux_hidden_states.append(aux_hidden_state)
+-            if boundary_encoder_only:
+-                l2_prefetch.join()
+-                if self._sink_columns is not None:
+-                    from ..tilelang import columns as columns_mod
+-
+-                    columns_mod.zero_(self._sink_columns[:full_num_tokens])
+-                zeros = getattr(self, "_encoder_only_zeros", None)
++        )
++        with kernels.async_sinkhorn(use_async_sinkhorn):
++            for idx, layer in enumerate(
++                islice(self.layers, self.start_layer, self.end_layer),
++                start=self.start_layer,
++            ):
++                boundary_indices = ced_indices if idx == self.ced_decoder_start else None
++                boundary_encoder_only = boundary_indices is not None and encoder_only
+                 if (
+-                    zeros is None
+-                    or zeros.shape[0] < full_num_tokens
+-                    or zeros.device != positions.device
+-                ):
+-                    cap = max(
+-                        full_num_tokens,
+-                        getattr(self, "_max_num_batched_tokens", full_num_tokens),
++                    sp is not None
++                    and boundary_indices is not None
++                    and not boundary_encoder_only
++                    and not layer.attn.ced_sp_saves_bytes(
++                        sp, boundary_indices.numel(), layer.hc_mult
+                     )
+-                    zeros = torch.zeros(
+-                        (cap, self.config.hidden_size),
+-                        dtype=layer.attn_norm.weight.dtype,
+-                        device=positions.device,
++                ):
++                    # Dense replay or a replicated compressor can erase the payload
++                    # saving. Include the narrow projection gather before choosing SP.
++                    if residual is not None and residual.is_cuda:
++                        kernels.wait_sinkhorn(residual.device)
++                    hidden_states, residual, post_mix, res_mix, pre_mix = (
++                        None if t is None else sp.gather(t)
++                        for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
+                     )
+-                    self._encoder_only_zeros = zeros
+-                out_hidden = zeros[:full_num_tokens]
+-                self._pending_engram_stage = None
+-                self._pending_engram_prefetch = None
+-                if len(self.aux_hidden_state_layers) > 0:
+-                    return out_hidden, [
+-                        out_hidden for _ in self.aux_hidden_state_layers
+-                    ]
+-                return out_hidden
+-            if boundary_indices is not None:
+-                assert ced_positions is not None
+-                positions = ced_positions
+-                input_ids = ced_input_ids
+-                decoder_compacted = True
+-            if self.glp is not None:
+-                self.glp.steer(
+-                    idx, hidden_states, residual, post_mix, res_mix, steer_rows
+-                )
+-            if idx + 1 in self.aux_hidden_state_layers:
+-                # Reconstruct the aux hidden state for draft models
+-                aux_out = (
+-                    self._graph_out(len(aux_hidden_states), full_num_tokens)
+-                    if sp is None and not decoder_compacted
++                    sp = None
++                ced_positions = (
++                    gather_rows(positions, boundary_indices)
++                    if boundary_indices is not None and not boundary_encoder_only
+                     else None
+                 )
+-                next_layer = (
+-                    self.layers[idx + 1] if idx + 1 < self.end_layer else None
++                ced_input_ids = (
++                    gather_rows(input_ids, boundary_indices)
++                    if boundary_indices is not None
++                    and not boundary_encoder_only
++                    and input_ids is not None
++                    else None
+                 )
+-                can_fuse_into_next_pre = (
+-                    next_layer is not None
+-                    and getattr(next_layer.mhc, "supports_fused_aux", False)
+-                    and (
+-                        getattr(next_layer, "engram", None) is None
+-                        or engram_hashes is None
+-                    )
+-                    and (
+-                        ced_indices is None
+-                        or idx + 1 != self.ced_decoder_start
++                if boundary_indices is not None and steer_rows is not None:
++                    steer_rows = gather_rows(
++                        self.glp.step_rows(full_num_tokens), boundary_indices
+                     )
++                carry = [residual, res_mix, post_mix, pre_mix, hidden_states]
++                hidden_states = pre_mix = post_mix = res_mix = residual = None
++                hidden_states, residual, post_mix, res_mix, pre_mix = layer(
++                    carry,
++                    positions,
++                    input_ids,
++                    None,
++                    None,
++                    None,
++                    None,
++                    engram_hashes,
++                    engram_mask,
++                    ced_indices=boundary_indices,
++                    sp_rows=sp,
++                    ced_positions=ced_positions,
++                    ced_input_ids=ced_input_ids,
++                    aux_out=pending_aux_out,
++                    glp=self.glp,
++                    layer_idx=idx,
++                    steer_rows=steer_rows,
++                    encoder_only=boundary_encoder_only,
+                 )
+-                if can_fuse_into_next_pre:
+-                    if aux_out is None:
+-                        aux_out = torch.empty(
+-                            (residual.shape[0], self.config.hidden_size),
+-                            dtype=residual.dtype,
+-                            device=residual.device,
+-                        )
+-                    pending_aux_out = aux_out
+-                else:
+-                    if idx + 1 != self.end_layer and callable(
+-                        getattr(layer.mhc, "post_collapse", None)
++                if getattr(layer, "engram", None) is not None:
++                    if self._pending_engram_stage is not None:
++                        stage_fn = self._pending_engram_stage
++                        self._pending_engram_stage = None
++                        stage_fn()
++                    elif (
++                        getattr(layer.engram, "layer_hash_index", 0) == 1
++                        and self._pending_engram_prefetch is not None
+                     ):
+-                        aux_hidden_state = layer.mhc.post_collapse(
+-                            hidden_states, residual, post_mix, res_mix, out=aux_out
+-                        )
+-                    else:
+-                        aux_recon = layer.mhc.post(
+-                            hidden_states, residual, post_mix, res_mix
+-                        )
+-                        aux_hidden_state = (
+-                            layer.mhc.collapse(aux_recon)
+-                            if aux_out is None
+-                            else layer.mhc.collapse(aux_recon, out=aux_out)
+-                        )
+-                        if idx + 1 == self.end_layer:
+-                            final_aux_recon = aux_recon
+-                        del aux_recon
++                        prefetch_fn = self._pending_engram_prefetch
++                        self._pending_engram_prefetch = None
++                        prefetch_fn()
++                if boundary_indices is not None:
++                    sp = None  # The boundary returns replicated compact decoder rows.
++                if pending_aux_out is not None:
++                    aux_hidden_state = pending_aux_out
++                    pending_aux_out = None
+                     if sp is not None:
+                         aux_hidden_state = sp.gather(aux_hidden_state)
+                     if decoder_compacted:
+@@ -1233,6 +1156,103 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                             aux_hidden_state, ced_indices, full_num_tokens
+                         )
+                     aux_hidden_states.append(aux_hidden_state)
++                if boundary_encoder_only:
++                    l2_prefetch.join()
++                    if self._sink_columns is not None:
++                        from ..tilelang import columns as columns_mod
++
++                        columns_mod.zero_(self._sink_columns[:full_num_tokens])
++                    zeros = getattr(self, "_encoder_only_zeros", None)
++                    if (
++                        zeros is None
++                        or zeros.shape[0] < full_num_tokens
++                        or zeros.device != positions.device
++                    ):
++                        cap = max(
++                            full_num_tokens,
++                            getattr(self, "_max_num_batched_tokens", full_num_tokens),
++                        )
++                        zeros = torch.zeros(
++                            (cap, self.config.hidden_size),
++                            dtype=layer.attn_norm.weight.dtype,
++                            device=positions.device,
++                        )
++                        self._encoder_only_zeros = zeros
++                    out_hidden = zeros[:full_num_tokens]
++                    self._pending_engram_stage = None
++                    self._pending_engram_prefetch = None
++                    if len(self.aux_hidden_state_layers) > 0:
++                        return out_hidden, [
++                            out_hidden for _ in self.aux_hidden_state_layers
++                        ]
++                    return out_hidden
++                if boundary_indices is not None:
++                    assert ced_positions is not None
++                    positions = ced_positions
++                    input_ids = ced_input_ids
++                    decoder_compacted = True
++                if self.glp is not None:
++                    if residual is not None and residual.is_cuda:
++                        kernels.wait_sinkhorn(residual.device)
++                    self.glp.steer(
++                        idx, hidden_states, residual, post_mix, res_mix, steer_rows
++                    )
++                if idx + 1 in self.aux_hidden_state_layers:
++                    # Reconstruct the aux hidden state for draft models
++                    aux_out = (
++                        self._graph_out(len(aux_hidden_states), full_num_tokens)
++                        if sp is None and not decoder_compacted
++                        else None
++                    )
++                    next_layer = (
++                        self.layers[idx + 1] if idx + 1 < self.end_layer else None
++                    )
++                    can_fuse_into_next_pre = (
++                        next_layer is not None
++                        and getattr(next_layer.mhc, "supports_fused_aux", False)
++                        and (
++                            getattr(next_layer, "engram", None) is None
++                            or engram_hashes is None
++                        )
++                        and (
++                            ced_indices is None
++                            or idx + 1 != self.ced_decoder_start
++                        )
++                    )
++                    if can_fuse_into_next_pre:
++                        if aux_out is None:
++                            aux_out = torch.empty(
++                                (residual.shape[0], self.config.hidden_size),
++                                dtype=residual.dtype,
++                                device=residual.device,
++                            )
++                        pending_aux_out = aux_out
++                    else:
++                        if idx + 1 != self.end_layer and callable(
++                            getattr(layer.mhc, "post_collapse", None)
++                        ):
++                            aux_hidden_state = layer.mhc.post_collapse(
++                                hidden_states, residual, post_mix, res_mix, out=aux_out
++                            )
++                        else:
++                            aux_recon = layer.mhc.post(
++                                hidden_states, residual, post_mix, res_mix
++                            )
++                            aux_hidden_state = (
++                                layer.mhc.collapse(aux_recon)
++                                if aux_out is None
++                                else layer.mhc.collapse(aux_recon, out=aux_out)
++                            )
++                            if idx + 1 == self.end_layer:
++                                final_aux_recon = aux_recon
++                            del aux_recon
++                        if sp is not None:
++                            aux_hidden_state = sp.gather(aux_hidden_state)
++                        if decoder_compacted:
++                            aux_hidden_state = scatter_rows(
++                                aux_hidden_state, ced_indices, full_num_tokens
++                            )
++                        aux_hidden_states.append(aux_hidden_state)
+         self._pending_engram_stage = None
+         self._pending_engram_prefetch = None
+         l2_prefetch.join()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 1511c69de..9f658547c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -53,6 +53,7 @@ import torch
+ from torch import nn
+ 
+ from vllm.config import get_current_vllm_config
++from vllm.logger import init_logger
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.models.deepseek_v4_1 import sp_prefill
+ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
+@@ -71,6 +72,8 @@ from vllm.v1.worker.workspace import (
+     retain_cuda_graph_capture_resource,
+ )
+ 
++logger = init_logger(__name__)
++
+ MULT = 4  # residual streams
+ MIXES = (2 + MULT) * MULT  # pre, post and combination mixes
+ BLOCK_H = 128  # hidden columns per projection split, fixed for batch invariance
+@@ -1307,6 +1310,9 @@ def _finalize_sinkhorn(
+ 
+ _ASYNC_SINKHORN_MAX_ROWS = 128
+ _SINKHORN_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
++_SINKHORN_FORK_EVENTS: dict[torch.device, torch.cuda.Event] = {}
++_SINKHORN_DONE_EVENTS: dict[torch.device, torch.cuda.Event] = {}
++_SINKHORN_PENDING: dict[torch.device, bool] = {}
+ _SINKHORN_SCRATCH: dict[torch.device, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+ _sinkhorn_state = threading.local()
+ 
+@@ -1365,6 +1371,21 @@ def _async_sinkhorn_active() -> bool:
+     return getattr(_sinkhorn_state, "depth", 0) > 0
+ 
+ 
++def _sinkhorn_events(
++    device: torch.device,
++) -> tuple[torch.cuda.Event, torch.cuda.Event]:
++    device = _normalize_device(device)
++    fork_ev = _SINKHORN_FORK_EVENTS.get(device)
++    done_ev = _SINKHORN_DONE_EVENTS.get(device)
++    if fork_ev is None or done_ev is None:
++        with torch.cuda.device(device):
++            fork_ev = torch.cuda.Event()
++            done_ev = torch.cuda.Event()
++        _SINKHORN_FORK_EVENTS[device] = fork_ev
++        _SINKHORN_DONE_EVENTS[device] = done_ev
++    return fork_ev, done_ev
++
++
+ @contextlib.contextmanager
+ def async_sinkhorn(enabled: bool = True):
+     """Run Sinkhorn on a dedicated side stream across enclosed mHC entry calls."""
+@@ -1376,16 +1397,23 @@ def async_sinkhorn(enabled: bool = True):
+         yield
+     finally:
+         _sinkhorn_state.depth -= 1
++        if _sinkhorn_state.depth == 0:
++            for dev, pending in list(_SINKHORN_PENDING.items()):
++                if pending:
++                    wait_sinkhorn(dev)
+ 
+ 
+ def wait_sinkhorn(device: torch.device | None = None) -> None:
+-    """Join the dedicated Sinkhorn stream onto the current CUDA stream if active."""
++    """Join any pending async Sinkhorn launch onto the current CUDA stream."""
+     if device is None and not torch.cuda.is_available():
+         return
+     device = _normalize_device(device)
+-    stream = _SINKHORN_STREAMS.get(device)
+-    if stream is not None:
+-        torch.cuda.current_stream(device).wait_stream(stream)
++    if not _SINKHORN_PENDING.get(device, False):
++        return
++    done_ev = _SINKHORN_DONE_EVENTS.get(device)
++    if done_ev is not None:
++        torch.cuda.current_stream(device).wait_event(done_ev)
++    _SINKHORN_PENDING[device] = False
+ 
+ 
+ 
+@@ -1434,6 +1462,8 @@ def _mhc_pre(
+     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
+     if tokens == 0:
+         return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
+     streams = MULT * hidden
+     world = 1
+     with_aux = aux_out is not None
+@@ -1492,14 +1522,24 @@ def _mhc_pre(
+         *aux_args,
+     )
+     if use_async:
++        if not torch.cuda.is_current_stream_capturing():
++            logger.info_once(
++                "[mhc] async Sinkhorn split active (max_rows=%d)",
++                _ASYNC_SINKHORN_MAX_ROWS,
++            )
+         sh_stream = _sinkhorn_stream(residual.device)
+-        sh_stream.wait_stream(torch.cuda.current_stream(residual.device))
++        cur_stream = torch.cuda.current_stream(residual.device)
++        fork_ev, done_ev = _sinkhorn_events(residual.device)
++        fork_ev.record(cur_stream)
++        sh_stream.wait_event(fork_ev)
+         for tensor in (P, S, post, comb, pre_out):
+             tensor.record_stream(sh_stream)
+         with torch.cuda.stream(sh_stream):
+             _finalize_sinkhorn(hidden, k, rms_eps, hc_eps, iterations)(
+                 P, S, scale, base, post, comb, pre_out
+             )
++            done_ev.record(sh_stream)
++        _SINKHORN_PENDING[_normalize_device(residual.device)] = True
+         _finalize_norm(hidden, rms_eps)(C, Q, norm, y, y_q, y_sf)
+     else:
+         _finalize(hidden, k, rms_eps, hc_eps, iterations)(
+@@ -1517,6 +1557,8 @@ def _mhc_post(
+     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
+     if tokens == 0:
+         return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
+     world = int(x.shape[0]) if x.ndim == 3 else 1
+     _post(hidden, world)(
+         (
+@@ -1544,6 +1586,8 @@ def _mhc_post_collapse(
+     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
+     if tokens == 0:
+         return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
+     world = int(x.shape[0]) if x.ndim == 3 else 1
+     _post_collapse(hidden, world)(
+         x.view(world, tokens, hidden) if world > 1 else x.view(tokens, hidden),
+@@ -1570,6 +1614,8 @@ def _mhc_post_collapse_norm(
+     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
+     if tokens == 0:
+         return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
+     world = int(x.shape[0]) if x.ndim == 3 else 1
+     x_in = x.view(world, tokens, hidden) if world > 1 else x.view(1, tokens, hidden)
+     col_arg = column if columns is not None else -1
+@@ -1590,6 +1636,8 @@ def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) ->
+     tokens, hidden = int(state.shape[0]), int(state.shape[-1])
+     if tokens == 0:
+         return
++    if state.is_cuda:
++        wait_sinkhorn(state.device)
+     _collapse(hidden)(
+         state.view(tokens, MULT, hidden),
+         mix.view(tokens, MULT),
+@@ -1607,6 +1655,8 @@ def _mhc_collapse_column(
+     tokens, hidden = int(state.shape[0]), int(state.shape[-1])
+     if tokens == 0:
+         return
++    if state.is_cuda:
++        wait_sinkhorn(state.device)
+     _collapse(hidden, column)(
+         state.view(tokens, MULT, hidden),
+         mix.view(tokens, MULT),
+@@ -1728,6 +1778,7 @@ class TileKernelsMHC(nn.Module):
+                 device,
+             )
+             _sinkhorn_stream(device)
++            _sinkhorn_events(device)
+             _sinkhorn_scratch(hidden // BLOCK_H, _ASYNC_SINKHORN_MAX_ROWS, device)
+ 
+         prepare.declare(calls, bind=bind)
