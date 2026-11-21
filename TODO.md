@@ -8,6 +8,40 @@ owner.
 
 ## Recent candidate decisions
 
+- **Candidate `64` (built & 2-boot qualified 2026-11-21 on `tp3-triangle`, unpromoted)**
+  ([`candidate-64`](experiments/2026-10-26-spark-ds41f-candidate/candidate-64/README.md),
+  image `spark-ds41f:candidate-64`, `sha256:50b29406...`, vLLM `0001..0843`, tree
+  `7464b04c3cc7`): builds on `candidate-63-r5` (`0830..0832` universal auto-sized
+  contiguous CUDA pool without `expandable_segments`, 2-pass `512 MiB` `hugetlb`
+  pageblock reset, and `engine_grid` TP rank sync; `3`-boot fresh-reboot drift
+  `+1.21% -> +0.02%`, `O13 = 189..209`) plus 11 verified patches (`0833..0843`):
+  `mhc` `async_sinkhorn` (`0833`, `#1264`: `-1.00%` grid, `c1 tpot_p50 -0.34 ms`),
+  exact BlockMax-32 wide prefill (`0834`, `#1265`: `+2.11%` at `1M`),
+  group-aware wide-decode `WO-A` (`0835`, `#1267`: `8x48 -0.410 ms`), real-row
+  profiler KV isolation (`0836`, `#1270`), defensive `T_decode >= 50 ms` async
+  prefill stall attribution (`0837`, `#1273`), exact full-vocab batched DSpark
+  top-2 (`0838`, `#1274`: `model` `acceptance_length +0.72%`, `c8` faster),
+  content-addressed warm-cache `prepare_declared()` index (`0839`, `#1275`:
+  `-13.8 s` warm boot), single-segment SWA `extend` route (`0840`, `#1277`),
+  per-request mixed-batch sampling split (`0841`, `#1278`: `-47.3%` / `-43.7%`
+  compute + `4x-16x` less RoCE), `#864` loop/thinking-budget verify invariance
+  (`0842`, `#1279`: 3 bugs fixed), and dedicated `R=3` decode dense
+  `indexer_score_v41` (`0843`, `#1276`: Cold-DRAM `-17.1%` at `8x6 @256K`,
+  `-27.4%` at `8x6 @1M`, `-24.2%` at `16x6 @1M`). Also accompanied on `main` by
+  zero-fork E-core `memguard` (`#1269`) and Sonar `engine_grid` prefix-cache
+  reset in `finally` (`#1266`). Measured neutral and dropped: `VLLM_SHARE_PYNCCL_COMMS=1`
+  (`#1264`), `WO_BANDS=""` & `NEXT_MB=15` on `tp3-triangle` (`#1268`). Audited &
+  bounded without patches: `M=128` CED tail fast-path (already routed), tail-slot
+  `CopyDrafter` splice & tree verify leaves, `#876`/`#948` (already solved in
+  `0824`/`0829`), sampled draft margin (already greedy DSpark), answer-only
+  `repetition_penalty` (canonical vLLM semantics). Built-image tests on `dgx4`:
+  **`2,315 passed, 40 skipped, 0 failed`** (`15/15` PDL). Live 2-boot
+  `tp3-triangle` qualification (unrebooted `1120`-aged nodes, `O13 = 3/13/7`,
+  `0` failed): **100% bit-exact** (`128/128` greedy & top-20 logprobs vs `1120`,
+  `256/256` across boots, `KL = 0`, `perplexity = 1.313727` [`+0.000%`],
+  `determinism --wide` `0/0` diffs), warm boot `108.7 s` (`-25.9 s` vs `1120`),
+  multi-stream grid `-1.72%` vs `1120` (`-1.44%` vs `c63` across all 15 shapes),
+  `1M` prefill `7,000 tok/s` (`+1.13%`), `stall-3 probe_p50` `-15.2%`.
 - **Candidate `62`, promoted 2026-11-20 as `spark-ds41f-1120`**
   ([`candidate-62`](experiments/2026-10-26-spark-ds41f-candidate/candidate-62/README.md)):
   `candidate-61-r2`'s series (vLLM `0001..0822`) plus the Python fixes
@@ -150,22 +184,22 @@ Open after `1120`:
    streams reads `1.76 s` against `1.18 s` on `1107` (`+48.88% ±16.13%`,
    `worse`) and `1.44 s` on the repeat boot (`+21.58% ±52.47%`, `same`), while
    beside three streams it improved (`1.07 -> 0.80 s`) and the prefill beside
-   six streams is `13.19%` faster. Unexplained and not in the release notes:
-   check the prefill yield and admission on the triangle's 6,144 budget before
-   the next release.
-4. **The mHC finalize split is in the image and never runs.** `0818` adds
-   `mhc_finalize_norm`, `mhc_finalize_sinkhorn`, `async_sinkhorn()` and
-   `wait_sinkhorn()` to `tilelang/mhc.py`, and the split path is taken only
-   inside `async_sinkhorn()`. No patch in `1120`'s series calls either
-   function, so the served step runs the single `mhc_finalize` kernel as on
-   `1107`: `candidate-61`'s traced step on `tp4-ring` lists
-   `mhc_finalize_kernel` and neither split kernel
-   (`experiments/2026-11-17-c1-floor-now/receipts/trace/`). The
-   `-0.20..-0.23 ms/step` recorded for `c61-r16`/`r17`/`r20` is the `sp8`
-   Cold-L2 kernel screen; no served step has measured it. Add the call sites to
-   `nvidia/model.py`, confirm both kernels in a decode trace, then screen `c1`,
-   `c16` and the grid over two boots with zero greedy diffs. If it holds it
-   becomes the only path; if not, `0818`'s split kernels come out.
+   six streams is `13.19%` faster. **Diagnosed (2026-11-21, `PR #1273` / `#1281`):**
+   `stall-7`'s exact `long_share = 0.3432` (`22/64` steps) proves `K = 2`
+   interleave already fires on every chunk (`T_decode ~ 25 ms < 50 ms`). The
+   bimodal `1.2–2.1 s` `stall-6` TTFT is a `max_num_seqs = 8` slot-8 occupancy
+   cascade: 6 decode streams + 1 long prefill leave 1 slot for `3.0 s`-spaced
+   probes, and `1120`'s higher `adaptive_verification_row_cost = 0.049` trims
+   drafts during prefill-interleaved decode steps, pushing 16-token probe
+   lifetime past `3.0 s` so Probe `i` holds slot 8 when Probe `i+1` arrives.
+   (`candidate-64` patch `0837` fixes the separate async `T_decode >= 50 ms`
+   undercounting bug for `tp4-ring` `stall-11` / 32-stream shapes; TP3 `stall-6`
+   interleaved-draft budgeting remains open.)
+4. **The mHC finalize split is in the image and never runs.** **Resolved in
+   `candidate-64` (`0833`, `PR #1264` / `#1280`):** wired `async_sinkhorn` across
+   `nvidia/model.py` and `nvidia/dspark.py`, verified `0` `mhc_finalize_kernel`
+   calls via CUPTI, and 2-boot verified `-1.00%` `tp3-triangle` engine grid /
+   `c1 tpot_p50 -0.34 ms (-2.35%)` with `128/128` bit-exactness.
 5. **GLP-27 did not become the default vector at promotion.** `candidate-55`'s
    [record](experiments/2026-10-26-spark-ds41f-candidate/candidate-55/README.md)
    carries the owner's decision of 2026-11-13 ("Yes, at promotion") for the
@@ -178,6 +212,11 @@ Open after `1120`:
    2026-11-15 as integrated. The owner decides whether the decision stands; the
    switch changes the promoted configuration and needs its own baseline.
 6. **TP1..TP3 ship a prefetch row band that its sweep did not confirm.**
+   **Measured on `tp3-triangle` (2026-11-21, `PR #1268` / `#1280`):** both
+   `WO_BANDS=""` (`mad5 -0.045%`, `fl25 -0.017%`, `c1 69.58`, `c8 169.39`) and
+   `NEXT_MB=15` (`mad5 -0.012%`, `fl25 -0.035%`, `c1 69.66`, `c8 169.45`) were
+   statistically flat within `±0.09%` noise on Boot 1; existing TP3 defaults
+   kept.
    `tp3-triangle`, `tp2-direct` and `tp1` set
    `VLLM_DS41_L2_PREFETCH_WO_BANDS=17-32=12`, and `tp3-switched`,
    `tp3-triangle-4k` and `tp2-switched` extend them. The sweep's two-boot
