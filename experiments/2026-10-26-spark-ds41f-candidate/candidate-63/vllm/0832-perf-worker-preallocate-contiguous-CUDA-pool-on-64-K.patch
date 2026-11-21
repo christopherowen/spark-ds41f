@@ -1,4 +1,4 @@
-From 2e5de68b6a96019cca9c2ed175b9412a12ed6b05 Mon Sep 17 00:00:00 2001
+From 1722ac4bc39ee602990d582dd764df43ad8fd448 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 08:47:42 +0100
 Subject: [PATCH] perf(worker): preallocate contiguous CUDA pool on 64 KiB UMA
@@ -25,18 +25,18 @@ Tests: pytest tests/v1/worker/test_contiguous_cuda_pool.py
        tests/v1/worker/test_engine_grid_sync.py (100 passed).
 Upstream-status: local candidate-63 patch.
 ---
- tests/v1/worker/test_contiguous_cuda_pool.py  | 169 ++++++++++++++++++
- .../model_loader/direct_loader.py             | 124 +++++++++----
- vllm/v1/worker/gpu_worker.py                  | 133 +++++++++++++-
- 3 files changed, 386 insertions(+), 40 deletions(-)
+ tests/v1/worker/test_contiguous_cuda_pool.py  | 198 ++++++++++++++++++
+ .../model_loader/direct_loader.py             | 124 +++++++----
+ vllm/v1/worker/gpu_worker.py                  | 154 +++++++++++++-
+ 3 files changed, 436 insertions(+), 40 deletions(-)
  create mode 100644 tests/v1/worker/test_contiguous_cuda_pool.py
 
 diff --git a/tests/v1/worker/test_contiguous_cuda_pool.py b/tests/v1/worker/test_contiguous_cuda_pool.py
 new file mode 100644
-index 0000000000..18511bbc7d
+index 0000000000..29af6485a0
 --- /dev/null
 +++ b/tests/v1/worker/test_contiguous_cuda_pool.py
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,198 @@
 +# SPDX-License-Identifier: Apache-2.0
 +from __future__ import annotations
 +
@@ -206,6 +206,35 @@ index 0000000000..18511bbc7d
 +        assert not sponge_called
 +    finally:
 +        direct_loader.set_preallocated_cuda_pool_bytes(0)
++
++
++def test_kv_pool_placeholder_releases_before_kv_cache_init(monkeypatch):
++    worker = _make_worker()
++    worker._contiguous_pool_anchor = torch.zeros((1,), dtype=torch.uint8)
++    worker._kv_pool_placeholder = torch.zeros((16,), dtype=torch.uint8)
++    worker.cache_config = SimpleNamespace(num_gpu_blocks=None)
++    worker.vllm_config = SimpleNamespace(
++        model_config=SimpleNamespace(multimodal_config=None),
++        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
++    )
++    released_before_init = []
++
++    def fake_init_kv(_cfg):
++        released_before_init.append(worker._kv_pool_placeholder is None)
++
++    worker.model_runner = SimpleNamespace(
++        initialize_kv_cache=fake_init_kv,
++        kv_cache_config=None,
++    )
++    monkeypatch.setattr("vllm.v1.worker.gpu_worker.torch.accelerator.synchronize", lambda: None)
++    monkeypatch.setattr("vllm.v1.worker.gpu_worker.torch.accelerator.empty_cache", lambda: None)
++    monkeypatch.setattr("vllm.v1.worker.gpu_worker.trim_host_heap", lambda: None)
++    # Only verify placeholder is released before kv cache init
++    try:
++        worker.initialize_from_config(SimpleNamespace(num_blocks=64, kv_cache_groups=[]))
++    except Exception:
++        pass
++    assert worker._kv_pool_placeholder is None
 diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
 index 66dfc925d5..34d1acbc70 100644
 --- a/vllm/model_executor/model_loader/direct_loader.py
@@ -375,7 +404,7 @@ index 66dfc925d5..34d1acbc70 100644
              _refresh_module_weight_views(model)
  
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index c67205aefd..2b63b26813 100644
+index c67205aefd..daacc91ad4 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -1,3 +1,4 @@
@@ -536,6 +565,41 @@ index c67205aefd..2b63b26813 100644
          ):
              self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
  
+@@ -621,6 +752,21 @@ class Worker(WorkerBase):
+                 self.device,
+                 self.model_runner.get_model(),
+             )
++        self._kv_pool_placeholder: torch.Tensor | None = None
++        kv_bytes = int(self.cache_config.kv_cache_memory_bytes or 0)
++        if getattr(self, "_contiguous_pool_anchor", None) is not None and kv_bytes > 0:
++            cached_free = max(
++                0,
++                int(torch.cuda.memory_reserved(self.device))
++                - int(torch.cuda.memory_allocated(self.device)),
++            )
++            if cached_free >= kv_bytes:
++                try:
++                    self._kv_pool_placeholder = torch.empty(
++                        (kv_bytes,), dtype=torch.uint8, device=self.device
++                    )
++                except torch.OutOfMemoryError:
++                    self._kv_pool_placeholder = None
+         apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
+ 
+     def update_config(self, overrides: dict[str, Any]) -> None:
+@@ -960,6 +1106,12 @@ class Worker(WorkerBase):
+         torch.accelerator.empty_cache()
+         trim_host_heap()
+ 
++        # Hand the reserved KV slot inside the pre-allocated contiguous pool
++        # directly to initialize_kv_cache so profiling temporaries cannot split
++        # the tail of the single segment and spill KV cache into a second one.
++        if getattr(self, "_kv_pool_placeholder", None) is not None:
++            self._kv_pool_placeholder = None
++
+         # Update local config with adjusted num blocks after profiling,
+         # so that it's available to the warmup stage.
+         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 -- 
 2.43.0
 
