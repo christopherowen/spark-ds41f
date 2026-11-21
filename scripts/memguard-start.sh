@@ -72,6 +72,20 @@ fi
 ready_file=$(mktemp "$runtime_dir/${name}-memguard.XXXXXX")
 rm -f -- "$ready_file"
 
+# Confine memguard to efficiency cores 0-4 on hosts with at least 5 CPUs
+# (GB10 Grace cores 0-4 are Cortex-A725, away from fast X925 P-cores).
+allowed_cpus_args=()
+allowed_cpus=${MEMGUARD_ALLOWED_CPUS:-}
+if [[ -z "$allowed_cpus" ]]; then
+  cpu_count=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '0')
+  if [[ "$cpu_count" =~ ^[0-9]+$ ]] && ((cpu_count >= 5)); then
+    allowed_cpus="0-4"
+  fi
+fi
+if [[ -n "$allowed_cpus" ]]; then
+  allowed_cpus_args=("--property=AllowedCPUs=$allowed_cpus")
+fi
+
 # A collected transient unit may still have a failed record from a prior stop.
 sudo -n install -d -m 0755 -o "$(id -un)" /var/log/spark-memguard >/dev/null 2>&1 || true
 sudo -n systemctl stop "$unit" >/dev/null 2>&1 || true
@@ -85,6 +99,7 @@ sudo -n systemd-run --quiet \
   --property=OOMScoreAdjust=-1000 \
   --property=MemoryMin=64M \
   --property=CPUWeight=1000 \
+  "${allowed_cpus_args[@]}" \
   --setenv="THRESHOLD_GIB=$guard_gib" \
   --setenv="INTERVAL=$interval" \
   --setenv="CONTAINER_NAME=$name" \

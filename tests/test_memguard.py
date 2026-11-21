@@ -30,17 +30,29 @@ class MemguardTest(unittest.TestCase):
         self.actions = self.root / "actions"
         self.ready = self.root / "ready"
         self.evidence = self.root / "evidence"
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+        self.meminfo = self.proc / "meminfo"
+        self.inspect_count = self.root / "inspect_count"
         self._write_command(
             "docker",
             """#!/usr/bin/env bash
 set -eu
 case "$1" in
   inspect)
+    if [[ -n "${FAKE_INSPECT_COUNT:-}" ]]; then
+      count=$(cat "$FAKE_INSPECT_COUNT" 2>/dev/null || printf '0')
+      printf '%s\n' "$((count + 1))" >"$FAKE_INSPECT_COUNT"
+    fi
     state=$(cat "$FAKE_STATE")
     if [[ "$state" == absent ]]; then
       exit 1
     fi
-    printf '%s\n' "$state"
+    if [[ "$state" == true && -n "${FAKE_CONTAINER_PID:-}" && "$*" == *"State.Pid"* ]]; then
+      printf 'true %s\n' "$FAKE_CONTAINER_PID"
+    else
+      printf '%s\n' "$state"
+    fi
     ;;
   kill)
     printf 'kill %s\n' "$*" >>"$FAKE_ACTIONS"
@@ -53,25 +65,6 @@ case "$1" in
     exit 2
     ;;
 esac
-""",
-        )
-        self._write_command(
-            "awk",
-            """#!/usr/bin/env bash
-set -eu
-if [[ -n "${FAKE_MEM_SEQUENCE:-}" ]]; then
-  counter="$FAKE_STATE.calls"
-  calls=$(cat "$counter" 2>/dev/null || printf '0')
-  printf '%s\n' "$((calls + 1))" >"$counter"
-  IFS=',' read -r -a values <<<"$FAKE_MEM_SEQUENCE"
-  index=$calls
-  if ((index >= ${#values[@]})); then
-    index=$((${#values[@]} - 1))
-  fi
-  printf '%s\n' "$((values[index] * 1024 * 1024))"
-  exit 0
-fi
-printf '%s\n' "$FAKE_MEM_AVAILABLE_KIB"
 """,
         )
         self._write_command(
@@ -91,14 +84,30 @@ if [[ -n "${FAKE_SLEEP_LIMIT:-}" ]]; then
   pauses=$(cat "$counter" 2>/dev/null || printf '0')
   pauses=$((pauses + 1))
   printf '%s\n' "$pauses" >"$counter"
+  if [[ -n "${FAKE_MEM_SEQUENCE:-}" ]]; then
+    IFS=',' read -r -a values <<<"$FAKE_MEM_SEQUENCE"
+    index=$pauses
+    if ((index >= ${#values[@]})); then
+      index=$((${#values[@]} - 1))
+    fi
+    printf 'MemTotal:       131072000 kB\nMemAvailable:   %s kB\n' "$((values[index] * 1024 * 1024))" >"$MEMGUARD_MEMINFO_FILE"
+  fi
   if ((pauses >= FAKE_SLEEP_LIMIT)); then
     printf 'false\n' >"$FAKE_STATE"
+    if [[ -n "${FAKE_CONTAINER_PID:-}" ]]; then
+      rm -rf "$MEMGUARD_PROC_DIR/$FAKE_CONTAINER_PID"
+    fi
   fi
   exit 0
 fi
 case "$state" in
   absent) printf 'true\n' >"$FAKE_STATE" ;;
-  true) printf 'false\n' >"$FAKE_STATE" ;;
+  true)
+    printf 'false\n' >"$FAKE_STATE"
+    if [[ -n "${FAKE_CONTAINER_PID:-}" ]]; then
+      rm -rf "$MEMGUARD_PROC_DIR/$FAKE_CONTAINER_PID"
+    fi
+    ;;
 esac
 """,
         )
@@ -136,10 +145,22 @@ fi
         warn_gib: int | None = None,
         mem_sequence: list[int] | None = None,
         sleep_limit: int | None = None,
+        container_pid: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run the guard. ``mem_sequence`` gives MemAvailable (GiB) sample by sample, the
         last value repeating; ``sleep_limit`` stops the container after that many pauses."""
         self.state.write_text(f"{state}\n", encoding="utf-8")
+        if self.inspect_count.exists():
+            self.inspect_count.unlink()
+        initial_kib = (
+            mem_sequence[0] * 1024 * 1024
+            if mem_sequence is not None
+            else (available_kib if available_kib is not None else available_gib * 1024 * 1024)
+        )
+        self.meminfo.write_text(
+            f"MemTotal:       131072000 kB\nMemAvailable:   {initial_kib} kB\n",
+            encoding="utf-8",
+        )
         environment = os.environ.copy()
         environment.update(
             {
@@ -151,12 +172,20 @@ fi
                 "WAIT_FOR_CONTAINER_SECONDS": str(wait_seconds),
                 "READY_FILE": str(self.ready),
                 "MEMGUARD_EVIDENCE_DIR": str(self.evidence),
+                "MEMGUARD_PROC_DIR": str(self.proc),
+                "MEMGUARD_MEMINFO_FILE": str(self.meminfo),
                 "FAKE_STATE": str(self.state),
                 "FAKE_ACTIONS": str(self.actions),
-                "FAKE_MEM_AVAILABLE_KIB": str(available_kib if available_kib is not None
-                                              else available_gib * 1024 * 1024),
+                "FAKE_INSPECT_COUNT": str(self.inspect_count),
             }
         )
+        if container_pid is not None:
+            pid_dir = self.proc / str(container_pid)
+            pid_dir.mkdir(exist_ok=True)
+            # 22-field /proc/<pid>/stat line with field 22 (starttime) = 123456
+            stat_fields = " ".join(["S"] + ["0"] * 18 + ["123456", "0"])
+            (pid_dir / "stat").write_text(f"{container_pid} (vllm worker) {stat_fields}\n", encoding="utf-8")
+            environment["FAKE_CONTAINER_PID"] = str(container_pid)
         if warn_gib is not None:
             environment["MEMGUARD_WARN_GIB"] = str(warn_gib)
         if mem_sequence is not None:
@@ -210,10 +239,9 @@ fi
         self.assertEqual(actions.count("low headroom on candidate during steady"), 1)
         self.assertIn("killing candidate during steady: MemAvailable 4194304 KiB below 5242880 KiB "
                       "(short by 1048576 KiB); warn line 8388608 KiB", actions)
-        self.assertEqual(Path(f"{self.state}.calls").read_text(encoding="utf-8").strip(), "2")
+        self.assertEqual(Path(f"{self.state}.sleeps").read_text(encoding="utf-8").strip(), "1")
         # A first sample below the kill line kills before any warning.
         self.actions.unlink()
-        Path(f"{self.state}.calls").unlink()
         Path(f"{self.state}.sleeps").unlink()
         result = self._run(state="true", available_gib=16, wait_seconds=0, phase="steady",
                            warn_gib=8, mem_sequence=[4, 16], sleep_limit=10)
@@ -303,6 +331,8 @@ fi
         self.assertIn("--property=OOMScoreAdjust=-1000", actions)
         self.assertIn("--property=MemoryMin=64M", actions)
         self.assertIn("--property=CPUWeight=1000", actions)
+        if (os.cpu_count() or 0) >= 5:
+            self.assertIn("--property=AllowedCPUs=0-4", actions)
         self.assertIn("--setenv=INTERVAL=0.25", actions)
         self.assertIn("--setenv=WAIT_FOR_CONTAINER_SECONDS=120", actions)
         self.assertIn("--setenv=CONTAINER_NAME=dsv41-karmic-kraken", actions)
@@ -412,6 +442,22 @@ fi
         self.assertEqual(gib, str(cluster["host"]["memguard_gib"]))
         self.assertEqual(interval, str(cluster["host"]["memguard_interval_seconds"]))
         self.assertEqual((mode, warn), ("running", "0"))  # no warn line unless the host sets one
+
+    def test_cached_pid_polls_proc_without_repeat_docker_inspect(self) -> None:
+        # Five steady polls with a live container PID call docker inspect only twice:
+        # once to cache the PID, and once to confirm exit after /proc/<pid>/stat disappears.
+        result = self._run(
+            state="true",
+            available_gib=16,
+            wait_seconds=0,
+            phase="steady",
+            mem_sequence=[16, 16, 16, 16, 16],
+            sleep_limit=5,
+            container_pid=4242,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.inspect_count.read_text(encoding="utf-8").strip(), "2")
 
 
 if __name__ == "__main__":
