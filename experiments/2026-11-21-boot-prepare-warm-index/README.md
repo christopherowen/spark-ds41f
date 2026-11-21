@@ -39,4 +39,15 @@ Add a content-addressed warm-cache index in `vllm/models/deepseek_v4_1/tilelang/
 ## Pre-Run Live Prediction & Screening Status
 
 - **Prediction**: Boot 1 populates `prepare-index-<prov[:16]>.json` at unchanged boot time (`~122 s`); Boot 2+ cuts `prepare_declared()` from `~25 s` down to `~1–2 s`, reducing total cluster time-to-API-ready from `~122 s` to **`~98–102 s` (`-20..-24 s`, `-16%..-20%`)** with `0` greedy diffs (`outputs_sha256 = b795e6d4...`), identical `MemAvailable`, and strictly neutral decode/prefill performance.
-- **Status**: Queued for 2-boot live confirmation on `tp3-triangle` (`experiments/2026-11-21-boot-prepare-warm-index/tp3-dev.json`).
+## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
+
+Tested inside lab window `dgx1-1795263633` on `spark-ds41f:candidate-63-r5` (`experiments/2026-11-21-boot-prepare-warm-index/tp3-dev.json`). Baseline `ctrl` warm boots (`candidate-63/tp3-dev.json` and unchanged-prepare profiles across Rounds 3–4) measured `+122.6 s`, `+122.5 s`, `+123.5 s`, `+122.5 s`, `+120.3 s` (**`122.3 s`** mean across 5 warm boots).
+
+| Boot | Role | `API ready` | Cluster Ready | `model` Bit-Exactness (`128` prompts) |
+| --- | --- | ---: | ---: | --- |
+| `boot-b1-populate` | Populates warm index in `/cache` | `+123.6 s` | `+123.9 s` | — |
+| **`boot-b2-warm`** | Warm-index boot #1 | **`+107.4 s`** | **`+107.7 s`** | **`128/128` bit-exact** (`b795e6d4...`, `rank1=1.0`, `ppl=1.3160824`, `failed=0`) |
+| **`boot-b3-warm`** | Warm-index boot #2 | **`+109.6 s`** | **`+109.9 s`** | — |
+| **2-boot warm mean vs `ctrl`** | — | **`108.5 s` (`-13.8 s`, `-11.3%`)** | **`108.8 s` (`-13.8 s`)** | **100% bit-exact** |
+
+- **Status**: **2-boot live verified win (`-13.8 s` / `-11.3%` per warm boot on `tp3-triangle`; `-25.9 s` total stacked with `candidate-63`'s `-12.1 s` `load_model` win vs `1120`)**. Ready for `candidate-64`.

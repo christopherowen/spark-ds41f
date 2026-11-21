@@ -66,7 +66,18 @@ docker run --rm --gpus all \
 
 Short-context Cold-L2 (`4K` / `16K`) also improved: `1x6 @ 4K` `-31.6%` (`13.8 -> 9.4 us`), `8x6 @ 4K` `-19.1%` (`31.9 -> 25.8 us`), `4x6 @ 16K` `-26.5%` (`46.2 -> 34.0 us`), `8x6 @ 16K` `-26.3%` (`85.0 -> 62.7 us`). Prefill (`rows > 96`) remains on its dedicated `row_group=4` kernel (`0%` regression).
 
-## Live Screening Status
+## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-- Overlay profile [`tp3-dev.json`](tp3-dev.json) is ready for 2-boot live confirmation on `tp3-triangle` (Round 4: `screen-tp3` + `single-stream` + deep-context decode grid `1x3/8x24 @ 256K` and `1x3 @ 1016K`).
-- Remaining optional follow-up under `Decode #9`: multi-request TP row split (`8x6` / `16x6` @ `256K–1M`) with one-shot `sparknet` RoCE gather of `topk_indices_buffer[:rows]` (`2 KiB/row`) to divide the remaining `~18.6 ms` (`8x6 @ 1M`) across TP ranks.
+Tested inside lab window `dgx1-1795263633` on `spark-ds41f:candidate-63-r5` (`experiments/2026-11-21-decode-indexer-multirow-kpool/tp3-dev.json`) against 2-boot `ctrl-b1/b2` (`candidate-63/tp3-dev.json`), `0` failed requests on all runs:
+
+| Arm | `model` (`128` prompts) | Grid `mad5` vs `ctrl` | Grid `fl25` vs `ctrl` | `1x3 @4K` | `8x48 @4K` | `1x3 @256K` | `1x3 @1016K` | `c1` (`tpot_p50`) | `c8` (`tpot_p50`) | Prefill `32K` / `262K` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `ctrl-b1/b2` mean | `128/128` (`b795e6d4...`) | `0.000%` (`±0.20%`) | `0.000%` (`±0.09%`) | `16.800` | `27.556` | `16.917` | `16.961` | `69.69` (`14.44`) | `169.53` (`46.96`) | `7,259 / 7,437` |
+| `idx-r3-b1` | `128/128` (`b795e6d4...`, `r1=1.0`, `ppl=1.3160824`) | `+0.151%` | `+0.067%` | `16.793` | `27.520` | `16.825` | `17.014` | `69.52` (`14.47`) | `168.93` (`47.48`) | `7,196 / 7,364` |
+| `idx-r3-b2` | `128/128` (`b795e6d4...`, `r1=1.0`, `ppl=1.3160824`) | `-0.015%` | `-0.084%` | `16.818` | `27.520` | `16.936` | `16.794` | `69.59` (`14.41`) | `169.17` (`46.78`) | `7,290 / 7,429` |
+| **2-boot mean** | **100% bit-exact** | **`+0.068%`** | **`-0.009%`** | **`16.805`** | **`27.520` (`-0.036 ms`)** | **`16.881` (`-0.036 ms`)** | **`16.904` (`-0.057 ms`)** | **`69.56` (`14.44`)** | **`169.05` (`47.13`)** | **`7,243 / 7,397`** |
+
+Note: `sonar engine` (`engine grid`) replays synthetic KV tables where `1x3 @4K..1016K` (`fwd_floor = 13.03 ms`) and `8x24 @4K..256K` (`fwd_floor = 17.72 ms`) stay L2-resident across all contexts, so the `engine grid` screen verifies zero short-context/L2 regression (`fl25 = -0.009%`) while the Cold-DRAM deep-context speedup (`-17.1%` / `-1.31 ms` across 8 dense layers at `8x6 @256K`, `-27.4%` / `-9.39 ms` at `8x6 @1M`) is measured on the disjoint Cold-L2 rotating-pool harness (`dgx4`) and applies to real long-context multi-stream serving.
+
+- **Status**: **2-boot live verified zero-regression + `128/128` bit-exact (`fl25 = -0.009%`)** + `-17.1%..-27.4%` Cold-DRAM deep-context dense-indexer speedup. Composed cleanly with BlockMax-32 (`#1265`) via `_BLOCKMAX_MIN_ROWS = _DECODE_SCORE_MAX_ROWS + 1` (`97`) for **`candidate-64`**.
+- Remaining optional follow-up under `Decode #9`: multi-request TP row split (`8x6` / `16x6` @ `256K–1M`) with one-shot `sparknet` RoCE gather of `topk_indices_buffer[:rows]` (`2 KiB/row`) to divide the remaining `~24.9 ms` (`8x6 @1M`, 8 layers) across TP ranks.
