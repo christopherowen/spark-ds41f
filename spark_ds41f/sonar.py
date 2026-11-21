@@ -603,25 +603,39 @@ def _patch_engine(engine_mod) -> None:
                     "replays": replays, "warmup": warmup, "settle": settle}
             if not fill_real_context:
                 spec["fill_real_context"] = False
-            answer = engine_mod._post(base + "/collective_rpc",
-                                      {"method": "engine_grid", "args": [json.dumps(spec)], "timeout": timeout},
-                                      timeout + 60)
-            workers = (answer or {}).get("results") or []
-            grids = [w for w in workers if isinstance(w, dict)]
-            if not grids:
-                raise RuntimeError(f"no engine grid in the reply: {str(answer)[:300]}")
-            reset = True
+            orig_error: BaseException | None = None
+            reset_error: Exception | None = None
             try:
-                engine_mod._post(base + "/reset_prefix_cache", None, 120)
-            except Exception:  # noqa: BLE001 - recorded: later cache hits could read dummy KV
-                reset = False
-            rank0 = min(grids, key=lambda g: g.get("rank", 0))
-            ignored = [engine_mod.label(shape) for shape, timed in zip(shapes, rank0["shapes"])
-                       if shape.get("real_rows") and not timed.get("real_rows")]
-            if ignored:
-                raise RuntimeError(f"the server ran padding rows for {', '.join(ignored)}: "
-                                   "its engine grid has no real_rows")
-            return {"workers": len(workers), "rank": rank0.get("rank"), "prefix_cache_reset": reset,
+                answer = engine_mod._post(base + "/collective_rpc",
+                                          {"method": "engine_grid", "args": [json.dumps(spec)], "timeout": timeout},
+                                          timeout + 60)
+                workers = (answer or {}).get("results") or []
+                grids = [w for w in workers if isinstance(w, dict)]
+                if not grids:
+                    raise RuntimeError(f"no engine grid in the reply: {str(answer)[:300]}")
+                rank0 = min(grids, key=lambda g: g.get("rank", 0))
+                ignored = [engine_mod.label(shape) for shape, timed in zip(shapes, rank0["shapes"])
+                           if shape.get("real_rows") and not timed.get("real_rows")]
+                if ignored:
+                    raise RuntimeError(f"the server ran padding rows for {', '.join(ignored)}: "
+                                       "its engine grid has no real_rows")
+            except BaseException as error:
+                orig_error = error
+                raise
+            finally:
+                try:
+                    engine_mod._post(base + "/reset_prefix_cache", None, 120)
+                except Exception as error:  # noqa: BLE001 - fail or preserve original error
+                    reset_error = error
+                    if orig_error is not None and hasattr(orig_error, "add_note"):
+                        orig_error.add_note(
+                            f"prefix cache reset failed after engine grid error: {type(error).__name__}: {error}"
+                        )
+            if reset_error is not None:
+                raise RuntimeError(
+                    f"prefix cache reset failed after engine grid: {type(reset_error).__name__}: {reset_error}"
+                ) from reset_error
+            return {"workers": len(workers), "rank": rank0.get("rank"), "prefix_cache_reset": True,
                     "replays": replays, "warmup": warmup, "settle": rank0.get("settle"), "shapes": shapes,
                     "grid": rank0["shapes"]}
 
