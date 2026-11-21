@@ -1,0 +1,42 @@
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -1124,14 +1124,21 @@
+         segments = tilelang.cdiv(chunks, segment_chunks)
+         sms = torch.cuda.get_device_properties(device).multi_processor_count
+         if decode_max_rows is None:
++            # Single-segment layers (e.g. SWA-only) have no K/V segments to split:
++            # decode/split would write FP32 Partial to DRAM and launch a merge kernel
++            # for one segment, which is strictly slower than single-kernel extend.
+             decode_max_rows = (
+-                DECODE_MAX_WAVES * sms // (segments * tilelang.cdiv(heads, block_H))
++                0
++                if segments <= 1
++                else DECODE_MAX_WAVES
++                * sms
++                // (segments * tilelang.cdiv(heads, block_H))
+             )
+         if split_max_rows is None:
+             split_max_rows = (
+-                sms // (segments * tilelang.cdiv(heads, split_block_H))
+-                if split_block_H
+-                else 0
++                0
++                if segments <= 1 or not split_block_H
++                else sms // (segments * tilelang.cdiv(heads, split_block_H))
+             )
+         decode_max_rows = min(decode_max_rows, max_rows)
+         split_max_rows = min(split_max_rows, decode_max_rows)
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -1368,8 +1368,9 @@
+ 
+     swa24 = SparseMlaV41Plan.routes(24, 128, 0, 128, swa_page_size=128, max_rows=2048)
+     assert swa24.segments == 1
+-    assert swa24.split_max_rows == 24
+-    assert swa24.decode_max_rows == 144
++    assert swa24.split_max_rows == 0
++    assert swa24.decode_max_rows == 0
++    assert list(swa24.kernels) == ["extend"]
+ 
+ 
+ @pytest.mark.parametrize("heads", [16, 24])
