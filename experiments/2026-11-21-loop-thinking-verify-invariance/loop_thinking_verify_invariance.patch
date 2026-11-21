@@ -1,0 +1,458 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-11-21 17:31:50.405122926 +0000
++++ b/vllm/v1/core/sched/scheduler.py	2026-11-21 17:36:40.288644907 +0000
+@@ -68,7 +68,12 @@
+     SchedulingPolicy,
+     create_request_queue,
+ )
+-from vllm.v1.core.sched.utils import check_stop, remove_all, stops_on_next_token
++from vllm.v1.core.sched.utils import (
++    FORCED_REASONING_END_GRACE,
++    check_stop,
++    remove_all,
++    stops_on_next_token,
++)
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+@@ -1185,6 +1190,7 @@
+         base = self.num_spec_tokens + self.sink_rejection
+         if (
+             request.is_prefill_chunk
++            or request.force_thinking_end
+             or len(placeholders) < base
+             or placeholders[0] != -1
+             or placeholders[-1] != -1
+@@ -3650,9 +3656,13 @@
+             ):
+                 # The copy state this step's proposal left: the drafts the
+                 # request's steps after the next one are laid out with.
+-                request.copy_draft_alloc = model_runner_output.copy_draft_alloc[
+-                    req_index
+-                ]
++                # Keep copy drafts off once a reasoning loop has requested a
++                # forced end, so an in-flight async step cannot re-enable them.
++                request.copy_draft_alloc = (
++                    0
++                    if request.force_thinking_end
++                    else model_runner_output.copy_draft_alloc[req_index]
++                )
+             # Sink rejection: whether this step's spec tokens started with
+             # draft zero, the provisional token of the request's previous step.
+             draft_zero = self.sink_rejection and req_id in (
+@@ -4223,6 +4233,10 @@
+                 request,
+                 self.max_model_len,
+                 thinking_loop_break=self.thinking_loop_break,
++                forced_reasoning_end_grace=max(
++                    FORCED_REASONING_END_GRACE,
++                    2 * (self.num_verification_tokens + 1),
++                ),
+             )
+             if not was_suspected and request.output_loop_since >= 0:
+                 loop_mode, loop_pat_len, loop_count = request.last_loop_info or (
+diff --git a/vllm/v1/core/sched/utils.py b/vllm/v1/core/sched/utils.py
+--- a/vllm/v1/core/sched/utils.py	2026-11-21 17:31:50.405043774 +0000
++++ b/vllm/v1/core/sched/utils.py	2026-11-21 17:36:40.287756782 +0000
+@@ -350,6 +350,7 @@
+     request: Request,
+     max_model_len: int,
+     thinking_loop_break: bool = True,
++    forced_reasoning_end_grace: int = FORCED_REASONING_END_GRACE,
+ ) -> bool:
+     assert not request.pooling_params
+ 
+@@ -396,7 +397,7 @@
+             # loop unchecked until max_tokens.
+             if (
+                 request.num_output_tokens - request.force_thinking_end_at
+-                <= FORCED_REASONING_END_GRACE
++                <= forced_reasoning_end_grace
+             ):
+                 return False
+             return _finish_repetition(request)
+diff --git a/vllm/v1/worker/gpu/_triton_refs.py b/vllm/v1/worker/gpu/_triton_refs.py
+--- a/vllm/v1/worker/gpu/_triton_refs.py	2026-11-21 17:31:50.405349613 +0000
++++ b/vllm/v1/worker/gpu/_triton_refs.py	2026-11-21 17:36:40.289393992 +0000
+@@ -1657,69 +1657,81 @@
+         last_end = -1
+ 
+     if scan_pos == 0 and last_start < 0 and last_end < 0:
+-        # Cold scan: walk backward in vectorized blocks, stopping at the first
+-        # block with a marker; only the relative order of the two positions
+-        # found matters below.
++        # Cold scan matching the reasoning parser state machine: find the latest
++        # natural end marker and the earliest start marker strictly after it.
+         block_hi = total_len
+-        while block_hi > 0 and last_start < 0 and last_end < 0:
++        while block_hi > 0 and last_end < 0 and (budget > 0 or last_start < 0):
+             block_lo = block_hi - BLOCK
+             if block_lo < 0:
+                 block_lo = 0
+             offs = block_lo + tl.arange(0, BLOCK)
+ 
+-            start_match = (offs < block_hi) & (offs + START_LEN <= total_len)
+-            for j in tl.static_range(0, START_LEN):
+-                expected = tl.load(reasoning_start_token_ids_ptr + j)
++            end_match = (offs < block_hi) & (offs + NATURAL_END_LEN <= total_len)
++            for j in tl.static_range(0, NATURAL_END_LEN):
++                expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
+                 actual = tl.load(
+                     all_token_ids_ptr + req_state_idx * all_token_ids_stride + offs + j,
+                     mask=offs + j < total_len,
+                     other=-1,
+                 )
+-                start_match = start_match & (actual == expected)
++                end_match = end_match & (actual == expected)
++            chunk_end = tl.max(tl.where(end_match, offs, -1), axis=0)
+ 
+-            end_match = (offs < block_hi) & (offs + NATURAL_END_LEN <= total_len)
+-            for j in tl.static_range(0, NATURAL_END_LEN):
+-                expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
++            start_match = (
++                (offs < block_hi)
++                & (offs > chunk_end)
++                & (offs + START_LEN <= total_len)
++            )
++            for j in tl.static_range(0, START_LEN):
++                expected = tl.load(reasoning_start_token_ids_ptr + j)
+                 actual = tl.load(
+                     all_token_ids_ptr + req_state_idx * all_token_ids_stride + offs + j,
+                     mask=offs + j < total_len,
+                     other=-1,
+                 )
+-                end_match = end_match & (actual == expected)
+-
+-            last_start = tl.max(tl.where(start_match, offs, -1), axis=0)
+-            last_end = tl.max(tl.where(end_match, offs, -1), axis=0)
++                start_match = start_match & (actual == expected)
++            chunk_start = tl.min(tl.where(start_match, offs, 2147483647), axis=0)
++            if chunk_start < 2147483647:
++                last_start = chunk_start
++            if chunk_end >= 0:
++                last_end = chunk_end
+             block_hi = block_lo
+     else:
+-        for i in tl.range(scan_pos, total_len):
+-            if i + START_LEN <= total_len:
+-                start_match = True
+-                for j in tl.static_range(0, START_LEN):
+-                    expected = tl.load(reasoning_start_token_ids_ptr + j)
+-                    actual = tl.load(
+-                        all_token_ids_ptr + req_state_idx * all_token_ids_stride + i + j
+-                    )
+-                    start_match = start_match & (actual == expected)
+-                if start_match:
+-                    last_start = i
+-
+-            if i + NATURAL_END_LEN <= total_len:
+-                end_match = True
+-                for j in tl.static_range(0, NATURAL_END_LEN):
+-                    expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
+-                    actual = tl.load(
+-                        all_token_ids_ptr + req_state_idx * all_token_ids_stride + i + j
+-                    )
+-                    end_match = end_match & (actual == expected)
+-                if end_match:
+-                    last_end = i
++        for end_pos in tl.range(scan_pos + 1, total_len + 1):
++            if last_start >= 0 and last_start > last_end:
++                i = end_pos - NATURAL_END_LEN
++                if i >= last_start + START_LEN:
++                    end_match = True
++                    for j in tl.static_range(0, NATURAL_END_LEN):
++                        expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
++                        actual = tl.load(
++                            all_token_ids_ptr
++                            + req_state_idx * all_token_ids_stride
++                            + i
++                            + j
++                        )
++                        end_match = end_match & (actual == expected)
++                    if end_match:
++                        last_end = i
++            else:
++                i = end_pos - START_LEN
++                if i >= 0 and (last_end < 0 or i >= last_end + NATURAL_END_LEN):
++                    start_match = True
++                    for j in tl.static_range(0, START_LEN):
++                        expected = tl.load(reasoning_start_token_ids_ptr + j)
++                        actual = tl.load(
++                            all_token_ids_ptr
++                            + req_state_idx * all_token_ids_stride
++                            + i
++                            + j
++                        )
++                        start_match = start_match & (actual == expected)
++                    if start_match:
++                        last_start = i
+ 
+     tl.store(cached_last_start_ptr + req_state_idx, last_start)
+     tl.store(cached_last_end_ptr + req_state_idx, last_end)
+-    new_scan_pos = total_len - (MAX_LEN - 1)
+-    if new_scan_pos < 0:
+-        new_scan_pos = 0
+-    tl.store(cached_scan_pos_ptr + req_state_idx, new_scan_pos)
++    tl.store(cached_scan_pos_ptr + req_state_idx, total_len)
+ 
+ 
+ @triton.jit
+@@ -1756,45 +1768,43 @@
+     last_start = tl.load(cached_last_start_ptr + req_state_idx)
+     last_end = tl.load(cached_last_end_ptr + req_state_idx)
+ 
+-    start_lo = total_len - START_LEN + 1
+-    if start_lo < 0:
+-        start_lo = 0
+-    for i in tl.range(start_lo, effective_len - START_LEN + 1):
+-        start_match = True
+-        for j in tl.static_range(0, START_LEN):
+-            expected = tl.load(reasoning_start_token_ids_ptr + j)
+-            actual = _load_effective_token(
+-                all_token_ids_ptr,
+-                all_token_ids_stride,
+-                input_ids_ptr,
+-                cur_req_first_pos,
+-                req_state_idx,
+-                total_len,
+-                i + j,
+-            )
+-            start_match = start_match & (actual == expected)
+-        if start_match:
+-            last_start = i
+-
+-    end_lo = total_len - NATURAL_END_LEN + 1
+-    if end_lo < 0:
+-        end_lo = 0
+-    for i in tl.range(end_lo, effective_len - NATURAL_END_LEN + 1):
+-        end_match = True
+-        for j in tl.static_range(0, NATURAL_END_LEN):
+-            expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
+-            actual = _load_effective_token(
+-                all_token_ids_ptr,
+-                all_token_ids_stride,
+-                input_ids_ptr,
+-                cur_req_first_pos,
+-                req_state_idx,
+-                total_len,
+-                i + j,
+-            )
+-            end_match = end_match & (actual == expected)
+-        if end_match:
+-            last_end = i
++    for end_pos in tl.range(total_len + 1, effective_len + 1):
++        if last_start >= 0 and last_start > last_end:
++            i = end_pos - NATURAL_END_LEN
++            if i >= last_start + START_LEN:
++                end_match = True
++                for j in tl.static_range(0, NATURAL_END_LEN):
++                    expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
++                    actual = _load_effective_token(
++                        all_token_ids_ptr,
++                        all_token_ids_stride,
++                        input_ids_ptr,
++                        cur_req_first_pos,
++                        req_state_idx,
++                        total_len,
++                        i + j,
++                    )
++                    end_match = end_match & (actual == expected)
++                if end_match:
++                    last_end = i
++        else:
++            i = end_pos - START_LEN
++            if i >= 0 and (last_end < 0 or i >= last_end + NATURAL_END_LEN):
++                start_match = True
++                for j in tl.static_range(0, START_LEN):
++                    expected = tl.load(reasoning_start_token_ids_ptr + j)
++                    actual = _load_effective_token(
++                        all_token_ids_ptr,
++                        all_token_ids_stride,
++                        input_ids_ptr,
++                        cur_req_first_pos,
++                        req_state_idx,
++                        total_len,
++                        i + j,
++                    )
++                    start_match = start_match & (actual == expected)
++                if start_match:
++                    last_start = i
+ 
+     if last_start < 0 or last_start <= last_end:
+         return
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_thinking.py b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+--- a/vllm/v1/worker/gpu/sample/tilelang_thinking.py	2026-11-21 17:31:50.405300045 +0000
++++ b/vllm/v1/worker/gpu/sample/tilelang_thinking.py	2026-11-21 17:36:40.288968330 +0000
+@@ -87,7 +87,7 @@
+             match = T.alloc_local((1,), "bool")
+             starts = T.alloc_fragment((1024,), "int32")
+             ends = T.alloc_fragment((1024,), "int32")
+-            start_max = T.alloc_fragment((1,), "int32")
++            start_min = T.alloc_fragment((1,), "int32")
+             end_max = T.alloc_fragment((1,), "int32")
+             if budget[req] >= 0:
+                 scan[0] = cached_pos[req]
+@@ -99,19 +99,18 @@
+                     last_end[0] = -1
+                 if (scan[0] == 0) & (last_start[0] < 0) & (last_end[0] < 0):
+                     hi[0] = lengths[req]
+-                    while (hi[0] > 0) & (last_start[0] < 0) & (last_end[0] < 0):
++                    # Match the reasoning parser state machine: find the latest
++                    # natural end marker, and the earliest start marker strictly
++                    # after it (repeated/quoted start markers inside an open
++                    # reasoning span do not reset the thinking budget).
++                    while (
++                        (hi[0] > 0)
++                        & (last_end[0] < 0)
++                        & ((budget[req] > 0) | (last_start[0] < 0))
++                    ):
+                         lo[0] = T.max(hi[0] - 1024, 0)
+                         for col in T.Parallel(1024):
+                             pos = lo[0] + col
+-                            match[0] = (pos < hi[0]) & (pos + start_len <= lengths[req])
+-                            for j in T.unroll(start_len):
+-                                if pos + j < lengths[req]:
+-                                    match[0] = match[0] & (
+-                                        tokens[req, pos + j] == start_ids[j]
+-                                    )
+-                                else:
+-                                    match[0] = False
+-                            starts[col] = T.if_then_else(match[0], pos, -1)
+                             match[0] = (pos < hi[0]) & (pos + end_len <= lengths[req])
+                             for j in T.unroll(end_len):
+                                 if pos + j < lengths[req]:
+@@ -121,36 +120,57 @@
+                                 else:
+                                     match[0] = False
+                             ends[col] = T.if_then_else(match[0], pos, -1)
+-                        T.reduce_max(starts, start_max, dim=0)
+                         T.reduce_max(ends, end_max, dim=0)
+-                        last_start[0] = start_max[0]
+-                        last_end[0] = end_max[0]
+-                        hi[0] = lo[0]
+-                else:
+-                    if T.get_thread_binding() == 0:
+-                        for pos in T.serial(scan[0], lengths[req]):
+-                            if pos + start_len <= lengths[req]:
+-                                match[0] = True
+-                                for j in T.unroll(start_len):
++                        for col in T.Parallel(1024):
++                            pos = lo[0] + col
++                            match[0] = (
++                                (pos < hi[0])
++                                & (pos > end_max[0])
++                                & (pos + start_len <= lengths[req])
++                            )
++                            for j in T.unroll(start_len):
++                                if pos + j < lengths[req]:
+                                     match[0] = match[0] & (
+                                         tokens[req, pos + j] == start_ids[j]
+                                     )
+-                                if match[0]:
+-                                    last_start[0] = pos
+-                            if pos + end_len <= lengths[req]:
+-                                match[0] = True
+-                                for j in T.unroll(end_len):
+-                                    match[0] = match[0] & (
+-                                        tokens[req, pos + j] == end_ids[j]
+-                                    )
+-                                if match[0]:
+-                                    last_end[0] = pos
++                                else:
++                                    match[0] = False
++                            starts[col] = T.if_then_else(match[0], pos, 2147483647)
++                        T.reduce_min(starts, start_min, dim=0)
++                        if start_min[0] < 2147483647:
++                            last_start[0] = start_min[0]
++                        if end_max[0] >= 0:
++                            last_end[0] = end_max[0]
++                        hi[0] = lo[0]
++                else:
++                    if T.get_thread_binding() == 0:
++                        for end_pos in T.serial(scan[0] + 1, lengths[req] + 1):
++                            if (last_start[0] >= 0) & (last_start[0] > last_end[0]):
++                                pos = end_pos - end_len
++                                if pos >= last_start[0] + start_len:
++                                    match[0] = True
++                                    for j in T.unroll(end_len):
++                                        match[0] = match[0] & (
++                                            tokens[req, pos + j] == end_ids[j]
++                                        )
++                                    if match[0]:
++                                        last_end[0] = pos
++                            else:
++                                pos = end_pos - start_len
++                                if (pos >= 0) & (
++                                    (last_end[0] < 0) | (pos >= last_end[0] + end_len)
++                                ):
++                                    match[0] = True
++                                    for j in T.unroll(start_len):
++                                        match[0] = match[0] & (
++                                            tokens[req, pos + j] == start_ids[j]
++                                        )
++                                    if match[0]:
++                                        last_start[0] = pos
+                 if T.get_thread_binding() == 0:
+                     cached_start[req] = last_start[0]
+                     cached_end[req] = last_end[0]
+-                    cached_pos[req] = T.max(
+-                        lengths[req] - (max(start_len, end_len) - 1), 0
+-                    )
++                    cached_pos[req] = lengths[req]
+ 
+     return update_markers
+ 
+@@ -202,28 +222,31 @@
+             if (req >= 0) & (budgets[safe_req] >= 0):
+                 last_start[0] = cached_start[req]
+                 last_end[0] = cached_end[req]
+-                for pos in T.serial(
+-                    T.max(total - start_len + 1, 0), length - start_len + 1
+-                ):
+-                    match[0] = True
+-                    for j in T.unroll(start_len):
+-                        effective_token(
+-                            actual, tokens, inputs, req, first, total, pos + j
+-                        )
+-                        match[0] = match[0] & (actual[0] == start_ids[j])
+-                    if match[0]:
+-                        last_start[0] = pos
+-                for pos in T.serial(
+-                    T.max(total - natural_len + 1, 0), length - natural_len + 1
+-                ):
+-                    match[0] = True
+-                    for j in T.unroll(natural_len):
+-                        effective_token(
+-                            actual, tokens, inputs, req, first, total, pos + j
+-                        )
+-                        match[0] = match[0] & (actual[0] == natural_ids[j])
+-                    if match[0]:
+-                        last_end[0] = pos
++                for end_pos in T.serial(total + 1, length + 1):
++                    if (last_start[0] >= 0) & (last_start[0] > last_end[0]):
++                        pos = end_pos - natural_len
++                        if pos >= last_start[0] + start_len:
++                            match[0] = True
++                            for j in T.unroll(natural_len):
++                                effective_token(
++                                    actual, tokens, inputs, req, first, total, pos + j
++                                )
++                                match[0] = match[0] & (actual[0] == natural_ids[j])
++                            if match[0]:
++                                last_end[0] = pos
++                    else:
++                        pos = end_pos - start_len
++                        if (pos >= 0) & (
++                            (last_end[0] < 0) | (pos >= last_end[0] + natural_len)
++                        ):
++                            match[0] = True
++                            for j in T.unroll(start_len):
++                                effective_token(
++                                    actual, tokens, inputs, req, first, total, pos + j
++                                )
++                                match[0] = match[0] & (actual[0] == start_ids[j])
++                            if match[0]:
++                                last_start[0] = pos
+                 if (
+                     (last_start[0] >= 0)
+                     & (last_start[0] > last_end[0])
