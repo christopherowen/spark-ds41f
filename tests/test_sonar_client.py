@@ -197,5 +197,99 @@ class EnvironmentTest(unittest.TestCase):
         self.assertEqual(Path(printed), sonar.checkout())
 
 
+class EngineGridCleanupTest(unittest.TestCase):
+    """P1: engine_grid resets the prefix cache on every exit after dispatch, failing if reset fails
+    while preserving the original RPC or validation error."""
+
+    def _shape(self):
+        return {"num_reqs": 1, "num_tokens": 2, "context_len": 4096}
+
+    def test_worker_failure_after_kv_write_resets_prefix_cache_and_restores_cold_tokens(self):
+        engine = sonar.module("engine")
+        state = {"kv_poisoned": False, "calls": []}
+
+        def fake_generate(prompt: str) -> list[int]:
+            return [999, 998] if state["kv_poisoned"] else [42, 43]
+
+        cold_tokens = fake_generate("shared-prefix")
+
+        def fake_post(url: str, body, timeout):
+            state["calls"].append(url)
+            if url.endswith("/collective_rpc"):
+                state["kv_poisoned"] = True
+                raise ConnectionError("worker crashed after writing profiling KV")
+            if url.endswith("/reset_prefix_cache"):
+                state["kv_poisoned"] = False
+                return {"ok": True}
+            raise AssertionError(f"unexpected URL {url}")
+
+        with mock.patch.object(engine, "_post", side_effect=fake_post):
+            with self.assertRaisesRegex(ConnectionError, "worker crashed after writing profiling KV"):
+                engine.run("http://h:8000", [self._shape()], require_idle=False)
+
+        self.assertEqual(state["calls"], ["http://h:8000/collective_rpc", "http://h:8000/reset_prefix_cache"])
+        self.assertFalse(state["kv_poisoned"])
+        self.assertEqual(fake_generate("shared-prefix"), cold_tokens)
+
+    def test_empty_reply_resets_prefix_cache(self):
+        engine = sonar.module("engine")
+        calls = []
+
+        def fake_post(url: str, body, timeout):
+            calls.append(url)
+            if url.endswith("/collective_rpc"):
+                return {"results": []}
+            if url.endswith("/reset_prefix_cache"):
+                return {"ok": True}
+            raise AssertionError(f"unexpected URL {url}")
+
+        with mock.patch.object(engine, "_post", side_effect=fake_post):
+            with self.assertRaisesRegex(RuntimeError, "no engine grid in the reply"):
+                engine.run("http://h:8000", [self._shape()], require_idle=False)
+
+        self.assertEqual(calls, ["http://h:8000/collective_rpc", "http://h:8000/reset_prefix_cache"])
+
+    def test_failed_reset_fails_successful_grid_run(self):
+        engine = sonar.module("engine")
+
+        def fake_post(url: str, body, timeout):
+            if url.endswith("/collective_rpc"):
+                return {"results": [{"rank": 0, "settle": 1, "shapes": [{"step_ms": [16.5]}]}]}
+            if url.endswith("/reset_prefix_cache"):
+                raise OSError("reset endpoint unavailable")
+            raise AssertionError(f"unexpected URL {url}")
+
+        with mock.patch.object(engine, "_post", side_effect=fake_post):
+            with self.assertRaisesRegex(RuntimeError, "prefix cache reset failed") as ctx:
+                engine.run("http://h:8000", [self._shape()], require_idle=False)
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+
+    def test_failed_reset_preserves_original_rpc_error(self):
+        engine = sonar.module("engine")
+
+        def fake_post(url: str, body, timeout):
+            if url.endswith("/collective_rpc"):
+                raise ValueError("worker RPC failed")
+            if url.endswith("/reset_prefix_cache"):
+                raise OSError("reset also failed")
+            raise AssertionError(f"unexpected URL {url}")
+
+        with mock.patch.object(engine, "_post", side_effect=fake_post):
+            with self.assertRaisesRegex(ValueError, "worker RPC failed") as ctx:
+                engine.run("http://h:8000", [self._shape()], require_idle=False)
+        notes = getattr(ctx.exception, "__notes__", [])
+        self.assertTrue(any("reset also failed" in note for note in notes))
+
+    def test_require_idle_failure_does_not_reset_before_dispatch(self):
+        engine = sonar.module("engine")
+        calls = []
+
+        with mock.patch.object(engine.prom, "require_idle", side_effect=RuntimeError("server busy")), \
+                mock.patch.object(engine, "_post", side_effect=lambda url, *a: calls.append(url)):
+            with self.assertRaisesRegex(RuntimeError, "server busy"):
+                engine.run("http://h:8000", [self._shape()], require_idle=True)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
