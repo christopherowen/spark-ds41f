@@ -685,7 +685,13 @@ def defragment_buddy_memory(nodes: dict, target_nodes: list[dict]) -> None:
             "-n",
             "sh",
             "-c",
-            "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory",
+            "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; "
+            "if [ -w /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages ]; then "
+            "o13=$(awk '/Node 0, zone[[:space:]]+Normal/{print $NF}' /proc/buddyinfo 2>/dev/null); "
+            "if [ -n \"$o13\" ] && [ \"$o13\" -gt 0 ] 2>/dev/null; then "
+            "echo \"$o13\" > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
+            "echo 0 > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
+            "fi; fi",
         )
         if res.returncode:
             detail = (res.stderr or res.stdout).strip() or f"exit {res.returncode}"
@@ -1239,6 +1245,8 @@ def command_cluster_stop(args: argparse.Namespace) -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
             failed = True
+    if not failed and defragment_before_start(cluster):
+        defragment_buddy_memory(nodes, nodes["nodes"])
     return int(failed)
 
 
