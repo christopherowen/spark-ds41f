@@ -683,6 +683,38 @@ committed token, step time and serving tok/s alongside the kernel timings.
     - count the NCCL communicators serving already makes at load (vLLM's
       groups, the prefill path's). If one beyond the step's own is made before
       capture, moving it after capture is a lever to screen. This is unmeasured.
+18. **Requests that set a sampling control (`top_k`, `top_p`, `min_p`, a
+    penalty, `logit_bias`).** Unmeasured. Every sampled point of
+    `config/suites/sampled.json` and `c32.json` sends `temperature` with
+    `top_p: 1.0` and no other control, and no record says how often clients
+    send one. The two paths differ:
+    - a step whose rows only scale by temperature samples and verifies from
+      the raw BF16 logits in one kernel (`0623`);
+    - a step with any other control takes the `[rows, vocab]` FP32 copy and
+      launches each control in turn. Top-k/top-p alone is four kernels, one of
+      them a five-step pivot search over the row (`0436`).
+
+    Size it before anything else, then screen the two levers only if the gap
+    is material:
+    - **Sizing (not run).** Count the controls that recorded agent traffic
+      sends. Read sampled `c1`, `c8` and `c16` with `top_p=0.95`, then with
+      `top_k` and a penalty added, against the `1120` sampled reference. This
+      needs a new suite: the recorded ones are not edited.
+    - **Choose the fused path per row.**
+      `any_non_temperature_logits_processing` is an `any` over the step's
+      rows, so one request with a control moves every row of that step to the
+      copy path. Screen a per-row flag that keeps temperature-only rows on the
+      raw-logit kernel while the other rows take the copy. Each row's tokens
+      must match its tokens today at a fixed seed.
+    - **One tile pass for the controls.** Apply the per-token controls
+      (penalties, bias, temperature) in the tile kernel's prologue and reduce
+      each vocabulary tile to its top-$k$ candidates with the tile max and
+      log-sum-exp, the summary item 4 proposes for uncontrolled sampling.
+      Top-k and top-p then merge candidates instead of searching the full row
+      for a pivot. The log-sum-exp bounds the mass outside the candidates;
+      when top-p needs more than they hold, the row falls back to today's
+      path, so the result stays exact. The top-p sum's order changes, so fix
+      its tie rule and compare token for token at fixed seeds.
 
 ## Speculative decoding
 
