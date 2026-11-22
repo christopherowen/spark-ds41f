@@ -20,4 +20,7 @@ Base: `candidate-66` (`vLLM 0001..0847`, tree `8ce4b43e546ba0d612f9694f0c3785348
 
 ## Build & Verification Status
 
-Pending build of `spark-ds41f:candidate-67` (vLLM `0001..0850`, `723` patches, `patch_head = 629d215f7b97d9909eaa31df542a599666fb6188`, `expected_tree = d2fefd95b6bfb59cf3a3d2874b919002b472604d`, `patchset_sha256 = 08f7ffa356629308fcc1b1edf4f9ce622ec7f7c0938e3a8cf1bd0763cc9f3a44`) on `dgx4`.
+Built `spark-ds41f:candidate-67` (`sha256:22725ab3a3242b16ea23eb59c5d0ee9031b5c7c6559b7837cf3d7228a8a583d4`, vLLM `0001..0850`, `723` patches, `patch_head = 629d215f7b97d9909eaa31df542a599666fb6188`, `expected_tree = d2fefd95b6bfb59cf3a3d2874b919002b472604d`, `patchset_sha256 = 08f7ffa356629308fcc1b1edf4f9ce622ec7f7c0938e3a8cf1bd0763cc9f3a44`) in `466 s` on `dgx4` (lowest `MemAvailable = 81.6 GiB`).
+
+- **Zero-overlay built-image unit tests on `dgx4` (`--gpus all`)**: **`2,838 passed, 8 skipped, 0 failed`** (`947.92 s`) across all 13 suites (`test_deepseek_v41_renderer_pool.py`, `test_deepseek_v41_postload_startup.py`, `test_deepseek_v41_tilelang_moe.py`, `test_deepseek_v41_tilelang_vocab.py`, `test_gpu_tilelang_logprob_softmax.py`, `test_gpu_tilelang_topk_ids.py`, `test_gpu_logprob_ranks.py`, `test_gpu_logit_bias.py`, `test_gpu_tilelang_inputs.py`, `test_jit_warmup_migration.py`, `test_gpu_verified_logprob_token_ids.py`, `test_tilelang_rejection.py`, `test_adaptive_verification.py`).
+- **Distribution**: Identical OCI digest `sha256:22725ab3a3242b16ea23eb59c5d0ee9031b5c7c6559b7837cf3d7228a8a583d4` verified on all four nodes (`dgx1`, `dgx2`, `dgx3`, `dgx4`). Production `spark-ds41f:1120` on `dgx1..dgx3` remained untouched.
