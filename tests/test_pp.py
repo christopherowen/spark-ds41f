@@ -265,7 +265,7 @@ class PipelineParallelTopologyAndOverlaysTest(unittest.TestCase):
                 self.assertNotIn("VLLM_LATE_ADMISSION_LAYER", c69["environment"])
                 if expected_transport == "oneshot-pp2-ring4":
                     self.assertNotIn("NCCL_SWITCHLESS_BIDIRECTIONAL", c69["environment"])
-                self.assertEqual(c69["container"]["image"], "spark-ds41f:candidate-69")
+                self.assertEqual(c69["container"]["image"], "spark-ds41f:candidate-69-r2")
                 self.assertEqual(topology.problems(c69, nodes), [])
                 self.assertEqual(spark_doctor._cluster_shape(c69), shape)
                 self.assertEqual(c69_dev["environment"].get("VLLM_SERVER_DEV_MODE"), "1")
