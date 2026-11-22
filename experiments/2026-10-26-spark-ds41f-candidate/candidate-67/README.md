@@ -20,4 +20,4 @@ Base: `candidate-66` (`vLLM 0001..0847`, tree `8ce4b43e546ba0d612f9694f0c3785348
 
 ## Build & Verification Status
 
-Pending build of `spark-ds41f:candidate-67` (vLLM `0001..0850`, `723` patches, `patch_head = 0f50f2a4e6965abdd28d200632ee524b70afd582`, `expected_tree = d2fefd95b6bfb59cf3a3d2874b919002b472604d`, `patchset_sha256 = 08f7ffa356629308fcc1b1edf4f9ce622ec7f7c0938e3a8cf1bd0763cc9f3a44`) on `dgx4`.
+Pending build of `spark-ds41f:candidate-67` (vLLM `0001..0850`, `723` patches, `patch_head = 629d215f7b97d9909eaa31df542a599666fb6188`, `expected_tree = d2fefd95b6bfb59cf3a3d2874b919002b472604d`, `patchset_sha256 = 08f7ffa356629308fcc1b1edf4f9ce622ec7f7c0938e3a8cf1bd0763cc9f3a44`) on `dgx4`.
