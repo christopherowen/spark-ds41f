@@ -1,0 +1,190 @@
+From 73394d31f6cdef404acb5b5d49baa7f19eaad74b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 16:26:38 +0100
+Subject: [PATCH] fix(dsv41): avoid empty historical think blocks and doubled
+ tool separators
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Completed assistant messages without reasoning_content under tools previously
+opened <think> on the preceding turn and immediately closed </think>, producing
+out-of-distribution <｜Assistant｜><think></think> pairs across multi-turn tool
+histories, while streamed assistant.content ending in \n\n doubled to \n\n\n\n
+before <｜DSML｜ calls> on replay and None-valued reasoning fields overwrote
+populated reasoning_content during message normalization.
+
+Render completed assistant turns lacking reasoning_content as <｜Assistant｜></think>
+(matching dropped-thinking history turns while preserving non-empty
+reasoning_content and wo_eos prefix continuations), trim one trailing \n\n from
+assistant content before appending \n\n<｜DSML｜ calls>, and preserve
+reasoning_content when an explicit None reasoning key is present.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Prevents multi-turn <think></think> imitation (0-token reasoning skips), \n\n\n\n separator drift, and clobbered reasoning_content in OpenAI-compatible multi-turn tool loops.
+Quality: Prompt-encoding fix for completed historical assistant turns without reasoning_content and streamed pre-tool content ending in \n\n; all official DeepSeek V4.1 reference fixtures, non-empty reasoning_content turns, and prefix=True continuations are byte-identical.
+Tests: pytest tests/tokenizers_/test_deepseek_v41.py tests/tokenizers_/test_deepseek_v41_effort.py tests/tokenizers_/test_deepseek_v41_renderer_pool.py tests/tokenizers_/test_deepseek_v4.py (188 passed).
+Upstream-status: Local DeepSeek-V4.1 prompt encoding fix.
+---
+ tests/tokenizers_/test_deepseek_v41.py   | 50 ++++++++++++++++++++++++
+ vllm/tokenizers/deepseek_v41.py          |  4 +-
+ vllm/tokenizers/deepseek_v41_encoding.py | 50 +++++++++++++++++++-----
+ 3 files changed, 93 insertions(+), 11 deletions(-)
+
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 70c9d5e4df..0be69361c4 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -1456,3 +1456,53 @@ def test_none_text_in_content_blocks_and_tool_references():
+         thinking_mode="chat",
+     )
+     assert "ok" in rendered
++def test_completed_tool_turns_without_reasoning_avoid_empty_think_blocks():
++    tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": "bash",
++                "description": "Run a shell command",
++                "parameters": {
++                    "type": "object",
++                    "properties": {"command": {"type": "string"}},
++                    "required": ["command"],
++                },
++            },
++        }
++    ]
++    messages = [
++        {"role": "user", "content": "Run checks."},
++        {
++            "role": "assistant",
++            "content": "Checking.\n\n",
++            "tool_calls": [
++                {
++                    "id": "c1",
++                    "type": "function",
++                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "c1", "content": "src"},
++        {
++            "role": "assistant",
++            "reasoning": None,
++            "reasoning_content": "Inspect src.",
++            "content": "Listing src.\n\n",
++            "tool_calls": [
++                {
++                    "id": "c2",
++                    "type": "function",
++                    "function": {"name": "bash", "arguments": '{"command":"ls src"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "c2", "content": "index.ts"},
++    ]
++    prompt = render(messages, tools=tools, add_generation_prompt=True)
++    assert "<think></think>" not in prompt
++    assert "<｜Assistant｜></think>Checking.\n\n<｜DSML｜ calls>" in prompt
++    assert "<｜Assistant｜><think>Inspect src.</think>Listing src.\n\n<｜DSML｜ calls>" in prompt
++    assert "\n\n\n\n<｜DSML｜ calls>" not in prompt
++    assert prompt.endswith("<｜Assistant｜><think>")
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index 00ac498593..b56d340a81 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -402,8 +402,10 @@ def _normalize_messages(
+             raise ValueError(f"Invalid role: {role}")
+         if role == "developer":
+             message["role"] = "system"
+-        if "reasoning" in message:
++        if message.get("reasoning") is not None:
+             message["reasoning_content"] = message["reasoning"]
++        elif "reasoning" in message and "reasoning_content" not in message:
++            message["reasoning_content"] = None
+         content = message.get("content")
+         if isinstance(content, list):
+             has_tool_ref = role == "tool" and any(
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index a5ea571db6..4193aeec3a 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -572,6 +572,28 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+     return last_user_index
+ 
+ 
++def _assistant_opens_thinking(msg: Dict[str, Any]) -> bool:
++    """Whether an assistant turn renders `<think>{rc}</think>` vs `</think>`.
++
++    Completed assistant messages (`not wo_eos`) without `reasoning_content`
++    render `<｜Assistant｜></think>` like dropped-thinking history turns rather
++    than empty `<｜Assistant｜><think></think>`, while preserving `wo_eos`
++    prefix continuations.
++    """
++    return bool(msg.get("reasoning_content")) or bool(msg.get("wo_eos"))
++
++
++def _next_turn_opens_thinking(index: int, messages: List[Dict[str, Any]]) -> bool:
++    for follow_idx in range(index + 1, len(messages)):
++        follow_role = messages[follow_idx].get("role")
++        if follow_role == "latest_reminder":
++            continue
++        if follow_role == "assistant":
++            return _assistant_opens_thinking(messages[follow_idx])
++        return True
++    return True
++
++
+ def render_message(
+     index: int,
+     messages: List[Dict[str, Any]],
+@@ -708,18 +730,24 @@ def render_message(
+             )
+ 
+         summary_content = content or ""
++        if tool_calls and summary_content.endswith("\n\n"):
++            summary_content = summary_content[:-2]
+         rc = reasoning_content or ""
+ 
+         # Check if previous message has a task - if so, this is a task output (no thinking)
+         prev_has_task = index - 1 >= 0 and messages[index - 1].get("task") is not None
+ 
+-        if thinking_mode == "thinking" and not prev_has_task:
+-            if not drop_thinking or index > last_user_idx:
+-                thinking_part = (
+-                    thinking_template.format(reasoning_content=rc) + thinking_end_token
+-                )
+-            else:
+-                thinking_part = ""
++        if (
++            thinking_mode == "thinking"
++            and not prev_has_task
++            and (not drop_thinking or index > last_user_idx)
++            and _assistant_opens_thinking(messages[index])
++        ):
++            thinking_part = (
++                thinking_template.format(reasoning_content=rc) + thinking_end_token
++            )
++        else:
++            thinking_part = ""
+ 
+         if wo_eos:
+             prompt += assistant_msg_wo_eos_template.format(
+@@ -768,9 +796,11 @@ def render_message(
+         # Normal generation: append Assistant + thinking token
+         # (mid-conversation system messages also trigger the assistant header)
+         prompt += ASSISTANT_SP_TOKEN
+-        if not drop_thinking and thinking_mode == "thinking":
+-            prompt += thinking_start_token
+-        elif drop_thinking and thinking_mode == "thinking" and index >= last_user_idx:
++        if (
++            thinking_mode == "thinking"
++            and (not drop_thinking or index >= last_user_idx)
++            and _next_turn_opens_thinking(index, messages)
++        ):
+             prompt += thinking_start_token
+         else:
+             prompt += thinking_end_token
+-- 
+2.43.0
+
