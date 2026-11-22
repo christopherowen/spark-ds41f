@@ -1,0 +1,68 @@
+From: spark-ds41f <dev@local>
+Subject: [PATCH] distributed: allow nccl-socket TP collectives (no RoCE, uint32 all_gather)
+
+Upstream base: local-inference-lab/vllm @ 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+  plus candidate-62 series (expected tree 8fc99ca7546c5c538f0fe64e7c82954f1d2d7ae0).
+Rationale:
+  1. CudaCommunicator unconditionally enabled sparknet RoCE on TP groups,
+     preventing nccl-socket / Ethernet-only functional tests when RDMA cabling
+     is absent. When NCCL_IB_DISABLE=1, leave use_roce_allreduce=False so PyNCCL
+     handles TP collectives over TCP while keeping the fail-closed RoCE guard
+     unchanged whenever IB/RoCE is enabled.
+  2. TileLang's wo.py all-gathers packed uint32 scale factors across TP ranks;
+     PyNCCL supports int32 rather than uint32, so view uint32 as int32 around
+     pynccl_comm.all_gather (bit-identical raw byte gather).
+Quality implications:
+  None.
+Tests:
+  Verified zero-fuzz apply on spark-ds41f:1120; used by pp2-tp2-socket.json.
+Upstream status:
+  Local experiment patch for Ethernet-only functional verification.
+
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -141,12 +142,15 @@
+                     "VLLM_ENABLE_ROCE_ALLREDUCE selected B12X's RoCE collectives, "
+                     "which are gone; sparknet's one-shot collectives are always on"
+                 )
+-            if not use_custom_allreduce:
+-                raise ValueError(
+-                    "sparknet's one-shot collectives need custom all-reduce"
+-                )
+-            use_roce_allreduce = True
+-            use_flashinfer_allreduce = False
++            if os.environ.get("NCCL_IB_DISABLE") == "1":
++                use_roce_allreduce = False
++            else:
++                if not use_custom_allreduce:
++                    raise ValueError(
++                        "sparknet's one-shot collectives need custom all-reduce"
++                    )
++                use_roce_allreduce = True
++                use_flashinfer_allreduce = False
+ 
+         self.use_custom_allreduce = use_custom_allreduce
+         self.use_torch_symm_mem = use_torch_symm_mem
+@@ -676,7 +680,13 @@
+         output_tensor = torch.empty(
+             output_size, dtype=input_.dtype, device=input_.device
+         )
+-        pynccl_comm.all_gather(output_tensor, input_.contiguous())
++        if input_.dtype == torch.uint32:
++            pynccl_comm.all_gather(
++                output_tensor.view(torch.int32),
++                input_.contiguous().view(torch.int32),
++            )
++        else:
++            pynccl_comm.all_gather(output_tensor, input_.contiguous())
+         if dim > 0 and dim == input_.dim() - 1:
+             # The rank-major shards side by side in one TileLang launch, not
+             # torch's movedim and reshape copy.

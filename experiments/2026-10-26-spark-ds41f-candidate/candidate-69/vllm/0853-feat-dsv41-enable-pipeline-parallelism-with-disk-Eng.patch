@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:15:00 +0100
+Subject: [PATCH 853/856] feat(dsv41): enable pipeline parallelism with disk
+ Engram, DSpark, and CED
+
+Enable PP=2 (and general PP>1) on DeepSeek-V4.1-Flash with disk-backed
+Engram, DSpark 5-token speculative decoding, FULL CUDA graphs, and
+multi-chunk CED prefill:
+
+- engram.py: remove the pipeline_parallel_size != 1 refusal on disk Engram.
+- model.py: scope disk_engram and Engram hash registration to PP stages
+  holding local Engram layers while keeping file_backed_engram true on all
+  stages so DirectModelLoader skips streaming Engram tables on Stage 1;
+  set supports_aux_hidden_states_over_pp = True; pack/collect aux hidden
+  states through IntermediateTensors; offset _graph_out by
+  _aux_slot_base_cached.
+- dspark.py: instantiate VocabParallelEmbedding on non-first PP stages,
+  set has_own_embed_tokens = True, add embed. to checkpoint prefixes, map
+  embed.weight -> model.embed_tokens.weight, and verify it loaded.
+- kv_cache_utils.py: skip projected PP KV-cache groups with empty
+  layer_names in get_kv_cache_config_from_groups so UniformTypeKVCacheSpecs
+  does not emit KVCacheTensors for another stage (e.g. DSpark draft KV on
+  Stage 0).
+- model_runner.py: gate LayerProgress with and not self.use_pp; preserve
+  model_inputs[input_ids] on non-first PP stages when
+  requires_raw_input_tokens is set; declare TileLang
+  post_update_num_computed_tokens_calls when not self.is_last_pp_rank.
+- cudagraph_utils.py: preserve model_inputs[input_ids] during CUDA graph
+  capture on non-first PP stages when requires_raw_input_tokens(model).
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Enables config-driven PP=2, TP=[2-4] serving on DeepSeek-V4.1-Flash without modifying PP=1 behavior.
+Quality: Zero PP=1 behavior change; live PP=2, TP=2 over 200 GbE RoCE passed Sonar quality LRU 5/5, deterministic greedy c1, 44K three-chunk and 131K multi-chunk CED prefill, and full-depth DSpark acceptance (2.361 prose / 3.161 code tok/step).
+Tests: Live PP=2, TP=2 verification on dgx1..dgx4 (oneshot-pp2-ring4 and nccl-socket) plus deployment unit suite (921 passed).
+Upstream-status: Local DeepSeek-V4.1 pipeline parallelism enablement.
+---
+ vllm/models/deepseek_v4_1/common/engram.py |  5 ----
+ vllm/models/deepseek_v4_1/nvidia/dspark.py | 28 +++++++++++++++++++---
+ vllm/models/deepseek_v4_1/nvidia/model.py  | 22 +++++++++++++----
+ vllm/v1/core/kv_cache_utils.py             |  4 +++-
+ vllm/v1/worker/gpu/cudagraph_utils.py      |  3 ++-
+ vllm/v1/worker/gpu/model_runner.py         |  7 +++---
+ 6 files changed, 51 insertions(+), 18 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index fa51ae297..ec016ce67 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -253,11 +253,6 @@ class EngramLayout:
+         self.projection_tp = (
+             engram_config.projection_tp if engram_config is not None else False
+         )
+-        if (
+-            self.table_memory == "disk"
+-            and vc.parallel_config.pipeline_parallel_size != 1
+-        ):
+-            raise ValueError("Disk Engram requires pipeline_parallel_size=1")
+         token_map, compressed_size = _token_map(
+             mc.tokenizer, mc.revision, mc.trust_remote_code
+         )
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index a1819d11b..444638c9e 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -20,6 +20,7 @@ import torch.nn as nn
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed import (
++    get_pp_group,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+ )
+@@ -34,6 +35,9 @@ from vllm.model_executor.layers.logits_processor import (
+     _is_packed_head,
+     _is_plain_bf16_head,
+ )
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    VocabParallelEmbedding,
++)
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.qwen3_dspark import (
+     DSparkConfidenceHead,
+@@ -298,9 +302,17 @@ class DSparkDeepseekV4Model(nn.Module):
+             or 3
+         )
+ 
+-        # Bound from the loaded target, as in K3DSparkModel. Do not create an
+-        # unused vocabulary allocation while loading the draft checkpoint.
+-        self.embed_tokens: nn.Module | None = None
++        # Bound from the loaded target, as in K3DSparkModel. When the target's
++        # embed_tokens lives on an earlier PP stage, own and load it here.
++        if get_pp_group().world_size > 1 and not get_pp_group().is_first_rank:
++            self.embed_tokens: nn.Module | None = VocabParallelEmbedding(
++                config.vocab_size,
++                config.hidden_size,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "embed_tokens"),
++            )
++        else:
++            self.embed_tokens = None
+ 
+         # Column-shard the projection of the target's auxiliary hidden states when
+         # TP > 1 and gather the output: same arithmetic.
+@@ -653,6 +665,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         self.model = DSparkDeepseekV4Model(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
++        if getattr(self.model, "embed_tokens", None) is not None:
++            self.has_own_embed_tokens = True
++            self.checkpoint_weight_name_prefixes = (
++                *self.checkpoint_weight_name_prefixes,
++                "embed.",
++            )
+         # Bound by load_dspark_model after loading. An unused online-quantized
+         # head otherwise remains on meta and cannot be natively precompiled.
+         self.lm_head: nn.Module | None = None
+@@ -1176,6 +1194,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+                 weight_loader(param, loaded_weight)
+                 loaded_params.add(name)
+ 
++        if self.has_own_embed_tokens and "model.embed_tokens.weight" not in loaded_params:
++            raise RuntimeError("The DSpark input embedding was not loaded")
+         if self.has_own_lm_head and "lm_head.weight" not in loaded_params:
+             raise RuntimeError("The DSpark NVFP4 draft head was not loaded")
+         if self.model.confidence_head is not None and not loaded_confidence_head:
+@@ -1217,6 +1237,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+ 
+         Returns None for non-mtp weights (owned by the target model).
+         """
++        if name == "embed.weight":
++            return "model.embed_tokens.weight" if self.has_own_embed_tokens else None
+         if name == "head.weight":
+             return "lm_head.weight" if self.has_own_lm_head else None
+         m = re.match(r"mtp\.(\d+)\.(.*)", name)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 322f6f46c..564cb1464 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -587,6 +587,8 @@ def _load_checkpoint_router_biases(
+ 
+ 
+ class DeepseekV4Model(nn.Module, EagleModelMixin):
++    supports_aux_hidden_states_over_pp: typing.ClassVar[bool] = True
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -672,6 +674,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # Hashing reads the runner's accepted-only lookback, never KV slot state.
+         self.engram_hash: NgramHashState | None = None
+         self.engram_swa_prefix: str | None = None
++        local_engram = False
+         if self.engram_layout is not None:
+             local_engram = any(
+                 isinstance(layer, DeepseekV4DecoderLayer) and layer.engram is not None
+@@ -687,7 +690,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 )
+                 self.engram_swa_prefix = swa_cache_module.prefix
+         self.disk_engram = (
+-            self.engram_layout is not None and self.engram_layout.table_memory == "disk"
++            local_engram
++            and self.engram_layout is not None
++            and self.engram_layout.table_memory == "disk"
+         )
+         self.file_backed_engram = (
+             self.engram_layout is not None
+@@ -1200,7 +1205,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 if idx + 1 in self.aux_hidden_state_layers:
+                     # Reconstruct the aux hidden state for draft models
+                     aux_out = (
+-                        self._graph_out(len(aux_hidden_states), full_num_tokens)
++                        self._graph_out(
++                            self._aux_slot_base_cached + len(aux_hidden_states),
++                            full_num_tokens,
++                        )
+                         if sp is None and not decoder_compacted
+                         else None
+                     )
+@@ -1326,9 +1334,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     hidden_states, ced_indices, full_num_tokens
+                 )
+                 pre_mix = scatter_rows(pre_mix, ced_indices, full_num_tokens)
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+-            )
++            tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
++            tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
++            return IntermediateTensors(tensors)
+ 
+         # Collapse the hc copies with the pre-mix from the last layer's FFN
+         # mixes — the mix the reference applies via
+@@ -1358,6 +1366,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             hidden_states = sp.gather(hidden_states)
+         if decoder_compacted:
+             hidden_states = scatter_rows(hidden_states, ced_indices, full_num_tokens)
++        if not get_pp_group().is_first_rank:
++            remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++            if remote_aux:
++                aux_hidden_states = remote_aux + aux_hidden_states
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 76388731d..0581e38f7 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2057,12 +2057,14 @@ def get_kv_cache_config_from_groups(
+ 
+     kv_cache_tensors = []
+     for group in kv_cache_groups:
++        if not group.layer_names:
++            continue
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+                 layers_by_spec[spec].append(layer_name)
+-        elif group.layer_names:
++        else:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 
+         byte_offset = 0
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 61b889dc2..b2f71b325 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1162,7 +1162,8 @@ class ModelCudaGraphManager(CudaGraphManager):
+             normalize_model_token_inputs(model, model_inputs)
+             if not self.is_first_pp_rank:
+                 # Update for non-first PP ranks.
+-                model_inputs["input_ids"] = None
++                if not requires_raw_input_tokens(model):
++                    model_inputs["input_ids"] = None
+                 model_inputs["inputs_embeds"] = None
+                 assert intermediate_tensors is not None
+                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2e08e6f54..7e50ac3d4 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -578,7 +578,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             time_after_load - time_before_load,
+         )
+ 
+-        if envs.VLLM_LATE_ADMISSION_LAYER >= 0:
++        if envs.VLLM_LATE_ADMISSION_LAYER >= 0 and not self.use_pp:
+             # Before graph capture, so every captured graph records the event.
+             self.layer_progress = LayerProgress(
+                 self.model, envs.VLLM_LATE_ADMISSION_LAYER
+@@ -3049,7 +3049,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.req_states.register_warmups()
+         if self.copy_drafter is not None:
+             self.copy_drafter.register_warmups()
+-        if self.is_pooling_model:
++        if self.is_pooling_model or not self.is_last_pp_rank:
+             tilelang_inputs.declare(
+                 tilelang_inputs.post_update_num_computed_tokens_calls
+             )
+@@ -4498,7 +4498,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         normalize_model_token_inputs(self.model, model_inputs)
+         if not self.is_first_pp_rank:
+             # Update for non-first PP ranks.
+-            model_inputs["input_ids"] = None
++            if not getattr(self.model, "requires_raw_input_tokens", False):
++                model_inputs["input_ids"] = None
+             model_inputs["inputs_embeds"] = None
+ 
+             # Prepare the intermediate tensors.
+-- 
+2.43.0
+

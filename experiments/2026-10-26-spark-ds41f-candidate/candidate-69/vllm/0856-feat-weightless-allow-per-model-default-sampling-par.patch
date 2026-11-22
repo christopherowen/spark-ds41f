@@ -1,0 +1,294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:45:00 +0100
+Subject: [PATCH 856/856] feat(weightless): allow per-model default sampling
+ params for steered model
+
+Add WEIGHTLESS_STEER_GENERATION_DEFAULTS (JSON object of sampling
+defaults such as temperature/top_p/top_k/min_p) applied only when a
+request targets WEIGHTLESS_STEER_MODEL and omits those fields, leaving
+the stock served model default sampling parameters untouched.
+
+Wired through BaseServing._default_sampling_params_for across Chat
+Completions, Batch Chat Completions, Completions, and Responses
+entrypoints so explicit caller fields still take precedence and
+SamplingParams validates greedy/top_p combinations normally.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Allows serving the GLP-steered model at a lower default sampling temperature (e.g. 0.3/0.95) while preserving DeepSeek stock generation defaults (1.0/1.0).
+Quality: Zero behavior change on the stock served model or when WEIGHTLESS_STEER_GENERATION_DEFAULTS is unset; explicit request parameters always win.
+Tests: pytest tests/models/test_deepseek_v4_1_glp.py -k steered_generation_defaults (7 passed).
+Upstream-status: Local per-model sampling defaults for weightless served model.
+---
+ tests/models/test_deepseek_v4_1_glp.py        | 70 +++++++++++++++++++
+ .../openai/chat_completion/batch_serving.py   |  2 +-
+ .../openai/chat_completion/serving.py         |  2 +-
+ vllm/entrypoints/openai/completion/serving.py |  2 +-
+ vllm/entrypoints/openai/responses/serving.py  |  2 +-
+ vllm/entrypoints/serve/engine/serving.py      |  7 +-
+ vllm/envs.py                                  |  6 ++
+ vllm/weightless.py                            | 58 +++++++++++++++
+ 8 files changed, 144 insertions(+), 5 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
+index dbbcd6bce..bd8d8b56a 100644
+--- a/tests/models/test_deepseek_v4_1_glp.py
++++ b/tests/models/test_deepseek_v4_1_glp.py
+@@ -89,6 +89,7 @@ def _no_steering_env(monkeypatch):
+     for name in STEER_ENV:
+         monkeypatch.delenv(name, raising=False)
+     monkeypatch.delenv("WEIGHTLESS_STEER_ALPHA", raising=False)
++    monkeypatch.delenv("WEIGHTLESS_STEER_GENERATION_DEFAULTS", raising=False)
+ 
+ 
+ # The container reader.
+@@ -734,3 +735,72 @@ def test_a_published_ds41_file_holds_only_unit_directions():
+     assert alpha == pytest.approx(float(metadata["glp.alpha_default"]))
+     for direction in directions.values():
+         assert np.linalg.norm(direction) == pytest.approx(1.0, abs=1e-5)
++
++
++def test_steered_generation_defaults_apply_only_to_steered_model(monkeypatch):
++    from vllm import weightless
++
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "deepseek-v4.1-flash-weightless")
++    monkeypatch.setenv(
++        "WEIGHTLESS_STEER_GENERATION_DEFAULTS",
++        '{"temperature": 0.3, "top_p": 0.95}',
++    )
++    base = {"temperature": 1.0, "top_p": 1.0}
++    assert weightless.sampling_defaults("deepseek-v4.1-flash", base) == {
++        "temperature": 1.0,
++        "top_p": 1.0,
++    }
++    assert weightless.sampling_defaults("deepseek-v4.1-flash-weightless", base) == {
++        "temperature": 0.3,
++        "top_p": 0.95,
++    }
++
++
++@pytest.mark.parametrize(
++    "raw",
++    [
++        "not-json",
++        "[1, 2]",
++        '{"temperature": -0.1}',
++        '{"top_p": 0}',
++        '{"top_p": 1.5}',
++        '{"unknown_key": 1}',
++    ],
++)
++def test_invalid_steered_generation_defaults_are_refused(monkeypatch, raw):
++    from vllm import weightless
++
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "deepseek-v4.1-flash-weightless")
++    monkeypatch.setenv("WEIGHTLESS_STEER_GENERATION_DEFAULTS", raw)
++    with pytest.raises(ValueError, match="WEIGHTLESS_STEER_GENERATION_DEFAULTS"):
++        weightless.sampling_defaults("deepseek-v4.1-flash-weightless", {"temperature": 1.0})
++
++
++def test_base_serving_default_sampling_params_for(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.entrypoints.openai.chat_completion.batch_serving import (
++        OpenAIServingChatBatch,
++    )
++    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
++    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
++    from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
++    from vllm.entrypoints.serve.engine.serving import BaseServing
++
++    assert issubclass(OpenAIServingChat, BaseServing)
++    assert issubclass(OpenAIServingChatBatch, BaseServing)
++    assert issubclass(OpenAIServingCompletion, BaseServing)
++    assert issubclass(OpenAIServingResponses, BaseServing)
++
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "deepseek-v4.1-flash-weightless")
++    monkeypatch.setenv(
++        "WEIGHTLESS_STEER_GENERATION_DEFAULTS",
++        '{"temperature": 0.3, "top_p": 0.95}',
++    )
++    dummy = SimpleNamespace(default_sampling_params={"temperature": 1.0, "top_p": 1.0})
++    assert BaseServing._default_sampling_params_for(
++        dummy, SimpleNamespace(model="deepseek-v4.1-flash")
++    ) == {"temperature": 1.0, "top_p": 1.0}
++    assert BaseServing._default_sampling_params_for(
++        dummy, SimpleNamespace(model="deepseek-v4.1-flash-weightless")
++    ) == {"temperature": 0.3, "top_p": 0.95}
+diff --git a/vllm/entrypoints/openai/chat_completion/batch_serving.py b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+index 70e08e444..0d8574c4b 100644
+--- a/vllm/entrypoints/openai/chat_completion/batch_serving.py
++++ b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+@@ -157,7 +157,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+             )
+             single_request = single_requests[i]
+             sampling_params = single_request.to_sampling_params(
+-                max_tokens, self.default_sampling_params
++                max_tokens, self._default_sampling_params_for(request)
+             )
+             self._mark_steering(request, sampling_params)
+             self._log_inputs(
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 3c175defa..00ae662d5 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -329,7 +329,7 @@ class OpenAIServingChat(GenerateBaseServing):
+             else:
+                 sampling_params = request.to_sampling_params(
+                     max_tokens,
+-                    self.default_sampling_params,
++                    self._default_sampling_params_for(request),
+                 )
+             self._mark_steering(request, sampling_params)
+ 
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 2162687f9..1f43442d7 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -176,7 +176,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+             else:
+                 sampling_params = request.to_sampling_params(
+                     max_tokens,
+-                    self.default_sampling_params,
++                    self._default_sampling_params_for(request),
+                 )
+             self._mark_steering(request, sampling_params)
+ 
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index c1b4f3115..a9e858d30 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -415,7 +415,7 @@ class OpenAIServingResponses(GenerateBaseServing):
+             )
+ 
+             sampling_params = request.to_sampling_params(
+-                default_max_tokens, self.default_sampling_params
++                default_max_tokens, self._default_sampling_params_for(request)
+             )
+             self._mark_steering(request, sampling_params)
+ 
+diff --git a/vllm/entrypoints/serve/engine/serving.py b/vllm/entrypoints/serve/engine/serving.py
+index f497d0390..c5b981bcc 100644
+--- a/vllm/entrypoints/serve/engine/serving.py
++++ b/vllm/entrypoints/serve/engine/serving.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from http import HTTPStatus
+-from typing import ClassVar
++from typing import Any, ClassVar
+ 
+ from fastapi import Request
+ 
+@@ -80,6 +80,11 @@ class BaseServing:
+             param="model",
+         )
+ 
++    def _default_sampling_params_for(self, request: AnyRequest) -> dict[str, Any]:
++        return weightless.sampling_defaults(
++            getattr(request, "model", None), self.default_sampling_params
++        )
++
+     def _mark_steering(
+         self, request: AnyRequest, sampling_params: SamplingParams | BeamSearchParams
+     ) -> None:
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 5c06437eb..8df168342 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -239,6 +239,7 @@ if TYPE_CHECKING:
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_MODEL: str | None = None
+     WEIGHTLESS_STEER_ALPHA: str | None = None
++    WEIGHTLESS_STEER_GENERATION_DEFAULTS: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+     VLLM_MIMO_L2_PREFETCH: bool = False
+@@ -1972,6 +1973,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Serve-time alpha replacing the file's glp.alpha_default when set;
+     # the reader refuses values that are not positive finite numbers.
+     "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
++    # Optional JSON object of sampling defaults (e.g. {"temperature":0.3,"top_p":0.95})
++    # applied only to requests targeting WEIGHTLESS_STEER_MODEL when the caller omits them.
++    "WEIGHTLESS_STEER_GENERATION_DEFAULTS": lambda: (
++        os.getenv("WEIGHTLESS_STEER_GENERATION_DEFAULTS") or None
++    ),
+     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+diff --git a/vllm/weightless.py b/vllm/weightless.py
+index 2cc891998..eae94ecd4 100644
+--- a/vllm/weightless.py
++++ b/vllm/weightless.py
+@@ -10,6 +10,8 @@ rows write different KV; the worker marks the request's rows for the steering
+ kernels. Unmarked requests are served as with steering off.
+ """
+ 
++import json
++import math
+ from typing import Any
+ 
+ import vllm.envs as envs
+@@ -45,3 +47,59 @@ def is_marked(sampling_params: Any) -> bool:
+     """Whether ``sampling_params`` (or None) belong to a steered request."""
+     extra = getattr(sampling_params, "extra_args", None)
+     return bool(extra and extra.get(EXTRA_ARGS_KEY))
++
++
++_ALLOWED_DEFAULTS = frozenset({"temperature", "top_p", "top_k", "min_p"})
++
++
++def generation_defaults() -> dict[str, Any]:
++    """Per-model sampling defaults for WEIGHTLESS_STEER_MODEL requests, or {}."""
++    raw = envs.WEIGHTLESS_STEER_GENERATION_DEFAULTS
++    if not raw:
++        return {}
++    try:
++        parsed = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        raise ValueError(
++            f"WEIGHTLESS_STEER_GENERATION_DEFAULTS is not valid JSON: {raw!r}"
++        ) from exc
++    if not isinstance(parsed, dict):
++        raise ValueError(
++            f"WEIGHTLESS_STEER_GENERATION_DEFAULTS must be a JSON object, got {type(parsed).__name__}"
++        )
++    unknown = sorted(set(parsed) - _ALLOWED_DEFAULTS)
++    if unknown:
++        raise ValueError(
++            f"WEIGHTLESS_STEER_GENERATION_DEFAULTS has unsupported keys {unknown}"
++        )
++    for key, val in parsed.items():
++        if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS[{key!r}] must be a finite number, got {val!r}"
++            )
++        if key == "temperature" and val < 0:
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS['temperature'] must be >= 0, got {val!r}"
++            )
++        if key == "top_p" and not (0 < val <= 1):
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS['top_p'] must be in (0, 1], got {val!r}"
++            )
++        if key == "min_p" and not (0 <= val <= 1):
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS['min_p'] must be in [0, 1], got {val!r}"
++            )
++    return parsed
++
++
++def sampling_defaults(
++    model_name: str | None, base_defaults: dict[str, Any]
++) -> dict[str, Any]:
++    """Return sampling defaults for ``model_name``: steered defaults merged over
++    ``base_defaults`` for WEIGHTLESS_STEER_MODEL, otherwise ``base_defaults`` unchanged."""
++    if not is_steered_model(model_name):
++        return base_defaults
++    overrides = generation_defaults()
++    if not overrides:
++        return base_defaults
++    return {**base_defaults, **overrides}
+-- 
+2.43.0
+

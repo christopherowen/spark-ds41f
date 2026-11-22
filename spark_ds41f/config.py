@@ -72,6 +72,7 @@ NODES_FILE = "config/nodes.json"
 NODE_MAP_EXAMPLES = {
     NODES_FILE: "config/nodes.example.json",
     "config/nodes-direct2.local.json": "config/examples/nodes-direct2.json",
+    "config/nodes-pp2-tp2.local.json": "config/examples/nodes-pp2-tp2.json",
     "config/nodes-ring4.local.json": "config/examples/nodes-ring4.json",
     "config/nodes-switched.local.json": "config/examples/nodes-switched.json",
     "config/nodes-switched2.local.json": "config/examples/nodes-switched2.json",
@@ -499,11 +500,15 @@ _GGUF_STRING, _GGUF_ARRAY = 8, 9
 def glp_reader_command(cluster: dict, path: str) -> list[str]:
     """The ``docker run`` of the profile image's GLP reader on the host file ``path``: never
     pulled, without GPU or network."""
-    return ["docker", "run", "--rm", "--pull=never", "--network=none",
-            "--entrypoint=/usr/bin/timeout",
-            "--volume", f"{path}:{cluster_recipe.GLP_TARGET}:ro",
-            cluster["container"]["image"],
-            "--signal=TERM", "--kill-after=10s", GLP_READER_TIMEOUT, *GLP_READER]
+    cmd = ["docker", "run", "--rm", "--pull=never", "--network=none",
+           "--entrypoint=/usr/bin/timeout"]
+    alpha = (cluster.get("environment") or {}).get(cluster_recipe.STEER_ALPHA)
+    if alpha is not None:
+        cmd.extend(["--env", f"{cluster_recipe.STEER_ALPHA}={alpha}"])
+    cmd.extend(["--volume", f"{path}:{cluster_recipe.GLP_TARGET}:ro",
+                cluster["container"]["image"],
+                "--signal=TERM", "--kill-after=10s", GLP_READER_TIMEOUT, *GLP_READER])
+    return cmd
 
 
 def gguf_metadata(data: bytes) -> dict[str, object]:

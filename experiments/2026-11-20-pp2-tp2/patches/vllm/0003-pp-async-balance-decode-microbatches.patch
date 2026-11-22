@@ -1,0 +1,65 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1438,6 +1438,18 @@
+                 len(self.running) + len(self.waiting) + len(self.skipped_waiting),
+             )
+             copy_rows_left = self.max_decode_rows - slots * (1 + self.num_spec_tokens)
++
++        pp_decode_budget: int | None = None
++        scheduled_decode_running = 0
++        if (
++            self.use_pp
++            and self.use_v2_model_runner
++            and self.scheduler_config.async_scheduling
++        ):
++            decode_running = sum(1 for r in self.running if not r.is_prefill_chunk)
++            if decode_running > 1:
++                pp_size = self.parallel_config.pipeline_parallel_size
++                pp_decode_budget = (decode_running + pp_size - 1) // pp_size
+ 
+         def schedule_running_requests(
+             service_class: ComputeServiceClass | None = None,
+@@ -1452,6 +1464,7 @@
+             nonlocal input_budget
+             nonlocal prefill_scheduled
+             nonlocal prefill_tokens_scheduled
++            nonlocal scheduled_decode_running
+             nonlocal step_prefill_token_cap
+             nonlocal token_budget
+             req_index = 0
+@@ -1517,6 +1530,17 @@
+                 if self.current_step < request.next_decode_eligible_step:
+                     # V2+PP+async: enforce `pp_size` steps between same-req decodes
+                     # to match worker-side sampled-tokens broadcast slot ring cadence.
++                    req_index += 1
++                    continue
++
++                if (
++                    pp_decode_budget is not None
++                    and not request.is_prefill_chunk
++                    and scheduled_decode_running >= pp_decode_budget
++                ):
++                    # V2+PP+async: balance eligible decodes across pp_size
++                    # microbatch slots so concurrent requests don't lockstep
++                    # into a single batch with empty bubble steps.
+                     req_index += 1
+                     continue
+ 
+@@ -1734,6 +1758,8 @@
+                             if preempted_req in scheduled_running_reqs:
+                                 preempted_req_id = preempted_req.request_id
+                                 scheduled_running_reqs.remove(preempted_req)
++                                if not preempted_req.is_prefill_chunk:
++                                    scheduled_decode_running -= 1
+                                 restored = num_scheduled_tokens.pop(preempted_req_id)
+                                 token_budget += restored
+                                 input_budget += restored + draft_slots
+@@ -1785,6 +1811,8 @@
+                 if request.is_prefill_chunk:
+                     scheduled_prefill_req_ids.add(request.request_id)
+                     prefill_tokens_scheduled += num_new_tokens
++                else:
++                    scheduled_decode_running += 1
+                 request_id = request.request_id
+                 req_to_new_blocks[request_id] = new_blocks
+                 num_scheduled_tokens[request_id] = num_new_tokens

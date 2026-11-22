@@ -1,0 +1,68 @@
+{
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp4-ring"
+  },
+  "set": {
+    "pipeline_parallel_size": 2,
+    "nodes_config": "config/nodes-pp2-tp2.local.json",
+    "fabric": {
+      "transport": "oneshot-pp2-ring4"
+    },
+    "speculative": {
+      "enable_adaptive_verification": false,
+      "adaptive_verification_row_cost": null
+    },
+    "environment": {
+      "VLLM_SINK_REJECTION": "0"
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-20-pp2-tp2/overlay/vllm/models/deepseek_v4_1/common/engram.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/common/engram.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-20-pp2-tp2/overlay/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-20-pp2-tp2/overlay/vllm/models/deepseek_v4_1/nvidia/dspark.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/dspark.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-20-pp2-tp2/overlay/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-20-pp2-tp2/overlay/vllm/v1/core/kv_cache_utils.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/kv_cache_utils.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-20-pp2-tp2/overlay/vllm/v1/worker/gpu/cudagraph_utils.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/cudagraph_utils.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-20-pp2-tp2/overlay/vllm/v1/core/sched/scheduler.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py",
+          "ro"
+        ]
+      ]
+    }
+  },
+  "unset": [
+    "environment.NCCL_SWITCHLESS_BIDIRECTIONAL"
+  ],
+  "notes": "PP=2, TP=2 over 4 switchless ring Sparks (oneshot-pp2-ring4: direct TP=2 pairs 0-1 and 2-3, direct PP=2 pairs 0-2 and 1-3) on spark-ds41f:1120 with pure-Python PP overlay."
+}
