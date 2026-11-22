@@ -1,0 +1,61 @@
+{
+ "notes": "Cold-boot Arm 1+2+3+4: Arm 1+2+3 + VLLM_WORKER_MULTIPROC_METHOD=forkserver on spark-ds41f:candidate-65 (tp3-triangle, 16 seats)",
+ "extends": {
+  "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-65/tp3.json"
+ },
+ "set": {
+  "environment": {
+   "PYTORCH_CUDA_ALLOC_CONF": "garbage_collection_threshold:0.6",
+   "VLLM_WORKER_MULTIPROC_METHOD": "forkserver"
+  },
+  "container": {
+   "mounts": [
+    [
+     "{checkout}/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/moe.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/utils.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/model_loader/utils.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/prepare.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/prepare.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/direct_loader.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/model_loader/direct_loader.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/mxfp4.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/model_executor/layers/quantization/mxfp4.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/envs.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/envs.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/system_utils.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/utils/system_utils.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-cold-boot-optimization/overlay/entry.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/entrypoints/launchers/api_server/entry.py",
+     "ro"
+    ]
+   ]
+  }
+ }
+}
