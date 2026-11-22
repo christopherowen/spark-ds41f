@@ -447,6 +447,10 @@ class RecipeTest(unittest.TestCase):
             "tp6-switched": False,
             "tp7-switched": False,
             "tp8-switched": False,
+            "pp2-tp2-ring": True,
+            "pp2-tp2-switched": True,
+            "pp2-tp3-switched": True,
+            "pp2-tp4-switched": True,
         }
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, on_disk in expected.items():
@@ -477,6 +481,7 @@ class RecipeTest(unittest.TestCase):
 
         piecewise_24 = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24]
         triangle = piecewise_24 + [28, 32, 40, 48]
+        triangle_16 = triangle + list(range(56, 97, 8))
         tp4_ladder = triangle + list(range(56, 193, 8))
         expected = {
             "tp4-ring": ("32", "192", tp4_ladder, "16192", "FULL_AND_PIECEWISE"),
@@ -485,12 +490,16 @@ class RecipeTest(unittest.TestCase):
             "tp6-switched": ("32", "192", tp4_ladder, "24384", "FULL_AND_PIECEWISE"),
             "tp7-switched": ("32", "192", tp4_ladder, "32576", "FULL_AND_PIECEWISE"),
             "tp8-switched": ("32", "192", tp4_ladder, "32576", "FULL_AND_PIECEWISE"),
-            "tp3-triangle": ("8", "48", triangle, "6096", "FULL_AND_PIECEWISE"),
-            "tp3-switched": ("8", "48", triangle, "6096", "FULL_AND_PIECEWISE"),
+            "tp3-triangle": ("16", "96", triangle_16, "6048", "FULL_AND_PIECEWISE"),
+            "tp3-switched": ("16", "96", triangle_16, "6048", "FULL_AND_PIECEWISE"),
             "tp3-triangle-4k": ("8", "48", triangle, "4048", "FULL_AND_PIECEWISE"),
             "tp2-direct": ("4", "24", piecewise_24, "4072", "PIECEWISE"),
             "tp2-switched": ("4", "24", piecewise_24, "4072", "PIECEWISE"),
             "tp1": ("4", "24", piecewise_24, "4072", "PIECEWISE"),
+            "pp2-tp2-ring": ("32", "192", tp4_ladder, "16192", "FULL_AND_PIECEWISE"),
+            "pp2-tp2-switched": ("32", "192", tp4_ladder, "16192", "FULL_AND_PIECEWISE"),
+            "pp2-tp3-switched": ("32", "192", tp4_ladder, "24384", "FULL_AND_PIECEWISE"),
+            "pp2-tp4-switched": ("32", "192", tp4_ladder, "32576", "FULL_AND_PIECEWISE"),
         }
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, (streams, largest, ladder, threshold, mode) in expected.items():
@@ -512,6 +521,7 @@ class RecipeTest(unittest.TestCase):
         36, as --max-cudagraph-capture-size does (#434 booted into vLLM's 36-versus-32 refusal)."""
         six = json.loads(json.dumps(self.recipe))
         six["shapes"]["tp3-triangle"]["sizing"]["max_num_seqs"] = 6
+        six["shapes"]["tp3-triangle-4k"]["sizing"]["max_num_seqs"] = 6
         for name in ("tp3-triangle", "tp3-triangle-4k"):
             resolved = recipe.resolve(six, name)
             ladder = json.loads(argument(resolved, "--compilation-config"))["cudagraph_capture_sizes"]
@@ -584,10 +594,12 @@ class RecipeTest(unittest.TestCase):
         expected = {"tp4-ring": ("16384", "16192"), "tp4-switched": ("16384", "16192"),
                     "tp5-switched": ("32768", "32576"), "tp6-switched": ("24576", "24384"),
                     "tp7-switched": ("32768", "32576"), "tp8-switched": ("32768", "32576"),
-                    "tp3-triangle": ("6144", "6096"), "tp3-switched": ("6144", "6096"),
+                    "tp3-triangle": ("6144", "6048"), "tp3-switched": ("6144", "6048"),
                     "tp3-triangle-4k": ("4096", "4048"),
                     "tp2-direct": ("4096", "4072"), "tp2-switched": ("4096", "4072"),
-                    "tp1": ("4096", "4072")}
+                    "tp1": ("4096", "4072"),
+                    "pp2-tp2-ring": ("16384", "16192"), "pp2-tp2-switched": ("16384", "16192"),
+                    "pp2-tp3-switched": ("24576", "24384"), "pp2-tp4-switched": ("32768", "32576")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, budget in expected.items():
             values = recipe.values(self.recipe, recipe.shape_entry(self.recipe, name))

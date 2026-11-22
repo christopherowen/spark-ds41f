@@ -181,7 +181,9 @@ class ReleaseTest(unittest.TestCase):
             suite_by_id = {s["id"]: s for s in embedded["suites"]}
             for s in embedded["shapes"]:
                 ref = s.get("benchmark_reference")
-                if ref and ref.endswith(".json"):
+                if not ref:
+                    continue
+                if ref.endswith(".json"):
                     self.assertIn(ref, bench_by_path, s["name"])
                 rec = (
                     suite_by_path.get(ref)
