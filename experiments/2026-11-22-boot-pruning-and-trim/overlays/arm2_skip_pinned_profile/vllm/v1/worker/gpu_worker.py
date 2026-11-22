@@ -1243,8 +1243,20 @@ class Worker(WorkerBase):
         self._startup_rendezvous("memory profiling")
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            has_compiled_submodule = any(
+                hasattr(m, "do_not_compile") and not m.do_not_compile
+                for model in (
+                    self.model_runner.get_model(),
+                    getattr(self.model_runner, "get_draft_model", lambda: None)(),
+                )
+                if model is not None
+                for m in model.modules()
+            )
             skip_profile = (
-                self.vllm_config.compilation_config.mode == CompilationMode.NONE
+                (
+                    self.vllm_config.compilation_config.mode == CompilationMode.NONE
+                    or not has_compiled_submodule
+                )
                 and self._b12x_session is None
                 and hasattr(self.model_runner, "_reserve_profile_scratch")
             )
