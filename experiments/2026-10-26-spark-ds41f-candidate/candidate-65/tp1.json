@@ -1,0 +1,23 @@
+{
+ "notes": "candidate-65 at tp1: vLLM 0001..0844 (tree 34b01980b09e), PIECEWISE adaptive verification (row_cost=0.5, DEAD_ROWS_TAU=0.6) + dead-row lookahead filter",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp1"
+ },
+ "set": {
+  "container": {
+   "image": "spark-ds41f:candidate-65",
+   "expected_labels": {
+    "local.spark-ds41f.vllm.tree": "34b01980b09e1f634738f7bc781a588327c26b75"
+   }
+  },
+  "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-65/upstreams.lock.json",
+  "environment": {
+   "PYTORCH_CUDA_ALLOC_CONF": "garbage_collection_threshold:0.6",
+   "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.6"
+  }
+ },
+ "serve_options": {
+  "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":1,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.5}"
+ }
+}

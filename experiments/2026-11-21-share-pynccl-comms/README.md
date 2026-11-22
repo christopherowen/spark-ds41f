@@ -19,4 +19,4 @@ Setting `VLLM_SHARE_PYNCCL_COMMS=1` (already implemented in `cuda_communicator.p
 
 ## Live Serving Runs (`tp3-triangle`, `dgx1..dgx3`)
 
-*(Pending execution inside coordinated lab window.)*
+Measured neutral on Boot 1 in Round 3 (`-0.043%` decode grid, `c1`/`c8` within noise) and dropped — see [2026-11-21-mhc-async-sinkhorn/README.md](../2026-11-21-mhc-async-sinkhorn/README.md) and [TODO.md](../../TODO.md).
