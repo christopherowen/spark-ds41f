@@ -1586,7 +1586,7 @@ class EngineCoreProc(EngineCore):
             if (
                 os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn"
                 and threading.active_count() == 1
-                and "--numa-bind" not in sys.argv
+                and not parallel_config.numa_bind
             ):
                 from vllm.utils.system_utils import (
                     cuda_is_initialized,
