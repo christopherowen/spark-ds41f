@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 11:21:42 +0100
+Subject: [PATCH] perf(dspark): allow PIECEWISE adaptive verification and
+ filter dead rows from expert-slot lookahead
+
+Remove the legacy full-CUDA-graph restriction from VllmConfig._validate_adaptive_verification and resolve_adaptive_cudagraph_mode (obsolete under the deterministic analytic row_cost model), and filter dead/padding rows (topk_ids < 0) out of ExpertSlotCache RouterLookaheadPredictor so NVMe-offloaded TP1/TP2 shapes never prefetch experts for pruned draft tails. Zero behavior or graph change on FULL_AND_PIECEWISE / FULL_DECODE_ONLY (TP3..TP8).
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Unlocks NVMe-calibrated PIECEWISE adaptive verification on TP1 (+64.6% c1 to 5.733 tok/s, -34.5% TPOT, +82.9% c4 to 5.425 tok/s, 89.2% vs 29.9% draft efficiency across 2 boots on dgx4).
+Quality: 2,048/2,048 greedy output tokens and top-20 logprobs bit-exact vs fixed drafts=5 and drafts=0 (rank1=1.0, perplexity=1.3209161, 0 diffs).
+Tests: tests/test_config.py, tests/v1/spec_decode/test_adaptive_verification.py, and 13-run live dgx4 screen (PR #1289).
+Upstream-status: Local DeepSeek-V4.1 adaptive verification and expert-slot offload patch.
+---
+ tests/test_config.py                          | 19 ++---
+ .../spec_decode/test_adaptive_verification.py | 71 +++++++++++++++++++
+ vllm/config/vllm.py                           |  7 --
+ .../deepseek_v4_1/expert_slots/cache.py       | 14 +++-
+ .../gpu/spec_decode/adaptive_verification.py  |  3 +-
+ 5 files changed, 93 insertions(+), 21 deletions(-)
+
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 73210e1c7..12d545b9c 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -895,27 +895,22 @@ def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("graph_mode", "should_raise"),
++    "graph_mode",
+     [
+-        (CUDAGraphMode.FULL_DECODE_ONLY, False),
+-        (CUDAGraphMode.FULL_AND_PIECEWISE, False),
+-        (CUDAGraphMode.NONE, True),
+-        (CUDAGraphMode.PIECEWISE, True),
++        CUDAGraphMode.FULL_DECODE_ONLY,
++        CUDAGraphMode.FULL_AND_PIECEWISE,
++        CUDAGraphMode.NONE,
++        CUDAGraphMode.PIECEWISE,
+     ],
+ )
+-def test_adaptive_verification_requires_full_cudagraphs(graph_mode, should_raise):
++def test_adaptive_verification_allows_all_cudagraph_modes(graph_mode):
+     config = SimpleNamespace(
+         speculative_config=SimpleNamespace(enable_adaptive_verification=True),
+         lora_config=None,
+         compilation_config=CompilationConfig(cudagraph_mode=graph_mode),
+         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+     )
+-
+-    if should_raise:
+-        with pytest.raises(ValueError, match="requires full CUDA graphs"):
+-            VllmConfig._validate_adaptive_verification(config)
+-    else:
+-        VllmConfig._validate_adaptive_verification(config)
++    VllmConfig._validate_adaptive_verification(config)
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index eeac8902b..3dc35c3da 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -1425,3 +1425,74 @@ def test_pure_decode_copy_draft_budget_respects_max_cudagraph_tokens() -> None:
+     )
+     assert total_mix > 128
+     assert mgr_mix._batch_budget[2] > 0
++
++
++def test_resolve_adaptive_cudagraph_mode_preserves_piecewise_and_none():
++    assert (
++        resolve_adaptive_cudagraph_mode(
++            CUDAGraphMode.PIECEWISE, piecewise_capture_available=True
++        )
++        == CUDAGraphMode.PIECEWISE
++    )
++    assert (
++        resolve_adaptive_cudagraph_mode(
++            CUDAGraphMode.PIECEWISE, piecewise_capture_available=False
++        )
++        == CUDAGraphMode.PIECEWISE
++    )
++    assert (
++        resolve_adaptive_cudagraph_mode(
++            CUDAGraphMode.NONE, piecewise_capture_available=False
++        )
++        == CUDAGraphMode.NONE
++    )
++
++
++def test_expert_slot_cache_lookahead_skips_dead_padding_rows():
++    from vllm.models.deepseek_v4_1.expert_slots.cache import ExpertSlotCache
++
++    seen_rows = []
++
++    class DummyPredictor:
++        def predict_experts(self, x):
++            seen_rows.append(x.detach().cpu().clone())
++            return [3, 4]
++
++    class DummyNextCache:
++        def __init__(self):
++            self.prefetched = []
++
++        def prefetch_async(self, exps):
++            self.prefetched.append(list(exps))
++
++    class DummyPlan:
++        def run(self, x, topk_ids, topk_weights, weights, out, **kwargs):
++            return out
++
++    class _StubCache(ExpertSlotCache):
++        weights = None
++
++    cache = object.__new__(_StubCache)
++    cache.prefill_protect_rows = 24
++    cache.expert_to_slot_gpu = None
++    cache._partition_windows = lambda arr: [(0, arr.shape[0], [0, 1])]
++    cache.ensure_active = lambda active, is_prefill=False: None
++
++    x = torch.arange(24, dtype=torch.float32).reshape(6, 4)
++    topk_ids = torch.tensor(
++        [[0, 1], [1, 2], [0, 2], [-1, -1], [-1, -1], [-1, -1]], dtype=torch.int32
++    )
++    topk_w = torch.ones((6, 2), dtype=torch.float32)
++    next_cache = DummyNextCache()
++    cache.run(
++        DummyPlan(),
++        x,
++        topk_ids,
++        topk_w,
++        None,
++        next_lookahead=(DummyPredictor(), next_cache),
++        lookahead_hidden=x,
++    )
++    assert len(seen_rows) == 1
++    assert torch.equal(seen_rows[0], x[:3])
++    assert next_cache.prefetched == [[3, 4]]
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 5c880c228..2194590b8 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3279,13 +3279,6 @@ class VllmConfig:
+                 "Adaptive verification is not currently compatible with LoRA"
+             )
+ 
+-        if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+-            raise ValueError(
+-                "Adaptive verification requires full CUDA graphs. Use cudagraph "
+-                "mode FULL, FULL_DECODE_ONLY, or FULL_AND_PIECEWISE, or disable "
+-                "adaptive verification."
+-            )
+-
+         if self.parallel_config.pipeline_parallel_size > 1:
+             # Cost curves and confidences currently only exist on the last PP rank;
+             # earlier ranks would diverge on the trimmed batch shape.
+diff --git a/vllm/models/deepseek_v4_1/expert_slots/cache.py b/vllm/models/deepseek_v4_1/expert_slots/cache.py
+index c1b5dc6c7..d1a5ffde7 100644
+--- a/vllm/models/deepseek_v4_1/expert_slots/cache.py
++++ b/vllm/models/deepseek_v4_1/expert_slots/cache.py
+@@ -1878,7 +1878,19 @@ class ExpertSlotCache:
+ 
+         if next_lookahead is not None and lookahead_hidden is not None and not is_prefill:
+             predictor, next_cache = next_lookahead
+-            pred_experts = predictor.predict_experts(lookahead_hidden)
++            live_mask = (topk_ids_np >= 0).any(axis=-1)
++            if not live_mask.all():
++                live_idx = torch.as_tensor(
++                    np.flatnonzero(live_mask),
++                    dtype=torch.long,
++                    device=lookahead_hidden.device,
++                )
++                lookahead_input = lookahead_hidden.reshape(
++                    -1, lookahead_hidden.shape[-1]
++                ).index_select(0, live_idx)
++            else:
++                lookahead_input = lookahead_hidden
++            pred_experts = predictor.predict_experts(lookahead_input)
+             if pred_experts:
+                 next_cache.prefetch_async(pred_experts)
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 5fd6ecb63..62285660d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -88,7 +88,8 @@ def resolve_adaptive_cudagraph_mode(
+     mode: CUDAGraphMode, *, piecewise_capture_available: bool
+ ) -> CUDAGraphMode:
+     """Select a separate decode route for variable-length verification."""
+-    assert mode.has_full_cudagraphs()
++    if not mode.has_full_cudagraphs():
++        return mode
+     if mode == CUDAGraphMode.FULL_DECODE_ONLY or not piecewise_capture_available:
+         return CUDAGraphMode.FULL_DECODE_ONLY
+     return CUDAGraphMode.FULL_AND_PIECEWISE
+-- 
+2.43.0
+
