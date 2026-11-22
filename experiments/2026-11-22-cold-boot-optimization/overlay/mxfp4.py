@@ -613,15 +613,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 shape, dtype=dt, device=torch.device("meta")
             )
         elif defer_arena_meta:
-            alloc_fn = lambda shape, dt: torch.empty(
-                shape, dtype=dt, device=torch.device("meta")
-            )
+            alloc_fn = lambda shape, dt: torch.empty((1,), dtype=dt).expand(shape)
         else:
             alloc_fn = lambda shape, dt: torch.zeros(shape, dtype=dt)
 
         def _mark_deferred(param: torch.nn.Parameter) -> torch.nn.Parameter:
             if defer_arena_meta:
-                param._direct_deferred_meta = True
+                param._direct_deferred_alloc = True
             return param
 
         # Fused gate_up_proj (column parallel)

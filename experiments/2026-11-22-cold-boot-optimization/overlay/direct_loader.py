@@ -613,6 +613,15 @@ def hold_weight_arena_sponge(device: torch.device | None = None):
             )
 
 
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    strides = [1] * len(shape)
+    acc = 1
+    for i in range(len(shape) - 1, -1, -1):
+        strides[i] = acc
+        acc *= shape[i]
+    return tuple(strides)
+
+
 def _refresh_module_weight_views(model: torch.nn.Module) -> None:
     """Rebind cached tensor slice views (e.g. ``shard_weight``) after ``param.set_``."""
     for module in model.modules():
@@ -651,17 +660,17 @@ def bind_weight_arena(
             for param in module.parameters(recurse=True):
                 data = param.data
                 if (
+                    getattr(param, "_direct_deferred_alloc", False)
+                    and data.device.type == "cuda"
+                    and data.numel() > 0
+                ):
+                    deferred_moe_param_ids.add(id(param))
+                elif (
                     data.device.type == "cuda"
                     and data.numel() > 0
                     and data.untyped_storage().nbytes() > 0
                 ):
                     moe_storage_ptrs.add(data.untyped_storage().data_ptr())
-                elif (
-                    getattr(param, "_direct_deferred_meta", False)
-                    and data.device.type == "meta"
-                    and data.numel() > 0
-                ):
-                    deferred_moe_param_ids.add(id(param))
 
     arena_groups: dict[
         int,
@@ -690,10 +699,11 @@ def bind_weight_arena(
             continue
         data = param.data
         if (
-            getattr(param, "_direct_deferred_meta", False)
-            and data.device.type == "meta"
+            getattr(param, "_direct_deferred_alloc", False)
+            and data.device.type == "cuda"
             and data.numel() > 0
         ):
+            shape = tuple(data.shape)
             nbytes = data.numel() * data.element_size()
             ptr = -id(param)
             target = (
@@ -706,8 +716,8 @@ def bind_weight_arena(
                         param,
                         data.element_size(),
                         0,
-                        tuple(data.shape),
-                        tuple(data.stride()),
+                        shape,
+                        _contiguous_strides(shape),
                     )
                 ],
             )
@@ -752,6 +762,8 @@ def bind_weight_arena(
         for groups in (arena_groups, moe_groups):
             for ptr, (nbytes, views) in groups.items():
                 if ptr < 0:
+                    for param, _, _, _, _ in views:
+                        param.set_(empty_storage, 0, (0,), (1,))
                     continue
                 if nbytes <= _PRESERVE_STORAGE_MAX_BYTES:
                     orig_storage = views[0][0].data.untyped_storage()
@@ -859,15 +871,14 @@ def bind_weight_arena(
                     if ptr in cpu_snapshots:
                         buf[offset : offset + nbytes].copy_(cpu_snapshots.pop(ptr))
                     for param, elem_size, orig_offset, shape, stride in views:
-                        target_offset = (offset // elem_size) + orig_offset
-                        if param.device.type == "meta":
-                            param.data = torch.empty(
-                                (0,), dtype=param.dtype, device=device
-                            ).set_(arena_storage, target_offset, shape, stride)
-                            if hasattr(param, "_direct_deferred_meta"):
-                                delattr(param, "_direct_deferred_meta")
-                        else:
-                            param.set_(arena_storage, target_offset, shape, stride)
+                        param.set_(
+                            arena_storage,
+                            (offset // elem_size) + orig_offset,
+                            shape,
+                            stride,
+                        )
+                        if hasattr(param, "_direct_deferred_alloc"):
+                            delattr(param, "_direct_deferred_alloc")
                     offset += _align_up(nbytes, _ARENA_ALIGN_BYTES)
                 model._direct_weight_arena = buf
                 return buf
@@ -883,14 +894,9 @@ def bind_weight_arena(
                         moe_buf.copy_(cpu_snapshots.pop(ptr))
                     moe_storage = moe_buf.untyped_storage()
                     for param, _, orig_offset, shape, stride in views:
-                        if param.device.type == "meta":
-                            param.data = torch.empty(
-                                (0,), dtype=param.dtype, device=device
-                            ).set_(moe_storage, orig_offset, shape, stride)
-                            if hasattr(param, "_direct_deferred_meta"):
-                                delattr(param, "_direct_deferred_meta")
-                        else:
-                            param.set_(moe_storage, orig_offset, shape, stride)
+                        param.set_(moe_storage, orig_offset, shape, stride)
+                        if hasattr(param, "_direct_deferred_alloc"):
+                            delattr(param, "_direct_deferred_alloc")
                     del moe_buf, moe_storage
 
             if use_preallocated_pool and _PREALLOCATED_CUDA_POOL_FRONT_CLEAN:
