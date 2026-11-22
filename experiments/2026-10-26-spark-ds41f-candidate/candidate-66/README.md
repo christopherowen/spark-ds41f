@@ -21,4 +21,7 @@ Base: `candidate-65` (`vLLM 0001..0844`, tree `34b01980b09e1f634738f7bc781a58832
 
 ## Build & Verification Status
 
-Pending build of `spark-ds41f:candidate-66` (vLLM `0001..0847`, `720` patches, `patch_head = 400ef80a06811ac53cee64e2262b640852815ddb`, `expected_tree = 8ce4b43e546ba0d612f9694f0c3785348326c2da`, `patchset_sha256 = c0787e6370d1351a19cec49ff99e1f9f51e5ac638a56ad9d06d15b30c9e7a301`) on `dgx4`.
+Built `spark-ds41f:candidate-66` (`sha256:bcee79aa3f2a8919415b489535a15b6b9e8a0252e0b9af1000a7b3ae7b4e56d3`, vLLM `0001..0847`, `720` patches, `patch_head = 400ef80a06811ac53cee64e2262b640852815ddb`, `expected_tree = 8ce4b43e546ba0d612f9694f0c3785348326c2da`, `patchset_sha256 = c0787e6370d1351a19cec49ff99e1f9f51e5ac638a56ad9d06d15b30c9e7a301`) in `457 s` on `dgx4` (lowest `MemAvailable = 81.5 GiB`).
+
+- **Zero-overlay built-image unit tests on `dgx4` (`--gpus all`)**: **`365 passed, 1 skipped, 0 failed`** (`361 passed, 1 skipped` in `187.92 s` across `test_deepseek_v41_renderer_pool.py`, `test_deepseek_v41.py`, `test_deepseek_v41_effort.py`, `test_deepseek_v41_serving_contract.py`, `test_adaptive_verification.py`, `test_deepseek_v41_postload_startup.py`, `test_deepseek_v41_tilelang_moe.py`, where the 1 skip is `@pytest.mark.distributed(num_gpus=2)`; plus `4 passed` in `4.89 s` for `test_config.py -k adaptive_verification`).
+- **Distribution**: Identical OCI digest `sha256:bcee79aa3f2a8919415b489535a15b6b9e8a0252e0b9af1000a7b3ae7b4e56d3` verified on all four nodes (`dgx1`, `dgx2`, `dgx3`, `dgx4`).
