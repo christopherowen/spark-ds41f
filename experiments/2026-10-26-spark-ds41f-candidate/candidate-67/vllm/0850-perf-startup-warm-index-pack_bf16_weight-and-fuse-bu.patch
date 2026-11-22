@@ -1,0 +1,330 @@
+From 0f50f2a4e6965abdd28d200632ee524b70afd582 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:48:14 +0100
+Subject: [PATCH 850/850] perf(startup): warm-index pack_bf16_weight and fuse
+ build_screen_weights
+
+Route packed_bf16_histogram, packed_bf16_exception_count, packed_bf16_pack_rows,
+and packed_bf16_build_screen_weights through prepare._prepare_with_warm_index so
+warm boots fast-load all four kernels in ~0.01 s without re-parsing TileLang
+AST/TIR during load_model.
+
+Replace the 43-chunk x 14-alpha PyTorch eager loop (and 1,200+ synchronous .any()
+CPU-GPU syncs) in build_screen_weights with a single-pass shared-memory TileLang
+kernel vllm_packed_bf16_build_screen_row<K, GROUP> (14.33 ms steady on
+[43136, 5120], 831.8x faster than cold PyTorch, 97/97 vocab tests passing).
+Saves ~1.7 s in load_model on every warm boot with 0 greedy diffs.
+---
+ vllm/models/deepseek_v4_1/tilelang/vocab.py | 268 ++++++++++++++++++++
+ 1 file changed, 268 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index b442f13dd..58e980a4c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -95,6 +95,8 @@ class PackedBf16Weight:
+ 
+ 
+ _PACK_HEADER = r"""
++#include <cuda_bf16.h>
++#include <math.h>
+ template <int GROUP>
+ __device__ __forceinline__ void vllm_packed_bf16_histogram(
+     const unsigned short* __restrict__ weight,
+@@ -209,6 +211,171 @@ __device__ __forceinline__ void vllm_packed_bf16_pack_row(
+   if (tx == 0 && written != offsets[row_index + 1]) bad += 1;
+   if (bad != 0) atomicAdd(mismatches, bad);
+ }
++
++__device__ __forceinline__ float vllm_block_reduce_max4(
++    float val, int tx, float* __restrict__ s_red) {
++  for (int offset = 16; offset > 0; offset >>= 1) {
++    val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, offset));
++  }
++  const int warp = tx >> 5;
++  const int lane = tx & 31;
++  if (lane == 0) s_red[warp] = val;
++  __syncthreads();
++  float out = s_red[0];
++  out = fmaxf(out, s_red[1]);
++  out = fmaxf(out, s_red[2]);
++  out = fmaxf(out, s_red[3]);
++  __syncthreads();
++  return out;
++}
++
++__device__ __forceinline__ float vllm_block_reduce_sum4(
++    float val, int tx, float* __restrict__ s_red) {
++  for (int offset = 16; offset > 0; offset >>= 1) {
++    val += __shfl_xor_sync(0xffffffffu, val, offset);
++  }
++  const int warp = tx >> 5;
++  const int lane = tx & 31;
++  if (lane == 0) s_red[warp] = val;
++  __syncthreads();
++  const float out = (s_red[0] + s_red[1]) + (s_red[2] + s_red[3]);
++  __syncthreads();
++  return out;
++}
++
++template <int K, int GROUP>
++__device__ __forceinline__ float vllm_screen_eval_cand_rv(
++    const unsigned short* __restrict__ s_bits,
++    float cand_scale,
++    int tx,
++    float* __restrict__ s_red) {
++  float sum_sq = 0.0f;
++  for (int col = tx; col < K; col += GROUP) {
++    const float wf = __bfloat162float(__ushort_as_bfloat16(s_bits[col]));
++    const float wfin = isfinite(wf) ? wf : 0.0f;
++    const float scaled = (fabsf(wfin) / cand_scale) * 128.0f;
++    float r = rintf(scaled);
++    if (r < 0.0f) r = 0.0f;
++    if (r > 127.0f) r = 127.0f;
++    const float q_signed = (wfin < 0.0f) ? -r : r;
++    const float q_bf16 = __bfloat162float(__float2bfloat16_rn(q_signed * (1.0f / 128.0f)));
++    const float w_hat = q_bf16 * cand_scale;
++    const float diff = wf - w_hat;
++    sum_sq += diff * diff;
++  }
++  const float total_sq = vllm_block_reduce_sum4(sum_sq, tx, s_red);
++  return sqrtf(total_sq);
++}
++
++template <int K, int GROUP>
++__device__ __forceinline__ void vllm_packed_bf16_build_screen_row(
++    const unsigned char* __restrict__ values,
++    const int* __restrict__ exception_entries,
++    const int* __restrict__ row_offsets,
++    unsigned char* __restrict__ w_q,
++    float* __restrict__ row_scale,
++    float* __restrict__ row_bound,
++    float* __restrict__ row_mma_tol,
++    int row,
++    int base,
++    int tx,
++    unsigned short* __restrict__ s_bits,
++    float* __restrict__ s_red,
++    int* __restrict__ s_flag) {
++  constexpr int HALF = GROUP / 2;
++  const unsigned char* row_vals = values + (long long)row * (K + K / 2);
++  const unsigned char* codes_ptr = row_vals + K;
++  const int half_idx = tx & (HALF - 1);
++  const bool hi_half = tx >= HALF;
++
++  float local_in_amax = 0.0f;
++  for (int group = 0; group < K / GROUP; ++group) {
++    const int col = group * GROUP + tx;
++    const unsigned char cbyte = codes_ptr[group * HALF + half_idx];
++    const int code = hi_half ? ((int)cbyte >> 4) : ((int)cbyte & 0xF);
++    const int low = (int)row_vals[col];
++    const int exp = (code == 0) ? 0 : (code + base - 1);
++    const unsigned short b = (unsigned short)(((low & 0x80) << 8) | (exp << 7) | (low & 0x7F));
++    s_bits[col] = b;
++    const float v = __bfloat162float(__ushort_as_bfloat16(b));
++    local_in_amax = fmaxf(local_in_amax, fabsf(v));
++  }
++  const float in_amax = fmaxf(vllm_block_reduce_max4(local_in_amax, tx, s_red), 1e-12f);
++  if (tx == 0) s_flag[0] = 0;
++  __syncthreads();
++
++  const int exc_lo = row_offsets[row];
++  const int exc_hi = row_offsets[row + 1];
++  for (int e = exc_lo + tx; e < exc_hi; e += GROUP) {
++    const int entry = exception_entries[e];
++    const int col = (entry >> 16) & 0xFFFF;
++    s_bits[col] = (unsigned short)(entry & 0xFFFF);
++  }
++  __syncthreads();
++
++  float local_full_amax = 0.0f;
++  float local_norm_sq = 0.0f;
++  int local_nonfinite = 0;
++  for (int col = tx; col < K; col += GROUP) {
++    const float v = __bfloat162float(__ushort_as_bfloat16(s_bits[col]));
++    if (!isfinite(v)) local_nonfinite = 1;
++    local_full_amax = fmaxf(local_full_amax, fabsf(v));
++    local_norm_sq += v * v;
++  }
++  if (local_nonfinite) atomicOr(&s_flag[0], 1);
++  const float full_amax = fmaxf(vllm_block_reduce_max4(local_full_amax, tx, s_red), 1e-12f);
++  const float norm_sq = vllm_block_reduce_sum4(local_norm_sq, tx, s_red);
++  const float w_norm = sqrtf(norm_sq);
++  const bool finite_row = (s_flag[0] == 0);
++  const bool extreme_mask = (full_amax > 8.0f * in_amax) || !finite_row;
++  const float use_amax = extreme_mask ? in_amax : full_amax;
++  const float scale_div = 127.0f / 128.0f;
++  const float base_scale = use_amax / scale_div;
++
++  float best_scale = base_scale;
++  float best_r_v = vllm_screen_eval_cand_rv<K, GROUP>(s_bits, base_scale, tx, s_red);
++  constexpr float kAlphas[13] = {
++      0.96f, 0.93f, 0.89f, 0.85f, 0.80f, 0.74f, 0.68f,
++      0.62f, 0.55f, 0.48f, 0.40f, 0.32f, 0.25f,
++  };
++  for (int i = 0; i < 13; ++i) {
++    const float cand_scale = base_scale * kAlphas[i];
++    const float cand_rv = vllm_screen_eval_cand_rv<K, GROUP>(s_bits, cand_scale, tx, s_red);
++    if (cand_rv < best_r_v) {
++      best_r_v = cand_rv;
++      best_scale = cand_scale;
++    }
++  }
++  if (extreme_mask && finite_row) {
++    const float full_base = full_amax / scale_div;
++    constexpr float kFAlphas[4] = {1.0f, 0.75f, 0.50f, 0.30f};
++    for (int i = 0; i < 4; ++i) {
++      const float cand_scale = full_base * kFAlphas[i];
++      const float cand_rv = vllm_screen_eval_cand_rv<K, GROUP>(s_bits, cand_scale, tx, s_red);
++      if (cand_rv < best_r_v) {
++        best_r_v = cand_rv;
++        best_scale = cand_scale;
++      }
++    }
++  }
++
++  unsigned char* wq_row = w_q + (long long)row * K;
++  for (int col = tx; col < K; col += GROUP) {
++    const float wf = __bfloat162float(__ushort_as_bfloat16(s_bits[col]));
++    const float wfin = isfinite(wf) ? wf : 0.0f;
++    const unsigned char sign = (wfin < 0.0f) ? 1u : 0u;
++    float r = rintf((fabsf(wfin) / best_scale) * 128.0f);
++    if (r < 0.0f) r = 0.0f;
++    if (r > 127.0f) r = 127.0f;
++    wq_row[col] = (unsigned char)((sign << 7) | (unsigned char)((int)r));
++  }
++  if (tx == 0) {
++    row_scale[row] = best_scale;
++    const float r_bound = best_r_v * 1.0005f + w_norm * 5e-4f + 1e-7f;
++    row_bound[row] = isfinite(r_bound) ? r_bound : __int_as_float(0x7f800000);
++    row_mma_tol[row] = w_norm * 5e-4f + 1e-6f;
++  }
++}
+ """
+ 
+ 
+@@ -332,6 +499,84 @@ def packed_bf16_pack_rows(K: int):
+     return vocab_packed_pack_rows
+ 
+ 
++_MAX_FAST_SCREEN_K = 16_384
++
++
++@functools.lru_cache(maxsize=None)
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    }
++)
++def packed_bf16_build_screen_weights(K: int):
++    """Build 8-bit sign-magnitude screening weights and certified bounds in one pass."""
++    assert K > 0 and K % GROUP == 0 and K <= _MAX_FAST_SCREEN_K
++    row_bytes = K + K // 2
++    M = T.dynamic("M")
++    O = T.dynamic("O")
++    E = T.dynamic("E")
++
++    @T.prim_func
++    def vocab_packed_build_screen(
++        values: T.Tensor((M, row_bytes), T.uint8),
++        exception_entries: T.Tensor((E,), T.int32),
++        row_offsets: T.Tensor((O,), T.int32),
++        w_q: T.Tensor((M, K), T.uint8),
++        row_scale: T.Tensor((M,), T.float32),
++        row_bound: T.Tensor((M,), T.float32),
++        row_mma_tol: T.Tensor((M,), T.float32),
++        base: T.int32,
++    ):
++        with T.Kernel(M, threads=GROUP) as (row,):
++            T.import_source(_PACK_HEADER)
++            s_bits = T.alloc_shared((K,), T.uint16)
++            s_red = T.alloc_shared((4,), T.float32)
++            s_flag = T.alloc_shared((1,), T.int32)
++            tx = T.get_thread_binding()
++            T.call_extern(
++                "handle",
++                f"vllm_packed_bf16_build_screen_row<{K}, {GROUP}>",
++                T.address_of(values[0, 0]),
++                T.address_of(exception_entries[0]),
++                T.address_of(row_offsets[0]),
++                T.address_of(w_q[0, 0]),
++                T.address_of(row_scale[0]),
++                T.address_of(row_bound[0]),
++                T.address_of(row_mma_tol[0]),
++                row,
++                base,
++                tx,
++                T.address_of(s_bits[0]),
++                T.address_of(s_red[0]),
++                T.address_of(s_flag[0]),
++            )
++
++    return vocab_packed_build_screen
++
++
++def _prepare_pack_kernels(K: int, *, include_screen: bool = False) -> None:
++    """Warm-index load pack_bf16 (and optional screen-build) kernels before first call."""
++    fns = [
++        packed_bf16_histogram,
++        packed_bf16_exception_count,
++        packed_bf16_pack_rows,
++    ]
++    if include_screen and K <= _MAX_FAST_SCREEN_K:
++        fns.append(packed_bf16_build_screen_weights)
++    pending = []
++    for fn in fns:
++        impl = getattr(fn, "__wrapped__", fn)
++        try:
++            key = impl.func.parse_args(K)[0]
++            if impl._get_prepared_kernel(key) is not None:
++                continue
++        except Exception:
++            pass
++        pending.append((impl, (K,), {}))
++    if pending:
++        prepare._prepare_with_warm_index(pending)
++
++
+ def _check_pack_weight(weight: torch.Tensor) -> None:
+     if weight.ndim != 2 or weight.dtype != torch.bfloat16:
+         raise TypeError("packing needs a 2-D torch.bfloat16 weight")
+@@ -357,6 +602,7 @@ def pack_bf16_weight(
+     """
+     _check_pack_weight(weight)
+     out_features, in_features = map(int, weight.shape)
++    _prepare_pack_kernels(in_features, include_screen=True)
+     width = in_features + in_features // 2
+     device = weight.device
+     bits = weight.view(torch.uint16)
+@@ -4104,6 +4350,28 @@ def build_screen_weights(
+     row_scale = torch.empty((count,), dtype=torch.float32, device=device)
+     row_bound = torch.empty((count,), dtype=torch.float32, device=device)
+     row_mma_tol = torch.empty((count,), dtype=torch.float32, device=device)
++    if k <= _MAX_FAST_SCREEN_K and packed.values.is_cuda:
++        _prepare_pack_kernels(k, include_screen=True)
++        exc_entries = (
++            packed.exception_entries[: packed.exceptions]
++            if packed.exceptions > 0
++            else (
++                packed.exception_entries[:1]
++                if packed.exception_entries.numel() > 0
++                else torch.zeros(1, dtype=torch.int32, device=device)
++            )
++        )
++        packed_bf16_build_screen_weights(k)(
++            packed.values.contiguous(),
++            exc_entries.contiguous(),
++            packed.row_offsets.contiguous(),
++            W_q,
++            row_scale,
++            row_bound,
++            row_mma_tol,
++            int(packed.exponent_base),
++        )
++        return W_q, row_scale, row_bound, row_mma_tol
+     offsets_cpu = packed.row_offsets.cpu().tolist()
+     entries = packed.exception_entries[: packed.exceptions]
+     exc_rows_all = packed.exception_rows[: packed.exceptions]
+-- 
+2.43.0
+

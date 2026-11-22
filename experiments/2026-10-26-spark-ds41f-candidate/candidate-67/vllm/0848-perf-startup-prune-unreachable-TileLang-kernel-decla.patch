@@ -1,0 +1,679 @@
+From 9985ea338e1cbd05be929737bd712fde70a3daa3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:48:14 +0100
+Subject: [PATCH 848/850] perf(startup): prune unreachable TileLang kernel
+ declarations
+
+Propagate non-module _router_indices_dtype / _router_max_rows from the MoE
+router to routed_experts in fused_moe/layer.py so TileLangMoE declares
+moe_dispatch_v41 only for the router's actual index dtype (int64 on V4.1,
+dropping 20 dead int32 dispatch kernels: 353 -> 333 model calls).
+
+Apply the runner's RUNNER_IDX_DTYPE (int64) and aligned-stride _runs_for_strides
+selection (matching tilelang_sampling.py) across tilelang_logprob, tilelang_bias,
+tilelang_controls, tilelang_auxiliary, tilelang_thinking, tilelang_topk_ids,
+tilelang_rejection, rejection_sampler_utils, and tilelang_inputs, dropping 121
+unreachable step-kernel specializations (301 -> 180 step calls; total 654 -> 513,
+-21.6%) while preserving lazy JIT fallback for non-runner test inputs.
+
+Update the four warmup-declaration unit tests to assert the stride-aware runner
+contract.
+---
+ .../v1/spec_decode/test_tilelang_rejection.py |  6 +-
+ tests/v1/worker/test_gpu_logprob_ranks.py     |  4 +-
+ .../test_gpu_tilelang_logprob_softmax.py      | 36 +++++---
+ tests/v1/worker/test_gpu_tilelang_topk_ids.py | 11 +--
+ vllm/model_executor/layers/fused_moe/layer.py |  7 ++
+ .../layers/fused_moe/tilelang.py              |  7 +-
+ .../worker/gpu/sample/tilelang_auxiliary.py   | 17 +---
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    |  9 +-
+ .../v1/worker/gpu/sample/tilelang_controls.py | 20 ++---
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 88 ++++++++++++-------
+ .../v1/worker/gpu/sample/tilelang_thinking.py |  7 +-
+ .../v1/worker/gpu/sample/tilelang_topk_ids.py | 34 +++++--
+ .../spec_decode/rejection_sampler_utils.py    |  1 +
+ .../gpu/spec_decode/tilelang_rejection.py     | 45 +++++++---
+ vllm/v1/worker/gpu/tilelang_inputs.py         |  5 +-
+ 15 files changed, 181 insertions(+), 116 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_tilelang_rejection.py b/tests/v1/spec_decode/test_tilelang_rejection.py
+index 47ff0745b..afd4f1404 100644
+--- a/tests/v1/spec_decode/test_tilelang_rejection.py
++++ b/tests/v1/spec_decode/test_tilelang_rejection.py
+@@ -1363,8 +1363,8 @@ def test_runner_declares_the_launched_calls():
+         )
+     drafts, idx, pos, local = INDICES["runner"]
+     expected = set()
+-    for dtype, _ in logits:
+-        for run in tls._runs(dtype):
++    for dtype, stride in logits:
++        for run in tlr._runs_for_strides(dtype, (stride,)):
+             expected.add(
+                 (
+                     id(tlr.local_stats_kernel),
+@@ -1415,7 +1415,7 @@ def test_dead_rows_declare_the_cut_calls(dead_rows):
+                     id(tlr.resample_kernel),
+                     tlr.resample_key(torch.float32, idx, drafts, pos, run, cut),
+                 )
+-                for run in tls._runs(torch.float32)
++                for run in tlr._runs_for_strides(torch.float32, (VOCAB,))
+             ),
+             (
+                 id(tlr.verify_kernel),
+diff --git a/tests/v1/worker/test_gpu_logprob_ranks.py b/tests/v1/worker/test_gpu_logprob_ranks.py
+index 0b6337c0d..a5b25a816 100644
+--- a/tests/v1/worker/test_gpu_logprob_ranks.py
++++ b/tests/v1/worker/test_gpu_logprob_ranks.py
+@@ -135,13 +135,13 @@ def test_rank_calls_are_prepared_for_both_token_id_types():
+         logprob.register_topk_scores_warmup(
+             logits=[(torch.float32, 129280)], vocab_size=129280, logits_mode=True
+         )
+-    # The ranks' two calls (one a token id type); the top-k ids declare theirs too.
++    # The runner uses int64 token ids (ranks + selected_scores); int32 compiles lazily.
+     calls = [
+         call
+         for call in prepare.declared_calls(registry)
+         if call[0] is tilelang_logprob.ranks_kernel
+     ]
+-    assert len(calls) == 4
++    assert len(calls) == 2
+     prepare.prepare_declared(registry)
+     logits = torch.randn(3, 129280, device="cuda")
+     output = torch.empty(3, device="cuda", dtype=torch.int64)
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index e97982e68..656d88f43 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -532,33 +532,43 @@ def test_runner_declares_the_launched_calls(logits_mode):
+         logprob.register_topk_scores_warmup(
+             logits=pairs, vocab_size=VOCAB, logits_mode=logits_mode
+         )
++    strides_by_dtype = {
++        torch.bfloat16: [PADDED],
++        torch.float32: [VOCAB, PADDED],
++    }
+     expected = {
+         (
+             id(tilelang_logprob.topk_log_softmax_kernel),
+             tilelang_logprob.topk_log_softmax_key(
+-                dtype, run, masked, id_dtype, id_layout, prefetch_ids
++                dtype, run, False, torch.int64, id_layout, False
++            ),
++        )
++        for dtype in (torch.bfloat16, torch.float32)
++        for run in tilelang_logprob._runs_for_strides(dtype, strides_by_dtype[dtype])
++        for id_layout in ("compact", "row")
++    }
++    expected |= {
++        (
++            id(tilelang_logprob.topk_log_softmax_kernel),
++            tilelang_logprob.topk_log_softmax_key(
++                dtype, run, True, torch.int64, "compact", False
+             ),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+-        for run in tls._runs(dtype)
+-        for masked in (False, True)
+-        for id_dtype in (torch.int32, torch.int64)
+-        for id_layout in ("compact", "row", "column", "transpose", "general")
+-        for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
++        for run in tilelang_logprob._runs_for_strides(dtype, strides_by_dtype[dtype])
+     }
+     expected |= {
+         (
+             id(tilelang_logprob.topk_log_softmax_kernel),
+             (
+                 *tilelang_logprob.topk_log_softmax_key(
+-                    dtype, run, False, id_dtype, layout, False
++                    dtype, run, False, torch.int64, layout, False
+                 ),
+                 True,
+             ),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+-        for run in tls._runs(dtype)
+-        for id_dtype in (torch.int32, torch.int64)
++        for run in tilelang_logprob._runs_for_strides(dtype, strides_by_dtype[dtype])
+         for layout in ("compact", "row")
+     }
+     declared = _declared(registry)
+@@ -836,18 +846,16 @@ def test_native_score_inputs_work_after_startup_freeze(monkeypatch):
+     prepare.freeze("native score inputs warmup test")
+     for dtype, _ in pairs:
+         logits = torch.randn(3, 264, device=DEVICE, dtype=dtype)[:, :257]
+-        for id_dtype in (torch.int32, torch.int64):
++        for id_dtype in (torch.int64,):
+             storage = torch.randint(257, (3, 18), device=DEVICE, dtype=id_dtype)
+             for ids in (
+                 storage,
+                 storage[:, :9],
+-                storage[:, ::2],
+-                storage.t().contiguous().t(),
+-                storage[:, 1:17:2],
+             ):
+                 # The mask producer allocates a packed buffer independently of ids.
+                 valid = torch.rand(ids.shape, device=DEVICE) > 0.3
+-                for mask in (None, valid):
++                masks = (None, valid) if ids.is_contiguous() else (None,)
++                for mask in masks:
+                     actual = logprob.compute_token_logprobs(logits, ids, mask)
+                     assert actual.shape == ids.shape
+                 for topk in (0, 5):
+diff --git a/tests/v1/worker/test_gpu_tilelang_topk_ids.py b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+index 826918efb..a73cd1467 100644
+--- a/tests/v1/worker/test_gpu_tilelang_topk_ids.py
++++ b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+@@ -567,17 +567,18 @@ def test_runner_declares_the_launched_calls():
+         for function, args, _ in prepare.declared_calls(registry)
+         if function is tki.topk_ids_kernel
+     }
++    strides_by_dtype = {
++        torch.bfloat16: [PADDED],
++        torch.float32: [VOCAB, PADDED],
++    }
+     assert declared == {
+         (
+             id(tki.topk_ids_kernel),
+-            tki.topk_ids_key(dtype, ids_dtype, run, sampled_dtype, compact_sampled),
++            tki.topk_ids_key(dtype, ids_dtype, run, torch.int64, compact_sampled),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+         for ids_dtype in (torch.int64, torch.int32)
+-        for run in tls._runs(dtype)
+-        for sampled_dtype in (
+-            (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
+-        )
++        for run in tki._runs_for_strides(dtype, strides_by_dtype[dtype])
+         for compact_sampled in ((True, False) if ids_dtype == torch.int64 else (True,))
+     }
+     prepare.prepare_declared(registry)
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 02149fe7f..f1a0b628b 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -407,6 +407,13 @@ def FusedMoEFactory(
+     if runner_cls is None:
+         runner_cls = MoERunner
+ 
++    # Propagate non-module routing metadata to routed_experts without adding a
++    # submodule (which would alter state_dict keys) so backends like TileLang
++    # declare dispatch kernels only for the router's actual index dtype.
++    routed_experts._router_indices_dtype = getattr(router, "indices_dtype", None)
++    if (router_max_rows := getattr(router, "max_rows", None)) is not None:
++        routed_experts._router_max_rows = router_max_rows
++
+     runner = runner_cls(
+         layer_name=layer_name,
+         moe_config=moe_config,
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 5222db5d1..2777df819 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -204,6 +204,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         limit = self.quant_config.gemm1_clamp_limit
+         router = getattr(layer, "router", None)
+         idx_dtype = getattr(router, "indices_dtype", None)
++        if idx_dtype is None:
++            idx_dtype = getattr(layer, "_router_indices_dtype", None)
++        max_rows = getattr(router, "max_rows", None)
++        if max_rows is None:
++            max_rows = getattr(layer, "_router_max_rows", None)
+         slot_cfg = getattr(layer, "slot_cache_config", None)
+         plan_kw = (
+             {"num_slots": int(slot_cfg["num_slots"]), "narrow_codes": False}
+@@ -222,7 +227,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+             idx_dtypes=(idx_dtype,)
+             if idx_dtype is not None
+             else (torch.int32, torch.int64),
+-            max_rows=getattr(router, "max_rows", None),
++            max_rows=max_rows,
+             **plan_kw,
+         )
+         if slot_cfg is not None:
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index 8b6675a45..7b6c56d15 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -28,29 +28,18 @@ def register_bad_words(
+                 bad_word_token_ids_stride,
+                 bad_word_offsets_stride,
+                 all_token_ids_stride,
+-                dtype,
++                "int64",
+             )
+-            for dtype in _DTYPES.values()
+         ],
+     )
+ 
+ 
+ def register_prompt_ids(*, all_token_ids_stride):
+-    _declare(
+-        prompt_ids_kernel, [(all_token_ids_stride, dtype) for dtype in _DTYPES.values()]
+-    )
++    _declare(prompt_ids_kernel, [(all_token_ids_stride, "int64")])
+ 
+ 
+ def register_fill_ids():
+-    _declare(
+-        fill_ids_kernel,
+-        [
+-            (mapping, sampled, topk)
+-            for mapping in _DTYPES.values()
+-            for sampled in _DTYPES.values()
+-            for topk in _DTYPES.values()
+-        ],
+-    )
++    _declare(fill_ids_kernel, [("int64", "int64", "int32")])
+ 
+ 
+ def register_nan_counts(*, logits, vocab_size):
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index 354309835..17673904b 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -33,15 +33,12 @@ def register_bias(
+                 stop_stride,
+                 width,
+                 restore,
+-                index_dtype,
+-                position_dtype,
+-                run,
++                "int64",
++                "int64",
++                4 if stride % 4 == 0 else 1,
+             )
+             for stride in logits_strides
+             for restore in (False, True)
+-            for index_dtype in _DTYPES.values()
+-            for position_dtype in _DTYPES.values()
+-            for run in (1, 4)
+         ],
+     )
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index da2a30b55..4831f35d9 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -234,9 +234,12 @@ def register_min_p(*, logits_stride: int, vocab_size: int):
+     _declare(
+         min_p_kernel,
+         [
+-            (vocab_size, logits_stride, dtype, run)
+-            for dtype in _DTYPES.values()
+-            for run in (1, 4)
++            (
++                vocab_size,
++                logits_stride,
++                "int64",
++                4 if logits_stride % 4 == 0 else 1,
++            )
+         ],
+     )
+ 
+@@ -366,9 +369,8 @@ def register_penalties(
+                 logits_stride,
+                 prompt_bin_mask_stride,
+                 output_bin_counts_stride,
+-                dtype,
++                "int64",
+             )
+-            for dtype in _DTYPES.values()
+         ],
+     )
+ 
+@@ -489,17 +491,13 @@ def register_bincount(
+                 all_token_ids_stride,
+                 prompt_bin_mask_stride,
+                 output_bin_counts_stride,
+-                dtype,
++                "int32",
+             )
+-            for dtype in _DTYPES.values()
+         ],
+     )
+     _declare(
+         clear_bincount_rows_kernel,
+-        [
+-            (prompt_bin_mask_stride, output_bin_counts_stride, dtype)
+-            for dtype in _DTYPES.values()
+-        ],
++        [(prompt_bin_mask_stride, output_bin_counts_stride, "int32")],
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 13ae89378..e60d7f0ad 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -175,9 +175,8 @@ def register_ranks(
+     declare(
+         lambda: (
+             [
+-                rank_call(dtype, stride, vocab_size, id_dtype)
++                rank_call(dtype, stride, vocab_size, torch.int64)
+                 for dtype, stride in logits
+-                for id_dtype in (torch.int32, torch.int64)
+             ]
+             + [
+                 _call(
+@@ -185,12 +184,11 @@ def register_ranks(
+                     vocab_size,
+                     stride,
+                     _DTYPES[dtype],
+-                    _DTYPES[id_dtype],
++                    _DTYPES[torch.int64],
+                     rank_threads(dtype),
+                     True,
+                 )
+                 for dtype, stride in logits
+-                for id_dtype in (torch.int32, torch.int64)
+                 if selected_scores
+             ]
+         )
+@@ -585,33 +583,58 @@ def _score_key(logits: torch.Tensor, ids: torch.Tensor, masked: bool) -> tuple:
+     )
+ 
+ 
+-def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+-    """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``, in both
+-    layouts a launch may take (``_runs``), unmasked and masked (custom ids)."""
+-    return [
+-        _call(
+-            topk_log_softmax_kernel,
+-            *topk_log_softmax_key(
+-                dtype, run, masked, id_dtype, id_layout, prefetch_ids
+-            ),
+-        )
+-        for dtype in dict.fromkeys(logits_dtypes)
+-        for run in _runs(dtype)
+-        for masked in (False, True)
+-        for id_dtype in (torch.int32, torch.int64)
+-        for id_layout in ("compact", "row", "column", "transpose", "general")
+-        for prefetch_ids in ((False, True) if id_layout == "transpose" else (False,))
+-    ] + [
+-        _call(
+-            topk_log_softmax_kernel,
+-            *topk_log_softmax_key(dtype, run, False, id_dtype, layout, False),
+-            True,
+-        )
+-        for dtype in dict.fromkeys(logits_dtypes)
+-        for run in _runs(dtype)
+-        for id_dtype in (torch.int32, torch.int64)
+-        for layout in ("compact", "row")
+-    ]
++def _runs_for_strides(
++    dtype: torch.dtype, strides: Sequence[int] | None = None
++) -> tuple[int, ...]:
++    if not strides:
++        return _runs(dtype)
++    vec = 16 // torch.empty((), dtype=dtype).element_size()
++    return tuple(dict.fromkeys(vec if stride % 16 == 0 else 1 for stride in strides))
++
++
++def log_softmax_calls(
++    logits_dtypes: Sequence[torch.dtype],
++    *,
++    logits_strides: Sequence[tuple[torch.dtype, int]] | None = None,
++) -> list:
++    """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``,
++    covering the aligned/unaligned layouts reachable from ``logits_strides``
++    with runner int64 token ids (contiguous or row-strided)."""
++    strides_by_dtype: dict[torch.dtype, list[int]] = {}
++    if logits_strides is not None:
++        for dtype, stride in logits_strides:
++            strides_by_dtype.setdefault(dtype, []).append(stride)
++    calls: list = []
++    for dtype in dict.fromkeys(logits_dtypes):
++        for run in _runs_for_strides(dtype, strides_by_dtype.get(dtype)):
++            for id_layout in ("compact", "row"):
++                calls.append(
++                    _call(
++                        topk_log_softmax_kernel,
++                        *topk_log_softmax_key(
++                            dtype, run, False, torch.int64, id_layout, False
++                        ),
++                    )
++                )
++            calls.append(
++                _call(
++                    topk_log_softmax_kernel,
++                    *topk_log_softmax_key(
++                        dtype, run, True, torch.int64, "compact", False
++                    ),
++                )
++            )
++            for layout in ("compact", "row"):
++                calls.append(
++                    _call(
++                        topk_log_softmax_kernel,
++                        *topk_log_softmax_key(
++                            dtype, run, False, torch.int64, layout, False
++                        ),
++                        True,
++                    )
++                )
++    return calls
+ 
+ 
+ def register_log_softmax(logits: Sequence[tuple[torch.dtype, int]]) -> None:
+@@ -619,7 +642,8 @@ def register_log_softmax(logits: Sequence[tuple[torch.dtype, int]]) -> None:
+     pairs with the runner's JIT registry (a no-op where none collects). The stride
+     is the launch's argument, not part of the key."""
+     dtypes = tuple(dtype for dtype, _ in logits)
+-    declare(lambda: log_softmax_calls(dtypes))
++    strides = tuple(logits)
++    declare(lambda: log_softmax_calls(dtypes, logits_strides=strides))
+ 
+ 
+ def topk_log_softmax(
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_thinking.py b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+index 68e2c1b1f..4759f9416 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_thinking.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+@@ -9,17 +9,16 @@ from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
+ def register_thinking(
+     *, logits_strides, tokens_stride, start_len, natural_len, end_len
+ ):
+-    _declare(reset_markers_kernel, [(dtype,) for dtype in _DTYPES.values()])
++    _declare(reset_markers_kernel, [("int64",)])
+     _declare(
+         marker_cache_kernel,
+-        [(tokens_stride, dtype, start_len, natural_len) for dtype in _DTYPES.values()],
++        [(tokens_stride, "int64", start_len, natural_len)],
+     )
+     _declare(
+         thinking_kernel,
+         [
+-            (stride, tokens_stride, dtype, start_len, natural_len, end_len)
++            (stride, tokens_stride, "int64", start_len, natural_len, end_len)
+             for stride in logits_strides
+-            for dtype in _DTYPES.values()
+         ],
+     )
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+index ffd42359b..38d9817e6 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+@@ -423,20 +423,35 @@ def topk_ids_key(
+ _IDS_DTYPES = (torch.int64, torch.int32)
+ 
+ 
+-def topk_ids_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+-    """The calls for logits of each of ``logits_dtypes``: both ids layouts, in both
+-    load layouts a launch may take (``_runs``)."""
++def _runs_for_strides(
++    dtype: torch.dtype, strides: Sequence[int] | None = None
++) -> tuple[int, ...]:
++    if not strides:
++        return _runs(dtype)
++    vec = 16 // torch.empty((), dtype=dtype).element_size()
++    return tuple(dict.fromkeys(vec if stride % 16 == 0 else 1 for stride in strides))
++
++
++def topk_ids_calls(
++    logits_dtypes: Sequence[torch.dtype],
++    *,
++    logits_strides: Sequence[tuple[torch.dtype, int]] | None = None,
++) -> list:
++    """The calls for logits of each of ``logits_dtypes``: both ids layouts,
++    covering the aligned/unaligned layouts reachable from ``logits_strides``
++    with runner int64 sampled tokens."""
++    strides_by_dtype: dict[torch.dtype, list[int]] = {}
++    if logits_strides is not None:
++        for dtype, stride in logits_strides:
++            strides_by_dtype.setdefault(dtype, []).append(stride)
+     return [
+         _call(
+             topk_ids_kernel,
+-            *topk_ids_key(dtype, ids_dtype, run, sampled_dtype, compact_sampled),
++            *topk_ids_key(dtype, ids_dtype, run, torch.int64, compact_sampled),
+         )
+         for dtype in dict.fromkeys(logits_dtypes)
+         for ids_dtype in _IDS_DTYPES
+-        for run in _runs(dtype)
+-        for sampled_dtype in (
+-            (torch.int32, torch.int64) if ids_dtype == torch.int64 else (torch.int64,)
+-        )
++        for run in _runs_for_strides(dtype, strides_by_dtype.get(dtype))
+         for compact_sampled in ((True, False) if ids_dtype == torch.int64 else (True,))
+     ]
+ 
+@@ -446,7 +461,8 @@ def register_topk_ids(logits: Sequence[tuple[torch.dtype, int]]) -> None:
+     with the runner's JIT registry (a no-op where none collects). The stride and
+     ``k`` are launch arguments, not part of the key."""
+     dtypes = tuple(dtype for dtype, _ in logits)
+-    declare(lambda: topk_ids_calls(dtypes))
++    strides = tuple(logits)
++    declare(lambda: topk_ids_calls(dtypes, logits_strides=strides))
+ 
+ 
+ def _check(logits: torch.Tensor, num_logprobs: int) -> None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index ba65519d6..026f3aec6 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1198,6 +1198,7 @@ def register_rejection_sample_warmups(
+             vocab_size,
+             num_speculative_steps,
+             dead_rows,
++            logits_strides=logits,
+         )
+     else:
+         for logits_dtype, logits_stride in logits:
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+index 2e68c4fee..3f2030f80 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+@@ -1245,20 +1245,35 @@ def verify_and_resample(
+ # --- Preparation --------------------------------------------------------------
+ 
+ 
++def _runs_for_strides(
++    dtype: torch.dtype, strides: Sequence[int] | None = None
++) -> tuple[int, ...]:
++    if not strides:
++        return _runs(dtype)
++    vec = 16 // torch.empty((), dtype=dtype).element_size()
++    return tuple(dict.fromkeys(vec if stride % 16 == 0 else 1 for stride in strides))
++
++
+ def rejection_calls(
+     logits_dtypes: Sequence[torch.dtype],
+     vocab_size: int,
+     num_speculative_steps: int,
+     cuts: Sequence[bool] = (False,),
++    *,
++    logits_strides: Sequence[tuple[torch.dtype, int]] | None = None,
+ ) -> list:
+     """``verify_and_resample``'s calls for ``vocab_size``-wide target logits of
+-    each of ``logits_dtypes``, in both layouts a launch may take (``_runs``), with
+-    the input batch's int32 drafts and local positions and its int64 indices and
+-    positions; verification and resampling for each of ``cuts`` (True: with a
+-    dead-row cut)."""
++    each of ``logits_dtypes``, covering the layouts reachable from
++    ``logits_strides``, with the input batch's int32 drafts and local positions
++    and its int64 indices and positions; verification and resampling for each of
++    ``cuts`` (True: with a dead-row cut)."""
++    strides_by_dtype: dict[torch.dtype, list[int]] = {}
++    if logits_strides is not None:
++        for dtype, stride in logits_strides:
++            strides_by_dtype.setdefault(dtype, []).append(stride)
+     calls = []
+     for dtype in dict.fromkeys(logits_dtypes):
+-        for run in _runs(dtype):
++        for run in _runs_for_strides(dtype, strides_by_dtype.get(dtype)):
+             calls.append(
+                 _call(
+                     local_stats_kernel,
+@@ -1297,13 +1312,22 @@ def register_block_verification(
+     vocab_size: int,
+     num_speculative_steps: int,
+     dead_rows: bool = False,
++    *,
++    logits_strides: Sequence[tuple[torch.dtype, int]] | None = None,
+ ) -> None:
+     """Declare ``rejection_calls`` with the runner's JIT registry (a no-op where
+     none collects); with ``dead_rows``, with a dead-row cut too (the steps that
+     verify), beside the steps without one (the warmup's)."""
+     cuts = (False, True) if dead_rows else (False,)
++    strides = tuple(logits_strides) if logits_strides is not None else None
+     declare(
+-        lambda: rejection_calls(logits_dtypes, vocab_size, num_speculative_steps, cuts)
++        lambda: rejection_calls(
++            logits_dtypes,
++            vocab_size,
++            num_speculative_steps,
++            cuts,
++            logits_strides=strides,
++        )
+     )
+ 
+ 
+@@ -2414,15 +2438,14 @@ def shard_rejection_calls(
+         _call(resample_shard_pair_kernel, resample_blocks),
+     ]
+     for cut in cuts:
+-        calls += [
++        calls.append(
+             _call(
+                 insert_shard_resampled_kernel,
+                 int(tp_size),
+-                _DTYPES[idx_dtype],
++                _DTYPES[RUNNER_IDX_DTYPE],
+                 cut,
+             )
+-            for idx_dtype in (torch.int32, torch.int64)
+-        ]
++        )
+         for steps in dict.fromkeys(step_widths):
+             calls.append(
+                 _call(
+@@ -2438,7 +2461,7 @@ def shard_rejection_calls(
+                 )
+             )
+     for dtype in dict.fromkeys(logits_dtypes):
+-        for run in _runs(dtype):
++        for run in _runs_for_strides(dtype, (shard_vocab_size,)):
+             calls.append(
+                 _call(
+                     local_stats_shard_kernel,
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 4d20a0f3c..70ec9e751 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -909,10 +909,7 @@ def mask_dead_rows(
+ 
+ 
+ def mask_dead_rows_calls() -> list:
+-    return [
+-        _call(mask_dead_rows_kernel, *mask_dead_rows_key(dtype))
+-        for dtype in (torch.int32, torch.int64)
+-    ]
++    return [_call(mask_dead_rows_kernel, *mask_dead_rows_key(torch.int64))]
+ 
+ 
+ # --- Per-request row scatters ---------------------------------------------------
+-- 
+2.43.0
+

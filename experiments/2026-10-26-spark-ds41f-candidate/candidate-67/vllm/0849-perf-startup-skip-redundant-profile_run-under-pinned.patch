@@ -1,0 +1,68 @@
+From 2538d221450307c0fbaa3113ef012206416e349a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:48:14 +0100
+Subject: [PATCH 849/850] perf(startup): skip redundant profile_run under
+ pinned kv_cache_memory_bytes
+
+When kv_cache_memory_bytes is pinned, no b12x session is active, and neither the
+target nor draft model contains an active @support_torch_compile submodule
+(do_not_compile == False), reserve persistent workspace lanes via
+model_runner._reserve_profile_scratch() and reclaim transient UMA allocator
+blocks instead of executing the three throwaway profiling passes (6 dummy vision
+images plus two 6,144-token dummy forwards). Saves ~3.3-3.5 s on every boot with
+0 greedy diffs and identical 4K-prefill and multimodal-vision serving.
+---
+ vllm/v1/worker/gpu_worker.py | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index a2965367b..a12b6c882 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -85,6 +85,7 @@ from vllm.utils.mem_utils import (
+     MemorySnapshot,
+     format_gib,
+     memory_profiling,
++    reclaim_uma_memory,
+     trim_host_heap,
+ )
+ from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
+@@ -1243,10 +1244,31 @@ class Worker(WorkerBase):
+         self._startup_rendezvous("memory profiling")
+ 
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+-            try:
+-                self.model_runner.profile_run(self._prepare_b12x_profile_state)
+-            finally:
+-                self._release_b12x_profile_state()
++            has_compiled_submodule = any(
++                hasattr(m, "do_not_compile") and not m.do_not_compile
++                for model in (
++                    self.model_runner.get_model(),
++                    getattr(self.model_runner, "get_draft_model", lambda: None)(),
++                )
++                if model is not None
++                for m in model.modules()
++            )
++            skip_profile = (
++                (
++                    self.vllm_config.compilation_config.mode == CompilationMode.NONE
++                    or not has_compiled_submodule
++                )
++                and self._b12x_session is None
++                and hasattr(self.model_runner, "_reserve_profile_scratch")
++            )
++            if skip_profile:
++                self.model_runner._reserve_profile_scratch()
++                reclaim_uma_memory(synchronize=False)
++            else:
++                try:
++                    self.model_runner.profile_run(self._prepare_b12x_profile_state)
++                finally:
++                    self._release_b12x_profile_state()
+             msg = (
+                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
+                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
+-- 
+2.43.0
+
