@@ -424,9 +424,9 @@ def overlay(arm: dict, base: dict) -> dict:
     qualifying benchmark, so starting it needs no qualification and a bench names
     its own reference.
     """
-    unknown = set(arm) - {"extends", "set", "serve_options", "unset", "notes"}
+    unknown = set(arm) - {"extends", "set", "serve_options", "add_serve_options", "unset", "notes"}
     if unknown:
-        raise SystemExit("an arm overlay holds extends, set, serve_options, unset and notes; not "
+        raise SystemExit("an arm overlay holds extends, set, serve_options, add_serve_options, unset and notes; not "
                          + ", ".join(sorted(unknown)))
     cluster = _merge(base, arm.get("set", {}))
     for flag, value in arm.get("serve_options", {}).items():
@@ -436,6 +436,15 @@ def overlay(arm: dict, base: dict) -> dict:
         if not isinstance(value, str):
             raise SystemExit(f"the arm sets {flag} to {value!r}: serve_args values are strings")
         args[args.index(flag) + 1] = value
+    for flag, value in arm.get("add_serve_options", {}).items():
+        args = cluster["serve_args"]
+        if not isinstance(flag, str) or not flag.startswith("--"):
+            raise SystemExit(f"the arm adds {flag!r}: add_serve_options keys must be --flags")
+        if flag in args:
+            raise SystemExit(f"the arm adds {flag}, which its base's serve_args already pass (use serve_options)")
+        if not isinstance(value, str):
+            raise SystemExit(f"the arm adds {flag} to {value!r}: serve_args values are strings")
+        args.extend([flag, value])
     sets = arm.get("set", {})
     if "models" in cluster and ("model" in sets or "mounts" in sets.get("container", {})):
         # The arm serves its model (another of the recipe's, or the one it extends)

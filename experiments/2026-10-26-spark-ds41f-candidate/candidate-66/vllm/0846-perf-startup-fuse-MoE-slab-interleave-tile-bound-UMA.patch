@@ -1,0 +1,422 @@
+From 79cc7e4e0bc12753958e088fa8b50e85f28f177d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:16:19 +0100
+Subject: [PATCH 846/847] perf(startup): fuse MoE slab-interleave tile, bound
+ UMA post-load flushes, and defer MoE arena alloc
+
+---
+ .../layers/quantization/mxfp4.py              | 95 +++++++++++--------
+ .../model_loader/direct_loader.py             | 82 +++++++++++++++-
+ vllm/model_executor/model_loader/utils.py     | 26 ++++-
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 47 ++++++++-
+ 4 files changed, 200 insertions(+), 50 deletions(-)
+
+diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
+index 6b3b5e655..4bf77982c 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4.py
++++ b/vllm/model_executor/layers/quantization/mxfp4.py
+@@ -602,41 +602,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             and not is_draft_layer
+             and (slot_target < 0 or slot_target < num_experts)
+         )
+-        weight_device = torch.device("meta") if use_slot_meta else None
++        from vllm.model_executor.model_loader.direct_loader import (
++            is_deferring_arena_weight_alloc,
++        )
++
++        defer_arena_meta = (not use_slot_meta) and is_deferring_arena_weight_alloc()
+         if use_slot_meta:
+             self.uses_meta_device = True
+             alloc_fn = lambda shape, dt: torch.empty(
+-                shape, dtype=dt, device=weight_device
++                shape, dtype=dt, device=torch.device("meta")
+             )
++        elif defer_arena_meta:
++            alloc_fn = lambda shape, dt: torch.empty((1,), dtype=dt).expand(shape)
+         else:
+             alloc_fn = lambda shape, dt: torch.zeros(shape, dtype=dt)
+ 
++        def _mark_deferred(param: torch.nn.Parameter) -> torch.nn.Parameter:
++            if defer_arena_meta:
++                param._direct_deferred_alloc = True
++            return param
++
+         # Fused gate_up_proj (column parallel)
+-        w13_weight = torch.nn.Parameter(
+-            alloc_fn(
+-                (
+-                    num_experts,
+-                    self.moe.w13_num_shards * intermediate_size_per_partition,
+-                    hidden_size // 2,
++        w13_weight = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                        hidden_size // 2,
++                    ),
++                    weight_dtype,
+                 ),
+-                weight_dtype,
+-            ),
+-            requires_grad=False,
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w13_weight", w13_weight)
+         set_weight_attrs(w13_weight, extra_weight_attrs)
+         set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
+ 
+-        w13_weight_scale = torch.nn.Parameter(
+-            alloc_fn(
+-                (
+-                    num_experts,
+-                    self.moe.w13_num_shards * intermediate_size_per_partition,
+-                    hidden_size // mxfp4_block,
++        w13_weight_scale = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                        hidden_size // mxfp4_block,
++                    ),
++                    scale_dtype,
+                 ),
+-                scale_dtype,
+-            ),
+-            requires_grad=False,
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w13_weight_scale", w13_weight_scale)
+         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+@@ -644,31 +659,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+         w13_weight_scale.quant_method = "block"
+ 
+         # down_proj (row parallel)
+-        w2_weight = torch.nn.Parameter(
+-            alloc_fn(
+-                (
+-                    num_experts,
+-                    hidden_size,
+-                    intermediate_size_per_partition // 2,
++        w2_weight = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        hidden_size,
++                        intermediate_size_per_partition // 2,
++                    ),
++                    weight_dtype,
+                 ),
+-                weight_dtype,
+-            ),
+-            requires_grad=False,
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w2_weight", w2_weight)
+         set_weight_attrs(w2_weight, extra_weight_attrs)
+         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
+ 
+-        w2_weight_scale = torch.nn.Parameter(
+-            alloc_fn(
+-                (
+-                    num_experts,
+-                    hidden_size,
+-                    intermediate_size_per_partition // mxfp4_block,
++        w2_weight_scale = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        hidden_size,
++                        intermediate_size_per_partition // mxfp4_block,
++                    ),
++                    scale_dtype,
+                 ),
+-                scale_dtype,
+-            ),
+-            requires_grad=False,
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index a1de477d0..fea00e03d 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -84,6 +84,24 @@ _HELD_SPONGE_STACK: list[list[torch.nn.Module]] = []
+ _PREALLOCATED_CUDA_POOL_BYTES: int = 0
+ _PREALLOCATED_CUDA_POOL_FRONT_CLEAN: bool = True
+ _PREALLOCATED_CUDA_POOL_RESIZE_CB = None
++_DEFER_ARENA_WEIGHT_ALLOC: int = 0
++
++
++def is_deferring_arena_weight_alloc() -> bool:
++    """True while ``DirectModelLoader.create_model`` defers large uninitialized
++    parameter allocations to ``meta`` so ``bind_weight_arena`` allocates them
++    once under the buddy sponge instead of allocating and freeing them twice."""
++    return _DEFER_ARENA_WEIGHT_ALLOC > 0
++
++
++@contextmanager
++def defer_arena_weight_alloc():
++    global _DEFER_ARENA_WEIGHT_ALLOC
++    _DEFER_ARENA_WEIGHT_ALLOC += 1
++    try:
++        yield
++    finally:
++        _DEFER_ARENA_WEIGHT_ALLOC -= 1
+ 
+ 
+ def set_preallocated_cuda_pool_bytes(
+@@ -595,6 +613,15 @@ def hold_weight_arena_sponge(device: torch.device | None = None):
+             )
+ 
+ 
++def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
++    strides = [1] * len(shape)
++    acc = 1
++    for i in range(len(shape) - 1, -1, -1):
++        strides[i] = acc
++        acc *= shape[i]
++    return tuple(strides)
++
++
+ def _refresh_module_weight_views(model: torch.nn.Module) -> None:
+     """Rebind cached tensor slice views (e.g. ``shard_weight``) after ``param.set_``."""
+     for module in model.modules():
+@@ -627,11 +654,18 @@ def bind_weight_arena(
+     )
+ 
+     moe_storage_ptrs: set[int] = set()
++    deferred_moe_param_ids: set[int] = set()
+     for module in model.modules():
+         if isinstance(getattr(module, "quant_method", None), FusedMoEMethodBase):
+             for param in module.parameters(recurse=True):
+                 data = param.data
+                 if (
++                    getattr(param, "_direct_deferred_alloc", False)
++                    and data.device.type == "cuda"
++                    and data.numel() > 0
++                ):
++                    deferred_moe_param_ids.add(id(param))
++                elif (
+                     data.device.type == "cuda"
+                     and data.numel() > 0
+                     and data.untyped_storage().nbytes() > 0
+@@ -664,6 +698,30 @@ def bind_weight_arena(
+         if hasattr(param, "load_view"):
+             continue
+         data = param.data
++        if (
++            getattr(param, "_direct_deferred_alloc", False)
++            and data.device.type == "cuda"
++            and data.numel() > 0
++        ):
++            shape = tuple(data.shape)
++            nbytes = data.numel() * data.element_size()
++            ptr = -id(param)
++            target = (
++                moe_groups if id(param) in deferred_moe_param_ids else arena_groups
++            )
++            target[ptr] = (
++                nbytes,
++                [
++                    (
++                        param,
++                        data.element_size(),
++                        0,
++                        shape,
++                        _contiguous_strides(shape),
++                    )
++                ],
++            )
++            continue
+         if data.device.type != "cuda" or data.numel() == 0:
+             continue
+         if any(display_carveout._holds(c, data) for c in display_carveout._carveouts):
+@@ -703,6 +761,10 @@ def bind_weight_arena(
+     with torch.no_grad():
+         for groups in (arena_groups, moe_groups):
+             for ptr, (nbytes, views) in groups.items():
++                if ptr < 0:
++                    for param, _, _, _, _ in views:
++                        param.set_(empty_storage, 0, (0,), (1,))
++                    continue
+                 if nbytes <= _PRESERVE_STORAGE_MAX_BYTES:
+                     orig_storage = views[0][0].data.untyped_storage()
+                     src = torch.empty((0,), dtype=torch.uint8, device=device).set_(
+@@ -815,6 +877,8 @@ def bind_weight_arena(
+                             shape,
+                             stride,
+                         )
++                        if hasattr(param, "_direct_deferred_alloc"):
++                            delattr(param, "_direct_deferred_alloc")
+                     offset += _align_up(nbytes, _ARENA_ALIGN_BYTES)
+                 model._direct_weight_arena = buf
+                 return buf
+@@ -831,6 +895,8 @@ def bind_weight_arena(
+                     moe_storage = moe_buf.untyped_storage()
+                     for param, _, orig_offset, shape, stride in views:
+                         param.set_(moe_storage, orig_offset, shape, stride)
++                        if hasattr(param, "_direct_deferred_alloc"):
++                            delattr(param, "_direct_deferred_alloc")
+                     del moe_buf, moe_storage
+ 
+             if use_preallocated_pool and _PREALLOCATED_CUDA_POOL_FRONT_CLEAN:
+@@ -898,11 +964,21 @@ class DirectModelLoader(DefaultModelLoader):
+         self._session = None
+ 
+     def create_model(self, vllm_config, model_config, prefix=""):
++        device = torch.device(
++            self.load_config.device or vllm_config.device_config.device
++        )
++        if self.weight_arena and device.type == "cuda":
++            with defer_arena_weight_alloc():
++                model = super().create_model(vllm_config, model_config, prefix)
++            bind_weight_arena(
++                model,
++                device,
++                order13_sponge=self.order13_sponge,
++                retain_sponge=True,
++            )
++            return model
+         model = super().create_model(vllm_config, model_config, prefix)
+         if self.weight_arena:
+-            device = torch.device(
+-                self.load_config.device or vllm_config.device_config.device
+-            )
+             bind_weight_arena(
+                 model,
+                 device,
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 3f0623f12..c76454313 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -149,11 +149,29 @@ def process_weights_after_loading(
+                 module.update_param_tp_status()
+             # Repacking transients above can leave large amounts of memory in
+             # the caching allocator, which starves the OS on UMA devices.
+-            if (
+-                not track_cuda_reserved
+-                or torch.cuda.memory_reserved(target_device) > reserved_before
+-            ):
++            # Keep a bounded reusable working set (< 4 GiB) across identical
++            # layers while host memory still has >= 8 GiB available so
++            # back-to-back MoE layers reuse the same scratch blocks instead of
++            # unmapping and re-faulting them on every layer; reclaim once after
++            # the loop.
++            if not track_cuda_reserved:
+                 release_device_memory_under_pressure(target_device)
++            else:
++                reserved_after = torch.cuda.memory_reserved(target_device)
++                if reserved_after > reserved_before:
++                    releasable = reserved_after - torch.cuda.memory_allocated(
++                        target_device
++                    )
++                    if releasable >= (4 << 30):
++                        release_device_memory_under_pressure(target_device)
++                    elif releasable >= (512 << 20):
++                        import psutil
++
++                        if psutil.virtual_memory().available < (8 << 30):
++                            release_device_memory_under_pressure(target_device)
++
++    if track_cuda_reserved:
++        release_device_memory_under_pressure(target_device)
+ 
+     # Initialize post-load attention weights for any attention layer and MM
+     # encoder. NOTE: Happens after other modules so we can easily decompress
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 37ee82fb9..d0150e3af 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -1619,7 +1619,7 @@ def _interleave_gate_up_slabs(tensor: torch.Tensor, slab: int = 64) -> torch.Ten
+     )
+ 
+ 
+-def tile_expert_weights(b_packed, block_N):
++def tile_expert_weights(b_packed, block_N, *, interleave_gate_up: bool = False):
+     """Tile-major copy of ``[E, N, K / 2]`` packed E2M1 expert weights.
+ 
+     Returns ``(tiles, tails)``. Tile ``(e, n, k)`` (``block_N`` rows by 128
+@@ -1627,12 +1627,47 @@ def tile_expert_weights(b_packed, block_N):
+     at index ``(e * N / block_N + n) * (K // 128) + k``. When ``K % 128 == 64``,
+     ``tails[e * N / block_N + n]`` holds that row block's last 64 columns as
+     ``[block_N, 32]`` bytes; otherwise ``tails`` is None.
++
++    When ``interleave_gate_up`` is True, fuses ``_interleave_gate_up_slabs``
++    (each ``block_N`` row tile holds ``block_N // 2`` gate rows followed by the
++    matching ``block_N // 2`` up rows) into the tile permutation with zero
++    intermediate allocation.
+     """
+     E, N, half_k = b_packed.shape
+     k_full, tail = divmod(2 * half_k, FP4_TMA_K)
++    slab_bytes = FP4_TMA_K // 2
++    if interleave_gate_up and block_N % 2 == 0 and N % block_N == 0:
++        slab = block_N // 2
++        n_blocks = N // block_N
++        b = b_packed.view(E, 2, n_blocks, slab, half_k)
++        full = b[..., : k_full * FP4_TMA_K // 2]
++        if slab_bytes % 8 == 0 and full.is_contiguous():
++            tiles = (
++                full.view(torch.int64)
++                .reshape(E, 2, n_blocks, slab, k_full, slab_bytes // 8)
++                .permute(0, 2, 4, 1, 3, 5)
++                .contiguous()
++                .view(b_packed.dtype)
++                .reshape(-1, block_N, slab_bytes)
++            )
++        else:
++            tiles = (
++                full.reshape(E, 2, n_blocks, slab, k_full, slab_bytes)
++                .permute(0, 2, 4, 1, 3, 5)
++                .contiguous()
++                .reshape(-1, block_N, slab_bytes)
++            )
++        if not tail:
++            return tiles, None
++        tails = (
++            b[..., k_full * FP4_TMA_K // 2 :]
++            .permute(0, 2, 1, 3, 4)
++            .contiguous()
++            .reshape(-1, block_N, tail // 2)
++        )
++        return tiles, tails.view(torch.uint8)
+     b = b_packed.view(E, N // block_N, block_N, half_k)
+     full = b[..., : k_full * FP4_TMA_K // 2]
+-    slab_bytes = FP4_TMA_K // 2
+     if slab_bytes % 8 == 0 and full.is_contiguous():
+         tiles = (
+             full.view(torch.int64)
+@@ -2252,8 +2287,8 @@ class MoeExpertsV41Plan:
+                 w.shape[1] == 2 * self.intermediate
+                 and w.shape[2] * 2 == self.hidden
+             )
+-        if gate_up and self._has_prefill_swiglu_fusion():
+-            w = _interleave_gate_up_slabs(w)
++        fuse_interleave = bool(gate_up and self._has_prefill_swiglu_fusion())
++        if fuse_interleave:
+             scale = _interleave_gate_up_slabs(scale)
+         if self.narrow_codes:
+             codes, codes_2bit, narrow_offsets, base = encode_expert_scale_codes(
+@@ -2266,7 +2301,9 @@ class MoeExpertsV41Plan:
+             codes_2bit = None
+             narrow_offsets = None
+             del packed
+-        tiles, tails = tile_expert_weights(w.view(torch.int8), self.block_N)
++        tiles, tails = tile_expert_weights(
++            w.view(torch.int8), self.block_N, interleave_gate_up=fuse_interleave
++        )
+         return tiles, tails, codes, codes_2bit, narrow_offsets, base
+ 
+     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
+-- 
+2.43.0
+

@@ -1,0 +1,139 @@
+From ec243899c1b35f8c375b9588e7fda29d21c14050 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:16:19 +0100
+Subject: [PATCH 847/847] perf(startup): warm-index TileLang step kernels and
+ fork local worker from EngineCore
+
+---
+ vllm/models/deepseek_v4_1/tilelang/prepare.py | 39 +++++++++----------
+ vllm/v1/engine/core.py                        | 20 ++++++++++
+ 2 files changed, 39 insertions(+), 20 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index e340b826e..9a9061c9a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -97,16 +97,10 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
+         self.compile_many([compile_key])
+ 
+     def compile_many(self, compile_keys: Iterable[_CallKey]) -> None:
+-        import tilelang
+-
+         pending = [(key.function, key.args, key.kwargs) for key in compile_keys]
+         if not pending:
+             return
+-        tilelang.prepare(
+-            pending,
+-            num_workers=compile_workers(),
+-            progress=PROGRESS.report,
+-        )
++        _prepare_with_warm_index(pending)
+ 
+ 
+ TILELANG = TileLangKernels()
+@@ -247,7 +241,7 @@ def _prepare_index_provenance(cache_dir: str) -> str:
+     import torch
+ 
+     h = hashlib.sha256()
+-    h.update(b"vllm-ds41-prepare-index-v1\0")
++    h.update(b"vllm-ds41-prepare-index-v2\0")
+     h.update(cache_dir.encode("utf-8"))
+     h.update(b"\0")
+     if torch.cuda.is_available():
+@@ -268,25 +262,17 @@ def _prepare_index_provenance(cache_dir: str) -> str:
+                 continue
+             h.update(f"{key}={os.environ[key]}\0".encode("utf-8"))
+ 
+-    # Hash every .py file under deepseek_v4_1/ and tilelang_sampling.py
++    # Hash every .py file under deepseek_v4_1/ and all tilelang_*.py under v1/worker/gpu/
+     roots: list[Path] = [Path(__file__).resolve().parents[1]]
+-    tls_path = (
+-        Path(__file__).resolve().parents[3]
+-        / "v1"
+-        / "worker"
+-        / "gpu"
+-        / "sample"
+-        / "tilelang_sampling.py"
+-    )
+-    if tls_path.is_file():
+-        roots.append(tls_path)
+-
++    gpu_worker_dir = Path(__file__).resolve().parents[3] / "v1" / "worker" / "gpu"
+     py_files: list[Path] = []
+     for root in roots:
+         if root.is_file():
+             py_files.append(root)
+         elif root.is_dir():
+             py_files.extend(sorted(root.rglob("*.py")))
++    if gpu_worker_dir.is_dir():
++        py_files.extend(sorted(gpu_worker_dir.rglob("tilelang*.py")))
+     for path in sorted(set(py_files)):
+         h.update(str(path).encode("utf-8"))
+         h.update(b"\0")
+@@ -335,12 +321,17 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
+     import concurrent.futures
+     import json
+     import os
++    import time
+     from pathlib import Path
+     import tilelang
+     import tilelang.cache as tl_cache
+     from tilelang import env as tl_env
+     from tilelang import tvm
+     from tilelang.cache.kernel_cache import normalize_pass_configs
++    from vllm.logger import init_logger
++
++    logger = init_logger(__name__)
++    t_start = time.monotonic()
+ 
+     if not calls or not tl_env.is_cache_enabled() or tl_cache.frozen() is not None:
+         tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
+@@ -509,6 +500,14 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
+             except OSError:
+                 pass
+ 
++    logger.info(
++        "TileLang warm index: %d fast-loaded, %d compiled/missed in %.2f s (index=%s)",
++        done_count,
++        len(miss_items),
++        time.monotonic() - t_start,
++        index_path.name,
++    )
++
+ 
+ def prepare_declared(registry: JitWarmupRegistry) -> int:
+     """Compile every TileLang call declared in ``registry`` in one thread pool;
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index c0d50750a..b4ae855eb 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1580,6 +1580,26 @@ class EngineCoreProc(EngineCore):
+                 )
+ 
+             parallel_config.data_parallel_index = dp_rank
++            # EngineCoreProc is a freshly spawned, single-threaded, zero-CUDA
++            # process with torch and vllm already imported; forking local
++            # workers here avoids a second full cold Python/torch/vllm spawn.
++            if (
++                os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn"
++                and threading.active_count() == 1
++                and not parallel_config.numa_bind
++            ):
++                from vllm.utils.system_utils import (
++                    cuda_is_initialized,
++                    in_wsl,
++                    is_in_ray_actor,
++                )
++
++                if (
++                    not cuda_is_initialized()
++                    and not is_in_ray_actor()
++                    and not in_wsl()
++                ):
++                    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
+             if vllm_config.uses_coordinated_dp:
+                 # Set data parallel rank for this engine process.
+                 parallel_config.data_parallel_rank = dp_rank
+-- 
+2.43.0
+
