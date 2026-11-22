@@ -1,0 +1,178 @@
+From e7d6da6bf84d3f0b6429d556836deef7d47a669f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 13:16:19 +0100
+Subject: [PATCH 845/847] perf(renderer): enable DeepseekV4Renderer thread pool
+ and BPE-invariant subchunk cache
+
+---
+ .../test_deepseek_v41_renderer_pool.py        | 57 +++++++++++++++++++
+ vllm/renderers/deepseek_v4.py                 |  5 ++
+ vllm/tokenizers/deepseek_v41.py               | 53 ++++++++++++-----
+ 3 files changed, 101 insertions(+), 14 deletions(-)
+ create mode 100644 tests/tokenizers_/test_deepseek_v41_renderer_pool.py
+
+diff --git a/tests/tokenizers_/test_deepseek_v41_renderer_pool.py b/tests/tokenizers_/test_deepseek_v41_renderer_pool.py
+new file mode 100644
+index 000000000..32b535691
+--- /dev/null
++++ b/tests/tokenizers_/test_deepseek_v41_renderer_pool.py
+@@ -0,0 +1,57 @@
++from types import SimpleNamespace
++
++from vllm.tokenizers import deepseek_v41 as dsv41_tok
++
++
++def test_subchunk_cache_reuses_prefix_subchunks_bit_exact():
++    calls = []
++
++    def encode_batch(texts):
++        calls.append(list(texts))
++        return [[ord(c) for c in t[:4]] + [len(t)] for t in texts]
++
++    cache = dsv41_tok._BoundedPieceCache()
++    prefix = "".join(
++        f"line_{i:04d} alpha beta gamma delta epsilon zeta\n" for i in range(1600)
++    )
++    p1 = prefix + "tail_one\n"
++    p2 = prefix + "tail_two_longer\n"
++
++    dsv41_tok._resolve_cached_pieces([p1], cache, encode_batch)
++    assert len(calls[0]) >= 4
++
++    r2 = dsv41_tok._resolve_cached_pieces([p2], cache, encode_batch)
++    assert len(calls) == 2
++    assert len(calls[1]) == 1
++
++    fresh_cache = dsv41_tok._BoundedPieceCache()
++    r2_fresh = dsv41_tok._resolve_cached_pieces([p2], fresh_cache, encode_batch)
++    assert r2[p2] == r2_fresh[p2]
++
++
++def test_deepseek_v4_renderer_initializes_lazy_thread_pool(monkeypatch):
++    from vllm.renderers import deepseek_v4 as dsv4_rend
++
++    pooled = []
++    monkeypatch.setattr(
++        dsv4_rend,
++        "maybe_make_thread_pool",
++        lambda tok, copies: pooled.append((tok, copies)) or tok,
++    )
++    monkeypatch.setattr(
++        dsv4_rend.BaseRenderer,
++        "__init__",
++        lambda self, cfg, tok: (
++            setattr(self, "tokenizer", tok),
++            setattr(self, "_executor", None),
++        )
++        and None,
++    )
++    tok = object()
++    cfg1 = SimpleNamespace(model_config=SimpleNamespace(renderer_num_workers=1))
++    dsv4_rend.DeepseekV4Renderer(cfg1, tok)
++    assert pooled == []
++
++    cfg8 = SimpleNamespace(model_config=SimpleNamespace(renderer_num_workers=8))
++    dsv4_rend.DeepseekV4Renderer(cfg8, tok)
++    assert pooled == [(tok, 0)]
+diff --git a/vllm/renderers/deepseek_v4.py b/vllm/renderers/deepseek_v4.py
+index e93069209..f1674a4d9 100644
+--- a/vllm/renderers/deepseek_v4.py
++++ b/vllm/renderers/deepseek_v4.py
+@@ -9,6 +9,7 @@ from vllm.entrypoints.chat_utils import (
+     parse_chat_messages_async,
+ )
+ from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer
++from vllm.tokenizers.hf import maybe_make_thread_pool
+ from vllm.utils.async_utils import make_async
+ 
+ from .base import BaseRenderer
+@@ -28,6 +29,10 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
+         self._apply_chat_template_async = make_async(
+             self._apply_chat_template, executor=self._executor
+         )
++        if self.tokenizer is not None and config.model_config.renderer_num_workers > 1:
++            maybe_make_thread_pool(self.tokenizer, 0)
++            if self._executor is not None and hasattr(self.tokenizer, "encode"):
++                self._executor.submit(self.tokenizer.encode, " ")
+ 
+     def _apply_chat_template(self, *args, **kwargs):
+         return self.get_tokenizer().apply_chat_template(*args, **kwargs)
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index cbe30163a..00ac49859 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -551,15 +551,35 @@ def _resolve_cached_pieces(
+         return resolved
+ 
+     work_items: list[str] = []
+-    spans: list[tuple[str, int, int]] = []
++    work_index: dict[str, int] = {}
++    piece_subchunks: list[tuple[str, list[str]]] = []
++    sub_cached: dict[str, tuple[int, ...]] = {}
+     total_chars = 0
+     for piece in missing:
+-        total_chars += len(piece)
+         subchunks = _split_parallel_newline_chunks(piece)
+-        spans.append((piece, len(work_items), len(subchunks)))
+-        work_items.extend(subchunks)
+-
+-    if (
++        piece_subchunks.append((piece, subchunks))
++        if len(subchunks) == 1:
++            sub = subchunks[0]
++            if sub not in work_index:
++                work_index[sub] = len(work_items)
++                work_items.append(sub)
++                total_chars += len(sub)
++        else:
++            for sub in subchunks:
++                if sub in sub_cached or sub in work_index:
++                    continue
++                hit = cache.get(sub)
++                if hit is not None:
++                    cache.touch(sub)
++                    sub_cached[sub] = hit
++                else:
++                    work_index[sub] = len(work_items)
++                    work_items.append(sub)
++                    total_chars += len(sub)
++
++    if not work_items:
++        work_ids: list[list[int]] = []
++    elif (
+         encode_single is not None
+         and len(work_items) == 1
+         and total_chars < _PARALLEL_CHUNK_THRESHOLD
+@@ -574,16 +594,21 @@ def _resolve_cached_pieces(
+     else:
+         work_ids = encode_batch(work_items)
+ 
+-    for piece, start, count in spans:
+-        if count == 1:
+-            ids_tuple = tuple(work_ids[start])
++    for piece, subchunks in piece_subchunks:
++        if len(subchunks) == 1:
++            ids_tuple = tuple(work_ids[work_index[subchunks[0]]])
++            resolved[piece] = ids_tuple
++            cache[piece] = ids_tuple
+         else:
+             joined: list[int] = []
+-            for sub in work_ids[start : start + count]:
+-                joined.extend(sub)
+-            ids_tuple = tuple(joined)
+-        resolved[piece] = ids_tuple
+-        cache[piece] = ids_tuple
++            for sub in subchunks:
++                hit = sub_cached.get(sub)
++                if hit is None:
++                    hit = tuple(work_ids[work_index[sub]])
++                    sub_cached[sub] = hit
++                    cache[sub] = hit
++                joined.extend(hit)
++            resolved[piece] = tuple(joined)
+     return resolved
+ 
+ 
+-- 
+2.43.0
+
