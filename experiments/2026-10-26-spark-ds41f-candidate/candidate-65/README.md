@@ -19,4 +19,4 @@ Base: `candidate-64` (`vLLM 0001..0843`, tree `7464b04c3cc79c6de1c1745f92c1cdeb2
 
 ## Build & Verification Status
 
-Building `spark-ds41f:candidate-65` on `dgx4`, running built-image unit tests, and distributing the built OCI digest to `dgx1..dgx3`.
+Built `spark-ds41f:candidate-65` (`sha256:4d6be6fa9e4086f60e2b5bc1beb4be9b1efc94a6ed0ff35c6ff45f5bc35d5c0a`, vLLM tree `34b01980b09e1f634738f7bc781a588327c26b75`) in `481 s` on `dgx4` (lowest `MemAvailable = 81.9 GiB`). Built-image unit tests (`test_adaptive_verification.py` + `test_config.py -k adaptive_verification`) passed with `0` failures; streaming identical digest to `dgx1..dgx3`.
