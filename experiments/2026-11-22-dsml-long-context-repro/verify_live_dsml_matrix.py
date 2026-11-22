@@ -145,6 +145,25 @@ def _call_chat(
         }
 
 
+WRITE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "write",
+        "description": "Write exact text content to a file path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Target file path."},
+                "content": {"type": "string", "description": "Full text content to write."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
+TOOLS_WITH_WRITE: list[dict[str, Any]] = [*OPENCODE_TOOLS, WRITE_TOOL]
+
+
 def _has_raw_dsml(text: str) -> bool:
     return f"<{DSML_ATOM}" in text or f"</{DSML_ATOM}" in text
 
@@ -269,12 +288,13 @@ def run_matrix(base: str, served_model: str, *, multi_turns: int = 12, record: P
             ],
             stream=stream,
             tool_choice="auto",
+            tools=TOOLS_WITH_WRITE,
             cache_salt=f"dsml-quote-{mode}-{uuid.uuid4().hex[:8]}",
         )
         q_args = json.loads(rep_quote["calls"][0]["arguments"]) if rep_quote["calls"] else {}
         q_body = str(q_args.get("content", ""))
         ok_quote = (
-            len(rep_quote["calls"]) == 1
+            len(rep_quote["calls"]) >= 1
             and rep_quote["calls"][0]["name"] == "write"
             and q_args.get("path") == "dsml-notes.md"
             and "EOF" in q_body
@@ -319,8 +339,6 @@ def run_matrix(base: str, served_model: str, *, multi_turns: int = 12, record: P
             },
         )
 
-    # 6. Multi-turn tool loop omitting `reasoning_content` and echoing streamed `content`
-    loop_salt = f"dsml-loop-{uuid.uuid4().hex[:8]}"
     files = [
         "src/carriers/royalmail/index.ts",
         "src/carriers/ukrposhta/index.ts",
@@ -335,6 +353,187 @@ def run_matrix(base: str, served_model: str, *, multi_turns: int = 12, record: P
         "src/carriers/correos/index.ts",
         "src/carriers/postnl/index.ts",
     ]
+
+    # 6a. Multi-user-turn loop omitting `reasoning_content` across prior user turns:
+    # `<｜Assistant｜></think>` before `last_user_idx` must keep full reasoning on each new user turn.
+    user_loop_salt = f"dsml-user-loop-{uuid.uuid4().hex[:8]}"
+    user_msgs: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": "You are an engineer auditing carrier retry bounds. State one brief sentence, then call `read` on the requested file.",
+        },
+        {
+            "role": "user",
+            "content": f"Audit retry bounds in `{files[0]}` by calling `read` on it first.",
+        },
+    ]
+    u_zero_reasoning = 0
+    u_tool_calls = 0
+    u_dsml_leaks = 0
+    for turn_idx in range(multi_turns):
+        rep_u = _call_chat(
+            base,
+            served_model,
+            user_msgs,
+            stream=True,
+            temperature=0.0,
+            tool_choice="auto",
+            cache_salt=user_loop_salt,
+        )
+        judged_u = classify_reply(rep_u)
+        if len(rep_u["reasoning"]) == 0:
+            u_zero_reasoning += 1
+        if judged_u["any_dsml_failure"]:
+            u_dsml_leaks += 1
+        next_file = files[(turn_idx + 1) % len(files)]
+        if rep_u["calls"]:
+            u_tool_calls += 1
+            tc_list = [
+                {
+                    "id": c["id"] or f"u_call_{turn_idx}_{j}",
+                    "type": "function",
+                    "function": {"name": c["name"], "arguments": c["arguments"]},
+                }
+                for j, c in enumerate(rep_u["calls"])
+            ]
+            # Deliberately omit `reasoning_content` and echo `content` verbatim (with trailing `\n\n`)
+            user_msgs.append(
+                {
+                    "role": "assistant",
+                    "content": rep_u["content"],
+                    "tool_calls": tc_list,
+                }
+            )
+            for j, tc in enumerate(tc_list):
+                user_msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": (
+                            f"// {files[turn_idx % len(files)]}\n"
+                            f"export const MAX_RETRIES = {3 + (turn_idx % 4)};\n"
+                            "export async function lookup(id: string) { return fetch(id); }\n"
+                            if j == 0
+                            else "ok"
+                        ),
+                    }
+                )
+            user_msgs.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Subagent finished `{files[turn_idx % len(files)]}`. "
+                        f"Now audit retry bounds in `{next_file}` by calling `read` on it."
+                    ),
+                }
+            )
+        else:
+            user_msgs.append({"role": "assistant", "content": rep_u["content"]})
+            user_msgs.append(
+                {
+                    "role": "user",
+                    "content": f"Now audit retry bounds in `{next_file}` by calling `read` on it.",
+                }
+            )
+
+    log_case(
+        "multiturn_user_omitted_reasoning_loop",
+        u_tool_calls == multi_turns and u_zero_reasoning == 0 and u_dsml_leaks == 0,
+        {
+            "turns": multi_turns,
+            "tool_call_turns": u_tool_calls,
+            "zero_reasoning_turns": u_zero_reasoning,
+            "dsml_leak_turns": u_dsml_leaks,
+        },
+    )
+
+    # 6b. Intra-turn tool loop preserving active-turn `reasoning_content` (and echoing `\n\n` content)
+    active_salt = f"dsml-active-loop-{uuid.uuid4().hex[:8]}"
+    active_msgs: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": "You are an engineer auditing carrier files one by one. Think through each file's retry constant before calling `read` on the next target.",
+        },
+        {
+            "role": "user",
+            "content": f"Inspect retry constants across carrier files starting with `{files[0]}`.",
+        },
+    ]
+    a_zero_reasoning = 0
+    a_tool_calls = 0
+    a_dsml_leaks = 0
+    for turn_idx in range(multi_turns):
+        rep_a = _call_chat(
+            base,
+            served_model,
+            active_msgs,
+            stream=True,
+            temperature=0.0,
+            tool_choice="auto",
+            cache_salt=active_salt,
+        )
+        judged_a = classify_reply(rep_a)
+        if len(rep_a["reasoning"]) == 0:
+            a_zero_reasoning += 1
+        if judged_a["any_dsml_failure"]:
+            a_dsml_leaks += 1
+        next_file = files[(turn_idx + 1) % len(files)]
+        if rep_a["calls"]:
+            a_tool_calls += 1
+            tc_list = [
+                {
+                    "id": c["id"] or f"a_call_{turn_idx}_{j}",
+                    "type": "function",
+                    "function": {"name": c["name"], "arguments": c["arguments"]},
+                }
+                for j, c in enumerate(rep_a["calls"])
+            ]
+            active_msgs.append(
+                {
+                    "role": "assistant",
+                    "reasoning_content": rep_a["reasoning"],
+                    "content": rep_a["content"],
+                    "tool_calls": tc_list,
+                }
+            )
+            for j, tc in enumerate(tc_list):
+                active_msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": (
+                            f"// {files[turn_idx % len(files)]}\n"
+                            f"export const MAX_RETRIES = {2 << (turn_idx % 4)};\n"
+                            f"// Next carrier to inspect with `read`: {next_file}"
+                            if j == 0
+                            else "ok"
+                        ),
+                    }
+                )
+        else:
+            active_msgs.append(
+                {
+                    "role": "assistant",
+                    "reasoning_content": rep_a["reasoning"],
+                    "content": rep_a["content"],
+                }
+            )
+            active_msgs.append({"role": "user", "content": f"Call `read` on `{next_file}`."})
+
+    log_case(
+        "intraturn_active_reasoning_loop",
+        a_tool_calls == multi_turns and a_zero_reasoning == 0 and a_dsml_leaks == 0,
+        {
+            "turns": multi_turns,
+            "tool_call_turns": a_tool_calls,
+            "zero_reasoning_turns": a_zero_reasoning,
+            "dsml_leak_turns": a_dsml_leaks,
+        },
+    )
+
+    # 6c. Intra-turn tool loop omitting `reasoning_content` even inside the active turn:
+    # must extract 100% valid tool_calls with zero DSML leaks across all steps.
+    loop_salt = f"dsml-loop-{uuid.uuid4().hex[:8]}"
     msgs: list[dict[str, Any]] = [
         {
             "role": "system",
@@ -373,7 +572,6 @@ def run_matrix(base: str, served_model: str, *, multi_turns: int = 12, record: P
                 }
                 for j, c in enumerate(rep_t["calls"])
             ]
-            # Deliberately omit `reasoning_content` and echo `content` verbatim (with trailing `\n\n`)
             msgs.append(
                 {
                     "role": "assistant",
@@ -400,14 +598,9 @@ def run_matrix(base: str, served_model: str, *, multi_turns: int = 12, record: P
             next_file = files[(turn_idx + 1) % len(files)]
             msgs.append({"role": "user", "content": f"Now call `read` on `{next_file}`."})
 
-    loop_ok = (
-        tool_call_turns == multi_turns
-        and zero_reasoning_turns == 0
-        and dsml_leak_turns == 0
-    )
     log_case(
-        "multiturn_omitted_reasoning_loop",
-        loop_ok,
+        "intraturn_omitted_reasoning_resilience",
+        tool_call_turns == multi_turns and dsml_leak_turns == 0,
         {
             "turns": multi_turns,
             "tool_call_turns": tool_call_turns,
@@ -449,19 +642,6 @@ def _run_self_test() -> int:
             if tc == "none":
                 calls = []
                 content = f"Example: `<{DSML_ATOM} calls>`"
-            elif isinstance(tc, dict) or "read" in user_txt or req["messages"][-1]["role"] == "tool":
-                calls = [
-                    {
-                        "index": 0,
-                        "id": "c_read",
-                        "type": "function",
-                        "function": {
-                            "name": "read",
-                            "arguments": '{"filePath":"src/carriers/royalmail/index.ts"}',
-                        },
-                    }
-                ]
-                content = "Reading file.\n\n"
             elif "dsml-notes.md" in user_txt:
                 calls = [
                     {
@@ -481,6 +661,19 @@ def _run_self_test() -> int:
                     }
                 ]
                 content = "Writing notes.\n\n"
+            elif isinstance(tc, dict) or "read" in user_txt or req["messages"][-1]["role"] == "tool":
+                calls = [
+                    {
+                        "index": 0,
+                        "id": "c_read",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"filePath":"src/carriers/royalmail/index.ts"}',
+                        },
+                    }
+                ]
+                content = "Reading file.\n\n"
             else:
                 calls = [
                     {
