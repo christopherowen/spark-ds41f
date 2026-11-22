@@ -70,4 +70,26 @@ Summary artifacts in `runs/`:
 
 ## Live `tp3-triangle` Overlay Verification (`tp3-c67-dsml.json`)
 
-Pending live `tp3-triangle` 2-boot verification (`verify_live_dsml_matrix.py` + `repro_warm_vs_cold_600k.py`).
+Measured across two clean cluster boots on `dgx1`–`dgx3` inside `spark-lab` window `dgx1-1795363437` (`MemAvailable = 117.8–118.3 GiB`, `config/cluster.json` restored and verified via `doctor --live` on close):
+
+1. **2-Boot Live `/v1/chat/completions` DSML Matrix (`verify_live_dsml_matrix.py`, `13` cases per boot):**
+   - `runs/c67-dsml-boot1-matrix.jsonl`: **`13/13 passed` (`all_passed: true`, `0` DSML leaks)**
+   - `runs/c67-dsml-boot2-matrix.jsonl`: **`13/13 passed` (`all_passed: true`, `0` DSML leaks)** — deterministic greedy outputs, `reasoning_chars` (`183`, `0`, `0`, `375`, `2602`), and loop counts (`8/8`, `8/8`, `8/8` tool calls; `0/8` zero-reasoning turns on active-turn `reasoning_content` replay) matched identically across both boots:
+     - `auto_bash_{whole,stream}`: valid `bash` call (`timeout=400000`), `reasoning_chars=183`, `0` leaks.
+     - `required_tool_choice_{whole,stream}` (`xgrammar` structural tag): valid `bash` + `read` calls, `0` leaks.
+     - `named_tool_choice_{whole,stream}` (`xgrammar` structural tag): valid `read` call on `src/carriers/royalmail/index.ts`, `0` leaks.
+     - `quoted_dsml_in_write_arg_{whole,stream}`: literal `</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\nEOF\n` preserved intact inside `write.arguments`, `0` leaks.
+     - `tool_choice_none_prose_{whole,stream}`: `calls=[]`, `reasoning_chars=2602`, markdown DSML example preserved as plain text.
+     - `intraturn_active_reasoning_loop` (`8` turns): `8/8` tool calls, **`0/8` zero-reasoning turns**, `0/8` DSML leaks.
+     - `multiturn_user_omitted_reasoning_loop` & `intraturn_omitted_reasoning_resilience` (`8` turns each): `8/8` tool calls, `0/8` DSML leaks.
+2. **Incremental `600K` Warm-vs-Cold Parity & Sampled Frontier Sweep (`runs/c67-dsml-warm-vs-cold-summary.jsonl`, `41` requests from `755` → `598,261` tokens):**
+
+| Milestone (`tp3-c67-dsml`) | Prompt Tokens | Warm Cached Tokens | Cold Cached Tokens | Greedy Tokens (Warm / Cold) | Exact Token Parity | Max Abs Logprob Diff | Reasoning Chars |
+| :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: |
+| `65K` | `70,244` | `48,128` | `0` | `462 / 462` | `True` (`0` diffs) | `0.000000` | `1,340` |
+| `262K` | `266,823` | `244,992` | `0` | `412 / 412` | `True` (`0` diffs) | `0.000000` | `743` |
+| `580K` | `598,261` | `575,488` | `0` | `157 / 157` | `True` (`0` diffs) | `0.000000` | `147` (vs `0` on `1120`) |
+
+   - **Bit-Exact `600K` Warm-vs-Cold Parity Maintained:** `3/3` checkpoints (`70,244`, `266,823`, `598,261` tokens) matched `100%` token-for-token with `0.000000` max abs logprob diff (`5.160s` warm vs `80.620s` cold at `598,261` tokens).
+   - **Zero DSML Failures Across All `41` Long-Context Requests:** `0/27` live incremental turns, `0/6` parity turns, and `0/8` sampled frontier turns leaked DSML markup.
+   - **Substantial Reduction in Omitted-Reasoning Zero-Think Skips at `598K`:** Even with `reasoning_content` omitted across all `27` historical turns, `598K` greedy parity recovered non-empty reasoning (`147` chars vs `0` on `1120`), live-turn zero-think skips fell from `5/27` (`18.5%`) to `3/27` (`11.1%`), and sampled `598K` frontier zero-think skips dropped from **`5/8` (`62.5%`)** on unpatched `1120` to **`1/8` (`12.5%`)** (`-80%` relative reduction).
