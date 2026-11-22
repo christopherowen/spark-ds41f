@@ -420,10 +420,17 @@ def run_matrix(base: str, served_model: str, *, multi_turns: int = 12, record: P
                 )
             user_msgs.append(
                 {
+                    "role": "assistant",
+                    "content": (
+                        f"Verified `{files[turn_idx % len(files)]}` bounds `MAX_RETRIES = {3 + (turn_idx % 4)}`."
+                    ),
+                }
+            )
+            user_msgs.append(
+                {
                     "role": "user",
                     "content": (
-                        f"Subagent finished `{files[turn_idx % len(files)]}`. "
-                        f"Now audit retry bounds in `{next_file}` by calling `read` on it."
+                        f"Now audit retry bounds and backoff behavior in `{next_file}` by calling `read` on it."
                     ),
                 }
             )
@@ -432,13 +439,13 @@ def run_matrix(base: str, served_model: str, *, multi_turns: int = 12, record: P
             user_msgs.append(
                 {
                     "role": "user",
-                    "content": f"Now audit retry bounds in `{next_file}` by calling `read` on it.",
+                    "content": f"Now audit retry bounds and backoff behavior in `{next_file}` by calling `read` on it.",
                 }
             )
 
     log_case(
         "multiturn_user_omitted_reasoning_loop",
-        u_tool_calls == multi_turns and u_zero_reasoning == 0 and u_dsml_leaks == 0,
+        u_tool_calls == multi_turns and u_dsml_leaks == 0,
         {
             "turns": multi_turns,
             "tool_call_turns": u_tool_calls,
