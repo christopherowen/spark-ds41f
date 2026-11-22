@@ -60,6 +60,41 @@ class GlpAlphaRecipeAndReaderTest(unittest.TestCase):
         cleared = recipe.overlay({"extends": {}, "unset": ["glp"]}, dosed)
         self.assertNotIn("WEIGHTLESS_STEER_ALPHA", cleared["environment"])
 
+    def test_glp_generation_defaults_render_validate_and_unset(self):
+        base = self._resolved()
+        self.assertNotIn("WEIGHTLESS_STEER_GENERATION_DEFAULTS", base["environment"])
+
+        dosed = recipe.overlay(
+            {"extends": {}, "set": {"glp": {"generation_defaults": {"temperature": 0.3, "top_p": 0.95}}}},
+            base,
+        )
+        self.assertEqual(
+            dosed["environment"]["WEIGHTLESS_STEER_GENERATION_DEFAULTS"],
+            '{"temperature":0.3,"top_p":0.95}',
+        )
+        # Stock --override-generation-config remains untouched at DeepSeek 1.0/1.0 default.
+        idx = dosed["serve_args"].index("--override-generation-config") + 1
+        self.assertEqual(json.loads(dosed["serve_args"][idx]), {"temperature": 1.0, "top_p": 1.0})
+
+        cleared = recipe.overlay({"extends": {}, "unset": ["glp"]}, dosed)
+        self.assertNotIn("WEIGHTLESS_STEER_GENERATION_DEFAULTS", cleared["environment"])
+
+        for bad in (
+            "0.3",
+            {"temperature": -0.1},
+            {"top_p": 0},
+            {"top_p": 1.2},
+            {"unknown": 1},
+        ):
+            with self.subTest(bad=bad), self.assertRaisesRegex(SystemExit, "glp generation_defaults"):
+                self._resolved(lambda r, b=bad: r["glp"].update(generation_defaults=b))
+
+        def hand_written(r):
+            r["environment"]["WEIGHTLESS_STEER_GENERATION_DEFAULTS"] = '{"temperature":0.3}'
+
+        with self.assertRaisesRegex(SystemExit, "does not set them itself"):
+            self._resolved(hand_written)
+
 
 class BenchIdentityGlpTest(unittest.TestCase):
     def test_bench_identity_records_glp_config_and_boot_lines(self):

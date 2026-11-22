@@ -52,6 +52,8 @@ MODEL_MOUNTS = ("/models", "/blobs", "/hub")
 GLP_TARGET = "/glp/vector.gguf"
 STEER_PATH, STEER_MODEL = "WEIGHTLESS_STEER_PATH", "WEIGHTLESS_STEER_MODEL"
 STEER_ALPHA = "WEIGHTLESS_STEER_ALPHA"
+STEER_GEN_DEFAULTS = "WEIGHTLESS_STEER_GENERATION_DEFAULTS"
+GLP_GEN_DEFAULT_KEYS = frozenset({"temperature", "top_p", "top_k", "min_p"})
 GLP_HUB = "{home}/.cache/huggingface/hub"
 GLP_KEYS = ("served_model_name", "repo", "revision", "file", "sha256")
 SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes",
@@ -251,6 +253,25 @@ def _glp_rendering(glp: dict) -> tuple[dict[str, str], list[str]]:
                 or not math.isfinite(alpha) or alpha <= 0):
             raise SystemExit(f"glp alpha is {alpha!r}; the serve-time dose must be a positive number")
         environment[STEER_ALPHA] = repr(float(alpha))
+    gen_defaults = glp.get("generation_defaults")
+    if gen_defaults is not None:
+        if not isinstance(gen_defaults, dict):
+            raise SystemExit("glp generation_defaults must be an object")
+        unknown = sorted(set(gen_defaults) - GLP_GEN_DEFAULT_KEYS)
+        if unknown:
+            raise SystemExit(f"glp generation_defaults has unsupported keys: {', '.join(unknown)}")
+        for key, value in gen_defaults.items():
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)):
+                raise SystemExit(f"glp generation_defaults.{key} must be a finite number, got {value!r}")
+            if key == "temperature" and value < 0:
+                raise SystemExit(f"glp generation_defaults.temperature must be >= 0, got {value!r}")
+            if key == "top_p" and not (0 < value <= 1):
+                raise SystemExit(f"glp generation_defaults.top_p must be in (0, 1], got {value!r}")
+            if key == "min_p" and not (0 <= value <= 1):
+                raise SystemExit(f"glp generation_defaults.min_p must be in [0, 1], got {value!r}")
+        if gen_defaults:
+            environment[STEER_GEN_DEFAULTS] = json.dumps(gen_defaults, separators=(",", ":"))
     return environment, [glp_file({"glp": glp}), GLP_TARGET, "ro"]
 
 
@@ -263,7 +284,7 @@ def _with_glp(cluster: dict, previous: dict | None = None) -> None:
     if previous:
         if previous["served_model_name"] in args:
             args.remove(previous["served_model_name"])
-        for key in (STEER_PATH, STEER_MODEL, STEER_ALPHA):
+        for key in (STEER_PATH, STEER_MODEL, STEER_ALPHA, STEER_GEN_DEFAULTS):
             environment.pop(key, None)
         mounts[:] = [mount for mount in mounts if mount[1] != GLP_TARGET]
     glp = cluster.get("glp")
@@ -273,10 +294,12 @@ def _with_glp(cluster: dict, previous: dict | None = None) -> None:
     if missing:
         raise SystemExit(f"glp lacks {', '.join(missing)}")
     if (STEER_PATH in environment or STEER_MODEL in environment
-            or STEER_ALPHA in environment
+            or STEER_ALPHA in environment or STEER_GEN_DEFAULTS in environment
             or any(mount[1] == GLP_TARGET for mount in mounts)):
-        raise SystemExit(f"glp renders {STEER_PATH}, {STEER_MODEL}, {STEER_ALPHA} and the "
-                         f"{GLP_TARGET} mount; a profile does not set them itself")
+        raise SystemExit(
+            f"glp renders {STEER_PATH}, {STEER_MODEL}, {STEER_ALPHA}, {STEER_GEN_DEFAULTS} and the "
+            f"{GLP_TARGET} mount; a profile does not set them itself"
+        )
     if "--served-model-name" not in args:
         raise SystemExit("glp needs --served-model-name in serve_args: the stock name it serves beside")
     at = args.index("--served-model-name") + 1

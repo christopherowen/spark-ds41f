@@ -519,6 +519,7 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
             "file": glp.get("file"),
             "sha256": glp.get("sha256"),
             "alpha": glp.get("alpha"),
+            "generation_defaults": glp.get("generation_defaults"),
             "boot_lines": [],
         }
         head = next((node for node in nodes["nodes"] if node.get("head")), nodes["nodes"][0])
