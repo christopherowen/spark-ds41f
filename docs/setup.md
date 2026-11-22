@@ -595,6 +595,17 @@ report a node whose file is missing or differs, with this command, and run the
 image's own GLP reader on the head's copy, so a vector the image cannot read is
 refused before a boot ([doctor](doctor.md#glp-steering-file)).
 
+The block may also set `alpha`, the serve-time dose: it renders as vLLM's
+`WEIGHTLESS_STEER_ALPHA` and replaces the file's `glp.alpha_default` for the
+served name (the reader support is the patch recorded with the dose evidence
+below; a build without it serves the file's default). The file itself is never
+edited — alpha is a serving decision, not a property of the vector — and it is
+not dose-neutral for tool calling: GLP-27's published 3.5 derails auto tool
+calling, while 2.0 passes the tool-calling gate with the steering effect
+retained. Serve GLP-27 at 2.0, and run the gate in the
+[dose-recalibration record](../experiments/2026-11-20-glp27-dose-recalibration/README.md)
+before raising any GLP dose.
+
 ## 6. Image
 
 On one idle node (the build host), from a clean checkout of `main`:

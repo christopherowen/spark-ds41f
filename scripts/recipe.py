@@ -22,8 +22,10 @@ gets (vLLM's ``--override-generation-config``). An arm may set either. ``glp``, 
 serves a GLP-steered variant of the model beside it: its ``served_model_name`` and the
 ``file`` of a Hugging Face ``repo`` at a pinned ``revision`` (with its ``sha256``), rendered
 as the second served name, vLLM's steering variables and a read-only mount of the file
-from the node's hub cache. The site names the shape it is cabled as in
-``config/site.json``; a site that names none gets the recipe's ``default_shape``,
+from the node's hub cache. An optional ``alpha`` is rendered as
+``WEIGHTLESS_STEER_ALPHA``, the serve-time dose that replaces the file's
+``glp.alpha_default``; without it the file's default is served. The site names
+the shape it is cabled as in ``config/site.json``; a site that names none gets the recipe's ``default_shape``,
 and ``--shape`` overrides either for planning.
 
 ``resolve`` returns the same concrete cluster configuration a per-shape file
@@ -37,6 +39,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import shlex
 import string
 from pathlib import Path
@@ -50,8 +53,13 @@ MODEL_MOUNTS = ("/models", "/blobs", "/hub")
 # cache on each node that ``hf download`` fills.
 GLP_TARGET = "/glp/vector.gguf"
 STEER_PATH, STEER_MODEL = "WEIGHTLESS_STEER_PATH", "WEIGHTLESS_STEER_MODEL"
+STEER_ALPHA = "WEIGHTLESS_STEER_ALPHA"
 GLP_HUB = "{home}/.cache/huggingface/hub"
 GLP_KEYS = ("served_model_name", "repo", "revision", "file", "sha256")
+# ``alpha`` is the block's one optional key: the serve-time dose, rendered as
+# STEER_ALPHA when present (see _glp_rendering). The GLP spec keeps alpha a
+# serve-time parameter, never folded into the vector; a block that sets none
+# serves the file's glp.alpha_default.
 SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes",
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
@@ -242,19 +250,25 @@ def glp_download(cluster: dict) -> str:
 
 def _glp_rendering(glp: dict) -> tuple[dict[str, str], list[str]]:
     environment = {STEER_PATH: GLP_TARGET, STEER_MODEL: glp["served_model_name"]}
+    alpha = glp.get("alpha")
+    if alpha is not None:
+        if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
+                or not math.isfinite(alpha) or alpha <= 0):
+            raise SystemExit(f"glp alpha is {alpha!r}; the serve-time dose must be a positive number")
+        environment[STEER_ALPHA] = repr(float(alpha))
     return environment, [glp_file({"glp": glp}), GLP_TARGET, "ro"]
 
 
 def _with_glp(cluster: dict, previous: dict | None = None) -> None:
     """Render ``glp`` (the steered model name and the GLP file it is steered with) as the
-    second ``--served-model-name``, vLLM's two ``WEIGHTLESS_STEER_*`` variables and a
+    second ``--served-model-name``, vLLM's ``WEIGHTLESS_STEER_*`` variables and a
     read-only mount of the file, after removing what ``previous`` rendered."""
     args, environment = cluster["serve_args"], cluster["environment"]
     mounts = cluster["container"].setdefault("mounts", [])
     if previous:
         if previous["served_model_name"] in args:
             args.remove(previous["served_model_name"])
-        for key in (STEER_PATH, STEER_MODEL):
+        for key in (STEER_PATH, STEER_MODEL, STEER_ALPHA):
             environment.pop(key, None)
         mounts[:] = [mount for mount in mounts if mount[1] != GLP_TARGET]
     glp = cluster.get("glp")
@@ -263,10 +277,11 @@ def _with_glp(cluster: dict, previous: dict | None = None) -> None:
     missing = [key for key in GLP_KEYS if not glp.get(key)]
     if missing:
         raise SystemExit(f"glp lacks {', '.join(missing)}")
-    if STEER_PATH in environment or STEER_MODEL in environment or any(
-            mount[1] == GLP_TARGET for mount in mounts):
-        raise SystemExit(f"glp renders {STEER_PATH}, {STEER_MODEL} and the {GLP_TARGET} mount; "
-                         "a profile does not set them itself")
+    if (STEER_PATH in environment or STEER_MODEL in environment
+            or STEER_ALPHA in environment
+            or any(mount[1] == GLP_TARGET for mount in mounts)):
+        raise SystemExit(f"glp renders {STEER_PATH}, {STEER_MODEL}, {STEER_ALPHA} and the "
+                         f"{GLP_TARGET} mount; a profile does not set them itself")
     if "--served-model-name" not in args:
         raise SystemExit("glp needs --served-model-name in serve_args: the stock name it serves beside")
     at = args.index("--served-model-name") + 1

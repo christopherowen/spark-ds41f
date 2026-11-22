@@ -1,0 +1,172 @@
+From c4dc9f3d1bd830a0b3a6708a8955a8b87c993cb6 Mon Sep 17 00:00:00 2001
+From: TysAIs <137817957+TysAIs@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:27:17 +0000
+Subject: [PATCH] feat(dsv41): serve a GLP file at WEIGHTLESS_STEER_ALPHA
+ instead of its alpha_default
+
+The GLP spec keeps alpha a serve-time parameter, never folded into the
+vector, and the spec's own readers honour WEIGHTLESS_STEER_ALPHA; this
+reader applied the file exactly as published, so a deployment whose
+dose had to change (GLP-27's published 3.5 derails auto tool calling
+where 2.0 does not) had to ship an edited file. When the variable is
+set it now replaces glp.alpha_default as the served alpha, logged at
+boot; unset, the file is applied as it was. A value that is not a
+positive finite number stops the boot, as a file this reader cannot
+apply exactly does. WEIGHTLESS_STEER_LAYERS stays unhonoured: the
+layers a file covers are part of the file. The variable joins
+environment_variables, so it is part of the compile key like the other
+steering variables.
+---
+ tests/models/test_deepseek_v4_1_glp.py | 23 ++++++++++++--
+ vllm/envs.py                           |  5 +++
+ vllm/models/deepseek_v4_1/glp.py       | 42 +++++++++++++++++++++++++-
+ 3 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
+index 8eb4aca..6acb7c2 100644
+--- a/tests/models/test_deepseek_v4_1_glp.py
++++ b/tests/models/test_deepseek_v4_1_glp.py
+@@ -88,6 +88,7 @@ def glp_file(tmp_path, metadata=None, tensors=None, **kwargs):
+ def _no_steering_env(monkeypatch):
+     for name in STEER_ENV:
+         monkeypatch.delenv(name, raising=False)
++    monkeypatch.delenv("WEIGHTLESS_STEER_ALPHA", raising=False)
+ 
+ 
+ # The container reader.
+@@ -247,7 +248,7 @@ def test_one_variable_without_the_other_is_refused(tmp_path, monkeypatch, name):
+         glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
+ 
+ 
+-@pytest.mark.parametrize("name", ["WEIGHTLESS_STEER_ALPHA", "WEIGHTLESS_STEER_LAYERS"])
++@pytest.mark.parametrize("name", ["WEIGHTLESS_STEER_LAYERS"])
+ def test_the_file_is_applied_as_it_is(tmp_path, monkeypatch, name):
+     steer(monkeypatch, glp_file(tmp_path))
+     monkeypatch.setenv(name, "2")
+@@ -256,6 +257,24 @@ def test_the_file_is_applied_as_it_is(tmp_path, monkeypatch, name):
+     assert steering.layers == frozenset(LAYERS)
+ 
+ 
++def test_the_alpha_override_replaces_the_file_default(tmp_path, monkeypatch):
++    steer(monkeypatch, glp_file(tmp_path))
++    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "2")
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
++    assert steering.alpha.item() == pytest.approx(2.0)
++    assert steering.layers == frozenset(LAYERS)
++
++
++@pytest.mark.parametrize("raw", ["high", "0", "-1", "inf", "nan"])
++def test_an_alpha_override_that_is_not_a_positive_number_is_refused(
++    tmp_path, monkeypatch, raw
++):
++    steer(monkeypatch, glp_file(tmp_path))
++    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", raw)
++    with pytest.raises(ValueError, match="WEIGHTLESS_STEER_ALPHA"):
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS, MAX_TOKENS)
++
++
+ def test_a_missing_file_is_refused(tmp_path, monkeypatch):
+     steer(monkeypatch, str(tmp_path / "missing.gguf"))
+     with pytest.raises(FileNotFoundError):
+@@ -270,7 +289,7 @@ def test_a_file_without_alpha_is_refused(tmp_path, monkeypatch):
+ 
+ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
+     unsteered = envs.compile_factors()
+-    for name in STEER_ENV:
++    for name in (*STEER_ENV, "WEIGHTLESS_STEER_ALPHA"):
+         assert name in unsteered
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", "/vectors/a.gguf")
+     assert envs.compile_factors() != unsteered
+diff --git a/vllm/envs.py b/vllm/envs.py
+index e23bac7..658c6b7 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -232,6 +232,7 @@ if TYPE_CHECKING:
+     VLLM_DS41_IKET_CACHE_DIR: str | None = None
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_MODEL: str | None = None
++    WEIGHTLESS_STEER_ALPHA: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+     VLLM_MIMO_L2_PREFETCH: bool = False
+@@ -1943,6 +1944,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # is: steering adds its launch to every covered layer.
+     "WEIGHTLESS_STEER_PATH": lambda: os.getenv("WEIGHTLESS_STEER_PATH") or None,
+     "WEIGHTLESS_STEER_MODEL": lambda: os.getenv("WEIGHTLESS_STEER_MODEL") or None,
++    # The serve-time alpha that replaces the file's glp.alpha_default when set
++    # (the GLP spec keeps alpha a serve-time parameter, never part of the
++    # vector); the reader refuses a value that is not a positive number.
++    "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
+     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+diff --git a/vllm/models/deepseek_v4_1/glp.py b/vllm/models/deepseek_v4_1/glp.py
+index d63ac44..2d803df 100644
+--- a/vllm/models/deepseek_v4_1/glp.py
++++ b/vllm/models/deepseek_v4_1/glp.py
+@@ -25,7 +25,12 @@ served model name it steers; one without the other stops the boot. Off, the
+ model has no steering module and its forward is unchanged. The reader is
+ fail-closed: a file this runtime cannot apply exactly stops the boot rather than
+ serving unsteered or steering at another site. The file's own layers and
+-``glp.alpha_default`` are applied as they are.
++``glp.alpha_default`` are applied as they are, with one exception:
++``WEIGHTLESS_STEER_ALPHA``, when set, replaces ``glp.alpha_default`` as the
++served alpha — the spec keeps alpha a serve-time parameter, never folded into
++the vector — and a value that is not a positive finite number stops the boot.
++``WEIGHTLESS_STEER_LAYERS`` is not honoured: the layers a file covers are
++part of the file.
+ 
+ On, steering is a property of rows. Each covered layer runs TileLang launches
+ (``tilelang/glp.py``) that fold and project the rows ``GLPSteering.rows`` marks,
+@@ -469,6 +474,31 @@ class GLPSteering(nn.Module):
+             )
+ 
+ 
++def _alpha_override(raw: str | None) -> float | None:
++    """The served alpha ``WEIGHTLESS_STEER_ALPHA`` asks for, or None when unset.
++
++    The GLP spec keeps alpha a serve-time parameter, never folded into the
++    vector, so a deployment may serve a file at a dose other than the one its
++    ``glp.alpha_default`` was published at, without editing the file. Anything
++    that is not a positive finite number stops the boot, as a file this reader
++    cannot apply exactly does.
++    """
++    if raw is None:
++        return None
++    try:
++        alpha = float(raw)
++    except ValueError:
++        raise ValueError(
++            f"WEIGHTLESS_STEER_ALPHA is not a number: {raw!r}"
++        ) from None
++    if not math.isfinite(alpha) or alpha <= 0:
++        raise ValueError(
++            f"WEIGHTLESS_STEER_ALPHA is {raw!r}; the served alpha must be a "
++            "positive finite number"
++        )
++    return alpha
++
++
+ def glp_steering(
+     num_layers: int, hidden_size: int, hc_mult: int, max_tokens: int
+ ) -> GLPSteering | None:
+@@ -486,6 +516,16 @@ def glp_steering(
+     directions, alpha, hook = _read_glp(path, num_layers, hidden_size)
+     if alpha is None:
+         raise ValueError(f"{path}: no glp.alpha_default")
++    override = _alpha_override(envs.WEIGHTLESS_STEER_ALPHA)
++    if override is not None:
++        logger.info(
++            "GLP alpha override: WEIGHTLESS_STEER_ALPHA=%s replaces %s's "
++            "glp.alpha_default %s",
++            envs.WEIGHTLESS_STEER_ALPHA,
++            path,
++            alpha,
++        )
++        alpha = override
+     layers = sorted(directions)
+     stack = torch.zeros((num_layers, hidden_size), dtype=torch.float32)
+     for layer in layers:
+-- 
+2.43.0
+
