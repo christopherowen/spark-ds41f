@@ -203,9 +203,12 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         w13, w2 = layer.w13_weight, layer.w2_weight  # [E, 2I, H/2], [E, H, I/2]
         limit = self.quant_config.gemm1_clamp_limit
         router = getattr(layer, "router", None)
-        if router is None:
-            router = getattr(getattr(layer, "runner", None), "router", None)
         idx_dtype = getattr(router, "indices_dtype", None)
+        if idx_dtype is None:
+            idx_dtype = getattr(layer, "_router_indices_dtype", None)
+        max_rows = getattr(router, "max_rows", None)
+        if max_rows is None:
+            max_rows = getattr(layer, "_router_max_rows", None)
         slot_cfg = getattr(layer, "slot_cache_config", None)
         plan_kw = (
             {"num_slots": int(slot_cfg["num_slots"]), "narrow_codes": False}
@@ -224,7 +227,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
             idx_dtypes=(idx_dtype,)
             if idx_dtype is not None
             else (torch.int32, torch.int64),
-            max_rows=getattr(router, "max_rows", None),
+            max_rows=max_rows,
             **plan_kw,
         )
         if slot_cfg is not None:
