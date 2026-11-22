@@ -29,4 +29,7 @@ Base: `candidate-68` (`vLLM 0001..0852`, tree `740f884e927d790cdc48e5b6fe60056a6
 
 ## Build & Verification Status
 
-Composed `candidate-69` (`vLLM 0001..0856`, `729` patches, `patch_head = 82ac8226badbcd69b93847fb1d78a51367483329`, `expected_tree = 4a1f3d210b3333ba921d495763bdeca1834c4224`, `patchset_sha256 = 3e63b9c181b31bd923921b3c8d2967a712e5b46f451fc5d9d5ade23bd50c5be7`). Image build (`spark-ds41f:candidate-69`) and 4-node distribution pending build window.
+Built `spark-ds41f:candidate-69` (`sha256:0ea9f803a09355bec3aea26e51053cb4eaa7b938b43f2109ed6e107d80cb761b`, vLLM `0001..0856`, `729` patches, `patch_head = 82ac8226badbcd69b93847fb1d78a51367483329`, `expected_tree = 4a1f3d210b3333ba921d495763bdeca1834c4224`, `patchset_sha256 = 3e63b9c181b31bd923921b3c8d2967a712e5b46f451fc5d9d5ade23bd50c5be7`) in `458 s` on `dgx4` (lowest `MemAvailable = 83.0 GiB`; `477 s` including GPU import smoke).
+
+- **Zero-overlay built-image GPU unit tests on `dgx4` (`--gpus all`)**: **`659 passed, 2 skipped, 0 failed`** (`37.36 s`) across `test_deepseek_v4_1_glp.py`, `test_deepseek_v41_serving_contract.py`, the DSML/parser/provenance/structural-closer suites (`test_deepseek_v4.py`, `test_deepseek_v41.py`, `test_deepseek_v41_dsml_provenance.py`, `test_deepseek_v41_structural_closers.py`), tokenizers (`test_deepseek_v4.py`, `test_deepseek_v41.py`, `test_deepseek_v41_effort.py`, `test_deepseek_v41_renderer_pool.py`), `test_deepseek_v41_postload_startup.py`, `test_jit_warmup_migration.py`, `test_adaptive_verification.py`, and `test_responses_custom_tools.py`.
+- **Distribution**: Identical OCI digest `sha256:0ea9f803a09355bec3aea26e51053cb4eaa7b938b43f2109ed6e107d80cb761b` verified on all four nodes (`dgx1`, `dgx2`, `dgx3`, `dgx4`).
