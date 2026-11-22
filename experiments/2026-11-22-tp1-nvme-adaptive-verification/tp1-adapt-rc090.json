@@ -1,0 +1,48 @@
+{
+  "notes": "candidate-64 at tp1 with PIECEWISE adaptive_verification=true (row_cost=0.9, dead_rows_tau=0) + dead-row lookahead filter",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-64/tp1.json"
+  },
+  "set": {
+    "container": {
+      "mounts": [
+        [
+          "{home}/.cache/huggingface/hub",
+          "/hub",
+          "ro"
+        ],
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{home}/.cache/huggingface/hub/models--msuiche--DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75/snapshots/2715ffd51f59899115853e1118db080536966c44/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf",
+          "/glp/vector.gguf",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-22-tp1-nvme-adaptive-verification/overlay/vllm.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/config/vllm.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-22-tp1-nvme-adaptive-verification/overlay/adaptive_verification.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-22-tp1-nvme-adaptive-verification/overlay/cache.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0"
+    }
+  },
+  "serve_options": {
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":1,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.9}"
+  }
+}
