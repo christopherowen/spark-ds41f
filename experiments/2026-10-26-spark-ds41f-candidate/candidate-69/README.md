@@ -29,4 +29,4 @@ Base: `candidate-68` (`vLLM 0001..0852`, tree `740f884e927d790cdc48e5b6fe60056a6
 
 ## Build & Verification Status
 
-Composed `candidate-69` (`vLLM 0001..0856`, `729` patches, `patch_head = 1c89e518a85545d3508d59b2f575f413b2292f0b`, `expected_tree = a8f729a5147f4b9195e7e44ecae2062791afd6ff`, `patchset_sha256 = 99f4f920f3a2e08318c93bf488d057d79af62a3aa3beff8601c80099d35e0b86`). Image build (`spark-ds41f:candidate-69`) and 4-node distribution pending build window.
+Composed `candidate-69` (`vLLM 0001..0856`, `729` patches, `patch_head = 82ac8226badbcd69b93847fb1d78a51367483329`, `expected_tree = 4a1f3d210b3333ba921d495763bdeca1834c4224`, `patchset_sha256 = 3e63b9c181b31bd923921b3c8d2967a712e5b46f451fc5d9d5ade23bd50c5be7`). Image build (`spark-ds41f:candidate-69`) and 4-node distribution pending build window.

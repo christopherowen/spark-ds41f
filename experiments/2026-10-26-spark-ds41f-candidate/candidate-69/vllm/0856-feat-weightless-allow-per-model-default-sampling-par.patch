@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:45:00 +0100
-Subject: [PATCH] feat(weightless): allow per-model default sampling params for
- steered model
+Subject: [PATCH 856/856] feat(weightless): allow per-model default sampling
+ params for steered model
 
 Add WEIGHTLESS_STEER_GENERATION_DEFAULTS (JSON object of sampling
 defaults such as temperature/top_p/top_k/min_p) applied only when a
@@ -20,18 +20,18 @@ Quality: Zero behavior change on the stock served model or when WEIGHTLESS_STEER
 Tests: pytest tests/models/test_deepseek_v4_1_glp.py -k steered_generation_defaults (7 passed).
 Upstream-status: Local per-model sampling defaults for weightless served model.
 ---
- tests/models/test_deepseek_v4_1_glp.py        | 40 +++++++++++++
+ tests/models/test_deepseek_v4_1_glp.py        | 70 +++++++++++++++++++
  .../openai/chat_completion/batch_serving.py   |  2 +-
  .../openai/chat_completion/serving.py         |  2 +-
  vllm/entrypoints/openai/completion/serving.py |  2 +-
  vllm/entrypoints/openai/responses/serving.py  |  2 +-
- vllm/entrypoints/serve/engine/serving.py      |  5 ++
+ vllm/entrypoints/serve/engine/serving.py      |  7 +-
  vllm/envs.py                                  |  6 ++
- vllm/weightless.py                            | 58 +++++++++++++++++++
- 8 files changed, 113 insertions(+), 4 deletions(-)
+ vllm/weightless.py                            | 58 +++++++++++++++
+ 8 files changed, 144 insertions(+), 5 deletions(-)
 
 diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
-index dbbcd6bce..0452d3d0c 100644
+index dbbcd6bce..bd8d8b56a 100644
 --- a/tests/models/test_deepseek_v4_1_glp.py
 +++ b/tests/models/test_deepseek_v4_1_glp.py
 @@ -89,6 +89,7 @@ def _no_steering_env(monkeypatch):
@@ -42,7 +42,7 @@ index dbbcd6bce..0452d3d0c 100644
  
  
  # The container reader.
-@@ -734,3 +735,42 @@ def test_a_published_ds41_file_holds_only_unit_directions():
+@@ -734,3 +735,72 @@ def test_a_published_ds41_file_holds_only_unit_directions():
      assert alpha == pytest.approx(float(metadata["glp.alpha_default"]))
      for direction in directions.values():
          assert np.linalg.norm(direction) == pytest.approx(1.0, abs=1e-5)
@@ -85,6 +85,36 @@ index dbbcd6bce..0452d3d0c 100644
 +    monkeypatch.setenv("WEIGHTLESS_STEER_GENERATION_DEFAULTS", raw)
 +    with pytest.raises(ValueError, match="WEIGHTLESS_STEER_GENERATION_DEFAULTS"):
 +        weightless.sampling_defaults("deepseek-v4.1-flash-weightless", {"temperature": 1.0})
++
++
++def test_base_serving_default_sampling_params_for(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.entrypoints.openai.chat_completion.batch_serving import (
++        OpenAIServingChatBatch,
++    )
++    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
++    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
++    from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
++    from vllm.entrypoints.serve.engine.serving import BaseServing
++
++    assert issubclass(OpenAIServingChat, BaseServing)
++    assert issubclass(OpenAIServingChatBatch, BaseServing)
++    assert issubclass(OpenAIServingCompletion, BaseServing)
++    assert issubclass(OpenAIServingResponses, BaseServing)
++
++    monkeypatch.setenv("WEIGHTLESS_STEER_MODEL", "deepseek-v4.1-flash-weightless")
++    monkeypatch.setenv(
++        "WEIGHTLESS_STEER_GENERATION_DEFAULTS",
++        '{"temperature": 0.3, "top_p": 0.95}',
++    )
++    dummy = SimpleNamespace(default_sampling_params={"temperature": 1.0, "top_p": 1.0})
++    assert BaseServing._default_sampling_params_for(
++        dummy, SimpleNamespace(model="deepseek-v4.1-flash")
++    ) == {"temperature": 1.0, "top_p": 1.0}
++    assert BaseServing._default_sampling_params_for(
++        dummy, SimpleNamespace(model="deepseek-v4.1-flash-weightless")
++    ) == {"temperature": 0.3, "top_p": 0.95}
 diff --git a/vllm/entrypoints/openai/chat_completion/batch_serving.py b/vllm/entrypoints/openai/chat_completion/batch_serving.py
 index 70e08e444..0d8574c4b 100644
 --- a/vllm/entrypoints/openai/chat_completion/batch_serving.py
@@ -138,9 +168,18 @@ index c1b4f3115..a9e858d30 100644
              self._mark_steering(request, sampling_params)
  
 diff --git a/vllm/entrypoints/serve/engine/serving.py b/vllm/entrypoints/serve/engine/serving.py
-index f497d0390..b44fc91cb 100644
+index f497d0390..c5b981bcc 100644
 --- a/vllm/entrypoints/serve/engine/serving.py
 +++ b/vllm/entrypoints/serve/engine/serving.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from http import HTTPStatus
+-from typing import ClassVar
++from typing import Any, ClassVar
+ 
+ from fastapi import Request
+ 
 @@ -80,6 +80,11 @@ class BaseServing:
              param="model",
          )

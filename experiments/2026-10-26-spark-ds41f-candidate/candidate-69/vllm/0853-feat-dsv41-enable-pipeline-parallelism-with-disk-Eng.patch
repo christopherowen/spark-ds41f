@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 19:15:00 +0100
-Subject: [PATCH 853/854] feat(dsv41): enable pipeline parallelism with disk
+Subject: [PATCH 853/856] feat(dsv41): enable pipeline parallelism with disk
  Engram, DSpark, and CED
 
 Enable PP=2 (and general PP>1) on DeepSeek-V4.1-Flash with disk-backed
@@ -60,7 +60,7 @@ index fa51ae297..ec016ce67 100644
              mc.tokenizer, mc.revision, mc.trust_remote_code
          )
 diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
-index a1819d11b..0619b5cf8 100644
+index a1819d11b..444638c9e 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
 @@ -20,6 +20,7 @@ import torch.nn as nn
@@ -106,7 +106,7 @@ index a1819d11b..0619b5cf8 100644
          self.model = DSparkDeepseekV4Model(
              vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
          )
-+        if self.model.embed_tokens is not None:
++        if getattr(self.model, "embed_tokens", None) is not None:
 +            self.has_own_embed_tokens = True
 +            self.checkpoint_weight_name_prefixes = (
 +                *self.checkpoint_weight_name_prefixes,
