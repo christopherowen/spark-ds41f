@@ -342,20 +342,20 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(listed["serve_args"], base["serve_args"])
 
     def test_generation_defaults_render_as_override_generation_config(self):
-        """The recipe's sampling defaults (DeepSeek's for 1017) render once, beside
+        """The recipe's sampling defaults render once, beside
         --generation-config; an arm merges its own values into them."""
-        self.assertEqual(self.recipe["generation_defaults"], {"temperature": 1.0, "top_p": 1.0})
+        self.assertEqual(self.recipe["generation_defaults"], {"temperature": 0.3, "top_p": 0.95})
         arm = recipe.resolve(self.recipe, "tp3-triangle")
         args = arm["serve_args"]
         at = args.index("--generation-config")
         self.assertEqual(args[at + 2 : at + 4],
-                         ["--override-generation-config", '{"temperature":1.0,"top_p":1.0}'])
+                         ["--override-generation-config", '{"temperature":0.3,"top_p":0.95}'])
         self.assertEqual(args.count("--override-generation-config"), 1)
         # An arm over that one merges its values (as every overlay merges a dictionary)
         # and replaces the flag rather than repeating it.
         again = recipe.overlay({"extends": {}, "set": {"generation_defaults": {"temperature": 0.6}}}, arm)
         self.assertEqual(again["serve_args"].count("--override-generation-config"), 1)
-        self.assertIn('{"temperature":0.6,"top_p":1.0}', again["serve_args"])
+        self.assertIn('{"temperature":0.6,"top_p":0.95}', again["serve_args"])
 
     def test_tp3_keeps_its_cabling_and_sizing(self):
         """TP3 keeps what the triangle and its memory need, and nothing else of r6h (through
@@ -836,6 +836,32 @@ class GLPTest(unittest.TestCase):
     def test_an_incomplete_block_is_refused(self):
         with self.assertRaisesRegex(SystemExit, "glp lacks sha256"):
             self.resolved(lambda candidate: candidate["glp"].pop("sha256"))
+
+    def test_an_alpha_in_the_block_renders_the_override(self):
+        cluster = self.resolved(lambda candidate: candidate["glp"].update(alpha=2.0))
+        self.assertEqual(cluster["environment"]["WEIGHTLESS_STEER_ALPHA"], "2.0")
+
+    def test_no_alpha_renders_no_override(self):
+        cluster = self.resolved()
+        self.assertNotIn("WEIGHTLESS_STEER_ALPHA", cluster["environment"])
+
+    def test_an_alpha_that_is_not_a_positive_number_is_refused(self):
+        for bad in ("2.0", 0, -1, True):
+            with self.subTest(bad=bad), self.assertRaisesRegex(SystemExit, "glp alpha"):
+                self.resolved(lambda candidate, bad=bad: candidate["glp"].update(alpha=bad))
+
+    def test_an_alpha_written_by_hand_beside_the_block_is_refused(self):
+        def by_hand(candidate):
+            candidate["environment"]["WEIGHTLESS_STEER_ALPHA"] = "2.0"
+        with self.assertRaisesRegex(SystemExit, "does not set them itself"):
+            self.resolved(by_hand)
+
+    def test_an_arm_sets_and_unsets_the_alpha_with_the_block(self):
+        base = self.resolved()
+        dosed = recipe.overlay({"extends": {}, "set": {"glp": {"alpha": 1.5}}}, base)
+        self.assertEqual(dosed["environment"]["WEIGHTLESS_STEER_ALPHA"], "1.5")
+        off = recipe.overlay({"extends": {}, "unset": ["glp"]}, dosed)
+        self.assertNotIn("WEIGHTLESS_STEER_ALPHA", off["environment"])
 
     def test_an_arm_renames_unsets_or_keeps_the_steering(self):
         base = self.resolved()
