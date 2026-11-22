@@ -500,11 +500,15 @@ _GGUF_STRING, _GGUF_ARRAY = 8, 9
 def glp_reader_command(cluster: dict, path: str) -> list[str]:
     """The ``docker run`` of the profile image's GLP reader on the host file ``path``: never
     pulled, without GPU or network."""
-    return ["docker", "run", "--rm", "--pull=never", "--network=none",
-            "--entrypoint=/usr/bin/timeout",
-            "--volume", f"{path}:{cluster_recipe.GLP_TARGET}:ro",
-            cluster["container"]["image"],
-            "--signal=TERM", "--kill-after=10s", GLP_READER_TIMEOUT, *GLP_READER]
+    cmd = ["docker", "run", "--rm", "--pull=never", "--network=none",
+           "--entrypoint=/usr/bin/timeout"]
+    alpha = (cluster.get("environment") or {}).get(cluster_recipe.STEER_ALPHA)
+    if alpha is not None:
+        cmd.extend(["--env", f"{cluster_recipe.STEER_ALPHA}={alpha}"])
+    cmd.extend(["--volume", f"{path}:{cluster_recipe.GLP_TARGET}:ro",
+                cluster["container"]["image"],
+                "--signal=TERM", "--kill-after=10s", GLP_READER_TIMEOUT, *GLP_READER])
+    return cmd
 
 
 def gguf_metadata(data: bytes) -> dict[str, object]:
