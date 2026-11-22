@@ -12,9 +12,8 @@ def test_subchunk_cache_reuses_prefix_subchunks_bit_exact():
         return [[ord(c) for c in t[:4]] + [len(t)] for t in texts]
 
     cache = dsv41_tok._BoundedPieceCache()
-    # Build >65536 char text with BPE-invariant newline breaks
-    line = "alpha beta gamma delta epsilon zeta eta theta\n"
-    prefix = line * 1600  # ~73,600 chars
+    # Build >65536 char text with unique lines and BPE-invariant newline breaks
+    prefix = "".join(f"line_{i:04d} alpha beta gamma delta epsilon zeta\n" for i in range(1600))
     p1 = prefix + "tail_one\n"
     p2 = prefix + "tail_two_longer\n"
 
