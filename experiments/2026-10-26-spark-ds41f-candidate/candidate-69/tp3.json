@@ -1,0 +1,28 @@
+{
+  "notes": "candidate-69 at tp3-triangle: vLLM 0001..0854 (tree 514f3b1d311b), 16 seats (max_num_seqs=16, capture=96, long_prefill_threshold=6048), contiguous CUDA pool",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp3-triangle"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:candidate-69",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "514f3b1d311b91e73e522c19e9fc7b1568b85745"
+      }
+    },
+    "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-69/upstreams.lock.json",
+    "environment": {
+      "PYTORCH_CUDA_ALLOC_CONF": "garbage_collection_threshold:0.6"
+    }
+  },
+  "serve_options": {
+    "--max-num-seqs": "16",
+    "--max-cudagraph-capture-size": "96",
+    "--long-prefill-token-threshold": "6048",
+    "--compilation-config": "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48,56,64,72,80,88,96]}"
+  },
+  "add_serve_options": {
+    "--renderer-num-workers": "8"
+  }
+}

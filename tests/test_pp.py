@@ -239,6 +239,38 @@ class PipelineParallelTopologyAndOverlaysTest(unittest.TestCase):
             any("mismatched roce_subnets" in err for err in topology.problems(ring, bad_subnet))
         )
 
+    def test_candidate_69_pp2_shapes_resolve_and_pass_doctor(self):
+        cases = [
+            ("pp2-tp2-ring", 4, 2, "oneshot-pp2-ring4", "config/examples/nodes-pp2-tp2.json"),
+            ("pp2-tp2-switched", 4, 2, "oneshot-switched", "config/examples/nodes-switched.json"),
+            ("pp2-tp3-switched", 6, 3, "oneshot-switched", "config/examples/nodes-switched6.json"),
+            ("pp2-tp4-switched", 8, 4, "oneshot-switched", "config/examples/nodes-switched8.json"),
+        ]
+        c69_lock = spark_config.read_json(
+            "experiments/2026-10-26-spark-ds41f-candidate/candidate-69/upstreams.lock.json"
+        )
+        for shape, expected_nodes, expected_tp, expected_transport, example_nodes in cases:
+            with self.subTest(source="candidate-69", shape=shape):
+                c69 = spark_config.read_cluster(
+                    f"experiments/2026-10-26-spark-ds41f-candidate/candidate-69/{shape}.json"
+                )
+                c69_dev = spark_config.read_cluster(
+                    f"experiments/2026-10-26-spark-ds41f-candidate/candidate-69/{shape}-dev.json"
+                )
+                nodes = self._aligned_nodes(c69, example_nodes)
+                self.assertEqual(_arg(c69["serve_args"], "--nnodes"), str(expected_nodes))
+                self.assertEqual(_arg(c69["serve_args"], "--tensor-parallel-size"), str(expected_tp))
+                self.assertEqual(_arg(c69["serve_args"], "--pipeline-parallel-size"), "2")
+                self.assertEqual(c69["fabric"]["transport"], expected_transport)
+                self.assertNotIn("VLLM_LATE_ADMISSION_LAYER", c69["environment"])
+                if expected_transport == "oneshot-pp2-ring4":
+                    self.assertNotIn("NCCL_SWITCHLESS_BIDIRECTIONAL", c69["environment"])
+                self.assertEqual(c69["container"]["image"], "spark-ds41f:candidate-69")
+                self.assertEqual(topology.problems(c69, nodes), [])
+                self.assertEqual(spark_doctor._cluster_shape(c69), shape)
+                self.assertEqual(c69_dev["environment"].get("VLLM_SERVER_DEV_MODE"), "1")
+                self.assertEqual(spark_doctor.qualified_recipe_problems(c69, nodes, c69_lock), [])
+
 
 if __name__ == "__main__":
     unittest.main()

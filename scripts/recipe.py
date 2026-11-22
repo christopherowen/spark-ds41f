@@ -426,6 +426,8 @@ def resolve(recipe: dict, name: str) -> dict:
     if int(fill["pipeline_parallel_size"]) > 1:
         cluster["environment"].pop("VLLM_LATE_ADMISSION_LAYER", None)
     cluster["fabric"] = shape["fabric"]
+    if isinstance(shape.get("fabric"), dict) and shape["fabric"].get("transport") == "oneshot-pp2-ring4":
+        cluster["environment"].pop("NCCL_SWITCHLESS_BIDIRECTIONAL", None)
     if isinstance(shape.get("fabric"), dict) and shape["fabric"].get("transport") == "local":
         docker_args = cluster.get("container", {}).get("docker_run_args")
         if isinstance(docker_args, list):
@@ -545,6 +547,9 @@ def overlay(arm: dict, base: dict) -> dict:
     if (cluster.get("fabric", {}).get("topology") == "switched"
             and base.get("fabric", {}).get("topology") != "switched"):
         _apply_switched_direct_env(cluster, sets.get("environment", {}), arm.get("unset", ()))
+    if cluster.get("fabric", {}).get("transport") == "oneshot-pp2-ring4":
+        if "NCCL_SWITCHLESS_BIDIRECTIONAL" not in sets.get("environment", {}):
+            cluster.get("environment", {}).pop("NCCL_SWITCHLESS_BIDIRECTIONAL", None)
     if cluster.get("fabric", {}).get("transport") == "nccl-socket":
         env = cluster.get("environment", {})
         for key in list(env):

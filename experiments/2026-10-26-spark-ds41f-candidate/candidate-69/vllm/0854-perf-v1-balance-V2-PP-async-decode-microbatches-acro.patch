@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:20:00 +0100
+Subject: [PATCH 854/854] perf(v1): balance V2+PP+async decode microbatches
+ across pipeline stages
+
+Under V2+PP+async, AsyncScheduler enforces
+next_decode_eligible_step = current_step + pp_size to match the
+worker-side sampled-tokens broadcast ring cadence. When multiple decode
+requests become eligible on the same step, Scheduler.schedule() greedily
+admits all of them into one microbatch and leaves alternating pipeline
+steps empty (a 50% pipeline bubble with sharp bimodal variance).
+
+Cap per-step scheduled running decodes at ceil(decode_running / pp_size)
+when use_pp, use_v2_model_runner, and async_scheduling are active, so
+concurrent requests split evenly across the pp_size pipeline slots and
+self-rebalance as requests finish.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Eliminates lockstepped PP pipeline bubbles and bimodal variance under V2+PP+async (+24.7% code-c2, +15.6% prose-c2 with CI collapsing from +/-20% to +/-1.8%, +6.7% code-c4 on PP=2, TP=2 over 200 GbE RoCE).
+Quality: Pure scheduling cadence change; zero PP=1 behavior change; verified LRU 5/5 and byte-identical DSpark acceptance rates on live PP=2, TP=2.
+Tests: Live PP=2, TP=2 Sonar quality+decode benchmark on dgx1..dgx4 (oneshot-pp2-ring4).
+Upstream-status: Local V2+PP+async scheduler microbatch balancing fix.
+---
+ vllm/v1/core/sched/scheduler.py | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index bc084675c..a4064377c 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1462,6 +1462,18 @@ class Scheduler(SchedulerInterface):
+             )
+             copy_rows_left = self.max_decode_rows - slots * (1 + self.num_spec_tokens)
+ 
++        pp_decode_budget: int | None = None
++        scheduled_decode_running = 0
++        if (
++            self.use_pp
++            and self.use_v2_model_runner
++            and self.scheduler_config.async_scheduling
++        ):
++            decode_running = sum(1 for r in self.running if not r.is_prefill_chunk)
++            if decode_running > 1:
++                pp_size = self.parallel_config.pipeline_parallel_size
++                pp_decode_budget = (decode_running + pp_size - 1) // pp_size
++
+         def schedule_running_requests(
+             service_class: ComputeServiceClass | None = None,
+             *,
+@@ -1475,6 +1487,7 @@ class Scheduler(SchedulerInterface):
+             nonlocal input_budget
+             nonlocal prefill_scheduled
+             nonlocal prefill_tokens_scheduled
++            nonlocal scheduled_decode_running
+             nonlocal step_prefill_token_cap
+             nonlocal token_budget
+             req_index = 0
+@@ -1543,6 +1556,17 @@ class Scheduler(SchedulerInterface):
+                     req_index += 1
+                     continue
+ 
++                if (
++                    pp_decode_budget is not None
++                    and not request.is_prefill_chunk
++                    and scheduled_decode_running >= pp_decode_budget
++                ):
++                    # V2+PP+async: balance eligible decodes across pp_size
++                    # microbatch slots so concurrent requests don't lockstep
++                    # into a single batch with empty bubble steps.
++                    req_index += 1
++                    continue
++
+                 if (
+                     request.is_prefill_chunk
+                     and prefill_interleave_step is not None
+@@ -1757,6 +1781,8 @@ class Scheduler(SchedulerInterface):
+                             if preempted_req in scheduled_running_reqs:
+                                 preempted_req_id = preempted_req.request_id
+                                 scheduled_running_reqs.remove(preempted_req)
++                                if not preempted_req.is_prefill_chunk:
++                                    scheduled_decode_running -= 1
+                                 restored = num_scheduled_tokens.pop(preempted_req_id)
+                                 token_budget += restored
+                                 input_budget += restored + draft_slots
+@@ -1808,6 +1834,8 @@ class Scheduler(SchedulerInterface):
+                 if request.is_prefill_chunk:
+                     scheduled_prefill_req_ids.add(request.request_id)
+                     prefill_tokens_scheduled += num_new_tokens
++                else:
++                    scheduled_decode_running += 1
+                 request_id = request.request_id
+                 req_to_new_blocks[request_id] = new_blocks
+                 num_scheduled_tokens[request_id] = num_new_tokens
+-- 
+2.43.0
+
