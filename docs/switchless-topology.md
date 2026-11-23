@@ -176,3 +176,11 @@ adds communication hops. Performance is not assumed equal to the three-node
 baseline. The promoted ring (`oneshot-ring4`) keeps one-shot collectives for
 small messages; the NCCL-only profile does not. Record a new baseline only
 after four-node serving and measurements pass and the owner accepts promotion.
+
+## When to use `PP=2` vs `TP`
+
+| Cluster size | Recommended default | When `PP=2` wins |
+| --- | --- | --- |
+| 4 Sparks (switchless ring or switched) | **`tp4-ring` / `tp4-switched`** (`~1.8×` faster decode, `~1.55×` faster prefill, `40/40` batch-invariant) | Only if you need more than `20M` tokens of KV capacity (`pp2-tp2-*` supports `24 GiB` KV ≈ `30M` tokens) or are qualifying `PP=2` locally on four nodes. |
+| 6 Sparks (switched) | **`pp2-tp3-switched`** when strict batch invariance or larger KV (`24 GiB` KV/node) matters; `tp6-switched` for lowest `C1` latency and prefill | `pp2-tp3-switched` keeps TP inside `sparknet.oneshot` (`TP=3`) for strict bit-exact batch invariance, whereas `tp6-switched` uses NCCL collectives. |
+| 8 Sparks (switched) | **`pp2-tp4-switched`** for strict batch invariance, large KV (`36 GiB` KV/node ≈ `68M` tokens, `2.4×` `tp8`), or high concurrency (`C16–C32`); **`tp8-switched`** for lowest `C1` latency and fastest prefill | `pp2-tp4-switched` keeps TP inside `sparknet.oneshot` (`TP=4`, `40/40` batch-invariant) while `tp8-switched` falls back to NCCL collectives (not batch-invariant under load) and leaves less host RAM (`12–14 GiB` vs `24–29 GiB` free at `36 GiB` KV). |
