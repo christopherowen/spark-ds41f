@@ -853,6 +853,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     by_layer[engram.layer_hash_index],
                 )
             return
+        if isinstance(early, tuple) and len(early) == 2:
+            early_0, early_1_or_fn = early
+            for engram in engrams:
+                idx = engram.layer_hash_index
+                layer_early = (
+                    early_0
+                    if idx == 0
+                    else (early_1_or_fn() if callable(early_1_or_fn) else early_1_or_fn)
+                )
+                engram.stage_rows(tokens, stream, layer_early)
+            return
         for engram in engrams:
             engram.stage_rows(
                 tokens,
