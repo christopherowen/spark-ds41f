@@ -2041,9 +2041,13 @@ class ExpertSlotCache:
         def _install_bank_mapping(wave_i: int) -> None:
             b = wave_i & 1
             base = bank_bases[b]
-            prev = bank_exps[b]
-            if prev is not None:
-                self.lfu.expert_to_slot[prev] = -1
+            bsize = bank_sizes[b]
+            for j in range(bsize):
+                s = base + j
+                old_e = int(self.lfu.slot_to_expert[s])
+                if old_e >= 0:
+                    self.lfu.expert_to_slot[old_e] = -1
+                    self.lfu.slot_to_expert[s] = -1
             arr = waves[wave_i]
             n = int(arr.size)
             for j in range(n):
