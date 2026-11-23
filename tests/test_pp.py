@@ -202,6 +202,8 @@ class PipelineParallelTopologyAndOverlaysTest(unittest.TestCase):
             self.assertEqual(env["NCCL_IB_SUBNET_AWARE_ROUTING"], "1")
             self.assertEqual(env["NCCL_RUNTIME_CONNECT"], "1")
             self.assertNotIn("NCCL_SWITCHLESS_BIDIRECTIONAL", env)
+            self.assertNotIn("SPARKNET_ROCE_GID_INDEX", env)
+            self.assertIn("SPARKNET_ROCE_SUBNETS", env)
 
     def test_pp2_ring4_node_environment_without_gid_pin_sets_tp_and_pp_subnets(self):
         cluster = spark_config.read_cluster("experiments/2026-11-20-pp2-tp2/pp2-tp2-ring.json")

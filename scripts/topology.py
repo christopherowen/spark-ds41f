@@ -213,17 +213,15 @@ def _pp2_ring4_node_environment(cluster: dict, node: dict, base: dict[str, str])
     if pp_hcas:
         env["SPARKNET_ROCE_PP_PEER_HCAS"] = json.dumps({pp_peer_local: pp_hcas}, separators=(",", ":"))
     if pinned:
-        for key in GID_PINS:
-            if key in base:
-                env[key] = base[key]
+        if "NCCL_IB_GID_INDEX" in base:
+            env["NCCL_IB_GID_INDEX"] = base["NCCL_IB_GID_INDEX"]
         if "roce_gid_index" in node:
             env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
-            env["SPARKNET_ROCE_GID_INDEX"] = str(node["roce_gid_index"])
-    else:
-        declared = node.get("roce_subnets", {})
-        subnets = {h: declared[h] for h in all_hcas if h in declared}
-        if subnets:
-            env["SPARKNET_ROCE_SUBNETS"] = json.dumps(subnets, separators=(",", ":"))
+        env.pop("SPARKNET_ROCE_GID_INDEX", None)
+    declared = node.get("roce_subnets", {})
+    subnets = {h: declared[h] for h in all_hcas if h in declared}
+    if subnets:
+        env["SPARKNET_ROCE_SUBNETS"] = json.dumps(subnets, separators=(",", ":"))
     iface = node.get("management_interface")
     if iface:
         env.update(NCCL_SOCKET_IFNAME="=" + iface, GLOO_SOCKET_IFNAME=iface, TP_SOCKET_IFNAME=iface)
