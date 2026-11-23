@@ -1904,7 +1904,8 @@ class ExpertSlotCache:
         rows = topk_ids.shape[0]
         if callable(shared):
             shared = shared()
-        out_dtype = torch.bfloat16 if shared is not None else plan.out_dtype
+        final_dtype = torch.bfloat16 if shared is not None else plan.out_dtype
+        pass_dtype = plan.out_dtype
 
         # Drain any pending decode lookahead before using dynamic slots.
         if self._w2_pending:
@@ -1922,10 +1923,10 @@ class ExpertSlotCache:
 
         safe_ids = topk_ids.clamp(min=0)
         valid_ids = topk_ids >= 0
-        tmp_out = torch.empty((rows, plan.hidden), dtype=out_dtype, device=self.device)
+        tmp_out = torch.empty((rows, plan.hidden), dtype=pass_dtype, device=self.device)
         mask_np = self._batch_mask_host.numpy()
 
-        # Pass 0: resident experts + shared expert (zero NVMe I/O).
+        # Pass 0: resident experts (zero NVMe I/O; shared added in FP32 at end).
         if resident_exps.size > 0:
             self.prefill_windows += 1
             self.hits += int(resident_exps.size)
@@ -1941,7 +1942,7 @@ class ExpertSlotCache:
                 self.weights,
                 tmp_out,
                 workspace=workspace,
-                shared=shared,
+                shared=None,
                 expert_to_slot=self.expert_to_slot_gpu,
                 wait_w2=None,
             )
@@ -1951,12 +1952,9 @@ class ExpertSlotCache:
                 # cold batch 0 overwrites dynamic slots.
                 torch.cuda.current_stream(self.device).synchronize()
         else:
-            if shared is not None:
-                acc_fp32 = shared.float().clone()
-            else:
-                acc_fp32 = torch.zeros(
-                    (rows, plan.hidden), dtype=torch.float32, device=self.device
-                )
+            acc_fp32 = torch.zeros(
+                (rows, plan.hidden), dtype=torch.float32, device=self.device
+            )
 
         # Passes 1..K: cold experts once each in ascending LBA batches.
         batch_size = max(1, self.dynamic_slots)
@@ -1988,11 +1986,14 @@ class ExpertSlotCache:
             if batch_start + batch_size < total_cold:
                 torch.cuda.current_stream(self.device).synchronize()
 
+        if shared is not None:
+            acc_fp32.add_(shared)
+
         if out is not None:
             out.copy_(acc_fp32)
             return out
 
-        final_out = acc_fp32.to(out_dtype)
+        final_out = acc_fp32.to(final_dtype)
 
         def combine(start: int, stop: int, rows_out: torch.Tensor) -> None:
             rows_out.copy_(final_out[start:stop])
