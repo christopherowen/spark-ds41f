@@ -114,6 +114,30 @@ bin/spark --cluster-config <cfg> bench --suites quality,decode,prefill \
 | `prefill 131K` (tok/s) | `10,543.0 ±0.9%` | `10,492.1 ±8.6%` | `10,548.5 ±5.2%` | **`10,520.3`** | `-0.2%` (parity) |
 | Min `MemAvailable` (GiB) | — | `14.25–16.62` (0 swap) | `14.37–16.65` (0 swap) | `>=14.25 GiB` | 0 thermal slowdown |
 
+## Revision `candidate-71-r2` (Bit-Exact Batch Invariance + `pp2-tp3/4` KV Headroom)
+
+Following the batch-invariance audit of `candidate-71`:
+- **vLLM patch `0865`** (`0865-fix-ds41-make-expert-centric-prefill-streaming-bit-e.patch`, `738` total patches, `patch_head = e69d8114e031c2a1724134ede5369b3102c2a0b3`, `expected_tree = ca4b59280d9211433442f6e1f529386d1497db58`): factors `MoeExpertsV41Plan.run_routed()` out of `run()` and stages each wave's BF16 per-route outputs into `(token, k)` order in `y_all` before running one final TileLang `dispatch.combine()` in exact `k = 0..topk-1` FP32 order with `shared` folded once. Restores strict `assert torch.equal(out_ref_p, out_slot_p)` and warm-cache repeat invariance in `test_deepseek_v41_expert_slots.py`, and fixes the `e_score_correction_bias` kwarg and `tk.device.type` check in `test_expert_hotlist_and_fast_lookahead.py`.
+- **`sparknet` bumped to `0a5c5dd2eba6`** (`patch_head = d642bcfa7813537c334a3bfc2ecec673f38ad76e`, `expected_tree = 7794c85affdc85c595abfa6fb07b568bb8f719ff`): adds `AllReduce`-matching legacy `SPARKNET_ROCE_GID_INDEX` compatibility to `oneshot.P2P` (PR #8).
+- **Profile sizing updates**:
+  - `tp2-direct` & `tp2-switched`: reverted `VLLM_DS41_EXPERT_SLOTS` from `252` to `240` (`240/64`) after `candidate-71-r2` at `252/64` dipped to `3.76 GiB` `MemAvailable` on `dgx1` during `131K` bit-exact prefill (`y_all` staging buffer), restoring `6.48 / 7.84 GiB` min `MemAvailable`.
+  - `pp2-tp3-switched`: raised `kv_cache_memory_bytes` to `25769803776` (`24.0 GiB`).
+  - `pp2-tp4-switched`: raised `kv_cache_memory_bytes` to `38654705664` (`36.0 GiB`, ~`68M` tokens, sized against external 8-Spark measurements showing `43–48 GiB` free at `16.5 GiB` KV).
+  - All 9 `tp3..tp8` profiles remain runtime-config-identical to `spark-ds41f-1122`.
+
+### `candidate-71-r2` Build, Unit Tests & Live Batch-Invariance Gates
+
+- **Image**: `spark-ds41f:candidate-71-r2` (`sha256:2d324e04b517a7ae22a1d539e095d6ecdd3e131adbbe17b68d8e73b9db4dbc41`), built on `dgx4` in `455 s` (lowest `MemAvailable = 82.8 GiB`), distributed along `dgx4 -> dgx3 -> dgx2 -> dgx1` (`56` identical `RootFS.Layers`, `sha256` prefix `ef6ac05a80e040db`, verified on all 4 nodes).
+- **Zero-overlay built-image GPU unit tests on `dgx4`**: **`74 passed, 1 skipped, 0 failed`** (`81.4 s`) across `test_deepseek_v41_expert_slots.py` (`14/14` strict `torch.equal`), `test_expert_hotlist_and_fast_lookahead.py` (`3/3`), `test_pp_sparknet_p2p.py`, and `test_adaptive_verification.py`.
+- **Live batch-invariance & prefill gates (`commit 89397d4300`)**:
+
+| Shape | Determinism Gate | Token Diffs | Logprob Diffs | Exact Digests (`ref` / `long`) | Live Bench / Memory Notes |
+| --- | --- | ---: | ---: | --- | --- |
+| `pp2-tp2-ring` (`c71` & `c71-r2`) | `token_determinism.py --wide` (`c8`, `staggered`, `mixed`, `cached`, `mixed15`, `again`, `192` tok) + 40-prompt idle vs `C16` | **`0`** (`40/40`) | **`0`** (`40/40`) | `0c521e72c482…` / `b4cfd5f84b1f…` | Identical SHA-256 across `c71` and `c71-r2`; warm boot `+78.5 s` / `+92.7 s` |
+| `tp2-direct` (`240/64`, `c71-r2`) | `token_determinism.py` (`c8`, `staggered`, `mixed`, `cached`, `again`, `128` tok) | **`0`** | **`0`** | `ce46870c9bf6…` / **`b4cfd5f84b1f…`** | `long_sha256` is **bit-for-bit identical to `pp2-tp2-ring`**; `LRU 5/5`; decode `prose-c1 26.2`, `prose-c4 90.0`, `code-c1 31.1`, `code-c4 86.9`; prefill `32K 4,438.7`, `131K 4,451.6 tok/s`; min `MemAvailable 6.48 / 7.84 GiB` (`0.0` swap) |
+| `tp2-direct` (`252/64`, `c71-r2`, unfavourable mem) | `token_determinism.py` (`128` tok) | **`0`** | **`0`** | `ce46870c9bf6…` / `b4cfd5f84b1f…` | Aborted `131K` prefill bench at `dgx1` min `MemAvailable 3.76 GiB` (`< 4 GiB` floor) -> motivated `240/64` above |
+| `tp1` (`108/48`, `c71-r2`) | `token_determinism.py` (`c8`, `staggered`, `mixed`, `cached`, `again`, `64` tok) | **`0`** | **`0`** | `d28389815160…` / `28e3acb32e98…` | Prefill `8K 1,455.6`, `32K 1,850.9` (`2,135` warm repeat); min `MemAvailable 7.87 GiB` (`0.0` swap) |
+
 ## Conclusion
 
-`candidate-71` passes every quality gate (`LRU 5/5` across all 8 boots), unit test gate (`929/929` repo tests, `336/336` built-image GPU & simulator tests), and memory/thermal guard (`0.0 GiB` swap growth, `0.0 ms` thermal slowdown on every boot), while delivering large reproducible wins across `pp2-tp2-ring` (`+18.4%` prefill, `+19.2%` `prose-c1`, `+21.2%` `prose-c4`, `+10.8%` `code-c8`, zero `code-c2` dip), `tp2-direct` (`+46–75%` decode, `16.6–20.6x` prefill), and `tp1` (`1.75–2.75x` decode, `12.8x` 1K prefill) with zero regression on `tp4-ring`.
+`candidate-71-r2` passes every quality gate (`LRU 5/5`), strict bit-exact batch-invariance gate (`0` token diffs and `0` logprob diffs across `pp2-tp2-ring`, `tp2-direct`, and `tp1`, including `40/40` idle-vs-`C16` on `pp2-tp2-ring` and bit-identical 6K long-prefill SHA-256 between `tp2-direct` NVMe streaming and full-GPU `pp2-tp2-ring`), unit test gate (`929/929` repo tests, `74/74` `r2` + `336/336` `r1` built-image GPU & simulator tests), and memory/thermal guard (`>= 6.48 GiB` min `MemAvailable` on `tp2-direct`, `7.87 GiB` on `tp1`, `17.93+ GiB` on `pp2-tp2-ring`, `0.0 GiB` swap growth, `0.0 ms` thermal slowdown), with zero regression on `tp4-ring`.
