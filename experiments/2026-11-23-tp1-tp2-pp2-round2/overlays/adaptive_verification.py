@@ -415,7 +415,7 @@ class AdaptiveVerificationManager:
             self._confidence_probs.index_copy_(0, idx_long, conf_slice[0])
             if self._confidence_buffer.shape[0] > 1:
                 self._planned_probs.index_copy_(0, idx_long, conf_slice[-1])
-        if self._pp_calibrated_override is None:
+        if getattr(self, "_pp_calibrated_override", None) is None:
             with gpu_sync_allowed():
                 self._pp_calibrated_override = bool(int(is_calibrated_tensor.item()))
         if idx_mapping.is_cuda and getattr(self, "_copy_stream", None) is not None:

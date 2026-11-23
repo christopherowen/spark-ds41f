@@ -2289,7 +2289,7 @@ class ExpertSlotCache:
         is_prefill = rows > self.prefill_protect_rows
 
         if (
-            self._fast_lookahead
+            getattr(self, "_fast_lookahead", False)
             and next_lookahead is not None
             and lookahead_hidden is not None
             and not is_prefill
@@ -2349,7 +2349,7 @@ class ExpertSlotCache:
                     if pred_experts:
                         next_cache.prefetch_async(pred_experts)
 
-        if self._capture_counts is not None and not is_prefill:
+        if getattr(self, "_capture_counts", None) is not None and not is_prefill:
             valid_c = topk_ids_np[topk_ids_np >= 0]
             if valid_c.size > 0:
                 np.add.at(self._capture_counts, valid_c, 1)
