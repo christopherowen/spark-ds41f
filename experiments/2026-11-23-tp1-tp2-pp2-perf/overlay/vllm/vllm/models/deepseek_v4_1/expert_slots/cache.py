@@ -1858,12 +1858,13 @@ class ExpertSlotCache:
         return windows
 
     def _maybe_record_hotlist(self, topk_ids_np: np.ndarray, *, is_prefill: bool) -> None:
-        if self._hotlist_counts is None or is_prefill:
+        counts = getattr(self, "_hotlist_counts", None)
+        if counts is None or is_prefill:
             return
         flat = topk_ids_np.reshape(-1)
         valid = flat[(flat >= 0) & (flat < self.num_experts)]
         if valid.size:
-            self._hotlist_counts += np.bincount(valid, minlength=self.num_experts)
+            counts += np.bincount(valid, minlength=self.num_experts)
         self._hotlist_steps += 1
         if self._hotlist_steps % 200 == 0:
             self._flush_hotlist()
@@ -1944,7 +1945,7 @@ class ExpertSlotCache:
                 expert_to_slot=self.expert_to_slot_gpu,
                 wait_w2=None,
             )
-            acc_fp32 = tmp_out.float()
+            acc_fp32 = tmp_out.to(torch.float32, copy=True)
             if cold_exps.size > 0:
                 # Ensure GPU finishes reading any resident dynamic slots before
                 # cold batch 0 overwrites dynamic slots.

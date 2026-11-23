@@ -411,8 +411,9 @@ class AdaptiveVerificationManager:
         self._pp_calibrated_override = cal
 
     def _is_calibrated(self) -> bool:
-        if self._pp_calibrated_override is not None:
-            return self._pp_calibrated_override
+        override = getattr(self, "_pp_calibrated_override", None)
+        if override is not None:
+            return override
         calibrated = getattr(self, "calibrated_confidence", False)
         if callable(calibrated):
             return bool(calibrated())
