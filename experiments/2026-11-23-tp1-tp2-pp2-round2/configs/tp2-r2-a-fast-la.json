@@ -1,0 +1,34 @@
+{
+  "notes": "Round 2 tp2-direct: BF16 fused single-sync L+1 lookahead (VLLM_DS41_EXPERT_FAST_LOOKAHEAD=1) + optional calib capture",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-70/tp2-direct.json"
+  },
+  "set": {
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-round2/overlays/cache.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-round2/overlays/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_DS41_EXPERT_FAST_LOOKAHEAD": "1",
+      "VLLM_DS41_EXPERT_CAPTURE_COUNTS": "/cache/ds41_expert_slots/calib_multidomain_raw.json"
+    },
+    "deployment": {
+      "branch": "tp1-tp2-pp2-round2"
+    }
+  }
+}

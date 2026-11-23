@@ -1,0 +1,35 @@
+{
+  "notes": "Round 2 tp2-direct: Sonar-disjoint multi-domain held-out hotlist (uniform slot counts) + fast lookahead",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-70/tp2-direct.json"
+  },
+  "set": {
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-round2/overlays/cache.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-round2/overlays/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_DS41_EXPERT_FAST_LOOKAHEAD": "1",
+      "VLLM_DS41_EXPERT_HOTLIST": "/cache/ds41_expert_slots/hotlist_multidomain_heldout.json",
+      "VLLM_DS41_EXPERT_HOTLIST_MODE": "pure"
+    },
+    "deployment": {
+      "branch": "tp1-tp2-pp2-round2"
+    }
+  }
+}
