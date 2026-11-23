@@ -1,16 +1,17 @@
 {
-  "notes": "pp2-tp2-ring stacking intra-stage sp_prefill + lockstep PP adaptive verification + 8K chunk + L2 prefetch 18/18/20",
+  "notes": "pp2-tp2-ring stacking confirmed winners: intra-stage sp_prefill + lockstep PP adaptive verification (rc=0.032, c1_scale=1.55, tau=0.2) + VLLM_SINK_REJECTION=1 (16K batch, 12/12/15 L2 prefetch, full 0854 balance)",
   "extends": {
     "config": "config/cluster.json",
     "shape": "pp2-tp2-ring"
   },
   "set": {
-    "sizing": {
-      "max_num_batched_tokens": 8192
+    "deployment": {
+      "branch": "tp1-tp2-pp2-perf"
     },
     "speculative": {
       "enable_adaptive_verification": true,
-      "adaptive_verification_row_cost": 0.045
+      "adaptive_verification_row_cost": 0.032,
+      "adaptive_verification_single_req_row_cost_scale": 1.55
     },
     "container": {
       "mounts": [
@@ -48,23 +49,13 @@
           "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/worker/gpu/model_runner.py",
           "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
           "ro"
-        ],
-        [
-          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/core/sched/scheduler.py",
-          "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py",
-          "ro"
         ]
       ]
     },
     "environment": {
       "VLLM_DS41_PP_SP_PREFILL": "1",
       "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.2",
-      "VLLM_DS41_L2_PREFETCH_FFN_MB": "18",
-      "VLLM_DS41_L2_PREFETCH_NEXT_MB": "18",
-      "VLLM_DS41_L2_PREFETCH_WO_MB": "20"
-    },
-    "deployment": {
-      "branch": "tp1-tp2-pp2-perf"
+      "VLLM_SINK_REJECTION": "1"
     }
   }
 }
