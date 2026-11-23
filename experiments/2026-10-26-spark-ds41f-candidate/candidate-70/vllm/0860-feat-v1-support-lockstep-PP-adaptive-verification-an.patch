@@ -1,4 +1,4 @@
-From 077e2f2c2e8aa02b52fd538a1f4209136997ed81 Mon Sep 17 00:00:00 2001
+From 466b59302f5fdb11514cf7e136d15dc4dbad48d0 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 10:47:52 +0100
 Subject: [PATCH 860/860] feat(v1): support lockstep PP adaptive verification
@@ -23,8 +23,8 @@ Upstream-status: Local PP adaptive verification and sink rejection support.
  vllm/config/vllm.py                           |  16 +-
  vllm/v1/worker/gpu/model_runner.py            |  84 ++++++--
  vllm/v1/worker/gpu/pp_utils.py                | 182 ++++++++++++++++--
- .../gpu/spec_decode/adaptive_verification.py  |  66 +++++++
- 5 files changed, 353 insertions(+), 36 deletions(-)
+ .../gpu/spec_decode/adaptive_verification.py  |  74 +++++++
+ 5 files changed, 361 insertions(+), 36 deletions(-)
 
 diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
 index 3dc35c3da..92035577b 100644
@@ -527,7 +527,7 @@ index ab1b991d1..807202200 100644
          return bool(need_sampled_mask.all())
  
 diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-index 62285660d..1e2cfd803 100644
+index 62285660d..af7495fe2 100644
 --- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 +++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 @@ -204,6 +204,7 @@ class AdaptiveVerificationManager:
@@ -538,7 +538,7 @@ index 62285660d..1e2cfd803 100644
          init_stale = self._initial_stale_values()
          for slot in self._stale_confidences:
              slot.np[:] = init_stale
-@@ -347,7 +348,72 @@ class AdaptiveVerificationManager:
+@@ -347,7 +348,80 @@ class AdaptiveVerificationManager:
              write_slot.copy_to_cpu()
              self._copy_events[write_idx].record()
  
@@ -593,11 +593,19 @@ index 62285660d..1e2cfd803 100644
 +        is_calibrated_tensor: torch.Tensor,
 +    ) -> None:
 +        """Apply broadcasted PP confidences identically on every PP stage."""
-+        tilelang_inputs.scatter_rows(idx_mapping, conf_slice[0], self._confidence_probs)
-+        if self._confidence_buffer.shape[0] > 1:
++        if idx_mapping.is_cuda:
 +            tilelang_inputs.scatter_rows(
-+                idx_mapping, conf_slice[-1], self._planned_probs
++                idx_mapping, conf_slice[0], self._confidence_probs
 +            )
++            if self._confidence_buffer.shape[0] > 1:
++                tilelang_inputs.scatter_rows(
++                    idx_mapping, conf_slice[-1], self._planned_probs
++                )
++        else:
++            idx_long = idx_mapping.long()
++            self._confidence_probs.index_copy_(0, idx_long, conf_slice[0])
++            if self._confidence_buffer.shape[0] > 1:
++                self._planned_probs.index_copy_(0, idx_long, conf_slice[-1])
 +        with gpu_sync_allowed():
 +            planned_np = conf_slice[-1].detach().cpu().numpy()
 +            cal = bool(int(is_calibrated_tensor.item()))

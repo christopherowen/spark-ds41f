@@ -1,4 +1,4 @@
-From d838d38fec170a03ebb8356d525839f442eb5a19 Mon Sep 17 00:00:00 2001
+From fd2e82c64fb1dc8e4d48a8d5f89a9f626db02593 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 10:47:51 +0100
 Subject: [PATCH 859/860] perf(dsv41): enable intra-stage prefill sequence
@@ -20,9 +20,9 @@ Tests: pytest tests/models/test_deepseek_v4_1_sp_prefill.py -k test_resolve_min_
 Upstream-status: Local PP+SP prefill optimization.
 ---
  tests/models/test_deepseek_v4_1_sp_prefill.py |  4 +++-
- vllm/models/deepseek_v4_1/nvidia/model.py     | 17 +++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 19 ++++++++++++++++++-
  vllm/models/deepseek_v4_1/sp_prefill.py       |  2 --
- 3 files changed, 20 insertions(+), 3 deletions(-)
+ 3 files changed, 21 insertions(+), 4 deletions(-)
 
 diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
 index b38cb4dca..c0b792d1a 100644
@@ -42,7 +42,7 @@ index b38cb4dca..c0b792d1a 100644
      ):
          assert sp_prefill.resolve_min_rows(disabled) == 0
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index 564cb1464..1e896e7fb 100644
+index 564cb1464..cefd86b2f 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -852,6 +852,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
@@ -81,6 +81,15 @@ index 564cb1464..1e896e7fb 100644
          decoder_compacted = False
          if (
              ced_indices is not None
+@@ -1206,7 +1221,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     # Reconstruct the aux hidden state for draft models
+                     aux_out = (
+                         self._graph_out(
+-                            self._aux_slot_base_cached + len(aux_hidden_states),
++                            getattr(self, "_aux_slot_base_cached", 0) + len(aux_hidden_states),
+                             full_num_tokens,
+                         )
+                         if sp is None and not decoder_compacted
 @@ -1329,6 +1344,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              del final_aux_recon, residual, post_mix, res_mix
  
