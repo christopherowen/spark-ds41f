@@ -1582,7 +1582,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
         from vllm.models.deepseek_v4_1.expert_slots.cache import (
             plan_layer_slot_budgets_empirical,
-            rank_experts_for_seeding,
         )
 
         expert_bytes = ExpertPackMeta.from_plan(
@@ -1702,7 +1701,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
                     ][:num_slots]
                 else:
-                    initial_experts = rank_experts_for_seeding(
+                    initial_experts = rank_experts_by_router_bias(
                         bias, hotlist_counts=hl_counts
                     )[:num_slots]
             else:
