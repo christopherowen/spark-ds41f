@@ -1,0 +1,35 @@
+{
+  "notes": "tp2-direct 252/64 slots (+12 static slots), decent 6.00 GiB KV (~25.7x 256K / ~6.4x 1M ctx), adaptive rc=0.25",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp2-direct"
+  },
+  "set": {
+    "sizing": {
+      "kv_cache_memory_bytes": 6442450944
+    },
+    "speculative": {
+      "enable_adaptive_verification": true,
+      "adaptive_verification_row_cost": 0.25
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_DS41_EXPERT_SLOTS": "252",
+      "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.45",
+      "VLLM_DS41_EXPERT_HOTLIST_DUMP": "/cache/ds41_expert_slots/hotlist-tp2"
+    }
+  }
+}

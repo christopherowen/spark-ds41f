@@ -1,0 +1,31 @@
+{
+  "notes": "tp2-direct config-only 0844 adaptive verification (rc=0.25, tau=0.45), full 8.00 GiB KV, + hotlist dump",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp2-direct"
+  },
+  "set": {
+    "speculative": {
+      "enable_adaptive_verification": true,
+      "adaptive_verification_row_cost": 0.25
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.45",
+      "VLLM_DS41_EXPERT_HOTLIST_DUMP": "/cache/ds41_expert_slots/hotlist-tp2"
+    }
+  }
+}

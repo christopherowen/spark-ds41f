@@ -1,0 +1,32 @@
+{
+  "notes": "pp2-tp2-ring with 8K prefill chunk pipelining, TP=2 L2 prefetch 18/18/20, and adaptive microbatch balance max_seqs=8",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "pp2-tp2-ring"
+  },
+  "set": {
+    "sizing": {
+      "max_num_batched_tokens": 8192
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/core/sched/scheduler.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_PP_DECODE_BALANCE_MAX_SEQS": "8",
+      "VLLM_DS41_L2_PREFETCH_FFN_MB": "18",
+      "VLLM_DS41_L2_PREFETCH_NEXT_MB": "18",
+      "VLLM_DS41_L2_PREFETCH_WO_MB": "20"
+    }
+  }
+}

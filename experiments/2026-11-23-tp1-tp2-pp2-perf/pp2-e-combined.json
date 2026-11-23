@@ -1,0 +1,67 @@
+{
+  "notes": "pp2-tp2-ring stacking intra-stage sp_prefill + lockstep PP adaptive verification + 8K chunk + L2 prefetch 18/18/20",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "pp2-tp2-ring"
+  },
+  "set": {
+    "sizing": {
+      "max_num_batched_tokens": 8192
+    },
+    "speculative": {
+      "enable_adaptive_verification": true,
+      "adaptive_verification_row_cost": 0.045
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/sp_prefill.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/config/vllm.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/config/vllm.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/worker/gpu/pp_utils.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/pp_utils.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/core/sched/scheduler.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/sched/scheduler.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_DS41_PP_SP_PREFILL": "1",
+      "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.2",
+      "VLLM_DS41_L2_PREFETCH_FFN_MB": "18",
+      "VLLM_DS41_L2_PREFETCH_NEXT_MB": "18",
+      "VLLM_DS41_L2_PREFETCH_WO_MB": "20"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "notes": "tp1 with 112/48 slots, 8.00 GiB KV, expert-centric LBA-sorted prefill streaming, and 8K batched tokens",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp1"
+  },
+  "set": {
+    "sizing": {
+      "max_num_batched_tokens": 8192
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_DS41_EXPERT_SLOTS": "112",
+      "VLLM_DS41_EXPERT_PREFILL_MODE": "expert"
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "notes": "pp2-tp2-ring with lockstep PP adaptive verification (row_cost=0.045, tau=0.2)",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "pp2-tp2-ring"
+  },
+  "set": {
+    "speculative": {
+      "enable_adaptive_verification": true,
+      "adaptive_verification_row_cost": 0.045
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/config/vllm.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/config/vllm.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/worker/gpu/pp_utils.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/pp_utils.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.2"
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "notes": "tp1 test of VLLM_USE_BREAKABLE_CUDAGRAPH=1 for piecewise non-MoE CUDA graphs over tp1-c",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp1"
+  },
+  "set": {
+    "sizing": {
+      "max_num_batched_tokens": 8192
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/expert_slots/cache.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_DS41_EXPERT_SLOTS": "112",
+      "VLLM_DS41_EXPERT_PREFILL_MODE": "expert",
+      "VLLM_DS41_EXPERT_HOTLIST_PATH": "/cache/ds41_expert_slots/hotlist-tp1",
+      "VLLM_USE_BREAKABLE_CUDAGRAPH": "1"
+    }
+  }
+}

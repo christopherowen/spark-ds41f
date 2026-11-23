@@ -1,0 +1,35 @@
+{
+  "notes": "pp2-tp2-ring with asymmetric KV-boundary partition VLLM_PP_LAYER_PARTITION=14,26 (8.5 GiB KV = ~10x 1M ctx) + intra-stage sp_prefill",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "pp2-tp2-ring"
+  },
+  "set": {
+    "sizing": {
+      "kv_cache_memory_bytes": 9126805504
+    },
+    "container": {
+      "mounts": [
+        [
+          "{checkout}/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/sp_prefill.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/sp_prefill.py",
+          "ro"
+        ],
+        [
+          "{checkout}/experiments/2026-11-23-tp1-tp2-pp2-perf/overlay/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py",
+          "ro"
+        ]
+      ]
+    },
+    "environment": {
+      "VLLM_PP_LAYER_PARTITION": "14,26",
+      "VLLM_DS41_PP_SP_PREFILL": "1"
+    }
+  }
+}
