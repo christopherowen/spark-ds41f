@@ -175,6 +175,12 @@ class PipelineParallelTopologyAndOverlaysTest(unittest.TestCase):
             2: ("1", ["rocep1s0f1", "roceP2p1s0f1"]),
             3: ("0", ["rocep1s0f0", "roceP2p1s0f0"]),
         }
+        expected_pp_peers = {
+            0: ("1", ["rocep1s0f1", "roceP2p1s0f1"]),
+            1: ("1", ["rocep1s0f0", "roceP2p1s0f0"]),
+            2: ("0", ["rocep1s0f0", "roceP2p1s0f0"]),
+            3: ("0", ["rocep1s0f1", "roceP2p1s0f1"]),
+        }
         for node in nodes["nodes"]:
             rank = node["rank"]
             env = topology.node_environment(cluster, node)
@@ -188,18 +194,28 @@ class PipelineParallelTopologyAndOverlaysTest(unittest.TestCase):
                 json.loads(env["SPARKNET_ROCE_PEER_HCAS"]),
                 {local_peer: tp_hcas},
             )
+            pp_local_peer, pp_hcas = expected_pp_peers[rank]
+            self.assertEqual(
+                json.loads(env["SPARKNET_ROCE_PP_PEER_HCAS"]),
+                {pp_local_peer: pp_hcas},
+            )
             self.assertEqual(env["NCCL_IB_SUBNET_AWARE_ROUTING"], "1")
             self.assertEqual(env["NCCL_RUNTIME_CONNECT"], "1")
             self.assertNotIn("NCCL_SWITCHLESS_BIDIRECTIONAL", env)
 
-    def test_pp2_ring4_node_environment_without_gid_pin_sets_tp_subnets_only(self):
+    def test_pp2_ring4_node_environment_without_gid_pin_sets_tp_and_pp_subnets(self):
         cluster = spark_config.read_cluster("experiments/2026-11-20-pp2-tp2/pp2-tp2-ring.json")
         cluster["environment"].pop("NCCL_IB_GID_INDEX", None)
         nodes = self._aligned_nodes(cluster, "config/examples/nodes-pp2-tp2.json")
         env0 = topology.node_environment(cluster, nodes["nodes"][0])
         self.assertEqual(
             json.loads(env0["SPARKNET_ROCE_SUBNETS"]),
-            {"rocep1s0f0": "10.40.0.0/24", "roceP2p1s0f0": "10.41.0.0/24"},
+            {
+                "rocep1s0f0": "10.40.0.0/24",
+                "roceP2p1s0f0": "10.41.0.0/24",
+                "rocep1s0f1": "10.40.3.0/24",
+                "roceP2p1s0f1": "10.41.3.0/24",
+            },
         )
 
     def test_pp2_ring4_node_map_derives_valid_layout_from_ring4(self):

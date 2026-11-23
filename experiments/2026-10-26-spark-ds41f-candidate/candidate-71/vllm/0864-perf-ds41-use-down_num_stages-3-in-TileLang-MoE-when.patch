@@ -1,0 +1,39 @@
+From 795a96b0690cd98721fb6f3f22357c989eff50bd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:10:46 +0100
+Subject: [PATCH 864/864] perf(ds41): use down_num_stages=3 in TileLang MoE
+ when intermediate % 128 == 0
+
+---
+ vllm/models/deepseek_v4_1/tilelang/moe.py | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index d0150e3af..7ab4c8650 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -2001,7 +2001,7 @@ class MoeExpertsV41Plan:
+         prefill_swizzle_panel=4,
+         block_N=128,
+         num_stages=3,
+-        down_num_stages=2,
++        down_num_stages=None,
+         out_dtype=torch.bfloat16,
+         idx_dtypes=(torch.int32, torch.int64),
+         max_rows: int | None = None,
+@@ -2039,7 +2039,11 @@ class MoeExpertsV41Plan:
+         )
+         self.prefill_swizzle_panel = prefill_swizzle_panel
+         self.num_stages = num_stages
+-        self.down_num_stages = down_num_stages
++        self.down_num_stages = (
++            (3 if intermediate % 128 == 0 else 2)
++            if down_num_stages is None
++            else down_num_stages
++        )
+         self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+         self.out_dtype = out_dtype
+-- 
+2.43.0
+

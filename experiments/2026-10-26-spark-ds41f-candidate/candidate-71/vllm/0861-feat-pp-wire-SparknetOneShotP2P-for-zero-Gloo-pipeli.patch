@@ -1,0 +1,574 @@
+From 8b126b445da9c71f430df244bf088bfbc919a4cd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:07:18 +0100
+Subject: [PATCH 861/864] feat(pp): wire SparknetOneShotP2P for zero-Gloo
+ pipeline activations and broadcast
+
+---
+ tests/v1/worker/test_pp_sparknet_p2p.py | 126 +++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py      |  32 ++++--
+ vllm/v1/worker/gpu/pp_utils.py          | 143 ++++++++++++++++++------
+ vllm/v1/worker/gpu_worker.py            | 102 ++++++++++++++---
+ 4 files changed, 346 insertions(+), 57 deletions(-)
+ create mode 100644 tests/v1/worker/test_pp_sparknet_p2p.py
+
+diff --git a/tests/v1/worker/test_pp_sparknet_p2p.py b/tests/v1/worker/test_pp_sparknet_p2p.py
+new file mode 100644
+index 000000000..55278665b
+--- /dev/null
++++ b/tests/v1/worker/test_pp_sparknet_p2p.py
+@@ -0,0 +1,126 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.v1.worker.gpu.pp_utils import PPHandler
++from vllm.v1.worker.gpu_worker import Worker
++
++
++class _FakeP2P:
++    def __init__(self, *, disabled: bool = False, failure_msg: str | None = None):
++        self.disabled = disabled
++        self._failure_msg = failure_msg
++        self.sent: list[tuple[list[tuple[tuple[int, ...], torch.dtype]], int]] = []
++        self.recvd: list[tuple[list[tuple[tuple[int, ...], torch.dtype]], int]] = []
++        self.health_checks = 0
++        self.closed = False
++
++    def send_tensors(self, tensors, dst: int, *, stream=None):
++        self.sent.append(([(tuple(t.shape), t.dtype) for t in tensors], dst))
++
++    def recv_tensors(self, outs, src: int, *, stream=None):
++        self.recvd.append(([(tuple(t.shape), t.dtype) for t in outs], src))
++        return list(outs)
++
++    def failure(self):
++        return self._failure_msg
++
++    def check_health(self):
++        self.health_checks += 1
++        if self._failure_msg:
++            raise RuntimeError(self._failure_msg)
++
++    def close(self):
++        self.closed = True
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_pp_handler_sparknet_p2p_coalesced_broadcast_and_recv(monkeypatch):
++    monkeypatch.setenv("VLLM_PP_SPARKNET_P2P", "1")
++    fake_tx = _FakeP2P()
++    fake_rx = _FakeP2P()
++
++    def _make_group(is_last: bool):
++        return SimpleNamespace(
++            is_last_rank=is_last,
++            last_rank=2,
++            world_size=2,
++            cpu_group="cpu-pp",
++            make_sibling_device_group=lambda **kw: (_ for _ in ()).throw(
++                AssertionError("should not create sibling NCCL group when P2P active")
++            ),
++        )
++
++    device = torch.device("cuda", 0)
++    with (
++        patch("vllm.v1.worker.gpu.pp_utils.get_pp_group", return_value=_make_group(True)),
++        patch("sparknet.integration.vllm.SparknetOneShotP2P", return_value=fake_tx),
++    ):
++        tx_handler = PPHandler(max_num_reqs=8, num_speculative_steps=5, device=device)
++        assert tx_handler.broadcast_group is None
++        tx_handler.configure_confidence_broadcast(True, planes=2)
++        batch = SimpleNamespace(
++            num_reqs=2,
++            num_computed_tokens_np=np.array([10, 10]),
++            prefill_len_np=np.array([5, 5]),
++            num_scheduled_tokens=np.array([1, 1]),
++            idx_mapping=torch.tensor([0, 1], dtype=torch.int32, device=device),
++            idx_mapping_np=np.array([0, 1], dtype=np.int32),
++        )
++        tx_handler.broadcast(
++            torch.ones((2, 6), dtype=torch.int64, device=device),
++            torch.ones((2,), dtype=torch.int32, device=device),
++            torch.zeros((2,), dtype=torch.int32, device=device),
++            batch,
++        )
++        tx_handler.broadcast_drafts(
++            torch.ones((8, 5), dtype=torch.int64, device=device),
++            batch,
++            confidences=torch.ones((2, 2, 5), dtype=torch.float32, device=device),
++            is_calibrated=True,
++        )
++        tx_handler.close()
++        assert fake_tx.closed
++
++    with (
++        patch("vllm.v1.worker.gpu.pp_utils.get_pp_group", return_value=_make_group(False)),
++        patch("sparknet.integration.vllm.SparknetOneShotP2P", return_value=fake_rx),
++    ):
++        rx_handler = PPHandler(max_num_reqs=8, num_speculative_steps=5, device=device)
++        assert rx_handler.broadcast_group is None
++        rx_handler.configure_confidence_broadcast(True, planes=2)
++        rx_handler.receive(batch)
++        rx_handler.close()
++        assert fake_rx.closed
++
++    # Sender targets PP-local rank 0; receiver reads from PP-local last rank 1; schemas match 1:1.
++    assert [dst for _, dst in fake_tx.sent] == [0, 0]
++    assert [src for _, src in fake_rx.recvd] == [1, 1]
++    assert [shapes for shapes, _ in fake_tx.sent] == [shapes for shapes, _ in fake_rx.recvd]
++
++
++def test_worker_roce_failure_and_health_include_pp_p2p():
++    w = object.__new__(Worker)
++    w._pp_p2p = _FakeP2P(failure_msg="p2p recv stalled")
++    w.model_runner = SimpleNamespace(
++        pp_handler=SimpleNamespace(_pp_bcast_p2p=_FakeP2P(failure_msg=None))
++    )
++    tp_comm = SimpleNamespace(
++        roce_failure=lambda: "tp stalled",
++        roce_ar_comm=SimpleNamespace(check_health=lambda: None),
++    )
++    with patch(
++        "vllm.v1.worker.gpu_worker.get_tp_group",
++        return_value=SimpleNamespace(device_communicator=tp_comm),
++    ):
++        report = w._roce_failure()
++        assert report == "tp stalled; p2p recv stalled"
++        check = w._roce_health_check()
++        assert check is not None
++        with pytest.raises(RuntimeError, match="p2p recv stalled"):
++            check()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6c1e399b2..2980502d9 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -4552,17 +4552,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             model_inputs["inputs_embeds"] = None
+ 
+             # Prepare the intermediate tensors.
+-            assert intermediate_tensors is not None
+             assert self.intermediate_tensors is not None
+             n = input_batch.num_tokens_after_padding
+-            new_tensors = {
+-                k: v[:n]
+-                if dummy_run
+-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
+-                for k, v in self.intermediate_tensors.tensors.items()
+-            }
+-            model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+-            del intermediate_tensors
++            _pp_p2p = getattr(self, "_pp_p2p", None)
++            if not dummy_run and intermediate_tensors is None and _pp_p2p is not None:
++                pp_group = get_pp_group()
++                src = (pp_group.rank_in_group - 1) % pp_group.world_size
++                new_tensors = {
++                    k: v[:n] for k, v in self.intermediate_tensors.tensors.items()
++                }
++                keys = [k for k in sorted(new_tensors.keys()) if new_tensors[k].numel() > 0]
++                if keys:
++                    _pp_p2p.recv_tensor_dict_fixed(new_tensors, keys, src=src)
++                model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
++            else:
++                assert intermediate_tensors is not None
++                new_tensors = {
++                    k: v[:n]
++                    if dummy_run
++                    else v[:n].copy_(intermediate_tensors.tensors[k][:n])
++                    for k, v in self.intermediate_tensors.tensors.items()
++                }
++                model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
++                del intermediate_tensors
+ 
+         # Update the EPLB meta.
+         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
+@@ -5206,6 +5218,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             del self.kv_cache_config
+         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
+             self.model_state.encoder_runner.clear()
++        if self.pp_handler is not None:
++            self.pp_handler.close()
+         free_before_shutdown(self.vllm_config)
+         if hasattr(self, "model_state"):
+             del self.model_state
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 807202200..3d92990c1 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Pipeline Parallelism utils for V2 Model Runner."""
+ 
++import os
+ from collections import deque
+ from collections.abc import Callable
+ from dataclasses import dataclass
+@@ -76,8 +77,11 @@ class PPHandler:
+     def __init__(
+         self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+     ):
+-        self.is_last_rank = get_pp_group().is_last_rank
+-        self.last_rank = get_pp_group().last_rank
++        pp_group = get_pp_group()
++        self.is_last_rank = pp_group.is_last_rank
++        self.last_rank = pp_group.last_rank
++        self.pp_world_size = pp_group.world_size
++        self.local_last_rank = pp_group.world_size - 1
+         self.max_sample_len = num_speculative_steps + 1
+         self.num_speculative_steps = num_speculative_steps
+         self.device = device
+@@ -97,9 +101,27 @@ class PPHandler:
+         # between PP decodes.
+         self.req_idx_gen_np = np.zeros(max_num_reqs, dtype=np.int32)
+ 
+-        # Dedicated subgroup for the sampled-token broadcast.
+-        self.broadcast_group = get_pp_group().make_sibling_device_group(
+-            group_desc="pp_broadcast"
++        # Use a lightweight dedicated SparknetOneShotP2P channel on broadcast_stream
++        # when enabled so backward sampled/draft broadcasts run over one-shot RoCE
++        # without creating a sibling NCCL communicator or coupling to main_stream.
++        self._pp_bcast_p2p = None
++        if os.environ.get("VLLM_PP_SPARKNET_P2P", "0") == "1":
++            from sparknet.integration.vllm import SparknetOneShotP2P
++
++            p2p = SparknetOneShotP2P(
++                group=get_pp_group().cpu_group,
++                device=device,
++                slot_bytes=64 * 1024,
++                pack_bytes=256 * 1024,
++            )
++            if not p2p.disabled:
++                self._pp_bcast_p2p = p2p
++
++        # Dedicated NCCL subgroup when one-shot PP P2P is not active.
++        self.broadcast_group = (
++            None
++            if self._pp_bcast_p2p is not None
++            else get_pp_group().make_sibling_device_group(group_desc="pp_broadcast")
+         )
+         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+         self.broadcast_confidences: bool = False
+@@ -264,9 +286,8 @@ class PPHandler:
+             # Must record the idx_mapping tensor since it was allocated
+             # on the main stream.
+             input_batch.idx_mapping.record_stream(self.broadcast_stream)
+-            torch.distributed.broadcast(
+-                send, src=self.last_rank, group=self.broadcast_group
+-            )
++            send_conf = None
++            send_cal = None
+             if self.broadcast_confidences:
+                 if confidences is None:
+                     send_conf = torch.ones(
+@@ -286,12 +307,31 @@ class PPHandler:
+                     dtype=torch.int32,
+                     device=self.device,
+                 )
+-                torch.distributed.broadcast(
+-                    send_conf, src=self.last_rank, group=self.broadcast_group
++            if self._pp_bcast_p2p is not None:
++                payload = (
++                    [send, send_conf, send_cal]
++                    if self.broadcast_confidences
++                    else [send]
+                 )
++                for dst in range(self.pp_world_size):
++                    if dst != self.local_last_rank:
++                        self._pp_bcast_p2p.send_tensors(
++                            payload, dst=dst, stream=self.broadcast_stream
++                        )
++            else:
+                 torch.distributed.broadcast(
+-                    send_cal, src=self.last_rank, group=self.broadcast_group
++                    send, src=self.last_rank, group=self.broadcast_group
+                 )
++                if self.broadcast_confidences:
++                    assert send_conf is not None and send_cal is not None
++                    torch.distributed.broadcast(
++                        send_conf, src=self.last_rank, group=self.broadcast_group
++                    )
++                    torch.distributed.broadcast(
++                        send_cal, src=self.last_rank, group=self.broadcast_group
++                    )
++            if self.broadcast_confidences:
++                assert send_conf is not None and send_cal is not None
+                 ev = self.broadcast_stream.record_event()
+                 send_conf.record_stream(self.main_stream)
+                 send_cal.record_stream(self.main_stream)
+@@ -326,12 +366,19 @@ class PPHandler:
+                 num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+             )
+             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
+-            torch.distributed.broadcast(
+-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
+-            )
+-            torch.distributed.broadcast(
+-                combined, src=self.last_rank, group=self.broadcast_group
+-            )
++            if self._pp_bcast_p2p is not None:
++                self._pp_bcast_p2p.recv_tensors(
++                    [sampled_tokens, combined],
++                    src=self.local_last_rank,
++                    stream=self.broadcast_stream,
++                )
++            else:
++                torch.distributed.broadcast(
++                    sampled_tokens, src=self.last_rank, group=self.broadcast_group
++                )
++                torch.distributed.broadcast(
++                    combined, src=self.last_rank, group=self.broadcast_group
++                )
+             draft_tokens = None
+             confidences = None
+             is_calibrated = None
+@@ -342,9 +389,6 @@ class PPHandler:
+                     dtype=torch.int64,
+                     device=self.device,
+                 )
+-                torch.distributed.broadcast(
+-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
+-                )
+                 if self.broadcast_confidences:
+                     confidences = torch.empty(
+                         self.confidence_planes,
+@@ -356,12 +400,31 @@ class PPHandler:
+                     is_calibrated = torch.empty(
+                         1, dtype=torch.int32, device=self.device
+                     )
+-                    torch.distributed.broadcast(
+-                        confidences, src=self.last_rank, group=self.broadcast_group
++                if self._pp_bcast_p2p is not None:
++                    rx_payload = (
++                        [draft_tokens, confidences, is_calibrated]
++                        if self.broadcast_confidences
++                        else [draft_tokens]
+                     )
++                    self._pp_bcast_p2p.recv_tensors(
++                        rx_payload,
++                        src=self.local_last_rank,
++                        stream=self.broadcast_stream,
++                    )
++                else:
+                     torch.distributed.broadcast(
+-                        is_calibrated, src=self.last_rank, group=self.broadcast_group
++                        draft_tokens, src=self.last_rank, group=self.broadcast_group
+                     )
++                    if self.broadcast_confidences:
++                        assert confidences is not None and is_calibrated is not None
++                        torch.distributed.broadcast(
++                            confidences, src=self.last_rank, group=self.broadcast_group
++                        )
++                        torch.distributed.broadcast(
++                            is_calibrated,
++                            src=self.last_rank,
++                            group=self.broadcast_group,
++                        )
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+@@ -411,15 +474,29 @@ class PPHandler:
+             send_tokens = torch.nn.functional.pad(
+                 sampled_token_ids,
+                 (0, self.max_sample_len - sampled_token_ids.shape[-1]),
+-            )
+-            torch.distributed.broadcast(
+-                send_tokens.contiguous(),
+-                src=self.last_rank,
+-                group=self.broadcast_group,
+-            )
+-            combined = torch.stack((num_sampled, num_rejected), dim=0)
+-            torch.distributed.broadcast(
+-                combined, src=self.last_rank, group=self.broadcast_group
+-            )
++            ).contiguous()
++            combined = torch.stack((num_sampled, num_rejected), dim=0).contiguous()
++            if self._pp_bcast_p2p is not None:
++                for dst in range(self.pp_world_size):
++                    if dst != self.local_last_rank:
++                        self._pp_bcast_p2p.send_tensors(
++                            [send_tokens, combined],
++                            dst=dst,
++                            stream=self.broadcast_stream,
++                        )
++            else:
++                torch.distributed.broadcast(
++                    send_tokens,
++                    src=self.last_rank,
++                    group=self.broadcast_group,
++                )
++                torch.distributed.broadcast(
++                    combined, src=self.last_rank, group=self.broadcast_group
++                )
+             for tensor in (sampled_token_ids, num_sampled, num_rejected):
+                 tensor.record_stream(self.broadcast_stream)
++
++    def close(self) -> None:
++        if self._pp_bcast_p2p is not None:
++            self._pp_bcast_p2p.close()
++            self._pp_bcast_p2p = None
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index a12b6c882..d60a0f5b7 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1086,6 +1086,20 @@ class Worker(WorkerBase):
+             self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
+                 self.vllm_config, self.device
+             )
++            self._pp_p2p = None
++            if (
++                self.parallel_config.pipeline_parallel_size > 1
++                and os.environ.get("VLLM_PP_SPARKNET_P2P", "0") == "1"
++            ):
++                from sparknet.integration.vllm import SparknetOneShotP2P
++
++                pp_p2p = SparknetOneShotP2P(
++                    group=get_pp_group().cpu_group,
++                    device=self.device,
++                )
++                if not pp_p2p.disabled:
++                    self._pp_p2p = pp_p2p
++                    self.model_runner._pp_p2p = pp_p2p
+         else:
+             from vllm.v1.worker.gpu_model_runner import (
+                 GPUModelRunner as GPUModelRunnerV1,
+@@ -2001,11 +2015,32 @@ class Worker(WorkerBase):
+             output = self.model_runner.sample_tokens(grammar_output)
+         return self._roce_guarded(output)
+ 
++    def _pp_p2p_runtimes(self) -> list[Any]:
++        runtimes: list[Any] = []
++        pp_p2p = getattr(self, "_pp_p2p", None)
++        if pp_p2p is not None and not getattr(pp_p2p, "disabled", False):
++            runtimes.append(pp_p2p)
++        runner = getattr(self, "model_runner", None)
++        pp_handler = getattr(runner, "pp_handler", None)
++        pp_bcast = getattr(pp_handler, "_pp_bcast_p2p", None)
++        if pp_bcast is not None and not getattr(pp_bcast, "disabled", False):
++            runtimes.append(pp_bcast)
++        return runtimes
++
+     def _roce_failure(self) -> str | None:
+-        """The TP communicator's one-shot collective failure report, or None."""
++        """One-shot TP collective and PP P2P failure report, or None."""
++        parts: list[str] = []
+         communicator = get_tp_group().device_communicator
+         failure = getattr(communicator, "roce_failure", None)
+-        return None if failure is None else failure()
++        if failure is not None:
++            report = failure()
++            if report:
++                parts.append(report)
++        for rt in self._pp_p2p_runtimes():
++            report = rt.failure()
++            if report:
++                parts.append(report)
++        return "; ".join(parts) if parts else None
+ 
+     def _start_startup_heartbeat(self) -> None:
+         """Publish this rank's startup heartbeat (see ``startup_rendezvous``)."""
+@@ -2113,16 +2148,33 @@ class Worker(WorkerBase):
+             logger.info("Waited %.1f s for every rank before %s.", waited, phase)
+ 
+     def _roce_health_check(self) -> Callable[[], None] | None:
+-        """The RoCEnante health check of the TP communicator, if one is active.
++        """The RoCEnante health check of the TP communicator and PP P2P runtimes.
+ 
+         Returns:
+-            The check callable, or None when RoCEnante is not in use.
++            The check callable, or None when neither is in use.
+         """
++        checks: list[Callable[[], None]] = []
+         communicator = get_tp_group().device_communicator
+         comm = getattr(communicator, "roce_ar_comm", None) or getattr(
+             communicator, "b12x_ar_comm", None
+         )
+-        return getattr(comm, "check_health", None)
++        tp_check = getattr(comm, "check_health", None)
++        if tp_check is not None:
++            checks.append(tp_check)
++        for rt in self._pp_p2p_runtimes():
++            pp_check = getattr(rt, "check_health", None)
++            if pp_check is not None:
++                checks.append(pp_check)
++        if not checks:
++            return None
++        if len(checks) == 1:
++            return checks[0]
++
++        def _check_all() -> None:
++            for fn in checks:
++                fn()
++
++        return _check_all
+ 
+     _b12x_roce_health_check = _roce_health_check
+ 
+@@ -2206,7 +2258,12 @@ class Worker(WorkerBase):
+                 )
+             }
+ 
+-        if forward_pass and not get_pp_group().is_first_rank:
++        _sparknet_pp_p2p = getattr(self, "_pp_p2p", None)
++        if (
++            forward_pass
++            and not get_pp_group().is_first_rank
++            and _sparknet_pp_p2p is None
++        ):
+             tensor_dict, comm_handles, comm_postprocess = (
+                 get_pp_group().irecv_tensor_dict(
+                     all_gather_group=get_tp_group(),
+@@ -2245,15 +2302,27 @@ class Worker(WorkerBase):
+             and not get_pp_group().is_last_rank
+         )
+ 
+-        # Non-blocking send of the intermediate tensors. The metadata handle
+-        # is reaped lazily by the GroupCoordinator; the device handles are
+-        # waited at the top of the next step.
+-        handles = get_pp_group().isend_tensor_dict(
+-            output.tensors,
+-            all_gather_group=get_tp_group(),
+-            all_gather_tensors=all_gather_tensors,
+-        )
+-        self._pp_send_work = handles[1:]
++        if _sparknet_pp_p2p is not None:
++            pp_group = get_pp_group()
++            dst = (pp_group.rank_in_group + 1) % pp_group.world_size
++            keys = [
++                k
++                for k in sorted(output.tensors.keys())
++                if output.tensors[k].numel() > 0
++            ]
++            if keys:
++                _sparknet_pp_p2p.send_tensor_dict_fixed(output.tensors, keys, dst=dst)
++            self._pp_send_work = []
++        else:
++            # Non-blocking send of the intermediate tensors. The metadata handle
++            # is reaped lazily by the GroupCoordinator; the device handles are
++            # waited at the top of the next step.
++            handles = get_pp_group().isend_tensor_dict(
++                output.tensors,
++                all_gather_group=get_tp_group(),
++                all_gather_tensors=all_gather_tensors,
++            )
++            self._pp_send_work = handles[1:]
+ 
+         if self.use_v2_model_runner and self.model_runner.is_pooling_model:
+             return self.model_runner.pool()  # type: ignore
+@@ -2558,6 +2627,9 @@ class Worker(WorkerBase):
+         if session := getattr(self, "_b12x_session", None):
+             session.close()
+             self._b12x_session = None
++        if pp_p2p := getattr(self, "_pp_p2p", None):
++            pp_p2p.close()
++            self._pp_p2p = None
+ 
+         # Release kept-alive cumem pools while the pluggable allocator wrappers
+         # and callbacks are still alive, so MemPool teardown is not deferred to
+-- 
+2.43.0
+
