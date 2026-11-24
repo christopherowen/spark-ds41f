@@ -1,0 +1,32 @@
+{
+  "notes": "candidate-71 at pp2-tp3-switched: vLLM 0001..0865 (tree ca4b59280d92), sparknet one-shot P2P (tree 7794c85affdc), async zero-sync PP adaptive verification (row_cost=0.25) + VLLM_SINK_REJECTION=1 + SPARK_DS41F_PP_USE_ENGINE_REQS=1 + intra-stage SP (0859) + TileLang down_num_stages=3 (0864)",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-69/pp2-tp3-switched.json"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:candidate-71-r2",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "ca4b59280d9211433442f6e1f529386d1497db58",
+        "local.spark-ds41f.sparknet.tree": "7794c85affdc85c595abfa6fb07b568bb8f719ff"
+      }
+    },
+    "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-71/upstreams.lock.json",
+    "speculative": {
+      "enable_adaptive_verification": true,
+      "adaptive_verification_row_cost": 0.25
+    },
+    "environment": {
+      "VLLM_PP_SPARKNET_P2P": "1",
+      "VLLM_SINK_REJECTION": "1",
+      "SPARK_DS41F_PP_USE_ENGINE_REQS": "1"
+    },
+    "sizing": {
+      "kv_cache_memory_bytes": 25769803776
+    }
+  },
+  "serve_options": {
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":3,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.25}",
+    "--kv-cache-memory-bytes": "25769803776"
+  }
+}

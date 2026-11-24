@@ -1,0 +1,260 @@
+From e69d8114e031c2a1724134ede5369b3102c2a0b3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:36:31 +0100
+Subject: [PATCH] fix(ds41): make expert-centric prefill streaming bit-exact
+ and batch-invariant
+
+Factor MoeExpertsV41Plan.run_routed() out of run() and stage each wave's BF16 down-projection rows into (token, k) order in y_all before running one final TileLang dispatch.combine() pass. Every token's routed experts are reduced in exact k=0..topk-1 FP32 order with shared folded once, matching ref_plan.run bit-for-bit (torch.equal) regardless of cache residency, prior traffic, or concurrent batch composition while preserving single-pass LBA NVMe streaming speed.
+
+Also restores strict torch.equal assertions (including warm-cache repeat invariance) in test_deepseek_v41_expert_slots.py and fixes the kwarg and device check in test_expert_hotlist_and_fast_lookahead.py.
+---
+ .../moe/test_deepseek_v41_expert_slots.py     | 15 +++--
+ .../test_expert_hotlist_and_fast_lookahead.py |  8 +--
+ .../deepseek_v4_1/expert_slots/cache.py       | 67 ++++++++++++-------
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 45 ++++++++++---
+ 4 files changed, 89 insertions(+), 46 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_expert_slots.py b/tests/kernels/moe/test_deepseek_v41_expert_slots.py
+index 8754f3522..cd7940a34 100644
+--- a/tests/kernels/moe/test_deepseek_v41_expert_slots.py
++++ b/tests/kernels/moe/test_deepseek_v41_expert_slots.py
+@@ -253,16 +253,17 @@ def test_pack_and_role_major_io_uring_read_fixed_bit_exact(
+         out_ref_p = torch.empty(p_rows, hidden, dtype=torch.bfloat16, device="cuda")
+         out_slot_p = torch.empty(p_rows, hidden, dtype=torch.bfloat16, device="cuda")
+         ref_plan.run(xp_q, p_ids, p_w, ref_weights, out_ref_p)
+-        # Default expert-centric prefill sweeps each cold expert once.
++        # Default expert-centric prefill sweeps each cold expert once and is
++        # bit-exact (cache-state and batch invariant) against ref_plan.run.
+         cache.run(slot_plan, xp_q, p_ids, p_w, out_slot_p)
+         torch.cuda.synchronize()
+-        assert torch.allclose(
+-            out_ref_p,
+-            out_slot_p,
+-            rtol=2e-2,
+-            atol=max(2.0, 2e-2 * float(out_ref_p.abs().max())),
+-        )
++        assert torch.equal(out_ref_p, out_slot_p)
+         assert 1 < cache.prefill_windows <= 4
++        # Repeat with the mutated warm cache state to prove cache-order invariance.
++        out_slot_p2 = torch.empty(p_rows, hidden, dtype=torch.bfloat16, device="cuda")
++        cache.run(slot_plan, xp_q, p_ids, p_w, out_slot_p2)
++        torch.cuda.synchronize()
++        assert torch.equal(out_ref_p, out_slot_p2)
+         # Token-order fallback remains bit-exact when selected.
+         cache._expert_centric_prefill = False
+         out_slot_tok = torch.empty(p_rows, hidden, dtype=torch.bfloat16, device="cuda")
+diff --git a/tests/models/deepseek_v4_1/test_expert_hotlist_and_fast_lookahead.py b/tests/models/deepseek_v4_1/test_expert_hotlist_and_fast_lookahead.py
+index 23efd90b6..4a544a19d 100644
+--- a/tests/models/deepseek_v4_1/test_expert_hotlist_and_fast_lookahead.py
++++ b/tests/models/deepseek_v4_1/test_expert_hotlist_and_fast_lookahead.py
+@@ -32,14 +32,14 @@ def test_missing_hotlist_raises():
+ def test_fast_bf16_lookahead_predict_topk_gpu():
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     torch.manual_seed(0)
+-    w = torch.randn(32, 64, dtype=torch.bfloat16, device=device)
++    w = torch.randn(32, 64, dtype=torch.bfloat16, device=device) * 0.1
+     bias = torch.randn(32, dtype=torch.bfloat16, device=device)
+-    x = torch.randn(4, 64, dtype=torch.bfloat16, device=device)
+-    pred = RouterLookaheadPredictor(w, bias=bias, top_k=6, max_rows=16)
++    x = torch.randn(4, 64, dtype=torch.bfloat16, device=device) * 0.1
++    pred = RouterLookaheadPredictor(w, e_score_correction_bias=bias, top_k=6, max_rows=16)
+     tk = pred.predict_topk_gpu(x)
+     assert tk is not None
+     assert tk.shape == (4, 6)
+     assert tk.dtype == torch.int32
+-    assert tk.device == device
++    assert tk.device.type == device.type
+     assert pred.predict_topk_gpu(x[:0]) is None
+     assert pred.predict_topk_gpu(torch.randn(17, 64, dtype=torch.bfloat16, device=device)) is None
+diff --git a/vllm/models/deepseek_v4_1/expert_slots/cache.py b/vllm/models/deepseek_v4_1/expert_slots/cache.py
+index 0ebfdbea4..47e2b553b 100644
+--- a/vllm/models/deepseek_v4_1/expert_slots/cache.py
++++ b/vllm/models/deepseek_v4_1/expert_slots/cache.py
+@@ -1895,11 +1895,7 @@ class ExpertSlotCache:
+         ``w13``/``w2`` overlap and FP32 cross-batch accumulation with ``shared``
+         folded once before the final cast.
+         """
+-        rows = topk_ids.shape[0]
+-        if callable(shared):
+-            shared = shared()
+-        final_dtype = torch.bfloat16 if shared is not None else plan.out_dtype
+-        pass_dtype = plan.out_dtype
++        rows, topk = topk_ids.shape
+ 
+         if self._w2_pending:
+             self._ensure_reader_open()
+@@ -1916,8 +1912,15 @@ class ExpertSlotCache:
+ 
+         safe_ids = topk_ids.clamp(min=0)
+         valid_ids = topk_ids >= 0
+-        tmp_out = torch.empty((rows, plan.hidden), dtype=pass_dtype, device=self.device)
++        # Stage per-route BF16 down-projection outputs in (token, k) order so
++        # the final TileLang combine reduces routes in exact k=0..topk-1 order,
++        # bit-identical to ref_plan.run regardless of cache state or wave split.
++        y_all = torch.empty(
++            (rows * topk, plan.hidden), dtype=torch.bfloat16, device=self.device
++        )
+         mask_np = self._batch_mask_host.numpy()
++        last_dispatch = None
++        last_layout = None
+ 
+         if resident_exps.size > 0:
+             self.prefill_windows += 1
+@@ -1927,24 +1930,23 @@ class ExpertSlotCache:
+             masked_ids = torch.where(
+                 valid_ids & self._batch_mask_gpu[safe_ids], topk_ids, -1
+             )
+-            plan.run(
++            last_dispatch, last_layout, y = plan.run_routed(
+                 x,
+                 masked_ids,
+                 topk_weights,
+                 self.weights,
+-                tmp_out,
+                 workspace=workspace,
+-                shared=None,
+                 expert_to_slot=self.expert_to_slot_gpu,
+                 wait_w2=None,
+             )
+-            acc_fp32 = tmp_out.to(torch.float32, copy=True)
++            flat_pos = last_layout["route_pos"].reshape(-1)
++            dst_idx = torch.nonzero(flat_pos >= 0, as_tuple=False).squeeze(1)
++            if dst_idx.numel() > 0:
++                y_all.index_copy_(
++                    0, dst_idx, y.index_select(0, flat_pos.index_select(0, dst_idx))
++                )
+             if cold_exps.size > 0:
+                 torch.cuda.current_stream(self.device).synchronize()
+-        else:
+-            acc_fp32 = torch.zeros(
+-                (rows, plan.hidden), dtype=torch.float32, device=self.device
+-            )
+ 
+         batch_size = max(1, self.dynamic_slots)
+         total_cold = int(cold_exps.size)
+@@ -1958,34 +1960,47 @@ class ExpertSlotCache:
+             masked_ids = torch.where(
+                 valid_ids & self._batch_mask_gpu[safe_ids], topk_ids, -1
+             )
+-            plan.run(
++            last_dispatch, last_layout, y = plan.run_routed(
+                 x,
+                 masked_ids,
+                 topk_weights,
+                 self.weights,
+-                tmp_out,
+                 workspace=workspace,
+-                shared=None,
+                 expert_to_slot=self.expert_to_slot_gpu,
+                 wait_w2=wait_w2,
+             )
+-            acc_fp32.add_(tmp_out)
++            flat_pos = last_layout["route_pos"].reshape(-1)
++            dst_idx = torch.nonzero(flat_pos >= 0, as_tuple=False).squeeze(1)
++            if dst_idx.numel() > 0:
++                y_all.index_copy_(
++                    0, dst_idx, y.index_select(0, flat_pos.index_select(0, dst_idx))
++                )
+             if wait_w2 is not None:
+                 wait_w2()
+             if batch_start + batch_size < total_cold:
+                 torch.cuda.current_stream(self.device).synchronize()
+ 
+-        if shared is not None:
+-            acc_fp32.add_(shared)
+-
++        assert last_dispatch is not None and last_layout is not None
++        combine_route_pos = torch.where(
++            valid_ids,
++            torch.arange(rows * topk, dtype=torch.int32, device=self.device).view(
++                rows, topk
++            ),
++            torch.tensor(-1, dtype=torch.int32, device=self.device),
++        )
++        combine_layout = {
++            "route_pos": combine_route_pos,
++            "layout_weights": last_layout["layout_weights"],
++        }
++        if callable(shared):
++            shared = shared()
+         if out is not None:
+-            out.copy_(acc_fp32)
+-            return out
+-
+-        final_out = acc_fp32.to(final_dtype)
++            return last_dispatch.combine(y_all, combine_layout, out, shared=shared)
+ 
+         def combine(start: int, stop: int, rows_out: torch.Tensor) -> None:
+-            rows_out.copy_(final_out[start:stop])
++            last_dispatch.combine(
++                y_all, combine_layout, rows_out, shared=shared, start=start, stop=stop
++            )
+ 
+         return combine
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 7ab4c8650..0b6e29cba 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -2378,6 +2378,41 @@ class MoeExpertsV41Plan:
+         and ``shared`` (a callable one is still called here), which must stay
+         unchanged until its last call.
+         """
++        dispatch, layout, y = self.run_routed(
++            x,
++            topk_ids,
++            topk_weights,
++            weights,
++            workspace=workspace,
++            expert_to_slot=expert_to_slot,
++            wait_w2=wait_w2,
++        )
++        if callable(shared):
++            shared = shared()
++        if out is not None:
++            return dispatch.combine(y, layout, out, shared=shared)
++
++        def combine(start, stop, rows_out):
++            dispatch.combine(y, layout, rows_out, shared=shared, start=start, stop=stop)
++
++        return combine
++
++    def run_routed(
++        self,
++        x: MXFP8Rows,
++        topk_ids,
++        topk_weights,
++        weights,
++        workspace=None,
++        *,
++        expert_to_slot=None,
++        wait_w2=None,
++    ):
++        """Run dispatch, gate_up/swiglu, and down without combining routes.
++
++        Returns ``(dispatch, layout, y)`` where ``y`` holds the BF16 per-route
++        down-projection rows addressed by ``layout["route_pos"]``.
++        """
+         rows = topk_ids.shape[0]
+         dispatch = self._dispatch_for(rows, topk_ids.dtype)
+         gate_up_kernel, swiglu_kernel, down_kernel = self._kernels_for(rows)
+@@ -2420,15 +2455,7 @@ class MoeExpertsV41Plan:
+         if wait_w2 is not None:
+             wait_w2()
+         down_kernel(hq, h_words, *_present(down), order, tile_expert, y)
+-        if callable(shared):
+-            shared = shared()
+-        if out is not None:
+-            return dispatch.combine(y, layout, out, shared=shared)
+-
+-        def combine(start, stop, rows_out):
+-            dispatch.combine(y, layout, rows_out, shared=shared, start=start, stop=stop)
+-
+-        return combine
++        return dispatch, layout, y
+ 
+ 
+ def _present(weights):
+-- 
+2.43.0
+

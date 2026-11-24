@@ -1,0 +1,117 @@
+From fd2e82c64fb1dc8e4d48a8d5f89a9f626db02593 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:47:51 +0100
+Subject: [PATCH 859/860] perf(dsv41): enable intra-stage prefill sequence
+ parallelism under PP > 1
+
+Allow DeepSeek-V4.1 prefill sequence parallelism within each TP > 1 pipeline
+stage while preserving the full-row IntermediateTensors PP wire ABI: non-first
+stages slice incoming hidden_states and pre_mix into local SP rows at entry,
+and non-last stages gather them via sp.gather_many before packing
+IntermediateTensors. Also fix prepare_disk_engram when Engram layers [1, 14]
+are split across separate pipeline stages.
+
+Zero behavior change when pipeline_parallel_size == 1.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Lifts PP=2, TP=2 prefill by +16.1% at 32K (5,572 -> 6,471 tok/s) and +16.2% at 131K (5,728 -> 6,655 tok/s) with zero memory or decode regression.
+Quality: Exact intra-stage SP; verified LRU 5/5 on live PP=2, TP=2.
+Tests: pytest tests/models/test_deepseek_v4_1_sp_prefill.py -k test_resolve_min_rows
+Upstream-status: Local PP+SP prefill optimization.
+---
+ tests/models/test_deepseek_v4_1_sp_prefill.py |  4 +++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 19 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |  2 --
+ 3 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index b38cb4dca..c0b792d1a 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -121,9 +121,11 @@ def test_resolve_min_rows(monkeypatch):
+     assert sp_prefill.resolve_min_rows(_config()) == 49
+     assert sp_prefill.resolve_min_rows(_config(capture=512)) == 513
+     assert sp_prefill.resolve_min_rows(_config(capture=None, spec_tokens=None)) == 9
++    # Intra-stage TP sequence parallelism runs under PP > 1 when TP > 1.
++    assert sp_prefill.resolve_min_rows(_config(pp=2)) == 49
+     for disabled in (
+         _config(tp=1),
+-        _config(pp=2),
++        _config(tp=1, pp=2),
+         _config(boundary=True),
+     ):
+         assert sp_prefill.resolve_min_rows(disabled) == 0
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 564cb1464..cefd86b2f 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -852,6 +852,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     by_layer[engram.layer_hash_index],
+                 )
+             return
++        if isinstance(early, tuple) and len(early) == 2:
++            early_0, early_1_or_fn = early
++            for engram in engrams:
++                idx = engram.layer_hash_index
++                layer_early = (
++                    early_0
++                    if idx == 0
++                    else (early_1_or_fn() if callable(early_1_or_fn) else early_1_or_fn)
++                )
++                engram.stage_rows(tokens, stream, layer_early)
++            return
+         for engram in engrams:
+             engram.stage_rows(
+                 tokens,
+@@ -981,6 +992,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         else:
+             assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
++            if sp is not None:
++                hidden_states = sp.local_slice(hidden_states)
+ 
+         engram_hashes: torch.Tensor | None = None
+         engram_mask: torch.Tensor | None = None
+@@ -1038,6 +1051,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         if not get_pp_group().is_first_rank:
+             assert intermediate_tensors is not None
+             pre_mix = intermediate_tensors["pre_mix"]
++            if sp is not None:
++                pre_mix = sp.local_slice(pre_mix)
+         decoder_compacted = False
+         if (
+             ced_indices is not None
+@@ -1206,7 +1221,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     # Reconstruct the aux hidden state for draft models
+                     aux_out = (
+                         self._graph_out(
+-                            self._aux_slot_base_cached + len(aux_hidden_states),
++                            getattr(self, "_aux_slot_base_cached", 0) + len(aux_hidden_states),
+                             full_num_tokens,
+                         )
+                         if sp is None and not decoder_compacted
+@@ -1329,6 +1344,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             del final_aux_recon, residual, post_mix, res_mix
+ 
+         if not last_rank:
++            if sp is not None:
++                hidden_states, pre_mix = sp.gather_many(hidden_states, pre_mix)
+             if decoder_compacted:
+                 hidden_states = scatter_rows(
+                     hidden_states, ced_indices, full_num_tokens
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 8feae849b..39f7a0cd5 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -153,8 +153,6 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) ->
+     reason = None
+     if parallel.tensor_parallel_size <= 1:
+         reason = "tensor parallel size is 1"
+-    elif parallel.pipeline_parallel_size != 1:
+-        reason = "pipeline parallelism keeps full-row intermediate tensors"
+     elif static_sequence_parallel:
+         reason = "static sequence parallelism is enabled"
+     elif vllm_config.use_request_boundary_checkpoints:
+-- 
+2.43.0
+

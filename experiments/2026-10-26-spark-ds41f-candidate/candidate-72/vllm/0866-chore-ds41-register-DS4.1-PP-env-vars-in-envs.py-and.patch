@@ -1,0 +1,87 @@
+From 8ab1ced62dd121db7dca20752775e76da7b8d9df Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:42:41 +0100
+Subject: [PATCH] chore(ds41): register DS4.1/PP env vars in envs.py and chunk
+ expert prefill y_all scatter
+
+Register VLLM_PP_SPARKNET_P2P, VLLM_DS41_EXPERT_HOTLIST, VLLM_DS41_EXPERT_HOTLIST_MODE, VLLM_DS41_EXPERT_FAST_LOOKAHEAD, and VLLM_DS41_EXPERT_PREFILL_MODE in vllm/envs.py so startup emits no unknown-env warnings.
+
+Also chunk the y_all.index_copy_ route gather in ExpertSlotCache._run_expert_centric_prefill into 2048-route slices (~20 MiB peak temporary instead of ~320 MiB full-wave index_select) while preserving bit-exact output.
+---
+ vllm/envs.py                                   | 16 ++++++++++++++++
+ .../models/deepseek_v4_1/expert_slots/cache.py | 18 ++++++++++--------
+ 2 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 8df168342..3c16b2e8d 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -236,6 +236,11 @@ if TYPE_CHECKING:
+     VLLM_DS41_EXPERT_CACHE_DIR: str | None = None
+     VLLM_DS41_EXPERT_HALF_LIFE: float = 64.0
+     VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS: int = 24
++    VLLM_DS41_EXPERT_PREFILL_MODE: str = "expert"
++    VLLM_DS41_EXPERT_HOTLIST: str | None = None
++    VLLM_DS41_EXPERT_HOTLIST_MODE: str = "pure"
++    VLLM_DS41_EXPERT_FAST_LOOKAHEAD: bool = False
++    VLLM_PP_SPARKNET_P2P: bool = False
+     WEIGHTLESS_STEER_PATH: str | None = None
+     WEIGHTLESS_STEER_MODEL: str | None = None
+     WEIGHTLESS_STEER_ALPHA: str | None = None
+@@ -1964,6 +1969,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": lambda: int(
+         os.getenv("VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS", "24")
+     ),
++    "VLLM_DS41_EXPERT_PREFILL_MODE": lambda: os.getenv(
++        "VLLM_DS41_EXPERT_PREFILL_MODE", "expert"
++    ),
++    "VLLM_DS41_EXPERT_HOTLIST": lambda: os.getenv("VLLM_DS41_EXPERT_HOTLIST") or None,
++    "VLLM_DS41_EXPERT_HOTLIST_MODE": lambda: os.getenv(
++        "VLLM_DS41_EXPERT_HOTLIST_MODE", "pure"
++    ),
++    "VLLM_DS41_EXPERT_FAST_LOOKAHEAD": lambda: bool(
++        int(os.getenv("VLLM_DS41_EXPERT_FAST_LOOKAHEAD", "0"))
++    ),
++    "VLLM_PP_SPARKNET_P2P": lambda: bool(int(os.getenv("VLLM_PP_SPARKNET_P2P", "0"))),
+     # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
+     # the served model name whose requests alone it steers (vllm/weightless.py),
+     # set together or not at all. Part of the compile key, as every variable here
+diff --git a/vllm/models/deepseek_v4_1/expert_slots/cache.py b/vllm/models/deepseek_v4_1/expert_slots/cache.py
+index 47e2b553b..05137d44d 100644
+--- a/vllm/models/deepseek_v4_1/expert_slots/cache.py
++++ b/vllm/models/deepseek_v4_1/expert_slots/cache.py
+@@ -1941,10 +1941,11 @@ class ExpertSlotCache:
+             )
+             flat_pos = last_layout["route_pos"].reshape(-1)
+             dst_idx = torch.nonzero(flat_pos >= 0, as_tuple=False).squeeze(1)
+-            if dst_idx.numel() > 0:
+-                y_all.index_copy_(
+-                    0, dst_idx, y.index_select(0, flat_pos.index_select(0, dst_idx))
+-                )
++            n_hit = int(dst_idx.numel())
++            for off in range(0, n_hit, 2048):
++                sub_dst = dst_idx[off : off + 2048]
++                sub_src = flat_pos.index_select(0, sub_dst)
++                y_all.index_copy_(0, sub_dst, y.index_select(0, sub_src))
+             if cold_exps.size > 0:
+                 torch.cuda.current_stream(self.device).synchronize()
+ 
+@@ -1971,10 +1972,11 @@ class ExpertSlotCache:
+             )
+             flat_pos = last_layout["route_pos"].reshape(-1)
+             dst_idx = torch.nonzero(flat_pos >= 0, as_tuple=False).squeeze(1)
+-            if dst_idx.numel() > 0:
+-                y_all.index_copy_(
+-                    0, dst_idx, y.index_select(0, flat_pos.index_select(0, dst_idx))
+-                )
++            n_hit = int(dst_idx.numel())
++            for off in range(0, n_hit, 2048):
++                sub_dst = dst_idx[off : off + 2048]
++                sub_src = flat_pos.index_select(0, sub_dst)
++                y_all.index_copy_(0, sub_dst, y.index_select(0, sub_src))
+             if wait_w2 is not None:
+                 wait_w2()
+             if batch_start + batch_size < total_cold:
+-- 
+2.43.0
+

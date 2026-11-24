@@ -1,0 +1,37 @@
+{
+  "notes": "candidate-71 at tp2-switched: vLLM 0001..0865 (tree ca4b59280d92), bit-exact expert-centric prefill streaming (0858/0865), 240/64 expert slots, 6.00 GiB KV (6.44M tok, 24.58x 256K), 8K batched, PIECEWISE adaptive verification (row_cost=0.25, DEAD_ROWS_TAU=0.45), bundled 5-domain held-out hotlist + BF16 fast lookahead (0863) + TileLang down_num_stages=3 (0864)",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-69/tp2-switched.json"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:candidate-71-r2",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "ca4b59280d9211433442f6e1f529386d1497db58",
+        "local.spark-ds41f.sparknet.tree": "7794c85affdc85c595abfa6fb07b568bb8f719ff"
+      }
+    },
+    "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-71/upstreams.lock.json",
+    "sizing": {
+      "max_num_batched_tokens": 8192,
+      "kv_cache_memory_bytes": 6442450944
+    },
+    "speculative": {
+      "enable_adaptive_verification": true,
+      "adaptive_verification_row_cost": 0.25
+    },
+    "environment": {
+      "VLLM_DS41_EXPERT_SLOTS": "240",
+      "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.45",
+      "VLLM_DS41_EXPERT_FAST_LOOKAHEAD": "1",
+      "VLLM_DS41_EXPERT_HOTLIST": "multidomain",
+      "VLLM_DS41_EXPERT_HOTLIST_MODE": "pure"
+    }
+  },
+  "serve_options": {
+    "--kv-cache-memory-bytes": "6442450944",
+    "--max-num-batched-tokens": "8192",
+    "--long-prefill-token-threshold": "8168",
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":2,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.25}"
+  }
+}

@@ -1,0 +1,289 @@
+From 32d6ab273e89923c6fea2fa8c415f8887b1da325 Mon Sep 17 00:00:00 2001
+From: James Meadlock <jmeadlock@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:45:00 -0600
+Subject: [PATCH] fix(dsv41): rotate decode queries on a rank dealt no index
+ rows
+
+Base: vLLM 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 plus the candidate-72
+series (0001..0867).
+
+Rationale:
+1. The overlapped decode path (0767) defers q's RoPE and shared decode
+   metadata to the aux stream and previously launched them inline inside
+   select_rows' loop over this rank's index chunks, beside _index_chunk.
+2. _decode_index_split deals a decode step's index rows across TP ranks
+   (SPRows(rows, tp, rank): ceil(rows / tp) rows each, in rank order) once
+   the step has 24 rows or more, or on an eager decode past 16,384 tokens.
+3. When (tp - 1) * ceil(rows / tp) >= rows the last rank is dealt no rows
+   (e.g. TP8 at 25..28, 33..35, 41, 42, and 49 rows; eager long-context TP3
+   at 4 and TP4 at 5, 6, and 9 rows). _index_query returns empty queries for
+   it, select() never enters the chunk loop, and the deferred _rope(q) never
+   runs. On TP8 (where rank 7 owns 8 local heads), forward_mqa then attends
+   with un-rotated queries on every layer with an indexer.
+4. Extract _launch_pending_decode_aux() on DeepseekV4Attention and guard it
+   with a single-shot issue_pending_aux() helper in forward_mqa that runs
+   once per overlapped decode forward: beside the first _index_chunk on
+   non-empty slices, right after select() before gather on empty rank-split
+   slices (so RoPE overlaps with the all-gather), and before every
+   wait_stream(pending_aux) join. This also prevents duplicate RoPE launches
+   across multi-chunk scoring or _INDEX_SPLIT_CHECK reference passes, and
+   skips empty aux-stream work on headless ranks (n_local_heads == 0).
+
+Quality:
+Output-changing only on affected empty-slice rank-split steps, restoring the
+same RoPE arithmetic those rows receive in every other step size. Non-empty
+single-chunk steps issue the same kernels on the same streams in the same
+order. Measured in experiments/2026-11-23-decode-rope-empty-index-slice.
+
+Tests:
+- tests/models/test_deepseek_v4_1_attention.py: extend
+  test_decode_two_stream_overlap_schedules_disjoint_workspaces to cover an
+  empty rank-split slice (asserting rope(q) and decode_metadata run once on
+  aux before gather and attend), a non-empty rank-split slice, multi-chunk
+  scoring idempotence (DECODE_CHUNK=2 on 4 rows), and a headless rank
+  (n_local_heads=0) dealt no index rows.
+
+Upstream status: local DeepSeek V4.1 TileLang decode overlap; nothing to send
+upstream.
+---
+ tests/models/test_deepseek_v4_1_attention.py | 87 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py       | 90 ++++++++++++++------
+ 2 files changed, 149 insertions(+), 28 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 8019f38a9..c04aea501 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -1901,6 +1901,93 @@ def test_decode_two_stream_overlap_schedules_disjoint_workspaces(monkeypatch):
+     assert ("index_chunk", "main") in names_reidx
+     assert ("attend", "main") in names_reidx
+ 
++    # A rank-split decode step (24 rows or more, or a long eager decode) deals
++    # index rows across TP ranks. The deferred rope(q) and shared decode
++    # metadata must still run once per forward on a rank dealt no rows (which
++    # scores no index chunk, e.g. rank 7 of 25..28 rows at TP8), issued before
++    # gather so they overlap with the all-gather; and must run only once across
++    # multiple index chunks and stay skipped on headless ranks (n_local_heads=0).
++    module.compressor = comp
++
++    class _FakeSplit:
++        local_rows = 2
++
++        def __init__(self, start, real_rows):
++            self.start, self.real_rows = start, real_rows
++
++        def gather(self, x):
++            events.append(("gather", active_stream[0].name))
++            return torch.zeros(4, 512, dtype=torch.int32)
++
++    def _reset_forward_state():
++        events.clear()
++        for key in [k for k in vars(ctx) if k != "attn_metadata"]:
++            delattr(ctx, key)
++
++    for split in (_FakeSplit(4, 0), _FakeSplit(0, 2)):
++        _reset_forward_state()
++        monkeypatch.setattr(
++            cls, "_decode_index_split", lambda self, *a, _split=split: _split
++        )
++        module._forward(
++            torch.arange(4, dtype=torch.int64),
++            torch.zeros(4, 32, dtype=torch.bfloat16),
++        )
++        real = split.real_rows
++        assert [e for e in events if e[:2] == ("rope", "q")] == [
++            ("rope", "q", "aux")
++        ], real
++        assert events.count(("decode_metadata", "aux")) == 1, real
++        assert events.count(("index_chunk", "main")) == (1 if real else 0), real
++        assert events.count(("gather", "main")) == 1, real
++        assert events.count(("attend", "main")) == 1, real
++        assert events.index(("rope", "q", "aux")) < events.index(("gather", "main")), real
++        assert events.index(("rope", "q", "aux")) < events.index(("attend", "main")), real
++
++    # Multi-chunk scoring with pending_aux issues deferred aux work once, not
++    # once per chunk (also guards reference-check passes with _INDEX_SPLIT_CHECK).
++    _reset_forward_state()
++    monkeypatch.setattr(module, "DECODE_CHUNK", 2)
++    module._pending_decode_aux = aux_s
++    q_multi = torch.zeros(4, 2, 512, dtype=torch.bfloat16)
++    out_multi = torch.empty_like(q_multi)
++    iq_multi = (
++        torch.zeros(4, 4, 64, dtype=torch.uint8),
++        torch.zeros(4, 4, 4, dtype=torch.uint8),
++        torch.ones(4, 4, dtype=torch.bfloat16),
++        None,
++        None,
++    )
++    module.forward_mqa(
++        q_multi,
++        None,
++        torch.arange(4, dtype=torch.int64),
++        out_multi,
++        index_query=iq_multi,
++    )
++    assert events.count(("index_chunk", "main")) == 2
++    assert [e for e in events if e[:2] == ("rope", "q")] == [("rope", "q", "aux")]
++    assert events.count(("decode_metadata", "aux")) == 1
++    assert events.count(("attend", "main")) == 1
++
++    # Headless rank dealt no index rows skips RoPE, decode metadata, and attend,
++    # while still completing the rank-split gather.
++    _reset_forward_state()
++    monkeypatch.setattr(module, "DECODE_CHUNK", 64)
++    monkeypatch.setattr(
++        cls, "_decode_index_split", lambda self, *a: _FakeSplit(4, 0)
++    )
++    module.n_local_heads = 0
++    module._forward(
++        torch.arange(4, dtype=torch.int64),
++        torch.zeros(4, 32, dtype=torch.bfloat16),
++    )
++    assert [e for e in events if e[:2] == ("rope", "q")] == []
++    assert events.count(("decode_metadata", "aux")) == 0
++    assert events.count(("index_chunk", "main")) == 0
++    assert events.count(("gather", "main")) == 1
++    assert events.count(("attend", "main")) == 0
++
+ 
+ @pytest.mark.parametrize("is_decode", [False, True])
+ @pytest.mark.parametrize("n_real", [4, 2, 0])
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 8802e42fc..45d37dc8c 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1920,6 +1920,52 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             bad_candidates,
+         )
+ 
++    def _launch_pending_decode_aux(
++        self,
++        aux_stream,
++        q,
++        positions,
++        swa,
++        metadata,
++        rows,
++        decode_rows,
++        pad_mask,
++    ):
++        """Issue the overlapped decode path's deferred ``q`` RoPE and shared
++        decode metadata on ``aux_stream`` after synchronizing the current stream
++        with the prior aux-stream index-query work.
++
++        Must run once per overlapped decode forward before joining
++        ``aux_stream``, even when a rank-split index step deals this rank no
++        rows so ``select_rows`` scores no chunk.
++        """
++        main_stream = torch.cuda.current_stream(q.device)
++        main_stream.wait_stream(aux_stream)
++        if self.n_local_heads <= 0:
++            return
++        main_meta = (
++            self._query_metadata(metadata[self._owner().prefix])
++            if self.compress_ratio
++            else None
++        )
++        decode_specs = self._attention_workspace_specs["decode"]
++        q.record_stream(aux_stream)
++        with torch.cuda.stream(aux_stream):
++            self._rope(q, positions, "q")
++            if not decode_rows:
++                meta_bufs = self._shared_decode_metadata(
++                    swa,
++                    main_meta,
++                    rows,
++                    decode_specs,
++                    q.device,
++                    is_padding=pad_mask,
++                )
++            else:
++                meta_bufs = ()
++        for buf in meta_bufs:
++            buf.record_stream(main_stream)
++
+     @eager_break_during_capture
+     def forward_mqa(
+         self,
+@@ -1958,6 +2004,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # Only the score matrix needs row chunking. All selected positions
+         # survive in the source-owned buffer until their reuse interval ends.
+         pad_mask = self._decode_is_padding(swa, rows)
++        pending_aux_to_issue = pending_aux
++
++        def issue_pending_aux():
++            nonlocal pending_aux_to_issue
++            aux = pending_aux_to_issue
++            if aux is None:
++                return
++            pending_aux_to_issue = None
++            self._launch_pending_decode_aux(
++                aux, q, positions, swa, metadata, rows, decode_rows, pad_mask
++            )
++
+         if self.indexer is not None:
+             index_mode = "decode" if mode == "decode" else "prefill"
+             *query, split, reference = index_query
+@@ -2094,34 +2152,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                             candidate_indices=source._candidates[row:row_end],
+                             candidate_lengths=source._candidate_lens[row:row_end],
+                         )
+-                    if pending_aux is not None:
+-                        main_stream = torch.cuda.current_stream(q.device)
+-                        main_stream.wait_stream(pending_aux)
+-                        main_meta = (
+-                            self._query_metadata(
+-                                metadata[self._owner().prefix]
+-                            )
+-                            if self.compress_ratio
+-                            else None
+-                        )
+-                        decode_specs = self._attention_workspace_specs["decode"]
+-                        q.record_stream(pending_aux)
+-                        with torch.cuda.stream(pending_aux):
+-                            if self.n_local_heads > 0:
+-                                self._rope(q, positions, "q")
+-                            if self.n_local_heads > 0 and not decode_rows:
+-                                meta_bufs = self._shared_decode_metadata(
+-                                    swa,
+-                                    main_meta,
+-                                    rows,
+-                                    decode_specs,
+-                                    q.device,
+-                                    is_padding=pad_mask,
+-                                )
+-                            else:
+-                                meta_bufs = ()
+-                        for buf in meta_bufs:
+-                            buf.record_stream(main_stream)
++                    issue_pending_aux()
+                     self._index_chunk(
+                         index_mode,
+                         count,
+@@ -2137,6 +2168,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+             if split is None:
+                 select(query, 0, self.topk_indices_buffer)
++                issue_pending_aux()
+                 if pending_aux is not None:
+                     torch.cuda.current_stream(device).wait_stream(pending_aux)
+                     pending_aux = None
+@@ -2172,6 +2204,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         self._candidates[local].fill_(-2)
+                         self._candidate_lens[local].fill_(-2)
+                 select(query, split.start, selected)
++                issue_pending_aux()
+                 if reference is not None:
+                     self._check_index_split(
+                         split, selected, expected, repeat, expected_candidates
+@@ -2187,6 +2220,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+ 
+         if pending_aux is not None:
++            issue_pending_aux()
+             torch.cuda.current_stream(device).wait_stream(pending_aux)
+         if getattr(self, "n_local_heads", 1) == 0:
+             if wait_selected is not None:
+-- 
+2.43.0
+

@@ -1,0 +1,79 @@
+From 13ed528a25a25ce3b3d9e42a22ac683a3fce0fc1 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:09:29 +0100
+Subject: [PATCH 862/864] perf(pp): async zero-sync PP adaptive verification
+ and engine-request concurrency
+
+---
+ .../gpu/spec_decode/adaptive_verification.py  | 34 +++++++++++++++----
+ 1 file changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index af7495fe2..f084c3edf 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -60,7 +60,10 @@ SINGLE_REQ_TILE_SPILL_SCALE = 2.0
+ # distinct experts per live draft row (~+2.5-4.1 ms/row) without cross-request
+ # coalescing; scale the calibrated c1 row cost accordingly while leaving
+ # multi-request concurrency (c2..c16) and long copy-draft proposals untouched.
+-SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = 2.5
++SINGLE_REQ_CALIBRATED_ROW_COST_SCALE = float(
++    os.environ.get("SPARK_DS41F_C1_ROW_COST_SCALE", "2.5")
++)
++_PP_USE_ENGINE_REQS = os.environ.get("SPARK_DS41F_PP_USE_ENGINE_REQS", "0") == "1"
+ WIDE_ROW_COST_KNEE = 32
+ CALIBRATED_HIGH_ROW_COST_SCALE = 0.65
+ CALIBRATED_WIDE_ROW_COST_SCALE = 0.50
+@@ -412,11 +415,24 @@ class AdaptiveVerificationManager:
+             self._confidence_probs.index_copy_(0, idx_long, conf_slice[0])
+             if self._confidence_buffer.shape[0] > 1:
+                 self._planned_probs.index_copy_(0, idx_long, conf_slice[-1])
+-        with gpu_sync_allowed():
+-            planned_np = conf_slice[-1].detach().cpu().numpy()
+-            cal = bool(int(is_calibrated_tensor.item()))
+-        self._stale_confidences[self._stale_idx].np[idx_mapping_np] = planned_np
+-        self._pp_calibrated_override = cal
++        if getattr(self, "_pp_calibrated_override", None) is None:
++            with gpu_sync_allowed():
++                self._pp_calibrated_override = bool(int(is_calibrated_tensor.item()))
++        if idx_mapping.is_cuda and getattr(self, "_copy_stream", None) is not None:
++            write_idx = 1 - self._stale_idx
++            current_stream = torch.cuda.current_stream(self.req_states.device)
++            self._copy_stream.wait_stream(current_stream)
++            with torch.cuda.stream(self._copy_stream):
++                self._stale_confidences[write_idx].cpu.copy_(
++                    self._planned_probs, non_blocking=True
++                )
++                self._copy_events[write_idx].record(self._copy_stream)
++            self._stale_idx = write_idx
++            self._pp_async_copy_pending = True
++        else:
++            with gpu_sync_allowed():
++                planned_np = conf_slice[-1].detach().cpu().numpy()
++            self._stale_confidences[self._stale_idx].np[idx_mapping_np] = planned_np
+ 
+     def _is_calibrated(self) -> bool:
+         override = getattr(self, "_pp_calibrated_override", None)
+@@ -634,6 +650,8 @@ class AdaptiveVerificationManager:
+         verifying_mask = eligible_drafts > 0
+         num_verification_reqs = int(np.count_nonzero(verifying_mask))
+         eff_reqs = num_verification_reqs if num_verification_reqs > 0 else num_reqs
++        if _PP_USE_ENGINE_REQS:
++            eff_reqs = max(eff_reqs, len(self.req_states.req_id_to_index))
+         tau = self.effective_dead_rows_tau(num_reqs=eff_reqs)
+         if (
+             num_reqs == 1
+@@ -648,6 +666,10 @@ class AdaptiveVerificationManager:
+             draft_budget = max_draft_budget
+             self._step_dead_rows_tau = tau
+         else:
++            if getattr(self, "_pp_async_copy_pending", False):
++                with gpu_sync_allowed():
++                    self._copy_events[self._stale_idx].synchronize()
++                self._pp_async_copy_pending = False
+             stale_confidences = self._stale_confidences[self._stale_idx].np[
+                 slots, :step_steps
+             ]
+-- 
+2.43.0
+
