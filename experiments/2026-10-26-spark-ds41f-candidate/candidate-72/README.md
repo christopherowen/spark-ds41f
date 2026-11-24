@@ -145,6 +145,59 @@ After reviewing the opt-in buffered atomic admission patch (PR #1141): it only a
   - Live `tp4-ring` smoke (`+81.4 s`): `GLP-27 alpha=2.0` loaded cleanly, zero unknown-env warnings, zero `TP8_*` debug logs; `scripts/sonar_determinism.py --wide`: **`0` token diffs, `0` logprob diffs** across all 6 scenarios (`reference_sha256 = 18d619615e51c7df...`, `long_sha256 = 547c1c1cbf911045...`, bit-identical to `candidate-72` r1).
   - Production `tp4-ring` (`config/cluster.json`, `spark-ds41f:1122`, `origin/main` @ `945d95d03`) restored (`+80.0 s`) and verified with `bin/spark --cluster-config config/cluster.json doctor --live`.
 
+## Revision `candidate-72-r3` (Full Step 9 Release Qualification)
+
+Date: 2026-11-24.
+Commit: `5099b083f6` (on `origin/candidate-72`, rebased onto `origin/main` `75fb3e72c6` after reverting premature `spark-ds41f-1122`).
+
+### Delta Over `candidate-72-r2`
+
+Running the full 174-file `release-tests` bundle on `candidate-72-r2` uncovered 6 test/stub compatibility failures (`6 failed, 12073 passed, 356 skipped`). Added vLLM patch `0867` (`0867-fix-tests-restore-release-test-compatibility-for-PP2.patch`, `740` patches total, `patch_head = 8d5315174cb88b84d48305e3418f757b471d7f22`, `expected_tree = 7eef5cb24aa415faa91b62cc89da810255944bcf`, `patchset_sha256 = 90c4f7f875d45a6ace0e6f51cfca7777b6190365ba2e62acb06f2de519456afa`):
+- Defensive `getattr(...)` guards for optional stub attributes in `vllm/v1/core/sched/scheduler.py` (`force_thinking_end`, `_last_prefill_output_id`, `num_verification_tokens`) and `vllm/v1/worker/gpu/model_runner.py` (`is_last_pp_rank`, `pp_handler`, `speculative_config`) — zero runtime behavior change.
+- Updated `tests/models/test_deepseek_v4_1_engram.py` (mock local Engram decoder layer under `0853` PP stage ownership), `tests/v1/worker/test_gpu_model_runner_v2.py` (assert `0860` `broadcast_drafts` confidence kwargs), and `tests/v1/worker/test_prepare_kernels.py` (`speculative_config` on `is_last_pp_rank=False` stub).
+- Classified all 10 new vLLM test files in `config/release-tests.json` (`174` gate files, `0` problems).
+
+### Image & Static / Release-Test Verification
+
+- **Image**: `spark-ds41f:candidate-72-r3` (superseded `candidate-72-r2` deleted from `dgx1..dgx4`).
+  - OCI digest: `sha256:3587a2b177a6e7fcff8abccfd90d79fe9b87dfd5220037494eff2ea4b1f36fda`
+  - Labels: `local.spark-ds41f.vllm.tree=7eef5cb24aa415faa91b62cc89da810255944bcf`, `local.spark-ds41f.sparknet.tree=1739407706277142da7a12c95fca3c503c8cb11c`
+  - Distributed along `dgx4 -> dgx3-internal -> dgx2-internal -> dgx1-internal`; identical `56` `RootFS.Layers` (`layers_sha = 85aa1db09dcbd8cf`) verified on all 4 nodes.
+- **Full Linux repo unit suite (`dgx4`)**: **`929 passed, 0 failed`** (`32.30 s`).
+- **Full 174-file `release-tests` bundle (`dgx4`, `receipts/release-tests/verdict.json`)**: **`12,079 passed, 356 skipped, 0 failed`** (`2,965.6 s`, `passed: true`).
+
+### Determinism & Formal `tool_gate` Receipts (`candidate-72-r3`)
+
+| Shape | Determinism Gate | Token / Logprob Diffs | `tool_gate` (`T=0.0, 0.3`, Stock + Weightless) |
+| --- | --- | ---: | --- |
+| `tp4-ring` | `--wide` (`192` tok, 6 scenarios) + `--no-logprobs` | **`0 / 0`** | **`80/80` strict PASS (`0` derailments)** |
+| `pp2-tp2-ring` (`24.0 GiB` KV) | `--wide` (`192` tok, 6 scenarios) + `--no-logprobs` | **`0 / 0`** | **`80/80` strict PASS (`0` derailments)** |
+| `tp2-direct` (`240/64` + `0866`) | `--tokens 128` (5 scenarios) | **`0 / 0`** | — |
+| `tp1` (`96/48` + `0866`) | `--tokens 128` (5 scenarios) | **`0 / 0`** | — |
+
+### `tp4-ring` Two-Boot Sonar Release Qualification vs `spark-ds41f-1120`
+
+Receipts in `receipts/tp4-ring/{release,single-stream,sampled}-table.txt` and `c{16,8,4}-distinct.json`:
+- **Startup time**: `+80.0–82.0 s` vs `spark-ds41f:1120`'s `+113.0–116.3 s` (**`-33 s` faster**).
+- **`distinct_streams` (`4` samples × `256` tok)**: `c16 = 281.23 ±0.39% tok/s`, `c8 = 209.92 ±0.65% tok/s`, `c4 = 163.32 ±0.19% tok/s` (`0` foreign requests).
+- **Vs recorded Nov 19 `manifests/suites/2026-11-20-spark-ds41f-1120-tp4`**:
+  - `prefill 1,000,000`: **`+1.24% ±0.63%` better** (`32K..512K`, `poisson`, `stall-3/11/15`, and `grid` geometric mean `+0.20%`: all `same`).
+  - Decode showed `-0.85%..-1.22%` vs Nov 19 recorded `1120` (`c1 -0.93%`, `c8 -1.22%`, `c16 -0.85%`, `sampled c1/c8/c16 -0.88%/-1.13%/-1.06%`).
+- **Same-session `spark-ds41f:1120` control (`docs/release-benchmark.md` ABBA confirmation)**:
+  - `1120` itself ran `-1.65%` slower on the aged host (`c16`: `280.43 -> 275.79 tok/s`), confirming session drift rather than a candidate regression.
+  - Head-to-head in the same session (`1120-ctrl -> c72r3`, both candidate boots): **`single-stream c1 +0.82% ±0.11%` better** (`86.76 -> 87.36 / 87.60 tok/s`, `TTFT paired -0.52% better`, `TPOT p50 -1.16%`), **`c16 +0.61%` faster** (`275.79 -> 277.51 / 277.42 tok/s`), and engine grid `4x24 -2.62%`, `8x24 -2.38%`, `4x12 -1.28%`, `12x72 -1.16%`.
+
+### Two-Boot `bin/spark bench` Summary Across All Four DGX Shapes (`candidate-72-r3`, `receipts/benchmarks/`)
+
+| Shape | Quality | `prose-c1` | `prose-c4` | `prose-c8` | `code-c1` | `code-c4` | `code-c8` | `prefill 32K` | `prefill 131K` | Min `MemAvailable` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tp4-ring` (`16.5 GiB` KV) | `LRU 5/5` | `83.8` | `276.9` | `395.7` | `104.6` | `321.4` | `530.1` | `10,185.2` | `10,453.3` | `>= 14.29 GiB` |
+| `pp2-tp2-ring` (`24.0 GiB` KV) | `LRU 5/5` | `48.0` | `145.0` | `240.1` | `53.7` | `153.4` | `248.3` | `6,585.2` | `6,798.4` | `>= 10.86 GiB` |
+| `tp2-direct` (`240/64` + `0866`) | `LRU 5/5` | `28.1` | `90.7` | — | `30.4` | `91.3` | — | `4,436.6` | `4,730.6` | `>= 8.52 GiB` |
+| `tp1` (`96/48` + `0866`) | `LRU 5/5` | `9.2` | `29.8` | — | `8.4` | `28.2` | — | `2,079.4` (`1K: 330.9`) | — | `>= 8.57 GiB` |
+
+*(Zero swap growth and `0.0 ms` thermal slowdown across all 8 boots. Notes: Spaceports `sp1..sp8` were unreachable during this session because the WireGuard container on `storage` was stopped; AgentX corpus `prepare` on `dgx1` previously OOM'd at `64G` on Oct 25 so AgentX could not run on `dgx1`, matching `1120` which also has no AgentX record.)*
+
 ## Conclusion
 
-`candidate-72-r2` (`spark-ds41f:candidate-72-r2`, `sha256:bca67b12033a...`) is verified end-to-end with zero local `sparknet` patches (`dgx-spark-networking v0.6.0`), `GLP-27` (`alpha=2.0`, `6/6` auto `tool_choice`), `0866` env registration + chunked bit-exact scatter, `24.0 GiB` KV on `pp2-tp2-*` (`30.70M` tokens), strict temperature-0 batch invariance (`0` token diffs, `0` logprob diffs across `tp4-ring`, `pp2-tp2-ring`, and `tp2-direct`), and no experimental opt-in atomic admission path. Ready for promotion review.
+`candidate-72-r3` (`spark-ds41f:candidate-72-r3`, `sha256:3587a2b177a6...`) passed full DGX Step 9 release qualification: `929/929` Linux repo tests, `12,079/12,079` (`174/174` files, `0` failed) in-image release tests, `0/0` strict temperature-0 batch invariance across all four DGX shapes (`tp4-ring`, `pp2-tp2-ring`, `tp2-direct`, `tp1`), `80/80` formal `tool_gate` strict pass on both `tp4-ring` and `pp2-tp2-ring` (`stock` + `deepseek-v4.1-flash-weightless` under `GLP-27 alpha=2.0`), zero local `sparknet` patches (`dgx-spark-networking v0.6.0`), faster same-session `tp4-ring` decode (`c1 +0.82%`, `c16 +0.61%`) and `+1.24%` `1M` prefill vs `spark-ds41f-1120`, `-33 s` faster startup, and `24.0 GiB` KV (`30.70M` tokens) on `pp2-tp2-ring`. Production `spark-ds41f:1120` is restored (`doctor --live OK`) and the cluster hold is released. Ready for release promotion.
