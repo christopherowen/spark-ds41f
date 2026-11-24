@@ -20,8 +20,8 @@ export SHAPE=tp8-switched   # tp2-switched..tp8-switched, or pp2-tp2-switched / 
 
 git clone https://github.com/christopherowen/spark-ds41f.git
 cd spark-ds41f
-git fetch origin "$CANDIDATE"
-git checkout "origin/$CANDIDATE"
+git fetch --tags origin
+git checkout "$CANDIDATE"
 
 export CFG="experiments/2026-10-26-spark-ds41f-candidate/$CANDIDATE/$SHAPE.json"
 ./bin/spark --cluster-config "$CFG" doctor
@@ -36,7 +36,7 @@ Build once on a node with no serving container running, then sync the checkout a
 ./bin/spark --cluster-config "$CFG" build check
 ./bin/spark --cluster-config "$CFG" build image --apply
 
-./bin/spark --cluster-config "$CFG" cluster sync --revision "origin/$CANDIDATE" --apply
+./bin/spark --cluster-config "$CFG" cluster sync --revision "$CANDIDATE" --apply
 ./bin/spark --cluster-config "$CFG" build distribute --apply
 ```
 
