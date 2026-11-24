@@ -37,4 +37,26 @@
 
 ## Receipts
 
-*(Populated upon completion of `candidate-73` build, `release-tests`, cold-boot, determinism, `tool_gate`, and `vision-eval` runs.)*
+- **Image**: `spark-ds41f:candidate-73` (superseded `candidate-72-r5` deleted from `dgx1..dgx4`).
+  - OCI digest: `sha256:cfef8ba79ad807de00ff04a31a779759c9f94fb3f5292fee4e422aa26bb96669`
+  - Labels: `local.spark-ds41f.vllm.tree=0aa091fa2b3dc5ab239816682a4b0f84e209cc58`, `local.spark-ds41f.sparknet.tree=1739407706277142da7a12c95fca3c503c8cb11c`
+  - Distributed along `dgx4 -> dgx3-internal -> dgx2-internal -> dgx1-internal`; identical `56` `RootFS.Layers` (`layers_sha=9dce50cc135da4cf`) verified on all 4 nodes ([`receipts/cold-boot/image-inspect.txt`](receipts/cold-boot/image-inspect.txt)); GPU import smoke passed.
+- **Full Linux repo unit suite (`dgx4`)**: **`929 passed, 0 failed`** (`36.03 s`).
+- **Full `174`-file `release-tests` bundle (`dgx4`, [`receipts/release-tests/verdict.json`](receipts/release-tests/verdict.json))**: **`12,079 passed, 356 skipped, 0 failed`** (`2,976.9 s`, `passed: true`, `exit_code: 0`).
+- **`tp4-ring` cold boot from cleared JIT cache (`bin/spark cache clear --apply`, [`receipts/cold-boot/`](receipts/cold-boot/))**:
+  - Ready at **`+981.2 s`** (`16m 21s`), compiling `536` TileLang kernels (`528` CUDA binaries, `3,737` files) identically on all 4 nodes.
+  - Minimum `MemAvailable` during cold compilation & startup: `dgx1 = 14.00 GiB`, `dgx2 = 12.64 GiB`, `dgx3 = 12.69 GiB`, `dgx4 = 15.43 GiB` (`0.00 GiB` swap growth).
+- **`tp4-ring` warm boot (`spark-ds41f:candidate-73`, [`receipts/cold-boot/warm-boot.log`](receipts/cold-boot/warm-boot.log))**:
+  - Ready at **`+82.2 s`** (vs `spark-ds41f-1120`'s `+113.0–116.3 s`), `0` new TileLang kernels compiled (`3,737` files unchanged across `dgx1..dgx4`), `doctor --live` OK.
+  - Minimum `MemAvailable` during warm startup: `dgx1 = 13.98 GiB`, `dgx2 = 15.94 GiB`, `dgx3 = 13.32 GiB`, `dgx4 = 13.68 GiB` (`0.00 GiB` swap growth).
+- **`tp4-ring` strict temperature-0 determinism ([`receipts/determinism/tp4-ring-wide{,-nologprobs}.jsonl`](receipts/determinism/tp4-ring-wide.jsonl))**:
+  - **`0` token diffs, `0` logprob diffs** across all 6 scenarios (`c8`, `staggered`, `mixed`, `cached`, `again`, `mixed15`), bit-for-bit identical to `spark-ds41f-1120` golden hashes (`reference_sha256 = 18d619615e51...`, `long_sha256 = d65686498eb8...`, `reference_text_sha256 = 0a2dacdde6ff...`, `long_text_sha256 = 12fd825767d2...`).
+- **Formal `tool_gate` (`T=0.0, 0.3`, stock + `deepseek-v4.1-flash-weightless` under `GLP-27 alpha=2.0`, [`receipts/tool-gate/tool-gate-tp4-ring.json`](receipts/tool-gate/tool-gate-tp4-ring.json))**:
+  - **`80/80` strict PASS (`0` derailments)**.
+- **Vision Eval (`2,283` items across 5 public benchmarks, `0` failed, [`receipts/vision-eval/score.txt`](receipts/vision-eval/score.txt))**:
+  - `ChartQA (n=300): 86.00`, `DocVQA (n=300): 94.05`, `OCRBench (n=1,000): 81.40`, `RealWorldQA (n=383): 77.28`, `TextVQA (n=300): 86.10`, **Overall: `83.59`** (vs original TileLang vision baseline `83.36` / B12X reference `83.79`).
+- **Carried-over 2-boot `tp4-ring` Sonar & 4-shape `bin/spark bench` receipts** (identical serving runtime; `0868` is a strict no-op on `TP1..TP4` and `PP2-TP2`, verified bit-identical on `tp4-ring`): see [`candidate-72/README.md`](../candidate-72/README.md#tp4-ring-two-boot-sonar-release-qualification-vs-spark-ds41f-1120).
+
+## Conclusion
+
+`candidate-73` (`spark-ds41f:candidate-73`, `sha256:cfef8ba79ad8...`) passed every DGX Step 9 qualification gate: `929/929` Linux repo tests, `12,079/12,079` (`174/174` files) in-image release tests, cold boot from empty JIT cache (`+981.2 s`, `>= 12.64 GiB` `MemAvailable`), warm boot (`+82.2 s`, `0` new TileLang kernels), `0/0` bit-identical `tp4-ring` determinism, `80/80` strict `tool_gate`, and `83.59` across `2,283` Vision Eval items, plus the carried-over 2-boot Sonar + 4-shape `bin/spark bench` suites from `candidate-72`. Ready for `spark-ds41f-MMDD` release promotion (with switched Spaceport shapes left to community qualification via [`docs/switched-qualification.md`](../../../docs/switched-qualification.md)).
