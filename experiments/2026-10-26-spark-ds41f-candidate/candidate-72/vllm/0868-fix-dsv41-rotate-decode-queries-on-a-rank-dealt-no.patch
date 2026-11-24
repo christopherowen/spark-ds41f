@@ -1,4 +1,4 @@
-From 4c0670f716bb5bf9828226f9ba329f7ad85351c4 Mon Sep 17 00:00:00 2001
+From 32d6ab273e89923c6fea2fa8c415f8887b1da325 Mon Sep 17 00:00:00 2001
 From: James Meadlock <jmeadlock@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 00:45:00 -0600
 Subject: [PATCH] fix(dsv41): rotate decode queries on a rank dealt no index
@@ -46,15 +46,15 @@ Tests:
 Upstream status: local DeepSeek V4.1 TileLang decode overlap; nothing to send
 upstream.
 ---
- tests/models/test_deepseek_v4_1_attention.py | 74 ++++++++++++++++
+ tests/models/test_deepseek_v4_1_attention.py | 87 +++++++++++++++++++
  vllm/models/deepseek_v4_1/attention.py       | 90 ++++++++++++++------
- 2 files changed, 136 insertions(+), 28 deletions(-)
+ 2 files changed, 149 insertions(+), 28 deletions(-)
 
 diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
-index 8019f38a9..866076449 100644
+index 8019f38a9..c04aea501 100644
 --- a/tests/models/test_deepseek_v4_1_attention.py
 +++ b/tests/models/test_deepseek_v4_1_attention.py
-@@ -1901,6 +1901,80 @@ def test_decode_two_stream_overlap_schedules_disjoint_workspaces(monkeypatch):
+@@ -1901,6 +1901,93 @@ def test_decode_two_stream_overlap_schedules_disjoint_workspaces(monkeypatch):
      assert ("index_chunk", "main") in names_reidx
      assert ("attend", "main") in names_reidx
  
@@ -101,13 +101,26 @@ index 8019f38a9..866076449 100644
 +        assert events.index(("rope", "q", "aux")) < events.index(("gather", "main")), real
 +        assert events.index(("rope", "q", "aux")) < events.index(("attend", "main")), real
 +
-+    # Multi-chunk scoring issues deferred aux work once, not once per chunk.
++    # Multi-chunk scoring with pending_aux issues deferred aux work once, not
++    # once per chunk (also guards reference-check passes with _INDEX_SPLIT_CHECK).
 +    _reset_forward_state()
-+    monkeypatch.setattr(cls, "_decode_index_split", lambda self, *a: None)
-+    monkeypatch.setattr(cls, "DECODE_CHUNK", 2)
-+    module._forward(
++    monkeypatch.setattr(module, "DECODE_CHUNK", 2)
++    module._pending_decode_aux = aux_s
++    q_multi = torch.zeros(4, 2, 512, dtype=torch.bfloat16)
++    out_multi = torch.empty_like(q_multi)
++    iq_multi = (
++        torch.zeros(4, 4, 64, dtype=torch.uint8),
++        torch.zeros(4, 4, 4, dtype=torch.uint8),
++        torch.ones(4, 4, dtype=torch.bfloat16),
++        None,
++        None,
++    )
++    module.forward_mqa(
++        q_multi,
++        None,
 +        torch.arange(4, dtype=torch.int64),
-+        torch.zeros(4, 32, dtype=torch.bfloat16),
++        out_multi,
++        index_query=iq_multi,
 +    )
 +    assert events.count(("index_chunk", "main")) == 2
 +    assert [e for e in events if e[:2] == ("rope", "q")] == [("rope", "q", "aux")]
@@ -117,7 +130,7 @@ index 8019f38a9..866076449 100644
 +    # Headless rank dealt no index rows skips RoPE, decode metadata, and attend,
 +    # while still completing the rank-split gather.
 +    _reset_forward_state()
-+    monkeypatch.setattr(cls, "DECODE_CHUNK", 64)
++    monkeypatch.setattr(module, "DECODE_CHUNK", 64)
 +    monkeypatch.setattr(
 +        cls, "_decode_index_split", lambda self, *a: _FakeSplit(4, 0)
 +    )
