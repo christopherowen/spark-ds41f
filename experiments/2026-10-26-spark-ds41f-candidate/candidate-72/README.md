@@ -198,6 +198,30 @@ Receipts in `receipts/tp4-ring/{release,single-stream,sampled}-table.txt` and `c
 
 *(Zero swap growth and `0.0 ms` thermal slowdown across all 8 boots. Notes: Spaceports `sp1..sp8` were unreachable during this session because the WireGuard container on `storage` was stopped; AgentX corpus `prepare` on `dgx1` previously OOM'd at `64G` on Oct 25 so AgentX could not run on `dgx1`, matching `1120` which also has no AgentX record.)*
 
+## Revision `candidate-72-r5` (Reworked PR `#1323` Empty-Index-Slice Decode RoPE Fix)
+
+Date: 2026-11-24.
+Commits: `06eebd1314` (cherry-picked PR `#1323` diagnostic record under `experiments/2026-11-23-decode-rope-empty-index-slice/`, authored by James Meadlock), `77e6b7154b`, `13d226bea2` (on `origin/candidate-72`).
+
+### Delta Over `candidate-72-r3`
+
+Added reworked vLLM patch `0868` (`0868-fix-dsv41-rotate-decode-queries-on-a-rank-dealt-no.patch`, preserving James Meadlock's authorship; `741` patches total, `patch_head = 32d6ab273e89923c6fea2fa8c415f8887b1da325`, `expected_tree = 0aa091fa2b3dc5ab239816682a4b0f84e209cc58`, `patchset_sha256 = 314d65b785222c70e3401050d193551917ef134cb9f0d0cea4afae18c15f0695`):
+- Extracted `DeepseekV4Attention._launch_pending_decode_aux(...)` in `vllm/models/deepseek_v4_1/attention.py` and guarded it with a single-shot `issue_pending_aux()` helper in `forward_mqa` invoked beside the first `_index_chunk` on non-empty slices, right after `select(...)` before `gather` on empty rank-split slices (so deferred `_rope(q)` + `_shared_decode_metadata` overlap with the all-gather), and before every `wait_stream(pending_aux)` join.
+- Prevents skipped decode query RoPE on ranks dealt `0` index rows (e.g. `TP8` rank 7 at `25..28, 33..35, 41..42, 49` rows; eager long-context `TP3`/`TP4`), prevents duplicate RoPE launches across multi-chunk scoring or `_INDEX_SPLIT_CHECK` reference passes, and skips empty aux-stream work on headless ranks (`n_local_heads == 0`).
+- Extended `tests/models/test_deepseek_v4_1_attention.py::test_decode_two_stream_overlap_schedules_disjoint_workspaces` to cover empty rank-split slices (asserting `("rope", "q", "aux")` runs before `("gather", "main")` and `("attend", "main")`), non-empty rank-split slices, multi-chunk idempotence (`DECODE_CHUNK=2` on `4` rows), and headless (`n_local_heads=0`) empty slices.
+  - Note: intermediate build `candidate-72-r4` (`sha256:dd75ce7cb82b...`) caught a test-only bug where `monkeypatch.setattr(cls, "DECODE_CHUNK", 2)` was shadowed by the instance attribute `module.DECODE_CHUNK = 64` and `_can_overlap_decode`'s `rows <= self.DECODE_CHUNK` guard; fixed in `candidate-72-r5` by calling `forward_mqa` directly with `module.DECODE_CHUNK = 2` and `_pending_decode_aux` set, and superseded `candidate-72-r4` was deleted from `dgx1..dgx4`.
+- Corrected the `When to use PP=2 vs TP` table in `docs/switchless-topology.md` to remove the inaccurate `TP6`/`TP8` NCCL batch-invariance claim.
+
+### Verification (`candidate-72-r5`)
+
+- **Image**: `spark-ds41f:candidate-72-r5` (superseded `candidate-72-r3` and `candidate-72-r4` deleted from `dgx1..dgx4`).
+  - OCI digest: `sha256:cc5107cc88e14bbd0c81d3e3e8dfe58bbeb8ac8977dd02622d7d92332d15a082`
+  - Labels: `local.spark-ds41f.vllm.tree=0aa091fa2b3dc5ab239816682a4b0f84e209cc58`, `local.spark-ds41f.sparknet.tree=1739407706277142da7a12c95fca3c503c8cb11c`
+  - Distributed along `dgx4 -> dgx3-internal -> dgx2-internal -> dgx1-internal`; identical `56` `RootFS.Layers` (`layers_sha = 1fc69a3f3bb0af19`) verified on all 4 nodes; GPU import smoke passed.
+- **Zero-overlay built-image pytest (`dgx4`, `tests/models/test_deepseek_v4_1_attention.py`)**: **`80 passed, 0 failed`** (`61.59 s`).
+- **Full Linux repo unit suite (`dgx4`)**: **`929 passed, 0 failed`** (`33.80 s`).
+- **`tp4-ring` strict temperature-0 determinism (`receipts/determinism/tp4-ring-r5-wide{,-nologprobs}.jsonl`)**: **`0` token diffs, `0` logprob diffs** across all 6 scenarios (`c8`, `staggered`, `mixed`, `cached`, `again`, `mixed15`), bit-for-bit identical SHA-256 outputs and logprobs to `candidate-72-r3` (`reference_sha256 = 18d619615e51...`, `long_sha256 = d65686498eb8...`, `reference_text_sha256 = 0a2dacdde6ff...`, `long_text_sha256 = 12fd825767d2...`).
+
 ## Conclusion
 
-`candidate-72-r3` (`spark-ds41f:candidate-72-r3`, `sha256:3587a2b177a6...`) passed full DGX Step 9 release qualification: `929/929` Linux repo tests, `12,079/12,079` (`174/174` files, `0` failed) in-image release tests, `0/0` strict temperature-0 batch invariance across all four DGX shapes (`tp4-ring`, `pp2-tp2-ring`, `tp2-direct`, `tp1`), `80/80` formal `tool_gate` strict pass on both `tp4-ring` and `pp2-tp2-ring` (`stock` + `deepseek-v4.1-flash-weightless` under `GLP-27 alpha=2.0`), zero local `sparknet` patches (`dgx-spark-networking v0.6.0`), faster same-session `tp4-ring` decode (`c1 +0.82%`, `c16 +0.61%`) and `+1.24%` `1M` prefill vs `spark-ds41f-1120`, `-33 s` faster startup, and `24.0 GiB` KV (`30.70M` tokens) on `pp2-tp2-ring`. Production `spark-ds41f:1120` is restored (`doctor --live OK`) and the cluster hold is released. Ready for release promotion.
+`candidate-72-r5` (`spark-ds41f:candidate-72-r5`, `sha256:cc5107cc88e1...`) carries the full `candidate-72-r3` Step 9 qualification plus the reworked PR `#1323` empty-index-slice decode RoPE fix (`0868`, `80/80` built-image attention tests, `929/929` Linux repo tests, `0/0` bit-identical `tp4-ring` determinism). Production `spark-ds41f:1120` is restored (`doctor --live OK`) and the cluster hold is released. Ready for release promotion.
