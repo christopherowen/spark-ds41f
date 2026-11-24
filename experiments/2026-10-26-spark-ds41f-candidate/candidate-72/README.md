@@ -124,6 +124,27 @@ bin/spark --cluster-config <cfg> bench --suites quality,decode,prefill \
 
 *(Chunked `0867` `y_all` scatter raised `tp2-direct` `131K` prefill `MemAvailable` floor from `6.48 / 7.84 GiB` in `candidate-71-r2` to `8.55–9.56 / 10.32–10.88 GiB` while keeping bit-exact determinism.)*
 
+## Revision `candidate-72-r2` (Dropped Opt-In Buffered Atomic Admission)
+
+Date: 2026-11-24.
+Commit: `ff1c376962` (on `origin/candidate-72`).
+
+After reviewing the opt-in buffered atomic admission patch (PR #1141): it only applies to `/v1/chat/completions/batch` under narrow experimental constraints (`temperature=0`, `max_tokens<=256`, `prompt<=2048`, `batch<=16`, custom header) with `+0.38%` delta on 4-node `tp4-ring` and zero effect on standard `/v1/chat/completions`. Removed rather than carrying an unused opt-in wire protocol:
+
+- **vLLM series (`0001..0866`, `739` patches)**: dropped `0866-perf-serving-admit-a-buffered-text-batch-in-one-engi.patch` and renumbered `0867` -> `0866-chore-ds41-register-DS4.1-PP-env-vars-in-envs.py-and.patch`.
+  - `patch_head = 11ff09dccfa89264f50089c46710bdc30ee75fb0`
+  - `expected_tree = 74e59cbfe31df3bd67fb75de6a165647b400e96f`
+  - `patchset_sha256 = f67d540529599a3a29dadd5fd07d1cf2446222dd9fc07a8e34e88aa0cc215bd9`
+- **Image**: `spark-ds41f:candidate-72-r2` (superseded `spark-ds41f:candidate-72` deleted from `dgx1..dgx4`).
+  - OCI digest: `sha256:bca67b12033acedd4160e8e411e7ee99aa9fc53b5b54861e4ad9c426f728af4b`
+  - Built on `dgx4` in `474 s` (lowest `MemAvailable = 82.6 GiB`); GPU import smoke passed (`DS4.1 SM12x`, `TileLang`, `sparknet 0.6.0` ABI `10`, B12X-free).
+  - Distributed along `dgx4 -> dgx3-internal -> dgx2-internal -> dgx1-internal`; identical `56` `RootFS.Layers` (`layers_sha = a539fbd431f3f898`) and labels (`vllm=74e59cbfe31d`, `sparknet=173940770627`) verified on all 4 nodes.
+- **Validation & Verification**:
+  - `bin/spark doctor` passed (`configuration OK`) across `tp4`, `tp3`, `pp2-tp2-ring`, `pp2-tp3-switched`, `pp2-tp4-switched`, `tp2-direct`, `tp1`, and `image-dgx4`.
+  - Zero-overlay built-image unit tests on `dgx4`: **`145 passed, 2 skipped, 0 failed`** (`81.60 s`), plus verified `ATOMIC_TEXT_BATCH_LIMIT` and `test_buffered_atomic.py` are absent (`atomic_absent=True`).
+  - Live `tp4-ring` smoke (`+81.4 s`): `GLP-27 alpha=2.0` loaded cleanly, zero unknown-env warnings, zero `TP8_*` debug logs; `scripts/sonar_determinism.py --wide`: **`0` token diffs, `0` logprob diffs** across all 6 scenarios (`reference_sha256 = 18d619615e51c7df...`, `long_sha256 = 547c1c1cbf911045...`, bit-identical to `candidate-72` r1).
+  - Production `tp4-ring` (`config/cluster.json`, `spark-ds41f:1122`, `origin/main` @ `945d95d03`) restored (`+80.0 s`) and verified with `bin/spark --cluster-config config/cluster.json doctor --live`.
+
 ## Conclusion
 
-`candidate-72` is verified end-to-end across unit tests (`154/154`), zero-patch `dgx-spark-networking v0.6.0`, live `GLP-27` (`alpha=2.0`, `6/6` auto `tool_choice`), opt-in buffered atomic admission (`160/160` exact parity), strict temperature-0 batch invariance (`0` token diffs, `0` logprob diffs across `tp4-ring`, `pp2-tp2-ring`, and `tp2-direct`), `24.0 GiB` KV (`30.70M` tokens) on `pp2-tp2-ring` with `>=10.97 GiB` free RAM, and chunked `0867` prefill scatter on `tp2-direct` with `>=8.55 GiB` free RAM. Ready for promotion review.
+`candidate-72-r2` (`spark-ds41f:candidate-72-r2`, `sha256:bca67b12033a...`) is verified end-to-end with zero local `sparknet` patches (`dgx-spark-networking v0.6.0`), `GLP-27` (`alpha=2.0`, `6/6` auto `tool_choice`), `0866` env registration + chunked bit-exact scatter, `24.0 GiB` KV on `pp2-tp2-*` (`30.70M` tokens), strict temperature-0 batch invariance (`0` token diffs, `0` logprob diffs across `tp4-ring`, `pp2-tp2-ring`, and `tp2-direct`), and no experimental opt-in atomic admission path. Ready for promotion review.
