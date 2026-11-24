@@ -1,0 +1,79 @@
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -4643,6 +4643,8 @@
+             aux_hidden_states = None
+             output_intermediate_tensors = model_output
+ 
++        if _BI_TRACE_DIR and not dummy_run and hidden_states is not None:
++            _bi_trace_step(self, scheduler_output, input_batch, batch_desc, hidden_states)
+         routed_experts = None
+         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
+             assert slot_mappings is not None
+@@ -5250,3 +5252,67 @@
+         num,
+     )
+     return sorted(num_tokens_per_req, key=key)
++
++
++# --- batch-invariance step trace (diagnostic overlay; off unless BI_TRACE_DIR is set) ---
++import os as _bi_os
++
++_BI_TRACE_DIR = _bi_os.environ.get("BI_TRACE_DIR")
++_bi_fh = None
++_bi_err = 0
++
++
++def _bi_trace_step(runner, scheduler_output, input_batch, batch_desc, hidden_states):
++    global _bi_fh, _bi_err
++    try:
++        import json
++        import socket
++        import time
++
++        from vllm.distributed import get_tensor_model_parallel_rank
++
++        rank = get_tensor_model_parallel_rank()
++        if _bi_fh is None:
++            _bi_os.makedirs(_BI_TRACE_DIR, exist_ok=True)
++            _bi_fh = open(
++                f"{_BI_TRACE_DIR}/{socket.gethostname()}-rank{rank}-{_bi_os.getpid()}.jsonl",
++                "a",
++            )
++        n = int(input_batch.num_tokens)
++        r = int(input_batch.num_reqs)
++        rec = {
++            "t": time.time(), "rank": rank, "n": n,
++            "n_pad": int(input_batch.num_tokens_after_padding), "num_reqs": r,
++            "cg_mode": str(batch_desc.cg_mode), "bd_tokens": batch_desc.num_tokens,
++            "bd_reqs": batch_desc.num_reqs, "bd_uniform": batch_desc.uniform_token_count,
++            "bd_maxq": batch_desc.max_query_len, "bd_exact": batch_desc.exact_num_tokens,
++            "ubatches": batch_desc.num_ubatches, "req_ids": list(input_batch.req_ids)[:r],
++            "qsl": [int(x) for x in input_batch.query_start_loc_np[: r + 1]],
++            "sched": [int(x) for x in input_batch.num_scheduled_tokens[:r]],
++            "drafts": None if input_batch.num_draft_tokens_per_req is None
++            else [int(x) for x in input_batch.num_draft_tokens_per_req[:r]],
++            "prefilling": [bool(x) for x in input_batch.is_prefilling_np[:r]],
++            "input_ids": input_batch.input_ids[:n].tolist(),
++            "positions": input_batch.positions[:n].tolist(),
++            "logits_indices": input_batch.logits_indices.tolist(),
++            "h_shape": list(hidden_states.shape), "h_dtype": str(hidden_states.dtype),
++        }
++        if n > 1024:
++            # a long prefill: keep the step's shape, skip per-row ids and checksums
++            rec["big"] = True
++            rec["input_ids"] = rec["input_ids"][:4]
++            rec["positions"] = [rec["positions"][0], rec["positions"][-1]]
++            rec["chk"] = []
++            rec["chk2"] = []
++        else:
++            h = hidden_states[: min(n, hidden_states.shape[0])].contiguous()
++            v = h.view(torch.int16).to(torch.int64).view(h.shape[0], -1)
++            rec["chk"] = v.sum(-1).tolist()
++            w = (torch.arange(v.shape[1], device=v.device, dtype=torch.int64) % 8191) + 1
++            rec["chk2"] = (v * w).sum(-1).tolist()
++        _bi_fh.write(json.dumps(rec) + "\n")
++        _bi_fh.flush()
++    except Exception as e:  # noqa: BLE001
++        _bi_err += 1
++        if _bi_err <= 3:
++            logger.warning("bi-trace failed: %r", e)
