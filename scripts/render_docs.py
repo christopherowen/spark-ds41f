@@ -611,15 +611,11 @@ def collect_manifest_data() -> dict[str, Any]:
             if ref_suite
             else (_short_release_name(Path(bench_ref).stem.rsplit("-", 1)[0]) if bench_ref else None)
         )
-        pp = int(entry.get("pipeline_parallel_size", 1))
-        tp = int(entry["nodes"]) // pp
         shapes_info.append(
             {
                 "name": shape_name,
                 "default": shape_name == cluster.get("default_shape"),
                 "nodes": int(entry["nodes"]),
-                "pipeline_parallel_size": pp,
-                "tensor_parallel_size": tp,
                 "transport": entry["fabric"]["transport"],
                 "kernel_release": resolved["host"]["kernel"]["release"],
                 "page_size_bytes": int(resolved["host"]["kernel"]["page_size"]),
@@ -757,11 +753,8 @@ def render_readme_current_baseline(data: dict[str, Any]) -> str:
         else:
             ref_link = "unqualified (`--unqualified-shape`)"
         default_badge = " **(default)**" if s["default"] else ""
-        pp = int(s.get("pipeline_parallel_size", 1))
-        tp = int(s.get("tensor_parallel_size", s["nodes"]))
-        parallel_label = f"PP{pp} TP{tp}" if pp > 1 else f"TP{tp}"
         lines.append(
-            f"| `{s['name']}`{default_badge} | {parallel_label} `{s['transport']}` ({s['page_size_label']}) | "
+            f"| `{s['name']}`{default_badge} | TP{s['nodes']} `{s['transport']}` ({s['page_size_label']}) | "
             f"{ctx_label} | {seq_label} | {s['max_num_batched_tokens']:,} | {s['kv_cache_gib']} | "
             f"{free_label} | {held_label} | {ref_link} |"
         )

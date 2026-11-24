@@ -120,7 +120,7 @@ before tuning anything on this basis.
 ## Next release
 
 <!-- BEGIN GENERATED: next-release-status -->
-Production is **spark-ds41f-1122** (`manifests/baselines/2026-11-22-spark-ds41f-1122.json`, image `spark-ds41f:1122`), promoted 2026-11-22 on `tp4-ring` ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md), [suite reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/)). `tp3-triangle`'s current qualified reference is **spark-ds41f-1120** ([suite reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/)); qualifying `spark-ds41f-1122`'s image on the triangle at its 6,144-token prefill budget is queued once the three-node triangle is cabled (#668).
+Production is **spark-ds41f-1120** (`manifests/baselines/2026-11-20-spark-ds41f-1120.json`, image `spark-ds41f:1120`), promoted 2026-11-20 across all 12 shapes: `tp4-ring` ([suite reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/)), `tp3-triangle` ([suite reference](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/)), `tp3-triangle-4k`, `tp2-direct`, `tp1`, and `tp2-switched`..`tp8-switched` ([release record](experiments/2026-10-26-spark-ds41f-candidate/README.md)).
 <!-- END GENERATED: next-release-status -->
 
 Open after `1120`:
@@ -284,9 +284,9 @@ After the two profiler fixes, prioritize the [eight-session replay](#mixed-prefi
 ## Current reference
 
 <!-- BEGIN GENERATED: current-reference -->
-Active baseline manifest: [`manifests/baselines/2026-11-22-spark-ds41f-1122.json`](manifests/baselines/2026-11-22-spark-ds41f-1122.json) (`spark-ds41f-1122`). Releases are judged by the release, single-stream and sampled suites, measured with Sonar (`docs/release-benchmark.md`, `scripts/sonar_table.py`). Current benchmark references are [`manifests/suites/2026-11-20-spark-ds41f-1120-tp4`](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/) for `tp4-ring` and [`manifests/suites/2026-11-20-spark-ds41f-1120-tp3`](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/) for `tp3-triangle`:
+Active baseline manifest: [`manifests/baselines/2026-11-20-spark-ds41f-1120.json`](manifests/baselines/2026-11-20-spark-ds41f-1120.json) (`spark-ds41f-1120`). Releases are judged by the release, single-stream and sampled suites, measured with Sonar (`docs/release-benchmark.md`, `scripts/sonar_table.py`). Current benchmark references are [`manifests/suites/2026-11-20-spark-ds41f-1120-tp4`](manifests/suites/2026-11-20-spark-ds41f-1120-tp4/) for `tp4-ring` and [`manifests/suites/2026-11-20-spark-ds41f-1120-tp3`](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/) for `tp3-triangle`:
 
-| Measure | `tp4-ring` (`spark-ds41f-1120`, 1M, 32 seqs, 16K batch) | `tp3-triangle` (`spark-ds41f-1120`, 1M, 16 seqs, 6K batch) |
+| Measure | `tp4-ring` (`spark-ds41f-1120`, 1M, 32 seqs, 16K batch) | `tp3-triangle` (`spark-ds41f-1120`, 1M, 8 seqs, 6K batch) |
 | --- | ---: | ---: |
 | Decode grid geometric mean (20 TP4 / 15 TP3 shapes) | 19.36 ms | 25.52 ms |
 | Decode `c16`, 16 streams (output tok/s) | 280.4 | — |
