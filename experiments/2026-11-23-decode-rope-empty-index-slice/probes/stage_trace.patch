@@ -1,0 +1,201 @@
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -4643,6 +4643,8 @@
+             aux_hidden_states = None
+             output_intermediate_tensors = model_output
+ 
++        if _BI_TRACE_DIR and not dummy_run and hidden_states is not None:
++            _bi_trace_step(self, scheduler_output, input_batch, batch_desc, hidden_states)
+         routed_experts = None
+         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
+             assert slot_mappings is not None
+@@ -5250,3 +5252,79 @@
+         num,
+     )
+     return sorted(num_tokens_per_req, key=key)
++
++
++# --- batch-invariance step trace (diagnostic overlay; off unless BI_TRACE_DIR is set) ---
++import os as _bi_os
++
++_BI_TRACE_DIR = _bi_os.environ.get("BI_TRACE_DIR")
++_bi_fh = None
++_bi_err = 0
++_bi_step = 0
++_bi_mods = None
++
++
++def _bi_trace_step(runner, scheduler_output, input_batch, batch_desc, hidden_states):
++    global _bi_fh, _bi_err
++    try:
++        import json
++        import socket
++        import time
++
++        from vllm.distributed import get_tensor_model_parallel_rank
++
++        rank = get_tensor_model_parallel_rank()
++        if _bi_fh is None:
++            _bi_os.makedirs(_BI_TRACE_DIR, exist_ok=True)
++            _bi_fh = open(
++                f"{_BI_TRACE_DIR}/{socket.gethostname()}-rank{rank}-{_bi_os.getpid()}.jsonl",
++                "a",
++            )
++        n = int(input_batch.num_tokens)
++        r = int(input_batch.num_reqs)
++        rec = {
++            "t": time.time(), "rank": rank, "n": n,
++            "n_pad": int(input_batch.num_tokens_after_padding), "num_reqs": r,
++            "cg_mode": str(batch_desc.cg_mode), "bd_tokens": batch_desc.num_tokens,
++            "bd_reqs": batch_desc.num_reqs, "bd_uniform": batch_desc.uniform_token_count,
++            "bd_maxq": batch_desc.max_query_len, "bd_exact": batch_desc.exact_num_tokens,
++            "ubatches": batch_desc.num_ubatches, "req_ids": list(input_batch.req_ids)[:r],
++            "qsl": [int(x) for x in input_batch.query_start_loc_np[: r + 1]],
++            "sched": [int(x) for x in input_batch.num_scheduled_tokens[:r]],
++            "drafts": None if input_batch.num_draft_tokens_per_req is None
++            else [int(x) for x in input_batch.num_draft_tokens_per_req[:r]],
++            "prefilling": [bool(x) for x in input_batch.is_prefilling_np[:r]],
++            "input_ids": input_batch.input_ids[:n].tolist(),
++            "positions": input_batch.positions[:n].tolist(),
++            "logits_indices": input_batch.logits_indices.tolist(),
++            "h_shape": list(hidden_states.shape), "h_dtype": str(hidden_states.dtype),
++        }
++        h = hidden_states[: min(n, hidden_states.shape[0])].contiguous()
++        v = h.view(torch.int16).to(torch.int64).view(h.shape[0], -1)
++        rec["chk"] = v.sum(-1).tolist()
++        w = (torch.arange(v.shape[1], device=v.device, dtype=torch.int64) % 8191) + 1
++        rec["chk2"] = (v * w).sum(-1).tolist()
++        if _bi_os.environ.get("BI_TRACE_LAYERS") and n <= 64:
++            global _bi_mods
++            if _bi_mods is None or len(_bi_mods) < 40:
++                _bi_mods = [
++                    (name, k, t)
++                    for name, m in runner.model.named_modules()
++                    for k, t in m.__dict__.items()
++                    if k.startswith("_bi_") and isinstance(t, torch.Tensor)
++                ]
++            if _bi_mods:
++                stacked = torch.stack([t for _, _, t in _bi_mods]).tolist()
++                rec["stages"] = [[name, k[4:], row[64], row[:n]] for (name, k, _), row in zip(_bi_mods, stacked)]
++        dump_max = int(_bi_os.environ.get("BI_TRACE_DUMP_ROWS", "0"))
++        if dump_max and n <= dump_max and rank == 0:
++            global _bi_step
++            _bi_step += 1
++            rec["dump"] = f"h-{_bi_os.getpid()}-{_bi_step:06d}.pt"
++            torch.save(h.float().cpu(), f"{_BI_TRACE_DIR}/{rec['dump']}")
++        _bi_fh.write(json.dumps(rec) + "\n")
++        _bi_fh.flush()
++    except Exception as e:  # noqa: BLE001
++        _bi_err += 1
++        if _bi_err <= 3:
++            logger.warning("bi-trace failed: %r", e)
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -449,8 +449,10 @@
+                     else ced_input_ids
+                 )
+         if sp_rows is None:
++            _bi_put(self, "pre", x)
+             with kernels.mxfp8_inputs(x_q):
+                 x = self.attn(positions, x, None)
++            _bi_put(self, "attn", x)
+         else:
+             # SP: attention gathers every row and reduce-scatters its output.
+             with sp_prefill.activate(sp_rows), kernels.mxfp8_inputs(x_q):
+@@ -473,8 +475,10 @@
+         )
+         del attn_pre
+         if sp_rows is None:
++            _bi_put(self, "ffnin", x)
+             with kernels.mxfp8_inputs(x_q):
+                 x = self.ffn(x, input_ids)
++            _bi_put(self, "ffn", x)
+             del x_q
+         else:
+             # SP: route local rows, gather MXFP8 + routes, and reduce-scatter.
+@@ -1834,3 +1838,32 @@
+             if isinstance(module, Engram):
+                 module.process_weights_after_loading()
+         self.model.finalize_expert_slot_cache()
++
++
++# --- batch-invariance per-stage row checksums (diagnostic; off unless BI_TRACE_DIR is set) ---
++import os as _bi_os2
++
++_BI_ON = bool(_bi_os2.environ.get("BI_TRACE_DIR")) and bool(_bi_os2.environ.get("BI_TRACE_LAYERS"))
++_BI_CAP = 64
++
++
++def _bi_put(mod, tag, x):
++    if not _BI_ON or not isinstance(x, torch.Tensor) or x.ndim < 1 or not x.is_cuda:
++        return
++    d = mod.__dict__
++    key = "_bi_" + tag
++    buf = d.get(key)
++    if buf is None:
++        buf = d[key] = torch.zeros(_BI_CAP + 1, dtype=torch.int64, device=x.device)
++    r = min(int(x.shape[0]), _BI_CAP)
++    buf[_BI_CAP].fill_(int(x.shape[0]))
++    if r == 0:
++        return
++    v = x[:r].contiguous()
++    if v.dtype in (torch.bfloat16, torch.float16):
++        v = v.view(torch.int16)
++    elif v.dtype == torch.float32:
++        v = v.view(torch.int32)
++    v = v.reshape(r, -1).to(torch.int64)
++    w = (torch.arange(v.shape[1], device=v.device, dtype=torch.int64) % 8191) + 1
++    buf[:r].copy_((v * w).sum(-1))
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py	2026-11-22 21:14:59
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py	2026-11-23 23:36:43
+@@ -464,6 +464,13 @@
+                 idx_lengths=indices["indexed_lengths"],
+                 idx_page_table=indices["indexed_page_table"],
+             )
++        _bi_put(self, "q", q)
++        _bi_put(self, "swalen", indices["swa_lengths"])
++        _bi_put(self, "swaidx", indices["swa_indices"])
++        _bi_put(self, "pos", positions)
++        if indexed:
++            _bi_put(self, "idxlen", indexed["idx_lengths"])
++            _bi_put(self, "idxidx", indexed["idx_indices"])
+         self._tilelang().mla.run(
+             q,
+             self.swa_cache_layer.kv_cache,
+@@ -476,6 +483,36 @@
+             scratch=scratch or None,
+             **indexed,
+         )
++        _bi_put(self, "mla", output)
+ 
+ 
+ __all__ = ["DeepseekV41TileLangAttention", "DeepseekV41TileLangBackend"]
++
++
++# --- batch-invariance per-stage row checksums (diagnostic; off unless BI_TRACE_DIR is set) ---
++import os as _bi_os2
++
++_BI_ON = bool(_bi_os2.environ.get("BI_TRACE_DIR")) and bool(_bi_os2.environ.get("BI_TRACE_LAYERS"))
++_BI_CAP = 64
++
++
++def _bi_put(mod, tag, x):
++    if not _BI_ON or not isinstance(x, torch.Tensor) or x.ndim < 1 or not x.is_cuda:
++        return
++    d = mod.__dict__
++    key = "_bi_" + tag
++    buf = d.get(key)
++    if buf is None:
++        buf = d[key] = torch.zeros(_BI_CAP + 1, dtype=torch.int64, device=x.device)
++    r = min(int(x.shape[0]), _BI_CAP)
++    buf[_BI_CAP].fill_(int(x.shape[0]))
++    if r == 0:
++        return
++    v = x[:r].contiguous()
++    if v.dtype in (torch.bfloat16, torch.float16):
++        v = v.view(torch.int16)
++    elif v.dtype == torch.float32:
++        v = v.view(torch.int32)
++    v = v.reshape(r, -1).to(torch.int64)
++    w = (torch.arange(v.shape[1], device=v.device, dtype=torch.int64) % 8191) + 1
++    buf[:r].copy_((v * w).sum(-1))
