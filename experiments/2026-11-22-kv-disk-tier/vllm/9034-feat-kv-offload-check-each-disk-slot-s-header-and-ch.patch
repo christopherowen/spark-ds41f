@@ -1,0 +1,420 @@
+From b6c226130cd7410071bd7bdc9108d4c17318d147 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:14:55 +0000
+Subject: [PATCH] feat(kv-offload): check each disk slot's header and checksum
+ on load
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9033
+of this series.
+
+Rationale: a read that returned the wrong bytes was served to the model
+with no error, whether the cause was a misdirected or lost write, a torn
+slot, media corruption, or a slot that was never written. Under
+O_DIRECT, when the padded slot has room for 32 bytes (a DeepSeek-V4.1
+slot has 1,536 bytes of padding), the store thread now writes a header
+after the block bytes. The header holds a magic number, a version, the
+checksum kind, the slot id, a generation, and a checksum of the block
+bytes; the generation is the slot's store count in this process, which
+the worker keeps in a per-slot array. The slot id catches a misdirected
+read, the generation catches a stale slot, and the checksum catches
+changed bytes. The load thread checks the whole header after preadv and
+before any DMA, and a mismatch raises DiskTierError(EBADMSG), which takes
+the fault path of the previous patch: the load fails as a cache miss and
+the tier degrades. The new kv_connector_extra_config key disk_checksum
+takes "crc32" (the connector's default), "sum64" (a 64-bit word sum), or
+"none". DiskBackend.init defaults to "none", so direct callers keep the
+layout without a header.
+
+Quality implications: a correct read gives the same output as before.
+The generation array costs 2 x 8 bytes of memory for each slot on each
+rank. The checksum adds CPU time to every load and store; its cost on
+the ARM cores of a GB10 was not measured alone, and "sum64" is the
+cheaper option.
+
+Tests: tests/v1/simple_kv_offload/test_ds41_tier_faults.py checks round
+trips with crc32 and with sum64. A byte flipped in the data or in the
+header of the file fails the load before any DMA, and the GPU block
+stays untouched. A lost write, made by restoring the previous generation
+in the file, and a slot that was never written also fail the load. A
+4096-byte block leaves no room for a header and turns the check off. On
+the CPU path the offload suite passed 146 tests, with 2 CUDA-only modules
+skipped. On DGX Spark hardware the patch ran only as part of the whole
+series.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_faults.py                  | 133 ++++++++++++++++++
+ .../v1/simple_cpu_offload_connector.py        |   4 +
+ vllm/v1/simple_kv_offload/disk_backend.py     |  99 +++++++++++++
+ vllm/v1/simple_kv_offload/worker.py           |   3 +
+ 4 files changed, 239 insertions(+)
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+index dc5bc95af..659156475 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+@@ -443,3 +443,136 @@ def test_prometheus_series_names() -> None:
+     a = metrics.SimpleCPUOffloadStats(data={"loads": 2, "degraded": 0})
+     b = metrics.SimpleCPUOffloadStats(data={"loads": 1, "io_errors": 1, "degraded": 1})
+     assert a.aggregate(b).data == {"loads": 3, "io_errors": 1, "degraded": 1}
++
++
++# ---------------------------------------------------------------------------
++# 0834: slot header (slot id, generation, checksum) in the slot padding
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture
++def sealed(tmp_path, host_cuda):
++    """A worker whose backend writes and checks slot headers."""
++    made = []
++
++    def make(checksum: str = "crc32"):
++        gen = torch.Generator().manual_seed(7)
++        gpu = torch.randint(-128, 127, (6, BLOCK), dtype=torch.int8, generator=gen)
++        worker = SimpleCPUOffloadWorker(
++            vllm_config=MagicMock(),
++            kv_cache_config=None,
++            cpu_capacity_bytes=0,
++            kv_offload_backend="disk",
++            disk_path=str(tmp_path / "unused"),
++            disk_capacity_bytes=SLOTS * 229376,
++            disk_checksum=checksum,
++        )
++        stream = _HostStream()
++        backend = DiskBackend()
++        path = _odirect_dir(tmp_path) / f"sealed.rank_{len(made)}"
++        backend.init(
++            {"packed": gpu},
++            torch.device("cpu"),
++            stream,
++            stream,
++            str(path),
++            SLOTS,
++            BLOCK,
++            checksum=checksum,
++        )
++        worker._backend = backend
++        worker.load_stream = worker.store_stream = stream
++        made.append(worker)
++        return worker, gpu, path
++
++    yield make
++    for worker in made:
++        worker._backend.shutdown()
++
++
++def _flip(path, offset) -> None:
++    with open(path, "r+b") as f:
++        f.seek(offset)
++        byte = f.read(1)
++        f.seek(offset)
++        f.write(bytes([byte[0] ^ 0x01]))
++
++
++@pytest.mark.parametrize("checksum", ["crc32", "sum64"])
++def test_sealed_slot_roundtrip(sealed, checksum) -> None:
++    worker, gpu, path = sealed(checksum)
++    want = gpu[:2].clone()
++    _stored(worker, [0, 1], [3, 15])
++    with open(path, "rb") as f:
++        f.seek(3 * 229376 + BLOCK)
++        assert f.read(4) == b"KVT1"
++    gpu[:2].zero_()
++    _load(worker, [3, 15], [0, 1], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.finished_recving == {"r1"} and not res.failed_recving
++    assert torch.equal(gpu[:2], want)
++
++
++@pytest.mark.parametrize("where", ["data", "header"])
++def test_flipped_byte_is_a_fault_not_wrong_state(sealed, where) -> None:
++    worker, gpu, path = sealed()
++    _stored(worker, [0], [5])
++    _flip(path, 5 * 229376 + (BLOCK // 2 if where == "data" else BLOCK + 20))
++    gpu[4].zero_()
++    _load(worker, [5], [4], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.failed_recving == {"r1"}
++    fault = worker._backend.fault
++    assert (fault.op, fault.slot, fault.errno) == ("load", 5, errno.EBADMSG)
++    assert torch.count_nonzero(gpu[4]) == 0  # verified before any DMA
++
++
++def test_stale_slot_content_is_a_fault(sealed) -> None:
++    """A write that never reached the disk leaves the previous generation:
++    a valid checksum, the wrong generation."""
++    worker, gpu, path = sealed()
++    _stored(worker, [0], [8])
++    with open(path, "rb") as f:
++        f.seek(8 * 229376)
++        old = f.read(229376)
++    worker._pending_store_event_indices.clear()
++    _store(worker, [1], [8], event=1)
++    deadline = time.monotonic() + 5
++    while 1 in worker._pending_store_event_indices:
++        worker.get_transfer_results(set())
++        assert time.monotonic() < deadline
++    with open(path, "r+b") as f:
++        f.seek(8 * 229376)
++        f.write(old)  # the lost write
++    _load(worker, [8], [5], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.failed_recving == {"r1"}
++    assert "generation 1, expected 2" in worker._backend.fault.message
++
++
++def test_never_written_slot_is_a_fault(sealed) -> None:
++    worker, gpu, path = sealed()
++    _load(worker, [9], [5], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.failed_recving == {"r1"}
++    assert "no slot header" in worker._backend.fault.message
++
++
++def test_no_room_for_header_turns_checks_off(tmp_path, host_cuda) -> None:
++    gpu = torch.zeros((2, 4096), dtype=torch.int8)
++    stream = _HostStream()
++    backend = DiskBackend()
++    backend.init(
++        {"k": gpu},
++        torch.device("cpu"),
++        stream,
++        stream,
++        str(_odirect_dir(tmp_path) / "aligned"),
++        4,
++        4096,
++        checksum="crc32",
++    )
++    try:
++        assert backend._checksum_kind == 0
++    finally:
++        backend.shutdown()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 01c419835..7c4a260c9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -63,6 +63,7 @@ _DISK_ONLY_KEYS = (
+     "disk_buffer_slots",
+     "use_page_cache",
+     "disk_io_timeout_s",
++    "disk_checksum",
+ )
+ # Seconds a disk transfer may take, from submission, before it is abandoned
+ # and its requests fall back to a cache miss (kv_connector_extra_config
+@@ -150,6 +151,8 @@ class SimpleCPUOffloadConnector(
+         disk_io_timeout_s = float(
+             extra_config.get("disk_io_timeout_s", DEFAULT_DISK_IO_TIMEOUT_S)
+         )
++        # Slot integrity check in the slot padding: "crc32", "sum64" or "none".
++        disk_checksum = str(extra_config.get("disk_checksum", "crc32"))
+ 
+         if disk_mode:
+             if disk_path is None:
+@@ -231,6 +234,7 @@ class SimpleCPUOffloadConnector(
+                 disk_buffer_slots=disk_buffer_slots,
+                 use_page_cache=use_page_cache,
+                 disk_io_timeout_s=disk_io_timeout_s,
++                disk_checksum=disk_checksum,
+             )
+ 
+     # --- Worker-side methods ---
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index ee884e5e5..b191b9d55 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -13,9 +13,12 @@ import contextlib
+ import errno
+ import os
+ import queue
++import struct
+ import threading
++import zlib
+ from typing import NamedTuple
+ 
++import numpy as np
+ import torch
+ 
+ from vllm.logger import init_logger
+@@ -34,6 +37,15 @@ logger = init_logger(__name__)
+ O_DIRECT = getattr(os, "O_DIRECT", 0)
+ _ALIGNMENT = 4096
+ 
++# Slot header, written into the slot's padding after the block bytes:
++# magic, version, checksum kind, slot id, generation, checksum. The slot id
++# catches a misdirected read, the generation (the slot's store count in this
++# process) a lost or stale write, the checksum corrupted or torn bytes.
++_HEADER = struct.Struct("<4sHHQQQ")
++_HEADER_MAGIC = b"KVT1"
++_HEADER_VERSION = 1
++CHECKSUMS = {"none": 0, "crc32": 1, "sum64": 2}
++
+ 
+ class DiskTierError(OSError):
+     """An I/O fault on one tier slot: the errno, the message and the slot."""
+@@ -136,6 +148,11 @@ class DiskBackend:
+         self._abandon_lock = threading.Lock()
+         # Slot under I/O in each thread, for the fault report of a timeout.
+         self._current_slot: dict[bool, int] = {True: -1, False: -1}
++        # Slot integrity (see _HEADER): kind 0 is off.
++        self._checksum_kind = 0
++        self._generation: np.ndarray | None = None
++        self._store_rows: list[np.ndarray] = []
++        self._load_rows: list[np.ndarray] = []
+ 
+     # --- fault state (thread-safe) ---
+ 
+@@ -239,6 +256,7 @@ class DiskBackend:
+         total_block_bytes: int,
+         num_buffer_slots: int = 2,
+         use_page_cache: bool = False,
++        checksum: str = "none",
+     ) -> None:
+         self._load_stream = load_stream
+         self._store_stream = store_stream
+@@ -294,6 +312,32 @@ class DiskBackend:
+         self._store_params = self._store_slot_params[0]
+         self._load_params = self._load_slot_params[0]
+ 
++        if checksum not in CHECKSUMS:
++            raise ValueError(f"disk_checksum {checksum!r}: expected {list(CHECKSUMS)}")
++        kind = CHECKSUMS[checksum]
++        if kind and self._slot_bytes - total_block_bytes < _HEADER.size:
++            logger.warning(
++                "DiskBackend: no room for the %d-byte slot header in %d-byte "
++                "slots of %d-byte blocks; slot integrity checks are off",
++                _HEADER.size,
++                self._slot_bytes,
++                total_block_bytes,
++            )
++            kind = 0
++        if kind == CHECKSUMS["sum64"] and total_block_bytes % 8:
++            kind = CHECKSUMS["crc32"]
++        self._checksum_kind = kind
++        if kind:
++            self._generation = np.zeros(num_disk_slots, dtype=np.uint64)
++            self._store_rows = [
++                self._store_buffer[slot].numpy().view(np.uint8)
++                for slot in range(num_buffer_slots)
++            ]
++            self._load_rows = [
++                self._load_buffer[slot].numpy().view(np.uint8)
++                for slot in range(num_buffer_slots)
++            ]
++
+         os.makedirs(os.path.dirname(disk_path) or ".", exist_ok=True)
+         # Slot contents never outlive the process, so unlink then O_EXCL rather
+         # than reopening: a pre-existing file would otherwise keep its own
+@@ -399,8 +443,59 @@ class DiskBackend:
+             event.record(stream)
+             events_list.append((event_idx, event))
+ 
++    def _checksum(self, data: np.ndarray) -> int:
++        if self._checksum_kind == CHECKSUMS["crc32"]:
++            return zlib.crc32(memoryview(data))
++        return int(data.view(np.uint64).sum(dtype=np.uint64))
++
++    def _seal_slot(self, buf_slot: int, slot: int) -> int:
++        """Write the header of a staged block; returns its generation."""
++        assert self._generation is not None
++        row = self._store_rows[buf_slot]
++        n = self._total_block_bytes
++        generation = int(self._generation[slot]) + 1
++        _HEADER.pack_into(
++            row,
++            n,
++            _HEADER_MAGIC,
++            _HEADER_VERSION,
++            self._checksum_kind,
++            slot,
++            generation,
++            self._checksum(row[:n]),
++        )
++        return generation
++
++    def _verify_slot(self, buf_slot: int, slot: int) -> None:
++        """Check a read slot's header and checksum before any DMA."""
++        assert self._generation is not None
++        row = self._load_rows[buf_slot]
++        n = self._total_block_bytes
++        magic, version, kind, got_slot, generation, checksum = _HEADER.unpack_from(
++            row, n
++        )
++        expected_generation = int(self._generation[slot])
++        problem = None
++        if magic != _HEADER_MAGIC or version != _HEADER_VERSION:
++            problem = "no slot header"
++        elif kind != self._checksum_kind:
++            problem = f"checksum kind {kind}, expected {self._checksum_kind}"
++        elif got_slot != slot:
++            problem = f"header of slot {got_slot}"
++        elif generation != expected_generation:
++            problem = f"generation {generation}, expected {expected_generation}"
++        elif checksum != self._checksum(row[:n]):
++            problem = "checksum mismatch"
++        if problem is not None:
++            raise DiskTierError(
++                errno.EBADMSG,
++                f"slot {slot} failed its integrity check: {problem}",
++                slot,
++            )
++
+     def _writev_slot(self, buf_slot: int, file_offset: int, slot: int = -1) -> None:
+         self._current_slot[True] = slot
++        generation = self._seal_slot(buf_slot, slot) if self._checksum_kind else 0
+         try:
+             written = os.pwritev(
+                 self._fd, self._store_slot_views[buf_slot], file_offset
+@@ -415,6 +510,8 @@ class DiskBackend:
+                 f"short write of slot {slot}: {written} of {self._slot_bytes} bytes",
+                 slot,
+             )
++        if self._generation is not None:
++            self._generation[slot] = generation
+ 
+     def _readv_slot(self, buf_slot: int, file_offset: int, slot: int = -1) -> None:
+         self._current_slot[False] = slot
+@@ -432,6 +529,8 @@ class DiskBackend:
+                 f"short read of slot {slot}: {bytes_read} of {self._slot_bytes} bytes",
+                 slot,
+             )
++        if self._checksum_kind:
++            self._verify_slot(buf_slot, slot)
+ 
+     def _load_loop(
+         self,
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index af567720e..8f0a5d02e 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -42,6 +42,7 @@ class SimpleCPUOffloadWorker:
+         disk_buffer_slots: int = 2,
+         use_page_cache: bool = False,
+         disk_io_timeout_s: float = 15.0,
++        disk_checksum: str = "crc32",
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -94,6 +95,7 @@ class SimpleCPUOffloadWorker:
+         # "recompute"). A failed store is reported complete and failed, so
+         # the scheduler drops its blocks instead of publishing them.
+         self.disk_io_timeout_s = disk_io_timeout_s
++        self.disk_checksum = disk_checksum
+         self._load_submit_time: dict[int, float] = {}
+         self._store_submit_time: dict[int, float] = {}
+         self._forced_failed_loads: set[int] = set()
+@@ -242,6 +244,7 @@ class SimpleCPUOffloadWorker:
+             total_bytes_per_block,
+             self.disk_buffer_slots,
+             self.use_page_cache,
++            checksum=self.disk_checksum,
+         )
+ 
+     def _init_cpu_mode(
+-- 
+2.56.1
+

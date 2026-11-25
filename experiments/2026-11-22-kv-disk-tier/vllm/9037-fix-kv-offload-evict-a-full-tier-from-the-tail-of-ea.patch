@@ -1,0 +1,538 @@
+From 35e5a2157fdb206caccc292fd912e7eb1cfc8782 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:45:34 +0000
+Subject: [PATCH] fix(kv-offload): evict a full tier from the tail of each
+ chain
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9036
+of this series.
+
+Rationale: free_blocks evicts first the block that was freed first, and
+stores free their blocks in prefix order over many events. A full tier
+therefore evicted the start of each session first, and every block
+behind that gap stayed resident although no lookup could reach it. A
+session whose prefix hit in the GPU pool also never refreshed its copy
+on disk, so the start of a busy session aged out first. With this patch,
+when a finished request has no store left in flight (in eager mode), its
+reachable chain in the offload pool is freed again in descending order
+of block end position. The chain then sits at the recent end of the LRU
+list, and its tail is evicted first. The reachable chain is the run of
+the full-attention group up to its first missing block, together with
+the cached blocks of the other prefix-cacheable groups that end inside
+that run. A finished request now also waits for its finish-time store
+before its state is cleaned up, and a degraded tier releases such a
+request when it drops the queued store.
+
+Quality implications: the patch does not change outputs. A full tier now
+keeps a usable prefix of each recent session in place of blocks that no
+lookup can reach.
+
+Tests: tests/v1/simple_kv_offload/test_ds41_tier_eviction.py holds 8
+tests on the real KVCacheManager and SimpleCPUOffloadScheduler with the
+DS41 layout. They check the order of the chain after a finish, a full
+tier that evicts a session from its tail with at most one checkpoint
+stranded, two sessions that share a prefix, a session that grows over
+three requests from hits in the GPU pool, the 18,724 slots of the 4 GiB
+profile filled past twice their count, the wait for the finish-time
+store, and the release by a degraded tier. On the tree of 9036, before
+this patch, 6 of the 8 tests fail, while the layout and slot-count
+tests pass on both trees. On the CPU path the offload suite passed 170
+tests, with 2 CUDA-only modules skipped. On DGX Spark hardware the patch
+ran only as part of the whole series.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_eviction.py                | 314 ++++++++++++++++++
+ vllm/v1/simple_kv_offload/manager.py          | 106 +++++-
+ 2 files changed, 415 insertions(+), 5 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_tier_eviction.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_eviction.py b/tests/v1/simple_kv_offload/test_ds41_tier_eviction.py
+new file mode 100644
+index 000000000..a1d3738e4
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_eviction.py
+@@ -0,0 +1,314 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Eviction order of a full disk tier on the DeepSeek-V4.1 packed layout.
++
++Runs the real KVCacheManager and SimpleCPUOffloadScheduler as the harness of
++test_ds41_e2e_review does: each session is a request that prefills in chunks
++with eager stores and finishes, so its finish-time store and its chain refresh
++(_refresh_chain) run. A session may start from a GPU-local hit, as a returning
++conversation does. ``usable`` measures the longest prefix a later lookup can
++take from the tier without touching the LRU.
++"""
++
++import pytest
++
++from tests.v1.simple_kv_offload import ds41_layout
++from tests.v1.simple_kv_offload.test_scheduler import (
++    _make_vllm_config,
++    make_scheduler_output,
++    simulate_store_completion,
++)
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.kv_cache_utils import (
++    get_request_block_hasher,
++    resolve_block_hashes,
++)
++from vllm.v1.request import Request
++from vllm.v1.simple_kv_offload.disk_backend import disk_slot_bytes
++from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++SB, HB = 256, 128
++GIB = 1024**3
++SLOT = disk_slot_bytes(ds41_layout.LIVE_BLOCK_BYTES, use_page_cache=False)
++
++
++def _req(tokens, rid):
++    return Request(
++        request_id=rid,
++        prompt_token_ids=list(tokens),
++        sampling_params=SamplingParams(max_tokens=1),
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=get_request_block_hasher(HB, sha256),
++    )
++
++
++class Tier:
++    """One GPU pool and one disk tier of ``slots`` slots."""
++
++    def __init__(self, slots: int, chunk: int = 6144):
++        cfg = ds41_layout.ds41_scheduler_kv_cache_config()
++        self.mgr = KVCacheManager(
++            cfg,
++            max_model_len=1 << 21,
++            scheduler_block_size=SB,
++            hash_block_size=HB,
++            enable_caching=True,
++        )
++        self.conn = SimpleCPUOffloadScheduler(
++            vllm_config=_make_vllm_config(),
++            kv_cache_config=cfg,
++            cpu_capacity_bytes=0,
++            scheduler_block_size=SB,
++            hash_block_size=HB,
++            lazy_offload=False,
++            disk_capacity_bytes=slots * SLOT,
++            disk_use_page_cache=False,
++        )
++        self.conn.bind_gpu_block_pool(self.mgr.block_pool)
++        self.chunk = chunk
++        self.n = 0
++        self.stored_tokens = 0
++
++    def _step(self, out):
++        meta = self.conn.build_connector_meta(out)
++        if meta.store_event >= 0:
++            simulate_store_completion(self.conn, meta.store_event)
++
++    def session(self, tokens, on_finish=None, confirm_step=True) -> int:
++        """Prefill ``tokens`` (GPU-local hit first), store, finish; return the
++        number of tokens the GPU pool served. Without ``confirm_step`` the
++        last chunk's blocks are left to the finish-time store."""
++        mgr, conn = self.mgr, self.conn
++        rid = f"s{self.n}"
++        self.n += 1
++        r = _req(tokens, rid)
++        blocks, nloc, _ = mgr.get_computed_blocks(r)
++        ext, _ = conn.get_num_new_matched_tokens(r, nloc)
++        # The sessions here are built so that the tier never extends a local
++        # hit: a returning session's prefix is still in the GPU pool.
++        assert ext == 0, ext
++        done, first = nloc, True
++        while done < len(tokens):
++            n = min(self.chunk, len(tokens) - done)
++            new = mgr.allocate_slots(
++                r,
++                n,
++                num_new_computed_tokens=nloc if first else 0,
++                new_computed_blocks=blocks if first else None,
++            )
++            assert new is not None
++            if first:
++                conn.update_state_after_alloc(r, mgr.get_blocks(rid), 0)
++                ids = mgr.get_blocks(rid).get_block_ids()
++                out = make_scheduler_output({rid: n}, new_reqs={rid: ids})
++                r.num_computed_tokens = nloc
++            else:
++                out = make_scheduler_output(
++                    {rid: n}, cached_req_new_blocks={rid: new.get_block_ids()}
++                )
++            self._step(out)
++            r.num_computed_tokens += n
++            done += n
++            first = False
++        if confirm_step:
++            self._step(
++                make_scheduler_output({rid: 1}, cached_req_new_blocks={rid: None})
++            )
++        conn.request_finished_all_groups(r, tuple(mgr.get_blocks(rid).get_block_ids()))
++        if on_finish is not None:
++            on_finish(conn, rid)
++        self._step(make_scheduler_output({}))
++        mgr.free(r)
++        self.stored_tokens += len(tokens) - nloc
++        return nloc
++
++    def usable(self, tokens) -> int:
++        """Tokens of ``tokens`` that a lookup takes from the tier (no GPU
++        prefix, no cap, no LRU touch)."""
++        r = _req(tokens, "probe")
++        cpu = self.conn.cpu_coordinator
++        _, hit, _ = cpu.find_longest_cache_hit(r.block_hashes, len(tokens))
++        return hit
++
++    def resident(self, tokens) -> int:
++        """Prefix-cacheable blocks of ``tokens`` that the tier still holds."""
++        conn = self.conn
++        r = _req(tokens, "probe")
++        n = 0
++        for g in conn.prefix_cacheable_group_ids:
++            size = conn.group_block_sizes[g]
++            for h in resolve_block_hashes(r.block_hashes, HB, size):
++                if conn.cpu_block_pool.get_cached_block(h, [g]) is not None:
++                    n += 1
++        return n
++
++    def stranded(self, tokens) -> int:
++        """Resident blocks of ``tokens`` that end past the usable prefix."""
++        conn = self.conn
++        reach = self.usable(tokens)
++        r = _req(tokens, "probe")
++        n = 0
++        for g in conn.prefix_cacheable_group_ids:
++            size = conn.group_block_sizes[g]
++            for i, h in enumerate(resolve_block_hashes(r.block_hashes, HB, size)):
++                if (i + 1) * size <= reach:
++                    continue
++                if conn.cpu_block_pool.get_cached_block(h, [g]) is not None:
++                    n += 1
++        return n
++
++    def reset_gpu(self):
++        assert self.mgr.reset_prefix_cache()
++
++
++_base = [0]
++
++
++def toks(n: int) -> list[int]:
++    """``n`` token ids that share no block with any other call."""
++    _base[0] += 1
++    start = 10_000_000 * _base[0]
++    return list(range(start, start + n))
++
++
++def blocks_per_512() -> int:
++    """Tier blocks a stored session costs per 512 tokens (measured)."""
++    t = Tier(slots=4096)
++    s = toks(16384)
++    t.session(s)
++    return t.resident(s) * 512 // 16384
++
++
++def test_session_cost_matches_the_layout():
++    # 2 compressed blocks of 256 tokens and one window checkpoint in each of
++    # the 7 encoder groups every 512 tokens (README "What a cache entry holds").
++    assert blocks_per_512() == 9
++
++
++def test_finished_chain_sits_at_the_recent_end_tail_first():
++    t = Tier(slots=2048)
++    s = toks(8192)
++    t.session(s)
++    conn = t.conn
++    order = [b.block_id for b in conn.cpu_block_pool.free_block_queue.get_all_free_blocks()]
++    chain = []
++    r = _req(s, "probe")
++    for g in conn.prefix_cacheable_group_ids:
++        size = conn.group_block_sizes[g]
++        for i, h in enumerate(resolve_block_hashes(r.block_hashes, HB, size)):
++            hit = conn.cpu_block_pool.get_cached_block(h, [g])
++            if hit is not None:
++                chain.append(((i + 1) * size, hit[0].block_id))
++    assert len(chain) == t.resident(s) > 0
++    tail = order[-len(chain) :]
++    assert set(tail) == {bid for _, bid in chain}
++    ends = {bid: end for end, bid in chain}
++    positions = [ends[bid] for bid in tail]
++    assert positions == sorted(positions, reverse=True)
++
++
++def test_full_tier_evicts_a_session_from_its_tail():
++    # About 1.5 sessions of 16K tokens: the filler evicts part of S.
++    t = Tier(slots=440)
++    s = toks(16384)
++    t.session(s)
++    assert t.usable(s) == 16384
++    t.session(toks(16384))
++    kept = t.usable(s)
++    assert 0 < kept < 16384
++    assert kept % SB == 0
++    # Nothing of S is left behind a gap (one checkpoint's blocks at most).
++    assert t.stranded(s) <= 9
++
++
++def test_shared_prefix_outlives_its_branches():
++    t = Tier(slots=400)
++    a, b, c = toks(8192), toks(4096), toks(4096)
++    t.session(a + b)
++    assert t.session(a + c) > 0  # A from the GPU pool, only C stored
++    t.session(toks(8192))
++    # The filler evicted from B's tail (the oldest blocks); A, refreshed by
++    # both sessions, and the newer branch C are whole.
++    assert t.usable(a + c) == 12288
++    assert 8192 <= t.usable(a + b) < 12288
++    assert t.stranded(a + b) <= 9
++
++
++def test_growing_session_refreshes_its_old_prefix():
++    # A conversation grows over three requests; each takes its prefix from
++    # the GPU pool, so the tier never stores that prefix again. The refresh
++    # at each finish still moves the prefix to the recent end.
++    t = Tier(slots=360)
++    p = toks(8192)
++    t.session(p)
++    f1 = toks(4096)
++    t.session(f1)
++    conv = p + toks(1024)
++    assert t.session(conv) > 0  # a GPU-local hit
++    conv = conv + toks(1024)
++    assert t.session(conv) > 0
++    whole = t.usable(conv)
++    assert whole >= 9984
++    t.session(toks(8192))  # past capacity
++    assert t.usable(conv) == whole
++    assert t.usable(f1) < 4096  # f1 went first, not the conversation's head
++
++
++@pytest.mark.parametrize("gib", [4])
++def test_small_arm_slot_count_and_reuse(gib):
++    slots = gib * GIB // SLOT
++    assert slots == 18724
++    # The arm's tier at its real size takes many sessions: fill it past
++    # capacity with 32K sessions and check that the last one stays whole
++    # and the stored total passed the slot count (slots were reused).
++    t = Tier(slots=slots)
++    assert t.conn.num_cpu_blocks == 18724
++    last = None
++    while t.stored_tokens < 2 * 18724 * 512 // 9:
++        last = toks(32768)
++        t.session(last)
++    assert t.usable(last) == 32768
++    assert t.conn.cpu_block_pool.get_num_free_blocks() >= 0
++
++
++def test_refresh_waits_for_the_finish_time_store():
++    t = Tier(slots=2048)
++    s = toks(8192)
++    seen = {}
++
++    def on_finish(conn, rid):
++        # The last chunk's blocks go out with the finish-time store, queued
++        # for the next step: the request waits for it.
++        seen["queued"] = any(x.req_id == rid for x in conn._pending_finished_stores)
++        seen["waiting"] = rid in conn._reqs_to_store and conn._reqs_to_store[rid].finished
++
++    t.session(s, on_finish=on_finish, confirm_step=False)
++    assert seen == {"queued": True, "waiting": True}
++    assert t.conn._reqs_to_store == {}
++    assert not t.conn._store_event_to_reqs
++    # The refresh ran after that store: the whole session is one chain at the
++    # recent end, tail first.
++    assert t.usable(s) == 8192
++    order = t.conn.cpu_block_pool.free_block_queue.get_all_free_blocks()
++    assert len({b.block_id for b in order[-t.resident(s) :] if b.block_hash}) == (
++        t.resident(s)
++    )
++
++
++def test_degraded_tier_releases_a_waiting_finished_request():
++    t = Tier(slots=2048)
++
++    def on_finish(conn, rid):
++        assert conn._reqs_to_store[rid].finished
++        conn._mark_degraded(None)
++
++    t.session(toks(8192), on_finish=on_finish, confirm_step=False)
++    conn = t.conn
++    assert conn._reqs_to_store == {}
++    assert not conn._pending_finished_stores
++    assert not conn._in_flight_store_gpu_blocks
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index d1dd43e9a..327d30adc 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -81,6 +81,9 @@ class TransferMeta:
+     gpu_block_ids: list[int]
+     cpu_block_ids: list[int]
+     block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = None
++    # Eager finish-time store only: the request it belongs to, so that the
++    # request's chain refresh waits for this store too.
++    req_id: str | None = None
+ 
+ 
+ @dataclass
+@@ -551,18 +554,27 @@ class SimpleCPUOffloadScheduler:
+         if self.degraded:
+             # Nothing new reaches a degraded tier: release the queued
+             # finish-time stores instead of submitting them.
+-            for transfer in self._pending_finished_stores:
++            dropped = self._pending_finished_stores
++            self._pending_finished_stores = []
++            for transfer in dropped:
+                 self._in_flight_store_gpu_blocks.difference_update(
+                     transfer.gpu_block_ids
+                 )
+                 self._release_transfer_refs(transfer)
+-            self._pending_finished_stores.clear()
++            for transfer in dropped:
++                if transfer.req_id is not None:
++                    self._maybe_cleanup_finished_store(transfer.req_id)
+         for transfer in self._pending_finished_stores:
+             store_gpu.extend(transfer.gpu_block_ids)
+             store_cpu.extend(transfer.cpu_block_ids)
+             if store_meta is not None:
+                 assert transfer.block_meta is not None
+                 store_meta.extend(transfer.block_meta)
++            if transfer.req_id is not None:
++                # The finished request waits for this event before its chain
++                # refresh (_cleanup_store_request).
++                store_req_ids.append(transfer.req_id)
++        store_req_ids = list(dict.fromkeys(store_req_ids))
+         self._pending_finished_stores.clear()
+ 
+         if store_gpu:
+@@ -1284,8 +1296,12 @@ class SimpleCPUOffloadScheduler:
+         if not self._lazy_mode:
+             store_state = self._reqs_to_store.get(req_id)
+             if store_state is not None:
+-                if store_state.store_events:
+-                    store_state.finished = True  # Defer: stores in-flight
++                if store_state.store_events or any(
++                    t.req_id == req_id for t in self._pending_finished_stores
++                ):
++                    # Defer: stores in flight, or the finish-time store is
++                    # queued for the next step.
++                    store_state.finished = True
+                 else:
+                     self._cleanup_store_request(req_id)
+ 
+@@ -1327,7 +1343,12 @@ class SimpleCPUOffloadScheduler:
+             return
+         cpu_blocks = self.cpu_block_pool.get_new_blocks(len(gpu_ids))
+         self._pending_finished_stores.append(
+-            TransferMeta(gpu_ids, [b.block_id for b in cpu_blocks], block_meta)
++            TransferMeta(
++                gpu_ids,
++                [b.block_id for b in cpu_blocks],
++                block_meta,
++                req_id=request.request_id,
++            )
+         )
+         self._in_flight_store_gpu_blocks.update(gpu_ids)
+         gpu_pool.touch([gpu_pool.blocks[bid] for bid in gpu_ids])
+@@ -1435,6 +1456,8 @@ class SimpleCPUOffloadScheduler:
+ 
+         Metadata-only cleanup but no block freeing. Job completion handles
+         block caching and GPU ref freeing via _process_store_completion().
++        Runs once a finished request has no store left in flight, so it also
++        refreshes the request's chain in the LRU (_refresh_chain).
+         """
+         state = self._reqs_to_store.pop(req_id, None)
+         if state is None:
+@@ -1446,6 +1469,79 @@ class SimpleCPUOffloadScheduler:
+                 if not reqs:
+                     self._store_event_to_reqs.pop(event_idx, None)
+         state.store_events.clear()
++        if not self.degraded:
++            self._refresh_chain(state.request)
++
++    def _maybe_cleanup_finished_store(self, req_id: str) -> None:
++        """Clean up a finished request whose queued finish-time store was
++        dropped (degraded tier) and that has no other store in flight."""
++        state = self._reqs_to_store.get(req_id)
++        if (
++            state is not None
++            and state.finished
++            and not state.store_events
++            and not any(t.req_id == req_id for t in self._pending_finished_stores)
++        ):
++            self._cleanup_store_request(req_id)
++
++    def _refresh_chain(self, request: "Request") -> int:
++        """Move a finished request's reachable chain to the recent end of the
++        offload LRU, tail first; return the number of blocks moved.
++
++        ``free_blocks`` evicts the first block it is given first, and stores
++        free their blocks in prefix order over many events, so without this a
++        full tier evicts the start of each session first and strands the rest
++        of it: no lookup can reach a block behind a missing one. Here the
++        chain's blocks are freed again ordered by their end position,
++        descending: eviction then takes a session from its tail, every
++        remaining prefix stays a hit, and a prefix shared by later requests
++        is refreshed by each of them. A request whose prefix hit in the GPU
++        pool refreshes the disk copy of that prefix too.
++
++        Only blocks that a lookup can reach are moved: the full-attention
++        group's run up to its first missing block, and in the other
++        prefix-cacheable groups the cached blocks that end at or before that
++        run. Blocks behind a gap stay where they are and age out first.
++        Blocks pinned by a load in flight keep their pin; they rejoin the
++        queue when the load releases them.
++        """
++        pool = self.cpu_block_pool
++        hashes = request.block_hashes
++        fa_size = self.fa_block_size
++        fa_hashes = resolve_block_hashes(hashes, self.hash_block_size, fa_size)
++        chain: list[tuple[int, KVCacheBlock]] = []
++        for i in range(len(fa_hashes)):
++            hit = pool.get_cached_block(fa_hashes[i], [self.fa_gidx])
++            if hit is None:
++                break
++            chain.append(((i + 1) * fa_size, hit[0]))
++        reach = len(chain) * fa_size
++        if reach == 0:
++            return 0
++        for g in sorted(self.prefix_cacheable_group_ids):
++            if g == self.fa_gidx:
++                continue
++            if not self.cpu_coordinator.single_type_managers[
++                g
++            ].has_positionally_stable_blocks:
++                continue
++            g_size = self.group_block_sizes[g]
++            g_hashes = resolve_block_hashes(hashes, self.hash_block_size, g_size)
++            for i in range(min(len(g_hashes), reach // g_size)):
++                hit = pool.get_cached_block(g_hashes[i], [g])
++                if hit is not None:
++                    chain.append(((i + 1) * g_size, hit[0]))
++        # Tail first: the first block freed is the first evicted.
++        chain.sort(key=lambda entry: entry[0], reverse=True)
++        seen: set[int] = set()
++        blocks: list[KVCacheBlock] = []
++        for _, blk in chain:
++            if blk.block_id not in seen:
++                seen.add(blk.block_id)
++                blocks.append(blk)
++        pool.touch(blocks)
++        pool.free_blocks(blocks)
++        return len(blocks)
+ 
+     def take_events(self) -> Iterable[KVCacheEvent]:
+         events = self.cpu_block_pool.take_events()
+-- 
+2.56.1
+

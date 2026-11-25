@@ -1,0 +1,1064 @@
+From 278e701970a07f881fefbfb68a640643bf90af14 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:42:14 +0000
+Subject: [PATCH] fix(kv-offload): pad disk slots to 4096 bytes under O_DIRECT
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829).
+
+Rationale: DiskBackend.init asserted that total_block_bytes is a
+multiple of 4096 under O_DIRECT. The packed block of DeepSeek-V4.1-Flash
+is 227,840 bytes, which leaves a remainder of 2,560, so the disk tier
+could not start unless it used the page cache, and the page cache takes
+the host memory that the tier is meant to save. Removing the assert is
+not enough, because slot n of an unpadded staging buffer starts at n *
+227,840, and a drive with 4096-byte logical blocks rejects such offsets,
+lengths, and addresses with EINVAL. This patch therefore stores each
+block in a slot of disk_slot_bytes(block) bytes, which is the block
+rounded up to a multiple of 4096 under O_DIRECT and the exact block size
+with use_page_cache. Each staging slot is one contiguous, 4096-aligned
+row that holds the tensors' bytes back to back and then zero padding,
+and each slot has its own DMA parameters, which address it as block 0,
+and moves to or from the file in one iovec. The worker and the scheduler
+both count the slots as capacity // disk_slot_bytes(block), and the
+connector passes use_page_cache to the scheduler for that count, so the
+scheduler never hands out a slot past the end of the file.
+
+Quality implications: the patch does not change outputs. A slot in the
+file differs from the old layout only by the padding at its end, which
+costs 1,536 bytes of disk for each block (0.67%) and keeps every offset,
+length, and address aligned to 4096 bytes on either drive format.
+
+Tests: tests/v1/simple_kv_offload/test_ds41_offload.py writes
+227,840-byte blocks to slots 0, 31, and 63 of a real O_DIRECT file
+through the real staging and pwritev/preadv code, with the CUDA batch
+copy replaced by a host memmove, then reads them back into a cleared
+pool and compares them byte for byte. The test runs with 2 and with 4
+staging slots, both directly and through the IO threads, and it checks
+that the file holds each block at slot * 229,376 followed by zero
+padding. Further tests check that two tensors of 1,536 and 2,048 bytes
+share one 4,096-byte slot in tensor order, and that the scheduler and
+the worker count the same slots at 100, 200, and 400 GiB. The disk of
+the test machine has 512-byte logical sectors, so the EINVAL case of a
+4096-byte drive was not reproduced. The alignment case of test_worker.py,
+which needs CUDA, now expects the padded size, and test_kv_events.py
+sizes its disk tiers in padded slots. On the CPU path the fork's offload
+tests passed 88 before this patch and 101 with the new tests, with 2
+CUDA-only modules skipped. On DGX Spark hardware the patch ran only as
+part of the whole series, which the experiment's README describes.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ tests/v1/simple_kv_offload/ds41_layout.py     | 151 +++++++
+ .../v1/simple_kv_offload/test_ds41_offload.py | 370 ++++++++++++++++++
+ tests/v1/simple_kv_offload/test_kv_events.py  |   9 +-
+ tests/v1/simple_kv_offload/test_worker.py     |  23 +-
+ .../v1/simple_cpu_offload_connector.py        |   1 +
+ vllm/v1/simple_kv_offload/disk_backend.py     | 143 ++++---
+ vllm/v1/simple_kv_offload/manager.py          |  28 +-
+ vllm/v1/simple_kv_offload/worker.py           |  14 +-
+ 8 files changed, 658 insertions(+), 81 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/ds41_layout.py
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_offload.py
+
+diff --git a/tests/v1/simple_kv_offload/ds41_layout.py b/tests/v1/simple_kv_offload/ds41_layout.py
+new file mode 100644
+index 000000000..657b48531
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/ds41_layout.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1-Flash KV cache layout, built without a GPU or a checkpoint.
++
++The per-layer specs repeat what the fork's model code returns:
++``vllm/models/deepseek_v4_1/attention.py`` (``_Cache.get_kv_cache_spec`` for the
++sliding windows and the indexer keys, ``DeepseekV41Attention.get_kv_cache_spec``
++for the compressed latents) and ``vllm/models/deepseek_v4_1/compressor.py``
++(``CompressorStateCache.get_kv_cache_spec``). The layer facts come from the
++checkpoint's ``config.json`` (``text_config``): 40 target layers plus 3 DSpark
++drafter layers, ``compress_ratios``, ``kv_source_layer_ids`` [2, 8, 14, 20], a
++128-token sliding window, and the CED decoder start at layer 20.
++
++The packing runs through the fork's own ``_get_packed_kv_cache_groups`` and
++``get_kv_cache_config_from_groups``. Spec registration order inside a layer is
++an assumption (main latent, window, compressor state, indexer key); it can move
++a layer between window groups but not change the block bytes, the number of
++groups or which group is full attention.
++"""
++
++from __future__ import annotations
++
++import os
++from unittest.mock import MagicMock
++
++import torch
++
++from vllm.config import CacheConfig
++from vllm.v1.core.kv_cache_utils import (
++    _get_packed_kv_cache_groups,
++    generate_scheduler_kv_cache_config,
++    get_kv_cache_config_from_groups,
++)
++from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
++from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
++    KVCacheConfig,
++    KVCacheSpec,
++    MLAAttentionSpec,
++    SlidingWindowMLASpec,
++)
++from vllm.v1.kv_cache_layout import KVCacheLayout
++
++# text_config of deepseek-ai/DeepSeek-V4.1-Flash-1017 (recipe state/config.json)
++NUM_TARGET_LAYERS = 40
++NUM_DRAFT_LAYERS = 3
++COMPRESS_RATIOS = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
++KV_SOURCE_LAYER_IDS = (2, 8, 14, 20)
++SLIDING_WINDOW = 128
++CED_DECODER_START = 20  # ced_decoder_start(): first ratio-1 kv source after ratio 2
++
++BLOCK_SIZE = 256  # --block-size 256 (DEFAULT_DS41_BLOCK_SIZE)
++SWA_BLOCK_SIZE = 128  # DEFAULT_DS41_SWA_BLOCK_SIZE
++NUM_SPECULATIVE_TOKENS = 5  # dspark, num_speculative_tokens 5
++RETENTION_INTERVAL = 512  # --prefix-cache-retention-interval 512
++
++# Live engine: --kv-cache-memory-bytes 3758096384 gives num_gpu_blocks 16494.
++LIVE_KV_CACHE_BYTES = 3758096384
++LIVE_NUM_GPU_BLOCKS = 16494
++LIVE_BLOCK_BYTES = 227840
++
++
++def _common(block_size: int, head_size: int, state_bytes: int, ratio: int) -> dict:
++    return dict(
++        block_size=block_size,
++        num_kv_heads=1,
++        head_size=head_size,
++        state_content_bytes=state_bytes,
++        dtype=torch.uint8,
++        tokens_per_state=ratio,
++        cache_dtype_str="dsv41",
++        alignment=None,
++        uses_only_written_slots=True,
++    )
++
++
++def layer_specs() -> dict[str, KVCacheSpec]:
++    """Per-layer KV cache specs in model registration order."""
++    lsa = os.environ.get("VLLM_DS41_LSA") == "1"
++    specs: dict[str, KVCacheSpec] = {}
++    for layer_id in range(NUM_TARGET_LAYERS + NUM_DRAFT_LAYERS):
++        prefix = f"model.layers.{layer_id}.self_attn"
++        ratio = COMPRESS_RATIOS[layer_id]
++        is_draft = layer_id >= NUM_TARGET_LAYERS
++        if layer_id in KV_SOURCE_LAYER_IDS:
++            specs[prefix] = MLAAttentionSpec(**_common(BLOCK_SIZE, 512, 288, ratio))
++        bounded_replay = is_draft or layer_id >= CED_DECODER_START
++        specs[f"{prefix}.swa_cache"] = SlidingWindowMLASpec(
++            **_common(SWA_BLOCK_SIZE, 512, 528, 1),
++            sliding_window=SLIDING_WINDOW,
++            extra_retained_tokens=int(is_draft),
++            prefix_cache_enabled=not bounded_replay,
++            prefill_replay_window=128 if bounded_replay else 0,
++        )
++        if layer_id in KV_SOURCE_LAYER_IDS:
++            state_block = max(8, 1 << (NUM_SPECULATIVE_TOKENS + 1).bit_length())
++            specs[f"{prefix}.compressor.state_cache"] = CircularBufferSpec(
++                block_size=state_block,
++                num_kv_heads=1,
++                head_size=1024,
++                head_size_v=0,
++                dtype=torch.float32,
++                uses_only_written_slots=True,
++            )
++            specs[f"{prefix}.indexer.k_cache"] = MLAAttentionSpec(
++                **_common(BLOCK_SIZE, 68, 84 if lsa else 68, ratio)
++            )
++    return specs
++
++
++def packing_vllm_config(layout: KVCacheLayout = KVCacheLayout.BLHNC) -> MagicMock:
++    """The few config fields the packing path reads."""
++    vllm_config = MagicMock()
++    vllm_config.cache_config = CacheConfig()
++    vllm_config.cache_config.block_size = BLOCK_SIZE
++    vllm_config.cache_config.kv_cache_layout = layout.name
++    vllm_config.cache_config.num_gpu_blocks_override = None
++    vllm_config.cache_config.prefix_cache_retention_interval = RETENTION_INTERVAL
++    vllm_config.parallel_config.decode_context_parallel_size = 1
++    vllm_config.attention_config.hisparse_config = None
++    vllm_config.kv_transfer_config = None
++    # dspark keeps its own drafter KV, so no EAGLE block drop.
++    vllm_config.speculative_config.use_eagle_block_drop.return_value = False
++    vllm_config.speculative_config.use_eagle.return_value = False
++    vllm_config.model_config.hf_config.model_type = "deepseek_v41"
++    return vllm_config
++
++
++def ds41_kv_cache_config(
++    kv_cache_memory_bytes: int = LIVE_KV_CACHE_BYTES,
++) -> KVCacheConfig:
++    """The packed KVCacheConfig of the live engine's pool."""
++    register_all_kvcache_specs(vllm_config=None)
++    vllm_config = packing_vllm_config()
++    groups = _get_packed_kv_cache_groups(vllm_config, layer_specs())
++    assert groups is not None, "DeepSeek-V4.1 must take the packed path"
++    return get_kv_cache_config_from_groups(vllm_config, groups, kv_cache_memory_bytes)
++
++
++def ds41_scheduler_kv_cache_config(
++    kv_cache_memory_bytes: int = LIVE_KV_CACHE_BYTES,
++) -> KVCacheConfig:
++    """The config the scheduler and its connector receive.
++
++    EngineCore._initialize_kv_caches passes the worker configs through
++    generate_scheduler_kv_cache_config, which replaces each
++    UniformTypeKVCacheSpecs group by its scheduler_spec.
++    """
++    return generate_scheduler_kv_cache_config(
++        [ds41_kv_cache_config(kv_cache_memory_bytes)]
++    )
+diff --git a/tests/v1/simple_kv_offload/test_ds41_offload.py b/tests/v1/simple_kv_offload/test_ds41_offload.py
+new file mode 100644
+index 000000000..7a8567927
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_offload.py
+@@ -0,0 +1,370 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SimpleCPUOffloadConnector disk tier on the DeepSeek-V4.1-Flash layout.
++
++CPU-only tests for the changes the tier needs on this model: the padded
++O_DIRECT slot, the expandable_segments declaration and the bounded-replay cap
++on external hits. A fourth suspected change, the full-attention group lookup,
++is shown not to be needed: the scheduler-side connector receives unwrapped
++group specs.
++The layout comes from ``ds41_layout`` (the fork's own packing on the model's
++real per-layer specs). The O_DIRECT tests move real bytes through the real
++``DiskBackend`` file and staging code; only the CUDA batch copy is replaced by
++a host memmove.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import os
++import threading
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from tests.v1.simple_kv_offload import ds41_layout
++from tests.v1.simple_kv_offload.test_scheduler import _make_vllm_config
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    MLAAttentionSpec,
++    is_full_attention_spec,
++    iter_layer_specs,
++)
++from vllm.v1.simple_kv_offload import disk_backend as disk_backend_mod
++from vllm.v1.simple_kv_offload.disk_backend import DiskBackend, disk_slot_bytes
++from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++GIB = 1024**3
++PADDED_BLOCK_BYTES = 229376  # 227,840 rounded up to a 4096 multiple
++SCHEDULER_BLOCK_SIZE = 256  # LCM of the 256-token latent and 128-token windows
++HASH_BLOCK_SIZE = 128  # the smallest prefix-cacheable group block
++
++
++@pytest.fixture(scope="module")
++def ds41_worker_config():
++    """The packed config each worker allocates (UniformTypeKVCacheSpecs)."""
++    return ds41_layout.ds41_kv_cache_config()
++
++
++@pytest.fixture(scope="module")
++def ds41_config():
++    """The config the scheduler, and so SimpleCPUOffloadScheduler, receives."""
++    return ds41_layout.ds41_scheduler_kv_cache_config()
++
++
++def _ds41_scheduler(kv_cache_config, disk_bytes: int, page_cache: bool = False):
++    return SimpleCPUOffloadScheduler(
++        vllm_config=_make_vllm_config(),
++        kv_cache_config=kv_cache_config,
++        cpu_capacity_bytes=0,
++        scheduler_block_size=SCHEDULER_BLOCK_SIZE,
++        hash_block_size=HASH_BLOCK_SIZE,
++        lazy_offload=False,
++        disk_capacity_bytes=disk_bytes,
++        disk_use_page_cache=page_cache,
++    )
++
++
++# ---------------------------------------------------------------------------
++# The layout the tests run on
++# ---------------------------------------------------------------------------
++
++
++def test_ds41_layout_matches_live_engine(ds41_worker_config) -> None:
++    """The desk layout reproduces the live pool: 16,494 blocks of 227,840 B."""
++    config = ds41_worker_config
++    assert config.num_blocks == ds41_layout.LIVE_NUM_GPU_BLOCKS
++    assert config.kv_cache_tensors[0].size // config.num_blocks == (
++        ds41_layout.LIVE_BLOCK_BYTES
++    )
++    groups = config.kv_cache_groups
++    # 15 window groups, one compressed latent group, one compressor-state group
++    assert len(groups) == 17
++    cacheable = config.prefix_cacheable_group_ids
++    # 7 encoder window groups (layers 0-19) and the compressed latents
++    assert len(cacheable) == 8
++    replay = {g.kv_cache_spec.prefill_replay_tokens for g in groups}
++    assert replay == {0, 128}
++    compressed = [g for g in groups if is_full_attention_spec(g.kv_cache_spec)]
++    assert len(compressed) == 1
++    layers = list(iter_layer_specs(compressed[0].kv_cache_spec))
++    assert all(isinstance(s, MLAAttentionSpec) for s in layers)
++    assert len(layers) == 8  # latents and indexer keys of layers 2, 8, 14, 20
++
++
++# ---------------------------------------------------------------------------
++# Suspected change 1: full-attention group lookup (not needed)
++# ---------------------------------------------------------------------------
++
++
++def test_worker_groups_hide_full_attention_from_isinstance(
++    ds41_worker_config,
++) -> None:
++    """The worker-side packed groups are all UniformTypeKVCacheSpecs, so an
++    isinstance(FullAttentionSpec) scan over them would find none."""
++    assert not any(
++        isinstance(g.kv_cache_spec, FullAttentionSpec)
++        for g in ds41_worker_config.kv_cache_groups
++    )
++
++
++def test_scheduler_config_unwraps_full_attention_group(ds41_config) -> None:
++    """generate_scheduler_kv_cache_config hands the scheduler each group's
++    scheduler_spec: the compressed group arrives as an MLAAttentionSpec, a
++    FullAttentionSpec subclass, and only that group is full attention."""
++    fa = [
++        i
++        for i, g in enumerate(ds41_config.kv_cache_groups)
++        if isinstance(g.kv_cache_spec, FullAttentionSpec)
++    ]
++    assert len(fa) == 1
++    assert isinstance(
++        ds41_config.kv_cache_groups[fa[0]].kv_cache_spec, MLAAttentionSpec
++    )
++
++
++def test_scheduler_boots_on_ds41_groups_unpatched_lookup(ds41_config) -> None:
++    """SimpleCPUOffloadScheduler builds on the engine's scheduler config with
++    the fork's own isinstance lookup (manager.py:173-178)."""
++    sched = _ds41_scheduler(ds41_config, disk_bytes=1 * GIB)
++    fa_group = ds41_config.kv_cache_groups[sched.fa_gidx]
++    assert is_full_attention_spec(fa_group.kv_cache_spec)
++    assert sched.fa_gidx in sched.prefix_cacheable_group_ids
++    assert sched.fa_block_size == ds41_layout.BLOCK_SIZE
++    assert sched.group_block_sizes.count(ds41_layout.SWA_BLOCK_SIZE) == 15
++    assert sched.cpu_coordinator.prefill_replay_tokens == 128
++
++
++# ---------------------------------------------------------------------------
++# 0831: padded O_DIRECT slots
++# ---------------------------------------------------------------------------
++
++
++def test_disk_slot_bytes() -> None:
++    assert disk_slot_bytes(227840) == PADDED_BLOCK_BYTES
++    assert disk_slot_bytes(227840, use_page_cache=True) == 227840
++    assert disk_slot_bytes(4096) == 4096
++    assert disk_slot_bytes(3 * 512) == 4096
++    # 1,536 bytes of padding a block: 0.67% of the tier
++    assert PADDED_BLOCK_BYTES - 227840 == 1536
++
++
++@pytest.mark.parametrize("gib", [100, 200, 400])
++def test_scheduler_counts_padded_disk_slots(ds41_config, gib: int) -> None:
++    """Scheduler and worker divide the capacity by the same padded slot."""
++    capacity = gib * GIB
++    sched = _ds41_scheduler(ds41_config, disk_bytes=capacity)
++    assert sched.num_cpu_blocks == capacity // PADDED_BLOCK_BYTES
++    # what SimpleCPUOffloadWorker._init_disk_mode computes for the same tier
++    worker_slots = capacity // disk_slot_bytes(227840, use_page_cache=False)
++    assert sched.num_cpu_blocks == worker_slots
++
++
++def test_scheduler_page_cache_slots_stay_unpadded(ds41_config) -> None:
++    capacity = 1 * GIB
++    sched = _ds41_scheduler(ds41_config, disk_bytes=capacity, page_cache=True)
++    assert sched.num_cpu_blocks == capacity // 227840
++
++
++class _HostEvent:
++    """torch.Event stand-in: the emulated copies finish before they return."""
++
++    def record(self, stream=None) -> None:
++        pass
++
++    def synchronize(self) -> None:
++        pass
++
++    def query(self) -> bool:
++        return True
++
++
++def _host_build_params(src_caches, dst_caches, stream, src_access_order=0):
++    assert list(src_caches) == list(dst_caches)
++    src = list(src_caches.values())
++    dst = list(dst_caches.values())
++    bpb = []
++    for s, d in zip(src, dst):
++        s_bpb = s.stride(0) * s.element_size()
++        assert s_bpb == d.stride(0) * d.element_size()
++        bpb.append(s_bpb)
++    return SimpleNamespace(
++        src_bases=[t.data_ptr() for t in src],
++        dst_bases=[t.data_ptr() for t in dst],
++        bpb=bpb,
++        num_layers=len(src),
++    )
++
++
++def _host_copy_blocks(src_ids, dst_ids, params) -> None:
++    """copy_blocks() semantics (base + block_id * bpb) with a host memmove."""
++    for layer in range(params.num_layers):
++        bpb = params.bpb[layer]
++        for s, d in zip(src_ids, dst_ids):
++            ctypes.memmove(
++                params.dst_bases[layer] + d * bpb,
++                params.src_bases[layer] + s * bpb,
++                bpb,
++            )
++
++
++@pytest.fixture
++def host_disk_backend(monkeypatch):
++    """DiskBackend with its CUDA calls replaced by host equivalents."""
++    monkeypatch.setattr(disk_backend_mod, "pin_tensor", lambda t: None)
++    monkeypatch.setattr(disk_backend_mod, "build_params", _host_build_params)
++    monkeypatch.setattr(disk_backend_mod, "copy_blocks", _host_copy_blocks)
++    monkeypatch.setattr(
++        disk_backend_mod,
++        "current_platform",
++        SimpleNamespace(set_device=lambda device: None),
++    )
++    monkeypatch.setattr(torch, "Event", _HostEvent)
++    backends: list[DiskBackend] = []
++
++    def make() -> DiskBackend:
++        backend = DiskBackend()
++        backends.append(backend)
++        return backend
++
++    yield make
++    for backend in backends:
++        backend.shutdown()
++
++
++def _odirect_dir(tmp_path):
++    """A directory on a filesystem that accepts O_DIRECT (tmpfs may not)."""
++    base = os.environ.get("DS41_ODIRECT_DIR")
++    path = tmp_path if base is None else type(tmp_path)(base) / f"t{os.getpid()}"
++    path.mkdir(parents=True, exist_ok=True)
++    probe = path / "probe"
++    try:
++        fd = os.open(probe, os.O_RDWR | os.O_CREAT | os.O_DIRECT, 0o600)
++    except OSError as e:
++        pytest.skip(f"O_DIRECT not supported under {path}: {e}")
++    os.close(fd)
++    probe.unlink()
++    return path
++
++
++@pytest.mark.parametrize("num_buffer_slots", [2, 4])
++def test_padded_odirect_roundtrip_227840_byte_blocks(
++    tmp_path, host_disk_backend, num_buffer_slots: int
++) -> None:
++    """Write 227,840-byte blocks to slots 0, middle and last through O_DIRECT,
++    read them back into a cleared pool and compare every byte."""
++    block = ds41_layout.LIVE_BLOCK_BYTES
++    num_gpu_blocks = 6
++    num_disk_slots = 64
++    gen = torch.Generator().manual_seed(1234)
++    gpu = torch.randint(
++        -128, 127, (num_gpu_blocks, block), dtype=torch.int8, generator=gen
++    )
++    original = gpu.clone()
++    caches = {"packed": gpu}
++    disk_path = _odirect_dir(tmp_path) / "kv-tier.bin"
++    stream = SimpleNamespace(wait_event=lambda event: None, cuda_stream=0)
++
++    backend = host_disk_backend()
++    backend.init(
++        caches,
++        torch.device("cpu"),
++        stream,
++        stream,
++        str(disk_path),
++        num_disk_slots,
++        block,
++        num_buffer_slots=num_buffer_slots,
++        use_page_cache=False,
++    )
++    flags = os.fstat(backend._fd)
++    assert flags.st_size == num_disk_slots * PADDED_BLOCK_BYTES
++    # every staging slot starts on a 4096-byte boundary
++    for slot in range(num_buffer_slots):
++        assert backend._store_buffer[slot].data_ptr() % 4096 == 0
++        assert backend._load_buffer[slot].data_ptr() % 4096 == 0
++        assert [len(v) for v in backend._store_slot_views[slot]] == [PADDED_BLOCK_BYTES]
++
++    gpu_ids = [0, 1, 2, 3, 4]
++    disk_ids = [0, 31, num_disk_slots - 1, 1, 30]  # first, middle, last, neighbours
++    backend._do_store(gpu_ids, disk_ids, stream)
++
++    # The file holds each block at slot * 229,376, followed by zero padding.
++    with open(disk_path, "rb") as raw:
++        for gpu_id, disk_id in zip(gpu_ids, disk_ids):
++            raw.seek(disk_id * PADDED_BLOCK_BYTES)
++            data = raw.read(PADDED_BLOCK_BYTES)
++            assert data[:block] == original[gpu_id].numpy().tobytes()
++            assert data[block:] == bytes(PADDED_BLOCK_BYTES - block)
++
++    gpu.zero_()
++    backend._do_load(disk_ids, gpu_ids, stream)
++    assert torch.equal(gpu[: len(gpu_ids)], original[: len(gpu_ids)])
++    assert torch.count_nonzero(gpu[len(gpu_ids) :]) == 0
++
++
++def test_padded_odirect_two_tensors_keep_file_layout(
++    tmp_path, host_disk_backend
++) -> None:
++    """Two regions of 1,536 and 2,048 bytes share one padded 4,096-byte slot,
++    back to back in tensor order, as the unpadded layout wrote them."""
++    gen = torch.Generator().manual_seed(7)
++    a = torch.randint(-128, 127, (4, 1536), dtype=torch.int8, generator=gen)
++    b = torch.randint(-128, 127, (4, 2048), dtype=torch.int8, generator=gen)
++    caches = {"a": a, "b": b}
++    want_a, want_b = a.clone(), b.clone()
++    disk_path = _odirect_dir(tmp_path) / "kv-two.bin"
++    stream = SimpleNamespace(wait_event=lambda event: None, cuda_stream=0)
++    backend = host_disk_backend()
++    backend.init(caches, torch.device("cpu"), stream, stream, str(disk_path), 8, 3584)
++    assert backend._slot_bytes == 4096
++    backend._do_store([0, 3], [5, 7], stream)
++    with open(disk_path, "rb") as raw:
++        raw.seek(5 * 4096)
++        slot = raw.read(4096)
++    assert slot[:1536] == want_a[0].numpy().tobytes()
++    assert slot[1536:3584] == want_b[0].numpy().tobytes()
++    a.zero_()
++    b.zero_()
++    backend._do_load([5, 7], [0, 3], stream)
++    assert torch.equal(a[[0, 3]], want_a[[0, 3]])
++    assert torch.equal(b[[0, 3]], want_b[[0, 3]])
++
++
++def test_disk_backend_io_threads_roundtrip(tmp_path, host_disk_backend) -> None:
++    """The launch_copy path (store and load threads) moves the same bytes."""
++    block = ds41_layout.LIVE_BLOCK_BYTES
++    gen = torch.Generator().manual_seed(99)
++    gpu = torch.randint(-128, 127, (3, block), dtype=torch.int8, generator=gen)
++    want = gpu.clone()
++    stream = SimpleNamespace(wait_event=lambda event: None, cuda_stream=0)
++    backend = host_disk_backend()
++    backend.init(
++        {"packed": gpu},
++        torch.device("cpu"),
++        stream,
++        stream,
++        str(_odirect_dir(tmp_path) / "kv-threads.bin"),
++        16,
++        block,
++    )
++    stored: list = []
++    backend.launch_copy([0, 1, 2], [15, 0, 8], True, 0, stored)
++    _wait_for(lambda: len(stored) == 1)
++    gpu.zero_()
++    loaded: list = []
++    backend.launch_copy([15, 0, 8], [0, 1, 2], False, 0, loaded)
++    _wait_for(lambda: len(loaded) == 1)
++    assert torch.equal(gpu, want)
++
++
++def _wait_for(predicate, timeout_s: float = 10.0) -> None:
++    done = threading.Event()
++    for _ in range(int(timeout_s / 0.01)):
++        if predicate():
++            return
++        done.wait(0.01)
++    raise AssertionError("IO thread did not finish")
+diff --git a/tests/v1/simple_kv_offload/test_kv_events.py b/tests/v1/simple_kv_offload/test_kv_events.py
+index f21dae7e0..126b18914 100644
+--- a/tests/v1/simple_kv_offload/test_kv_events.py
++++ b/tests/v1/simple_kv_offload/test_kv_events.py
+@@ -54,6 +54,7 @@ from vllm.v1.kv_cache_interface import (
+     SlidingWindowSpec,
+ )
+ from vllm.v1.request import Request
++from vllm.v1.simple_kv_offload.disk_backend import disk_slot_bytes
+ from vllm.v1.simple_kv_offload.manager import (
+     SimpleCPUOffloadScheduler,
+     StoreRequestState,
+@@ -306,7 +307,7 @@ def test_eager_store_lora_metadata() -> None:
+ def test_disk_mode_medium_storage_on_block_stored() -> None:
+     """disk_capacity_bytes>0 sets kv_event_medium=STORAGE on BlockStored."""
+     fix = make_events_scheduler(
+-        disk_capacity_bytes=_BYTES_PER_BLOCK * 8,
++        disk_capacity_bytes=disk_slot_bytes(_BYTES_PER_BLOCK) * 8,
+         enable_events=True,
+     )
+     sched = fix.scheduler
+@@ -322,7 +323,7 @@ def test_disk_mode_medium_storage_on_block_stored() -> None:
+ def test_finished_eager_store_emits_all_storage_events() -> None:
+     """Finished stores preserve and announce every registered hash."""
+     fix = make_events_scheduler(
+-        disk_capacity_bytes=_BYTES_PER_BLOCK * 8,
++        disk_capacity_bytes=disk_slot_bytes(_BYTES_PER_BLOCK) * 8,
+         enable_events=True,
+     )
+     sched = fix.scheduler
+@@ -398,7 +399,7 @@ def test_finished_eager_store_emits_all_storage_events() -> None:
+ def test_secondary_hash_block_stored_metadata() -> None:
+     """Secondary hashes carry their own token range and block size."""
+     fix = make_events_scheduler(
+-        disk_capacity_bytes=_BYTES_PER_BLOCK * 8,
++        disk_capacity_bytes=disk_slot_bytes(_BYTES_PER_BLOCK) * 8,
+         enable_events=True,
+     )
+     sched = fix.scheduler
+@@ -682,7 +683,7 @@ def test_disk_mode_block_removed_relabeled_storage() -> None:
+     fix = make_events_scheduler(
+         num_cpu_blocks=5,
+         num_gpu_blocks=16,
+-        disk_capacity_bytes=_BYTES_PER_BLOCK * 5,
++        disk_capacity_bytes=disk_slot_bytes(_BYTES_PER_BLOCK) * 5,
+     )
+     sched = fix.scheduler
+     assert sched.kv_event_medium == MEDIUM_STORAGE
+diff --git a/tests/v1/simple_kv_offload/test_worker.py b/tests/v1/simple_kv_offload/test_worker.py
+index 173929005..8210898bf 100644
+--- a/tests/v1/simple_kv_offload/test_worker.py
++++ b/tests/v1/simple_kv_offload/test_worker.py
+@@ -626,21 +626,23 @@ def test_mixed_page_byte_placement_is_dcp_invariant():
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("block_bytes", "use_page_cache", "expect_ok"),
++    ("block_bytes", "use_page_cache", "slot_bytes"),
+     [
+-        (4096, True, True),  # aligned control
+-        (3 * 512, True, True),  # 512-aligned only: fine for buffered I/O
+-        (3 * 512, False, False),  # O_DIRECT keeps enforcing 4096 alignment
++        (4096, True, 4096),  # aligned control
++        (3 * 512, True, 3 * 512),  # 512-aligned only: fine for buffered I/O
++        (3 * 512, False, 4096),  # O_DIRECT pads the slot to 4096
++        (227840, False, 229376),  # DeepSeek-V4.1 packed block
+     ],
+ )
+ def test_disk_backend_alignment_only_required_for_direct_io(
+-    tmp_path, monkeypatch, block_bytes: int, use_page_cache: bool, expect_ok: bool
++    tmp_path, monkeypatch, block_bytes: int, use_page_cache: bool, slot_bytes: int
+ ):
+-    """The 4096 stride assert belongs to O_DIRECT; page-cache I/O must not hit it.
++    """O_DIRECT pads each slot to 4096 bytes; page-cache I/O keeps the block size.
+ 
+     Hybrid models (e.g. 101 per-rank cache tensors) sum to a block stride that
+     is 512- but not 4096-aligned, which previously made disk offload unbootable
+-    even with use_page_cache=True.
++    even with use_page_cache=True. DeepSeek-V4.1's packed block is 227,840
++    bytes, which made O_DIRECT unbootable until slots were padded.
+     """
+     # Host pinning is a separate lifecycle concern with its own tests; the
+     # alignment gate must not depend on registration state, so stub both ends.
+@@ -669,13 +671,8 @@ def test_disk_backend_alignment_only_required_for_direct_io(
+             use_page_cache=use_page_cache,
+         )
+ 
+-    if not expect_ok:
+-        with pytest.raises(AssertionError, match="not aligned"):
+-            _init()
+-        return
+-
+     _init()
+     try:
+-        assert disk_path.stat().st_size == num_blocks * block_bytes
++        assert disk_path.stat().st_size == num_blocks * slot_bytes
+     finally:
+         backend.shutdown()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index f4f7906b9..21d5407db 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -167,6 +167,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+                 hash_block_size=hash_block_size,
+                 lazy_offload=lazy_offload,
+                 disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
++                disk_use_page_cache=use_page_cache,
+             )
+         elif role == KVConnectorRole.WORKER:
+             self.worker_handler = SimpleCPUOffloadWorker(
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index dfa717cc9..1e27b034b 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -33,6 +33,20 @@ O_DIRECT = getattr(os, "O_DIRECT", 0)
+ _ALIGNMENT = 4096
+ 
+ 
++def disk_slot_bytes(block_bytes: int, use_page_cache: bool = False) -> int:
++    """Bytes one offload block occupies in the disk file and in a staging slot.
++
++    O_DIRECT needs every file offset, iovec length and buffer address aligned
++    to the device's logical block (4096 covers 512e and 4Kn drives). A block
++    whose bytes are not a multiple of 4096 is padded up to the next multiple,
++    so every slot starts aligned and moves in one aligned I/O. Page-cache I/O
++    has no such rule and keeps the exact block size.
++    """
++    if use_page_cache:
++        return block_bytes
++    return -(-block_bytes // _ALIGNMENT) * _ALIGNMENT
++
++
+ def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
+     """Allocate a staging buffer whose base address is O_DIRECT aligned.
+ 
+@@ -71,13 +85,34 @@ class DiskBackend:
+         self._fd: int = -1
+         self._disk_path: str = ""
+         self._total_block_bytes: int = 0
+-        self._store_buffer_caches: dict[str, torch.Tensor] = {}
+-        self._load_buffer_caches: dict[str, torch.Tensor] = {}
++        # Bytes of one block on disk and in one staging slot: the block's
++        # bytes, padded to 4096 under O_DIRECT (see disk_slot_bytes).
++        self._slot_bytes: int = 0
++        # One [num_buffer_slots, slot_bytes] buffer per direction. A slot
++        # holds the tensors' bytes back to back, then the padding.
++        self._store_buffer: torch.Tensor | None = None
++        self._load_buffer: torch.Tensor | None = None
+         self._store_slot_views: list[list[memoryview]] = []
+         self._load_slot_views: list[list[memoryview]] = []
++        # Per staging slot, the DMA parameters that address that slot as
++        # block 0, so the slot can start on any aligned address.
++        self._store_slot_params: list[BatchMemcpyParams] = []
++        self._load_slot_params: list[BatchMemcpyParams] = []
+         self._per_tensor_bpb: list[int] = []
+         self._tensor_names: list[str] = []
+ 
++    def _slot_tensor_views(
++        self, buffer: torch.Tensor, slot: int
++    ) -> dict[str, torch.Tensor]:
++        """[1, bpb] byte views of each tensor's part of one staging slot."""
++        row = buffer[slot]
++        views: dict[str, torch.Tensor] = {}
++        offset = 0
++        for name, bpb in zip(self._tensor_names, self._per_tensor_bpb):
++            views[name] = row[offset : offset + bpb].view(1, bpb)
++            offset += bpb
++        return views
++
+     def init(
+         self,
+         gpu_caches: dict[str, torch.Tensor],
+@@ -98,54 +133,51 @@ class DiskBackend:
+         self._per_tensor_bpb = [
+             t.stride(0) * t.element_size() for t in gpu_caches.values()
+         ]
++        assert sum(self._per_tensor_bpb) == total_block_bytes, (
++            f"tensor block bytes {self._per_tensor_bpb} do not sum to "
++            f"total_block_bytes={total_block_bytes}"
++        )
++        # O_DIRECT pads each slot to 4096; page-cache I/O keeps the exact size.
++        self._slot_bytes = disk_slot_bytes(total_block_bytes, use_page_cache)
+ 
+-        # The stride alignment is an O_DIRECT kernel-DMA requirement; buffered
+-        # I/O through the page cache has no alignment constraint.
+-        if not use_page_cache:
+-            assert total_block_bytes % _ALIGNMENT == 0, (
+-                f"total_block_bytes={total_block_bytes} not aligned to {_ALIGNMENT}"
+-            )
+-
+-        # Separate buffer pools for store and load threads
+-        self._store_buffer_caches = {}
+-        self._load_buffer_caches = {}
+-        for name, gpu_t in gpu_caches.items():
+-            bpb = gpu_t.stride(0) * gpu_t.element_size()
+-            store_buf = _alloc_aligned(num_buffer_slots, bpb)
+-            pin_tensor(store_buf)
+-            self._store_buffer_caches[name] = store_buf
+-            load_buf = _alloc_aligned(num_buffer_slots, bpb)
+-            pin_tensor(load_buf)
+-            self._load_buffer_caches[name] = load_buf
++        # Separate buffer pools for store and load threads. Each slot is one
++        # contiguous row of slot_bytes, so slot starts stay 4096-aligned and a
++        # slot moves to or from disk in a single aligned iovec.
++        self._store_buffer = _alloc_aligned(num_buffer_slots, self._slot_bytes)
++        pin_tensor(self._store_buffer)
++        self._load_buffer = _alloc_aligned(num_buffer_slots, self._slot_bytes)
++        pin_tensor(self._load_buffer)
+ 
+         # Pre-built iovec views per slot (avoid per-transfer .numpy() calls)
+         self._store_slot_views = [
+-            [
+-                memoryview(self._store_buffer_caches[name][slot].numpy())
+-                for name in self._tensor_names
+-            ]
++            [memoryview(self._store_buffer[slot].numpy())]
+             for slot in range(num_buffer_slots)
+         ]
+         self._load_slot_views = [
+-            [
+-                memoryview(self._load_buffer_caches[name][slot].numpy())
+-                for name in self._tensor_names
+-            ]
++            [memoryview(self._load_buffer[slot].numpy())]
+             for slot in range(num_buffer_slots)
+         ]
+ 
+-        self._store_params = build_params(
+-            gpu_caches,
+-            self._store_buffer_caches,
+-            store_stream,
+-            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+-        )
+-        self._load_params = build_params(
+-            self._load_buffer_caches,
+-            gpu_caches,
+-            load_stream,
+-            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+-        )
++        self._store_slot_params = [
++            build_params(
++                gpu_caches,
++                self._slot_tensor_views(self._store_buffer, slot),
++                store_stream,
++                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
++            )
++            for slot in range(num_buffer_slots)
++        ]
++        self._load_slot_params = [
++            build_params(
++                self._slot_tensor_views(self._load_buffer, slot),
++                gpu_caches,
++                load_stream,
++                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
++            )
++            for slot in range(num_buffer_slots)
++        ]
++        self._store_params = self._store_slot_params[0]
++        self._load_params = self._load_slot_params[0]
+ 
+         os.makedirs(os.path.dirname(disk_path) or ".", exist_ok=True)
+         # Slot contents never outlive the process, so unlink then O_EXCL rather
+@@ -160,15 +192,16 @@ class DiskBackend:
+             flags |= O_DIRECT
+         self._fd = os.open(disk_path, flags, 0o600)
+         self._disk_path = disk_path
+-        os.ftruncate(self._fd, num_disk_slots * total_block_bytes)
++        os.ftruncate(self._fd, num_disk_slots * self._slot_bytes)
+ 
+         logger.info(
+-            "DiskBackend: path=%s, slots=%d, total=%.2f GB, buf=%dx%d bytes"
+-            " (page_cache=%s)",
++            "DiskBackend: path=%s, slots=%d, total=%.2f GB, buf=%dx%d bytes, "
++            "block=%d bytes (page_cache=%s)",
+             disk_path,
+             num_disk_slots,
+-            (num_disk_slots * total_block_bytes) / (1024**3),
++            (num_disk_slots * self._slot_bytes) / (1024**3),
+             num_buffer_slots,
++            self._slot_bytes,
+             total_block_bytes,
+             use_page_cache,
+         )
+@@ -253,18 +286,16 @@ class DiskBackend:
+ 
+     def _writev_slot(self, buf_slot: int, file_offset: int) -> None:
+         written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
+-        if written < self._total_block_bytes:
++        if written < self._slot_bytes:
+             raise OSError(
+-                f"Short write: expected {self._total_block_bytes} bytes, "
+-                f"wrote {written}"
++                f"Short write: expected {self._slot_bytes} bytes, wrote {written}"
+             )
+ 
+     def _readv_slot(self, buf_slot: int, file_offset: int) -> None:
+         bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
+-        if bytes_read < self._total_block_bytes:
++        if bytes_read < self._slot_bytes:
+             raise OSError(
+-                f"Short read: expected {self._total_block_bytes} bytes, "
+-                f"read {bytes_read}"
++                f"Short read: expected {self._slot_bytes} bytes, read {bytes_read}"
+             )
+ 
+     def _load_loop(
+@@ -292,7 +323,7 @@ class DiskBackend:
+         stream: torch.cuda.Stream,
+     ) -> None:
+         """GPU -> buffer (DMA) -> disk (pwritev), interleaved double-buffer."""
+-        assert self._store_params is not None
++        assert self._store_slot_params
+         n = self._num_buffer_slots
+         # (DMA event, file offset) of the block already staged in each slot.
+         pending: list[tuple[torch.Event, int] | None] = [None] * n
+@@ -304,10 +335,10 @@ class DiskBackend:
+                 prev[0].synchronize()
+                 self._writev_slot(buf_slot, prev[1])
+ 
+-            copy_blocks([gpu_blk], [buf_slot], self._store_params)
++            copy_blocks([gpu_blk], [0], self._store_slot_params[buf_slot])
+             ev = torch.Event()
+             ev.record(stream)
+-            pending[buf_slot] = (ev, disk_slot * self._total_block_bytes)
++            pending[buf_slot] = (ev, disk_slot * self._slot_bytes)
+ 
+         for slot, last in enumerate(pending):
+             if last is not None:
+@@ -321,7 +352,7 @@ class DiskBackend:
+         stream: torch.cuda.Stream,
+     ) -> None:
+         """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
+-        assert self._load_params is not None
++        assert self._load_slot_params
+         n = self._num_buffer_slots
+         prev_dma_events: list[torch.Event | None] = [None] * n
+ 
+@@ -331,9 +362,9 @@ class DiskBackend:
+             if prev is not None:
+                 prev.synchronize()
+ 
+-            self._readv_slot(buf_slot, disk_slot * self._total_block_bytes)
++            self._readv_slot(buf_slot, disk_slot * self._slot_bytes)
+ 
+-            copy_blocks([buf_slot], [gpu_blk], self._load_params)
++            copy_blocks([0], [gpu_blk], self._load_slot_params[buf_slot])
+             ev = torch.Event()
+             ev.record(stream)
+             prev_dma_events[buf_slot] = ev
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 825911fc6..0e5c81db0 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
+     get_kv_cache_spec_sliding_window,
+ )
+ from vllm.v1.outputs import KVConnectorOutput
++from vllm.v1.simple_kv_offload.disk_backend import disk_slot_bytes
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+@@ -143,6 +144,7 @@ class SimpleCPUOffloadScheduler:
+         hash_block_size: int,
+         lazy_offload: bool = False,
+         disk_capacity_bytes: int = 0,
++        disk_use_page_cache: bool = False,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -150,6 +152,16 @@ class SimpleCPUOffloadScheduler:
+         offload_capacity = (
+             disk_capacity_bytes if disk_capacity_bytes > 0 else cpu_capacity_bytes
+         )
++        # Under O_DIRECT the disk backend pads every block to a 4096-byte slot
++        # (disk_slot_bytes); count slots the same way, or the scheduler hands
++        # out slot ids past the end of the worker's file.
++        disk_slot_size: int | None = None
++        if disk_capacity_bytes > 0 and not disk_use_page_cache:
++            assert kv_cache_config is not None and kv_cache_config.kv_cache_tensors
++            block_bytes = (
++                kv_cache_config.kv_cache_tensors[0].size // kv_cache_config.num_blocks
++            )
++            disk_slot_size = disk_slot_bytes(block_bytes, use_page_cache=False)
+         self.enable_kv_cache_events = (
+             vllm_config.kv_events_config is not None
+             and vllm_config.kv_events_config.enable_kv_cache_events
+@@ -162,7 +174,7 @@ class SimpleCPUOffloadScheduler:
+         # Derive a CPU KVCacheConfig from the GPU config and build a coordinator
+         assert kv_cache_config is not None
+         self.cpu_kv_cache_config = self._derive_cpu_config(
+-            kv_cache_config, offload_capacity
++            kv_cache_config, offload_capacity, slot_bytes=disk_slot_size
+         )
+         self.num_cpu_blocks = self.cpu_kv_cache_config.num_blocks
+         self.prefix_cacheable_group_ids = frozenset(
+@@ -259,10 +271,13 @@ class SimpleCPUOffloadScheduler:
+ 
+     @staticmethod
+     def _derive_cpu_config(
+-        gpu_config: "KVCacheConfig", cpu_capacity_bytes: int
++        gpu_config: "KVCacheConfig",
++        cpu_capacity_bytes: int,
++        slot_bytes: int | None = None,
+     ) -> "KVCacheConfig":
+         """Derive a CPU KVCacheConfig from the GPU config.
+-        Same kv_cache_groups, num_blocks scaled by CPU/GPU memory ratio."""
++        Same kv_cache_groups, num_blocks scaled by CPU/GPU memory ratio, or
++        the capacity divided by ``slot_bytes`` when blocks are stored padded."""
+         # Import here to avoid potential circular imports
+         from vllm.v1.kv_cache_interface import KVCacheTensor
+ 
+@@ -272,7 +287,12 @@ class SimpleCPUOffloadScheduler:
+         # so its size is the total GPU KV cache size.
+         gpu_total_bytes = gpu_config.kv_cache_tensors[0].size
+         num_gpu_blocks = gpu_config.num_blocks
+-        num_cpu_blocks = max(1, num_gpu_blocks * cpu_capacity_bytes // gpu_total_bytes)
++        if slot_bytes is not None:
++            num_cpu_blocks = max(1, cpu_capacity_bytes // slot_bytes)
++        else:
++            num_cpu_blocks = max(
++                1, num_gpu_blocks * cpu_capacity_bytes // gpu_total_bytes
++            )
+         # Create CPU kv_cache_tensors mirroring GPU by scaling size proportionally.
+         cpu_tensors = [
+             KVCacheTensor(
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index fc950af40..b8fee5775 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -11,7 +11,7 @@ from vllm.logger import init_logger
+ from vllm.utils.torch_utils import PIN_MEMORY
+ from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+ from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+-from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
++from vllm.v1.simple_kv_offload.disk_backend import DiskBackend, disk_slot_bytes
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+@@ -179,14 +179,20 @@ class SimpleCPUOffloadWorker:
+         total_bytes_per_block: int,
+         device: torch.device,
+     ) -> None:
+-        num_disk_slots = max(1, self.disk_capacity_bytes // total_bytes_per_block)
++        # Must match SimpleCPUOffloadScheduler's slot count: both divide the
++        # capacity by the padded slot size (disk_slot_bytes).
++        slot_bytes = disk_slot_bytes(total_bytes_per_block, self.use_page_cache)
++        num_disk_slots = max(1, self.disk_capacity_bytes // slot_bytes)
+         self.num_cpu_blocks = num_disk_slots
+ 
+         logger.info(
+-            "SimpleCPUOffloadWorker [DISK]: %d tensors, %d disk slots (%.2f GB)",
++            "SimpleCPUOffloadWorker [DISK]: %d tensors, %d disk slots (%.2f GB), "
++            "block %d bytes in %d-byte slots",
+             len(unique_gpu_caches),
+             num_disk_slots,
+-            (num_disk_slots * total_bytes_per_block) / (1024**3),
++            (num_disk_slots * slot_bytes) / (1024**3),
++            total_bytes_per_block,
++            slot_bytes,
+         )
+ 
+         assert self.disk_path is not None
+-- 
+2.56.1
+

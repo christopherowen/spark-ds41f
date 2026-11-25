@@ -1,0 +1,943 @@
+From 7e3d9a65fe208576595066301a94c6b3e8ba02c2 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:36:58 +0000
+Subject: [PATCH] fix(kv-offload): time disk I/O from the dequeue and by
+ progress
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9039
+of this series.
+
+Rationale: a later read of the code found two gaps. The 15 s timeout of
+9033 counted from submission, so a burst of returning sessions queued on
+one load thread could degrade the tier with no disk fault. No test
+failed when the drain of the load stream after a timeout was removed,
+because the host copies of the CPU tests are synchronous. With this
+patch the I/O timeout no longer counts queue time. Each IO thread
+records when it takes a transfer from the queue and when each slot of
+the transfer completes, and a transfer is abandoned when no slot has
+completed for disk_io_timeout_s since the later of the two, so a
+transfer that keeps completing slots runs to the end. When the tier of
+a rank has a fault, every transfer still queued on that rank fails at
+once with no I/O, so the loads behind a hung read do not wait for a
+blocked thread. The scheduler records the time of each load event and
+reports the slowest load since the start as the gauge
+vllm:kv_offload_disk_load_seconds_max, which includes the queue time and
+the wait for every rank. A debug hook, VLLM_KVTIER_DEBUG_READ_DELAY with
+the value <read>:<seconds>[:<rank>], makes one slot read sleep so that a
+test or a hardware run can hang a read; it is off by default and is read
+once at init.
+
+Quality implications: the patch does not change outputs, and the debug
+hook stays off unless the variable is set.
+
+Tests: on the CPU path the offload suite passed 185 tests, with 2
+CUDA-only modules skipped. The new file test_ds41_tier_timeouts.py holds
+8 tests. In them, 8 loads queued behind each other, the last taking
+about 0.96 s under a timeout of 0.3 s, do not degrade the tier, and
+neither does one load of 12 slots over 0.72 s. A hung first read fails
+its load at the timeout and fails the two loads queued behind it at
+once with no I/O. The debug delay is parsed and hangs the named read,
+and it is off without the variable. With a load stream whose copies run
+0.5 s late, an abandoned load is released only after the copy in flight
+lands, and blocks given to another request afterwards keep the new
+bytes. The slowest load is reported once the figure rises. A total
+bound on a transfer that progresses slowly does not exist at this patch
+and was not tested, and neither were the drain on a CUDA stream and the
+debug hook on hardware. On DGX Spark hardware the patch ran only as part
+of the whole series.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_faults.py                  |  23 +-
+ .../test_ds41_tier_timeouts.py                | 390 ++++++++++++++++++
+ .../v1/simple_cpu_offload_connector.py        |   8 +-
+ vllm/v1/simple_kv_offload/disk_backend.py     |  72 ++++
+ vllm/v1/simple_kv_offload/manager.py          |  24 +-
+ vllm/v1/simple_kv_offload/metrics.py          |  37 +-
+ vllm/v1/simple_kv_offload/worker.py           |  69 ++--
+ 7 files changed, 578 insertions(+), 45 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+index 659156475..7f5823581 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+@@ -370,6 +370,8 @@ def test_degraded_reaches_scheduler_from_one_of_three_ranks(caplog) -> None:
+         assert sched.prepare_store_specs(make_scheduler_output({}))[0] == []
+     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+     stats = sched.get_stats()
++    # the slowest load since the start: the failed load of r2, two steps
++    assert stats.pop("load_seconds_max") > 0
+     # the setup's store of 2 blocks, then the fault
+     assert stats == {
+         "stored_blocks": 2,
+@@ -431,7 +433,10 @@ def test_store_failed_on_one_rank_is_dropped_from_index() -> None:
+ def test_prometheus_series_names() -> None:
+     from vllm.v1.simple_kv_offload import metrics
+ 
+-    names = sorted(n for n, _ in metrics.COUNTERS.values()) + [metrics.DEGRADED[0]]
++    names = sorted(n for n, _ in metrics.COUNTERS.values()) + [
++        metrics.DEGRADED[0],
++        metrics.LOAD_SECONDS_MAX[0],
++    ]
+     assert names == [
+         "vllm:kv_offload_disk_io_errors",
+         "vllm:kv_offload_disk_load_failures",
+@@ -439,10 +444,20 @@ def test_prometheus_series_names() -> None:
+         "vllm:kv_offload_disk_store_failed_blocks",
+         "vllm:kv_offload_disk_stored_blocks",
+         "vllm:kv_offload_disk_degraded",
++        "vllm:kv_offload_disk_load_seconds_max",
+     ]
+-    a = metrics.SimpleCPUOffloadStats(data={"loads": 2, "degraded": 0})
+-    b = metrics.SimpleCPUOffloadStats(data={"loads": 1, "io_errors": 1, "degraded": 1})
+-    assert a.aggregate(b).data == {"loads": 3, "io_errors": 1, "degraded": 1}
++    a = metrics.SimpleCPUOffloadStats(
++        data={"loads": 2, "degraded": 0, "load_seconds_max": 1.5}
++    )
++    b = metrics.SimpleCPUOffloadStats(
++        data={"loads": 1, "io_errors": 1, "degraded": 1, "load_seconds_max": 0.5}
++    )
++    assert a.aggregate(b).data == {
++        "loads": 3,
++        "io_errors": 1,
++        "degraded": 1,
++        "load_seconds_max": 1.5,
++    }
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+new file mode 100644
+index 000000000..1871a7c0d
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+@@ -0,0 +1,390 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The disk tier's I/O timeout counts from the moment a transfer leaves its
++queue and resets at every completed slot (CPU-only).
++
++A burst of loads queued behind each other does not degrade the tier; a
++transfer that stops making progress does, and the transfers queued behind it
++fail at once. The debug read delay hangs one read on purpose. A copy still in
++flight on the load stream when a load is abandoned lands before the load's
++GPU blocks are released, so it never writes into blocks that another request
++holds by then (the drain after the timeout).
++"""
++
++from __future__ import annotations
++
++import errno
++import os
++import queue
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from tests.v1.simple_kv_offload import ds41_layout
++from tests.v1.simple_kv_offload.test_ds41_offload import (
++    _host_build_params,
++    _host_copy_blocks,
++    _odirect_dir,
++)
++from tests.v1.simple_kv_offload.test_ds41_tier_faults import (  # noqa: F401
++    _HostStream,
++    _poll,
++    _stored,
++    host_cuda,
++    tier,
++)
++from vllm.v1.simple_kv_offload import disk_backend as disk_backend_mod
++from vllm.v1.simple_kv_offload.disk_backend import (
++    DEBUG_READ_DELAY_ENV,
++    DiskBackend,
++    parse_debug_read_delay,
++)
++from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
++from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++BLOCK = ds41_layout.LIVE_BLOCK_BYTES
++SLOT = 229376
++SLOTS = 16
++READ_S = 0.06  # each slot read in the slow-disk tests
++
++
++def _slow_reads(monkeypatch, seconds=READ_S):
++    """Every preadv takes ``seconds`` longer; returns the call counter."""
++    real = os.preadv
++    calls = {"n": 0}
++
++    def slow(fd, bufs, offset):
++        calls["n"] += 1
++        time.sleep(seconds)
++        return real(fd, bufs, offset)
++
++    monkeypatch.setattr(os, "preadv", slow)
++    return calls
++
++
++def _submit_loads(worker, loads):
++    """Submit load events back to back, as consecutive steps would, then bind
++    a metadata that maps every event to its request (as the scheduler's
++    load_event_to_reqs does)."""
++    event_to_reqs = {}
++    for event, (slots, gpu_ids) in enumerate(loads):
++        event_to_reqs[event] = [f"r{event}"]
++        worker.bind_connector_metadata(
++            SimpleCPUOffloadMetadata(
++                load_event=event,
++                load_gpu_blocks=gpu_ids,
++                load_cpu_blocks=slots,
++                load_event_to_reqs=dict(event_to_reqs),
++            )
++        )
++        worker.start_load_kv()
++    worker.bind_connector_metadata(
++        SimpleCPUOffloadMetadata(load_event_to_reqs=dict(event_to_reqs))
++    )
++    return {f"r{e}" for e in event_to_reqs}
++
++
++def _poll_all(worker, reqs, timeout_s=10.0):
++    finished, failed = set(), set()
++    deadline = time.monotonic() + timeout_s
++    while finished != reqs:
++        assert time.monotonic() < deadline, f"finished {finished} of {reqs}"
++        res = worker.get_transfer_results(set())
++        finished |= res.finished_recving
++        failed |= res.failed_recving
++        time.sleep(0.01)
++    return failed
++
++
++# ---------------------------------------------------------------------------
++# The timeout from dequeue, with the progress check
++# ---------------------------------------------------------------------------
++
++
++def test_queued_burst_does_not_degrade(tier, monkeypatch) -> None:
++    """8 loads of 2 slots each queue behind each other on one load thread:
++    about 0.96 s for the last one, three times the 0.3 s timeout, while no
++    single read takes longer than 0.06 s."""
++    timeout_s = 0.3
++    worker, gpu = tier(timeout_s=timeout_s)
++    _stored(worker, [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
++    calls = _slow_reads(monkeypatch)
++    start = time.monotonic()
++    pairs = [[i % 6, (i + 1) % 6] for i in range(8)]
++    reqs = _submit_loads(worker, [(pair, pair) for pair in pairs])
++    failed = _poll_all(worker, reqs)
++    waited = time.monotonic() - start
++    assert failed == set()
++    assert worker._backend.fault is None
++    assert calls["n"] == 16
++    assert waited > 3 * timeout_s  # the queue time exceeded the timeout
++
++
++def test_long_transfer_that_progresses_does_not_degrade(tier, monkeypatch) -> None:
++    """One load of 12 slots at 0.06 s a slot: 0.72 s, more than the 0.3 s
++    timeout, with a completed slot every 0.06 s."""
++    worker, gpu = tier(timeout_s=0.3)
++    _stored(worker, [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
++    _slow_reads(monkeypatch)
++    slots = [0, 1, 2, 3, 4, 5] * 2
++    start = time.monotonic()
++    reqs = _submit_loads(worker, [(slots, slots)])
++    assert _poll_all(worker, reqs) == set()
++    assert time.monotonic() - start > 0.3
++    assert worker._backend.fault is None
++
++
++def test_hung_transfer_degrades_and_fails_the_queue(tier, monkeypatch) -> None:
++    """The first read of the first load never returns: that load fails at
++    the timeout after it left the queue, and the two loads queued behind it
++    fail at once, with no I/O, although their thread is still blocked."""
++    timeout_s = 0.3
++    worker, gpu = tier(timeout_s=timeout_s)
++    _stored(worker, [0, 1, 2], [3, 4, 5])
++    real = os.preadv
++    calls = {"n": 0}
++    release = threading.Event()
++
++    def hang_first(fd, bufs, offset):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            release.wait(10)
++        return real(fd, bufs, offset)
++
++    monkeypatch.setattr(os, "preadv", hang_first)
++    gpu[0:3].zero_()
++    start = time.monotonic()
++    reqs = _submit_loads(worker, [([3], [0]), ([4], [1]), ([5], [2])])
++    failed = _poll_all(worker, reqs)
++    waited = time.monotonic() - start
++    assert failed == reqs
++    assert timeout_s <= waited < timeout_s + 0.3
++    fault = worker._backend.fault
++    assert (fault.op, fault.slot, fault.errno) == ("load", 3, errno.ETIMEDOUT)
++    assert "made no progress for 0.3 s" in fault.message
++    assert calls["n"] == 1  # the queued loads did no I/O
++    release.set()
++    time.sleep(0.2)
++    assert torch.count_nonzero(gpu[0:3]) == 0  # no late copy
++    assert worker._backend.thread_alive(False)
++
++
++# ---------------------------------------------------------------------------
++# The debug read delay
++# ---------------------------------------------------------------------------
++
++
++def test_debug_read_delay_parsing() -> None:
++    assert parse_debug_read_delay(None, 0) is None
++    assert parse_debug_read_delay("", 0) is None
++    assert parse_debug_read_delay("2:20", 1) == (2, 20.0)
++    assert parse_debug_read_delay("2:20:1", 1) == (2, 20.0)
++    assert parse_debug_read_delay("2:20:2", 1) is None  # another rank
++    for bad in ("2", "0:5", "2:0", "x:1", "1:2:3:4"):
++        with pytest.raises(ValueError):
++            parse_debug_read_delay(bad, 0)
++
++
++def test_debug_read_delay_hangs_the_nth_read(tier, monkeypatch) -> None:
++    """VLLM_KVTIER_DEBUG_READ_DELAY=2:1.0: the second slot read of the
++    process sleeps 1 s; with a 0.3 s timeout the load fails on that slot."""
++    monkeypatch.setenv(DEBUG_READ_DELAY_ENV, "2:1.0")
++    worker, gpu = tier(timeout_s=0.3)
++    assert worker._backend._debug_read_delay == (2, 1.0)
++    _stored(worker, [0, 1], [6, 7])
++    reqs = _submit_loads(worker, [([6, 7], [4, 5])])
++    assert _poll_all(worker, reqs) == reqs
++    fault = worker._backend.fault
++    assert (fault.op, fault.slot, fault.errno) == ("load", 7, errno.ETIMEDOUT)
++
++
++def test_debug_read_delay_is_off_by_default(tier, monkeypatch) -> None:
++    monkeypatch.delenv(DEBUG_READ_DELAY_ENV, raising=False)
++    worker, gpu = tier()
++    assert worker._backend._debug_read_delay is None
++
++
++# ---------------------------------------------------------------------------
++# The drain after a timeout: a load stream whose copies run late
++# ---------------------------------------------------------------------------
++
++
++class _DeferredStream:
++    """A stream stand-in whose copies run in order on a host thread, each
++    ``delay_s`` after the previous one: a copy can still be in flight when
++    the IO thread has moved on, as on a CUDA stream."""
++
++    cuda_stream = 0
++
++    def __init__(self, delay_s: float) -> None:
++        self.delay_s = delay_s
++        self.cv = threading.Condition()
++        self.enqueued = 0
++        self.done = 0
++        self.q: queue.SimpleQueue = queue.SimpleQueue()
++        self.thread = threading.Thread(target=self._run, daemon=True)
++        self.thread.start()
++
++    def submit(self, fn) -> None:
++        with self.cv:
++            self.enqueued += 1
++            n = self.enqueued
++        self.q.put((n, fn))
++
++    def _run(self) -> None:
++        while (item := self.q.get()) is not None:
++            n, fn = item
++            time.sleep(self.delay_s)
++            fn()
++            with self.cv:
++                self.done = n
++                self.cv.notify_all()
++
++    def wait_for(self, n: int) -> None:
++        with self.cv:
++            self.cv.wait_for(lambda: self.done >= n, timeout=10)
++
++    def synchronize(self) -> None:
++        with self.cv:
++            n = self.enqueued
++        self.wait_for(n)
++
++    def wait_event(self, event) -> None:
++        pass
++
++    def close(self) -> None:
++        self.q.put(None)
++
++
++class _DeferredEvent:
++    def __init__(self) -> None:
++        self.stream = None
++        self.mark = 0
++
++    def record(self, stream=None) -> None:
++        self.stream = stream
++        if isinstance(stream, _DeferredStream):
++            with stream.cv:
++                self.mark = stream.enqueued
++
++    def synchronize(self) -> None:
++        if isinstance(self.stream, _DeferredStream):
++            self.stream.wait_for(self.mark)
++
++    def query(self) -> bool:
++        if isinstance(self.stream, _DeferredStream):
++            with self.stream.cv:
++                return self.stream.done >= self.mark
++        return True
++
++
++def _deferred_build_params(src_caches, dst_caches, stream, src_access_order=0):
++    params = _host_build_params(src_caches, dst_caches, stream, src_access_order)
++    params.stream = stream
++    return params
++
++
++def _deferred_copy_blocks(src_ids, dst_ids, params) -> None:
++    src_ids, dst_ids = list(src_ids), list(dst_ids)
++    if isinstance(params.stream, _DeferredStream):
++        params.stream.submit(lambda: _host_copy_blocks(src_ids, dst_ids, params))
++    else:
++        _host_copy_blocks(src_ids, dst_ids, params)
++
++
++def test_late_copy_lands_before_the_blocks_are_released(tmp_path, monkeypatch) -> None:
++    """A load of two slots: the copy of the first slot runs 0.5 s late on the
++    load stream, the read of the second hangs 1.5 s (the debug read delay).
++    The 0.2 s timeout abandons the load while the first copy is in flight;
++    the drain waits for it before the request is released. The blocks are
++    then given to another request (a sentinel is written); neither the late
++    first copy nor the second slot's read may change them."""
++    monkeypatch.setattr(disk_backend_mod, "pin_tensor", lambda t: None)
++    monkeypatch.setattr(disk_backend_mod, "build_params", _deferred_build_params)
++    monkeypatch.setattr(disk_backend_mod, "copy_blocks", _deferred_copy_blocks)
++    monkeypatch.setattr(
++        disk_backend_mod,
++        "current_platform",
++        SimpleNamespace(set_device=lambda device: None),
++    )
++    monkeypatch.setattr(torch, "Event", _DeferredEvent)
++    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _HostStream())
++    monkeypatch.setenv(DEBUG_READ_DELAY_ENV, "2:1.5")
++
++    gen = torch.Generator().manual_seed(5)
++    gpu = torch.randint(-128, 127, (6, BLOCK), dtype=torch.int8, generator=gen)
++    load_stream = _DeferredStream(delay_s=0.5)
++    store_stream = _HostStream()
++    worker = SimpleCPUOffloadWorker(
++        vllm_config=MagicMock(),
++        kv_cache_config=None,
++        cpu_capacity_bytes=0,
++        kv_offload_backend="disk",
++        disk_path=str(tmp_path / "unused"),
++        disk_capacity_bytes=SLOTS * SLOT,
++        disk_io_timeout_s=0.2,
++    )
++    backend = DiskBackend()
++    backend.init(
++        {"packed": gpu},
++        torch.device("cpu"),
++        load_stream,
++        store_stream,
++        str(_odirect_dir(tmp_path) / "drain.rank_0"),
++        SLOTS,
++        BLOCK,
++        checksum="crc32",
++    )
++    worker._backend = backend
++    worker.load_stream = load_stream
++    worker.store_stream = store_stream
++    try:
++        _stored(worker, [0, 1], [2, 3])
++        start = time.monotonic()
++        reqs = _submit_loads(worker, [([2, 3], [4, 5])])
++        assert _poll_all(worker, reqs) == reqs
++        released = time.monotonic() - start
++        # released only after the late copy of the first slot landed
++        assert released >= 0.45
++        assert torch.equal(gpu[4], gpu[0])
++        # the blocks now belong to another request
++        gpu[4].fill_(7)
++        gpu[5].fill_(7)
++        time.sleep(max(0.0, 2.2 - (time.monotonic() - start)))
++        assert backend.running(False) is None  # the hung read has returned
++        assert torch.all(gpu[4] == 7) and torch.all(gpu[5] == 7)
++        fault = backend.fault
++        assert (fault.op, fault.slot, fault.errno) == ("load", 3, errno.ETIMEDOUT)
++    finally:
++        backend.shutdown()
++        load_stream.close()
++
++
++# ---------------------------------------------------------------------------
++# The slowest load, as a gauge
++# ---------------------------------------------------------------------------
++
++
++def test_slowest_load_is_reported_once_it_rises() -> None:
++    from tests.v1.simple_kv_offload.test_ds41_tier_faults import (
++        _scheduler_with_pending_load,
++    )
++    from vllm.v1.outputs import KVConnectorOutput
++
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    (event,) = sched._load_event_time
++    sched._load_event_time[event] -= 2.5  # the load was sent 2.5 s ago
++    sched.get_stats()
++    sched.update_connector_output(KVConnectorOutput(finished_recving={"r2"}))
++    stats = sched.get_stats()
++    assert stats["loads"] == 1
++    assert 2.5 <= stats["load_seconds_max"] < 3.5
++    assert sched._load_event_time == {}  # forgotten with its last request
++    assert sched.get_stats() is None  # not repeated while it does not rise
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index ae2d35ca0..f614c6bd4 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -66,9 +66,11 @@ _DISK_ONLY_KEYS = (
+     "disk_checksum",
+     "disk_preallocate",
+ )
+-# Seconds a disk transfer may take, from submission, before it is abandoned
+-# and its requests fall back to a cache miss (kv_connector_extra_config
+-# "disk_io_timeout_s").
++# Seconds a disk transfer under I/O may go without completing a slot, counted
++# from the moment its IO thread takes it from the queue or from its last
++# completed slot, before it is abandoned and its requests fall back to a cache
++# miss (kv_connector_extra_config "disk_io_timeout_s"). Queue time does not
++# count.
+ DEFAULT_DISK_IO_TIMEOUT_S = 15.0
+ 
+ 
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 464516bbe..8a260d0fa 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -16,6 +16,7 @@ import os
+ import queue
+ import struct
+ import threading
++import time
+ import zlib
+ from typing import NamedTuple
+ 
+@@ -37,6 +38,28 @@ logger = init_logger(__name__)
+ 
+ O_DIRECT = getattr(os, "O_DIRECT", 0)
+ _ALIGNMENT = 4096
++# Debug only, off by default: "<read>:<seconds>[:<rank>]" makes the <read>-th
++# slot read of this process (from 1) sleep <seconds> before its preadv, on
++# every rank or on <rank> only. Read once at init. It stands in for a hung
++# read in tests and in one window row.
++DEBUG_READ_DELAY_ENV = "VLLM_KVTIER_DEBUG_READ_DELAY"
++
++
++def parse_debug_read_delay(value: str | None, rank: int) -> tuple[int, float] | None:
++    """(read number, seconds) of the debug read delay for this rank, or None."""
++    if not value:
++        return None
++    parts = value.split(":")
++    if len(parts) not in (2, 3):
++        raise ValueError(
++            f"{DEBUG_READ_DELAY_ENV}={value!r}: expected <read>:<seconds>[:<rank>]"
++        )
++    read, seconds = int(parts[0]), float(parts[1])
++    if read < 1 or seconds <= 0:
++        raise ValueError(f"{DEBUG_READ_DELAY_ENV}={value!r}: read >= 1, seconds > 0")
++    if len(parts) == 3 and int(parts[2]) != rank:
++        return None
++    return read, seconds
+ 
+ # Slot header, written into the slot's padding after the block bytes:
+ # magic, version, checksum kind, slot id, generation, block key, checksum.
+@@ -167,6 +190,19 @@ class DiskBackend:
+         self._abandon_lock = threading.Lock()
+         # Slot under I/O in each thread, for the fault report of a timeout.
+         self._current_slot: dict[bool, int] = {True: -1, False: -1}
++        # Progress of each IO thread, for the worker's I/O timeout. The clock
++        # of a transfer starts when its thread takes it from the queue, so
++        # time in the queue never counts. _running holds the event under I/O
++        # and the time of its start or of its last completed slot, whichever
++        # is later; _started is the highest event index taken from the queue
++        # (events leave each queue in index order).
++        self._running: dict[bool, tuple[int, float] | None] = {
++            True: None,
++            False: None,
++        }
++        self._started: dict[bool, int] = {True: -1, False: -1}
++        self._debug_read_delay: tuple[int, float] | None = None
++        self._reads = 0
+         # Slot integrity (see _HEADER): kind 0 is off, the header with it.
+         self._checksum_kind = 0
+         self._generation: np.ndarray | None = None
+@@ -204,6 +240,24 @@ class DiskBackend:
+         thread = self._store_thread if is_store else self._load_thread
+         return thread is not None and thread.is_alive()
+ 
++    def started(self, is_store: bool, event_idx: int) -> bool:
++        """Whether the IO thread has taken this event from its queue."""
++        return event_idx <= self._started[is_store]
++
++    def running(self, is_store: bool) -> tuple[int, float] | None:
++        """(event index, time of its start or last completed slot) of the
++        transfer under I/O on this thread, or None."""
++        return self._running[is_store]
++
++    def _begin(self, is_store: bool, event_idx: int) -> None:
++        self._started[is_store] = max(self._started[is_store], event_idx)
++        self._running[is_store] = (event_idx, time.monotonic())
++
++    def _progress(self, is_store: bool) -> None:
++        running = self._running[is_store]
++        if running is not None:
++            self._running[is_store] = (running[0], time.monotonic())
++
+     def _copy_unless_abandoned(
+         self,
+         is_store: bool,
+@@ -252,6 +306,7 @@ class DiskBackend:
+             )
+         finally:
+             self._current_slot[is_store] = -1
++            self._running[is_store] = None
+ 
+     def _slot_tensor_views(
+         self, buffer: torch.Tensor, slot: int
+@@ -278,8 +333,18 @@ class DiskBackend:
+         use_page_cache: bool = False,
+         checksum: str = "none",
+         preallocate: bool = False,
++        rank: int = 0,
+     ) -> None:
+         self._load_stream = load_stream
++        self._debug_read_delay = parse_debug_read_delay(
++            os.environ.get(DEBUG_READ_DELAY_ENV), rank
++        )
++        if self._debug_read_delay is not None:
++            logger.warning(
++                "DiskBackend: debug read delay on (%s): read %d sleeps %.1f s",
++                DEBUG_READ_DELAY_ENV,
++                *self._debug_read_delay,
++            )
+         self._store_stream = store_stream
+         self._total_block_bytes = total_block_bytes
+         self._num_buffer_slots = num_buffer_slots
+@@ -485,6 +550,7 @@ class DiskBackend:
+             if item is None:
+                 return
+             (src_blocks, dst_blocks, event_idx, events_list, wait_event, keys) = item
++            self._begin(True, event_idx)
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+             self._run_transfer(True, src_blocks, dst_blocks, stream, event_idx, keys)
+@@ -566,11 +632,15 @@ class DiskBackend:
+             )
+         if self._generation is not None:
+             self._generation[slot] = generation
++        self._progress(True)
+ 
+     def _readv_slot(
+         self, buf_slot: int, file_offset: int, slot: int = -1, key: int = 0
+     ) -> None:
+         self._current_slot[False] = slot
++        self._reads += 1
++        if self._debug_read_delay and self._reads == self._debug_read_delay[0]:
++            time.sleep(self._debug_read_delay[1])
+         try:
+             bytes_read = os.preadv(
+                 self._fd, self._load_slot_views[buf_slot], file_offset
+@@ -587,6 +657,7 @@ class DiskBackend:
+             )
+         if self._checksum_kind:
+             self._verify_slot(buf_slot, slot, key)
++        self._progress(False)
+ 
+     def _load_loop(
+         self,
+@@ -599,6 +670,7 @@ class DiskBackend:
+             if item is None:
+                 return
+             (src_blocks, dst_blocks, event_idx, events_list, wait_event, keys) = item
++            self._begin(False, event_idx)
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+             self._run_transfer(False, src_blocks, dst_blocks, stream, event_idx, keys)
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 5fd8b3778..cd6b7a328 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -4,6 +4,7 @@
+ 
+ import contextlib
+ import errno
++import time
+ from collections.abc import Iterable
+ from dataclasses import dataclass, field, replace
+ from enum import Enum, auto
+@@ -291,8 +292,13 @@ class SimpleCPUOffloadScheduler:
+         # get_stats() call feed the connector's Prometheus metrics.
+         self.degraded = False
+         self._failed_store_events: set[int] = set()
+-        self._stats: dict[str, int] = {}
++        self._stats: dict[str, int | float] = {}
+         self._degraded_reported: bool | None = None
++        # Load latency: seconds from the step that sends a load event to the
++        # step that sees it finished on every rank, queue time included. The
++        # slowest since the engine started is a gauge.
++        self._load_event_time: dict[int, float] = {}
++        self._load_seconds_max = 0.0
+ 
+     @staticmethod
+     def _derive_cpu_config(
+@@ -642,6 +648,7 @@ class SimpleCPUOffloadScheduler:
+         if load_req_ids:
+             load_event = self._load_event_counter
+             self._load_event_counter += 1
++            self._load_event_time[load_event] = time.monotonic()
+             for req_id in load_req_ids:
+                 self._reqs_to_load[req_id].load_event = load_event
+             self._load_event_to_reqs[load_event] = load_req_ids
+@@ -1083,12 +1090,21 @@ class SimpleCPUOffloadScheduler:
+ 
+         # --- Load completions ---
+         failed_recving = connector_output.failed_recving or set()
++        now = time.monotonic()
+         for req_id in list(connector_output.finished_recving or []):
+             if req_id in self._reqs_to_load:
+                 if req_id in failed_recving:
+                     self._count("load_failures")
+                 else:
+                     self._count("loads")
++            state = self._reqs_to_load.get(req_id) or self._abandoned_reqs_to_load.get(
++                req_id
++            )
++            if state is not None and state.load_event is not None:
++                sent = self._load_event_time.get(state.load_event)
++                if sent is not None and now - sent > self._load_seconds_max:
++                    self._load_seconds_max = now - sent
++                    self._stats["load_seconds_max"] = round(self._load_seconds_max, 3)
+             self._cleanup_load_request(req_id)
+         if failed_recving and not self.degraded:
+             # A rank failed a load without a fault record reaching here yet.
+@@ -1286,8 +1302,9 @@ class SimpleCPUOffloadScheduler:
+             message,
+         )
+ 
+-    def get_stats(self) -> dict[str, int] | None:
+-        """Counters since the last call and the degraded flag (0 or 1).
++    def get_stats(self) -> dict[str, int | float] | None:
++        """Counters since the last call, the degraded flag (0 or 1) and, when
++        it rose, the slowest load since the start (load_seconds_max).
+ 
+         None when nothing changed, so idle steps send nothing.
+         """
+@@ -1477,6 +1494,7 @@ class SimpleCPUOffloadScheduler:
+                     reqs.remove(req_id)
+                 if not reqs:
+                     self._load_event_to_reqs.pop(state.load_event, None)
++                    self._load_event_time.pop(state.load_event, None)
+ 
+         if state.transfer_meta is not None:
+             # Free CPU touch refs
+diff --git a/vllm/v1/simple_kv_offload/metrics.py b/vllm/v1/simple_kv_offload/metrics.py
+index 3db388458..c3cc51210 100644
+--- a/vllm/v1/simple_kv_offload/metrics.py
++++ b/vllm/v1/simple_kv_offload/metrics.py
+@@ -17,6 +17,9 @@ engine label set):
+   on a rank and were dropped from the index.
+ - ``vllm:kv_offload_disk_io_errors_total``: disk faults reported by ranks
+   (each rank reports its first fault).
++- ``vllm:kv_offload_disk_load_seconds_max`` gauge: the slowest load since the
++  engine started, in seconds from the step that sent it to the step that saw
++  it finished on every rank (queue time included, failed loads included).
+ 
+ External prefix-cache hits keep their generic series,
+ ``vllm:external_prefix_cache_hits_total`` and
+@@ -61,11 +64,19 @@ DEGRADED = (
+     "vllm:kv_offload_disk_degraded",
+     "1 when a disk fault degraded the offload tier until the engine restarts.",
+ )
++LOAD_SECONDS_MAX = (
++    "vllm:kv_offload_disk_load_seconds_max",
++    "Slowest offload-tier load since the engine started, in seconds from the "
++    "step that sent it to the step that saw it finished on every rank.",
++)
++# Keys whose reports merge by max, not by sum.
++_MAX_KEYS = ("degraded", "load_seconds_max")
+ 
+ 
+ @dataclass
+ class SimpleCPUOffloadStats(KVConnectorStats):
+-    """Counters since the last report, plus ``degraded`` (0 or 1)."""
++    """Counters since the last report, plus ``degraded`` (0 or 1) and
++    ``load_seconds_max`` when it rose."""
+ 
+     def reset(self) -> None:
+         self.data = {}
+@@ -73,7 +84,7 @@ class SimpleCPUOffloadStats(KVConnectorStats):
+     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+         merged = dict(self.data)
+         for key, value in other.data.items():
+-            if key == "degraded":
++            if key in _MAX_KEYS:
+                 merged[key] = max(merged.get(key, 0), value)
+             else:
+                 merged[key] = merged.get(key, 0) + value
+@@ -102,20 +113,24 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
+             )
+             for key, (name, doc) in COUNTERS.items()
+         }
+-        name, doc = DEGRADED
+-        self.degraded = create_metric_per_engine(
+-            self._gauge_cls(
+-                name=name,
+-                documentation=doc,
+-                multiprocess_mode="mostrecent",
+-                labelnames=labelnames,
+-            ),
+-            per_engine_labelvalues,
++        self.degraded, self.load_seconds_max = (
++            create_metric_per_engine(
++                self._gauge_cls(
++                    name=name,
++                    documentation=doc,
++                    multiprocess_mode="mostrecent",
++                    labelnames=labelnames,
++                ),
++                per_engine_labelvalues,
++            )
++            for name, doc in (DEGRADED, LOAD_SECONDS_MAX)
+         )
+ 
+     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+         for key, value in transfer_stats_data.items():
+             if key == "degraded":
+                 self.degraded[engine_idx].set(value)
++            elif key == "load_seconds_max":
++                self.load_seconds_max[engine_idx].set(value)
+             elif key in self.counters and value:
+                 self.counters[key][engine_idx].inc(value)
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index c99d97c82..eaace11c1 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -87,9 +87,12 @@ class SimpleCPUOffloadWorker:
+         # Completed store events to report via build_connector_worker_meta
+         self._completed_store_events: dict[int, int] = {}
+ 
+-        # Disk fault handling (disk mode). A transfer that has not completed
+-        # disk_io_timeout_s after submission is abandoned and reported failed;
+-        # so is every pending transfer of an IO thread that is not running. A
++        # Disk fault handling (disk mode). A transfer under I/O that has made
++        # no progress for disk_io_timeout_s (no slot completed since its IO
++        # thread took it from the queue or since its last slot) is abandoned
++        # and reported failed; time in the queue does not count. So is every
++        # pending transfer of an IO thread that is not running, and every
++        # transfer still queued on a rank whose tier has a fault. A
+         # failed load is still reported finished, so all ranks release the
+         # request together, and it is also reported in failed_recving, which
+         # the scheduler turns into a cache miss (kv_load_failure_policy
+@@ -248,6 +251,7 @@ class SimpleCPUOffloadWorker:
+             self.use_page_cache,
+             checksum=self.disk_checksum,
+             preallocate=self.disk_preallocate,
++            rank=self._rank,
+         )
+ 
+     def _init_cpu_mode(
+@@ -425,13 +429,20 @@ class SimpleCPUOffloadWorker:
+         )
+ 
+     def _check_overdue_transfers(self) -> None:
+-        """Abandon disk transfers past the I/O timeout or on a dead IO thread.
+-
+-        Bound: a transfer is reported failed at the first get_finished call
+-        after disk_io_timeout_s from its submission, or at once when its IO
+-        thread is not running. Abandoned copies stop before their next DMA
+-        (DiskBackend.abandon); copies already queued on the load stream are
+-        drained before the request's blocks are released.
++        """Abandon disk transfers that stopped making progress.
++
++        Bound: a transfer under I/O is reported failed at the first
++        get_finished call after disk_io_timeout_s with no completed slot,
++        counted from the moment its IO thread took it from the queue or from
++        its last completed slot. Time in the queue does not count, so a burst
++        of loads queued behind each other does not fail; a transfer that
++        keeps completing slots is not abandoned however long it runs. Every
++        pending transfer fails at once when its IO thread is not running, and
++        every transfer still queued fails at once when the rank's tier has a
++        fault (its thread may be blocked in a hung read). Abandoned copies
++        stop before their next DMA (DiskBackend.abandon); copies already
++        queued on the load stream are drained before the request's blocks
++        are released.
+         """
+         backend = self._backend
+         if not isinstance(backend, DiskBackend):
+@@ -445,23 +456,33 @@ class SimpleCPUOffloadWorker:
+                 continue
+             op = "store" if is_store else "load"
+             dead = not backend.thread_alive(is_store)
+-            overdue = [
+-                j
+-                for j in pending
+-                if dead or now - submitted.get(j, now) > self.disk_io_timeout_s
+-            ]
+-            if not overdue:
+-                continue
++            overdue: list[int] = []
+             if dead:
++                overdue = list(pending)
+                 backend.record_fault(op, -1, errno.EPIPE, f"the {op} thread stopped")
+             else:
+-                backend.record_fault(
+-                    op,
+-                    backend.current_slot(is_store),
+-                    errno.ETIMEDOUT,
+-                    f"{op} event {min(overdue)} exceeded the "
+-                    f"{self.disk_io_timeout_s:g} s I/O timeout",
+-                )
++                running = backend.running(is_store)
++                if (
++                    running is not None
++                    and running[0] in pending
++                    and now - running[1] > self.disk_io_timeout_s
++                ):
++                    overdue.append(running[0])
++                    backend.record_fault(
++                        op,
++                        backend.current_slot(is_store),
++                        errno.ETIMEDOUT,
++                        f"{op} event {running[0]} made no progress for "
++                        f"{self.disk_io_timeout_s:g} s (I/O timeout)",
++                    )
++                if backend.fault is not None:
++                    overdue.extend(
++                        j
++                        for j in pending
++                        if j not in overdue and not backend.started(is_store, j)
++                    )
++            if not overdue:
++                continue
+             for j in overdue:
+                 backend.abandon(is_store, j)
+             if not is_store and self.load_stream is not None:
+-- 
+2.56.1
+

@@ -1,0 +1,405 @@
+From b2256cb666340209011f4a344d9971030ab98e2a Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 06:18:32 +0000
+Subject: [PATCH] feat(kv-offload): bound the total time of a disk transfer
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9040
+of this series.
+
+Rationale: with the progress check alone, a disk that completes one slot
+every few seconds held a load, and every load queued behind it, for
+hours without a fault. This patch also fails a disk transfer that runs
+longer than disk_io_timeout_s plus disk_io_slot_budget_s for each of its
+slots, counted from the moment the IO thread took it from the queue,
+however steady its progress. The progress check stays and runs first.
+The new kv_connector_extra_config key disk_io_slot_budget_s defaults to
+0.02 s. On three DGX Spark nodes a restore of 1,959 slots took 0.53 to
+0.55 ms a slot while 2 and 4 other streams were decoding, which is about
+36 times under that budget (experiments/2026-11-22-kv-disk-tier/README.md).
+The running transfer of each IO thread is now a RunningTransfer record
+with the event, the start, the last progress, and the slot count, and a
+transfer that an IO thread takes from the queue after a fault no longer
+leaves a stale running record behind.
+
+Quality implications: the patch does not change outputs.
+
+Tests: on the CPU path the offload suite passed 188 tests, with 2
+CUDA-only modules skipped. In the new tests, a store of 12 slots at
+0.06 s a write under a 0.3 s timeout does not degrade the tier, a load of
+12 slots at 0.1 s a read fails at its bound of 0.54 s, and the load
+queued behind that slow load fails with no I/O. Another test checks that
+a load taken from the queue after a fault leaves no running transfer.
+The CUDA path of a transfer that reaches the bound was not tested, and
+no transfer reached the bound during the hardware run.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_faults.py                  |  3 +-
+ .../test_ds41_tier_timeouts.py                | 75 +++++++++++++++++--
+ .../v1/simple_cpu_offload_connector.py        | 17 +++++
+ vllm/v1/simple_kv_offload/disk_backend.py     | 39 ++++++----
+ vllm/v1/simple_kv_offload/worker.py           | 43 ++++++++---
+ 5 files changed, 146 insertions(+), 31 deletions(-)
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+index 7f5823581..e363bf571 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+@@ -83,7 +83,7 @@ def tier(tmp_path, host_cuda):
+     """A worker in disk mode on a host-copy DiskBackend; 6 GPU blocks."""
+     made = []
+ 
+-    def make(timeout_s: float = 15.0):
++    def make(timeout_s: float = 15.0, slot_budget_s: float = 0.02):
+         gen = torch.Generator().manual_seed(42)
+         gpu = torch.randint(-128, 127, (6, BLOCK), dtype=torch.int8, generator=gen)
+         worker = SimpleCPUOffloadWorker(
+@@ -94,6 +94,7 @@ def tier(tmp_path, host_cuda):
+             disk_path=str(_odirect_dir(tmp_path) / "tier"),
+             disk_capacity_bytes=SLOTS * 229376,
+             disk_io_timeout_s=timeout_s,
++            disk_io_slot_budget_s=slot_budget_s,
+         )
+         stream = _HostStream()
+         backend = DiskBackend()
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+index 1871a7c0d..16fc77e9a 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+@@ -1,11 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """The disk tier's I/O timeout counts from the moment a transfer leaves its
+-queue and resets at every completed slot (CPU-only).
++queue and resets at every completed slot; a total bound per transfer, also
++from the dequeue, catches a disk that is slow but not hung (CPU-only).
+ 
+ A burst of loads queued behind each other does not degrade the tier; a
+-transfer that stops making progress does, and the transfers queued behind it
+-fail at once. The debug read delay hangs one read on purpose. A copy still in
++transfer that stops making progress does, and so does one that runs past its
++total bound; the transfers queued behind it fail at once. The debug read delay hangs one read on purpose. A copy still in
+ flight on the load stream when a load is abandoned lands before the load's
+ GPU blocks are released, so it never writes into blocks that another request
+ holds by then (the drain after the timeout).
+@@ -128,8 +129,9 @@ def test_queued_burst_does_not_degrade(tier, monkeypatch) -> None:
+ 
+ def test_long_transfer_that_progresses_does_not_degrade(tier, monkeypatch) -> None:
+     """One load of 12 slots at 0.06 s a slot: 0.72 s, more than the 0.3 s
+-    timeout, with a completed slot every 0.06 s."""
+-    worker, gpu = tier(timeout_s=0.3)
++    timeout, with a completed slot every 0.06 s, inside its total bound of
++    0.3 + 12 x 0.1 = 1.5 s."""
++    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.1)
+     _stored(worker, [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
+     _slow_reads(monkeypatch)
+     slots = [0, 1, 2, 3, 4, 5] * 2
+@@ -140,6 +142,69 @@ def test_long_transfer_that_progresses_does_not_degrade(tier, monkeypatch) -> No
+     assert worker._backend.fault is None
+ 
+ 
++def test_long_store_that_progresses_does_not_degrade(tier, monkeypatch) -> None:
++    """One store of 12 slots at 0.06 s a write: 0.72 s, more than the 0.3 s
++    timeout, inside its total bound of 1.5 s. Each completed write counts as
++    progress, as each completed read does for a load."""
++    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.1)
++    real = os.pwritev
++    calls = {"n": 0}
++
++    def slow(fd, bufs, offset):
++        calls["n"] += 1
++        time.sleep(READ_S)
++        return real(fd, bufs, offset)
++
++    monkeypatch.setattr(os, "pwritev", slow)
++    start = time.monotonic()
++    _stored(worker, [0, 1, 2, 3, 4, 5] * 2, list(range(12)))
++    assert time.monotonic() - start > 0.3
++    assert calls["n"] == 12
++    assert worker._backend.fault is None
++
++
++def test_slow_steady_transfer_hits_the_total_bound(tier, monkeypatch) -> None:
++    """One load of 12 slots at 0.1 s a read, under a 0.3 s timeout: a slot
++    completes every 0.1 s, so the progress check never fires, but the load
++    runs past its total bound of 0.3 + 12 x 0.02 = 0.54 s and fails; the tier
++    degrades, and the load queued behind it fails at once with no I/O."""
++    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.02)
++    _stored(worker, [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
++    calls = _slow_reads(monkeypatch, seconds=0.1)
++    slots = [0, 1, 2, 3, 4, 5] * 2
++    start = time.monotonic()
++    reqs = _submit_loads(worker, [(slots, slots), ([0], [0])])
++    failed = _poll_all(worker, reqs)
++    waited = time.monotonic() - start
++    assert failed == reqs
++    assert 0.54 <= waited < 0.54 + 0.3
++    fault = worker._backend.fault
++    assert (fault.op, fault.errno) == ("load", errno.ETIMEDOUT)
++    assert "ran past its 0.54 s bound (0.3 s + 12 slots x 0.02 s)" in fault.message
++    time.sleep(0.2)
++    assert calls["n"] < 12  # abandoned before its last read
++    assert worker._backend.thread_alive(False)
++
++
++def test_degraded_rank_leaves_no_running_transfer(tier, monkeypatch) -> None:
++    """A transfer that the load thread takes from its queue after a fault
++    fails with no I/O and leaves nothing under I/O behind it."""
++    worker, gpu = tier(timeout_s=0.3)
++    _stored(worker, [0, 1], [0, 1])
++    backend = worker._backend
++    backend.record_fault("store", 0, errno.EIO, "injected")
++    calls = _slow_reads(monkeypatch, seconds=0.0)
++    reqs = _submit_loads(worker, [([0, 1], [2, 3])])
++    assert _poll_all(worker, reqs) == reqs
++    deadline = time.monotonic() + 5
++    while not (backend.started(False, 0) and backend._load_queue.empty()):
++        assert time.monotonic() < deadline
++        time.sleep(0.01)
++    time.sleep(0.05)
++    assert calls["n"] == 0
++    assert backend.running(False) is None
++
++
+ def test_hung_transfer_degrades_and_fails_the_queue(tier, monkeypatch) -> None:
+     """The first read of the first load never returns: that load fails at
+     the timeout after it left the queue, and the two loads queued behind it
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index f614c6bd4..9acb3a3c8 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -63,6 +63,7 @@ _DISK_ONLY_KEYS = (
+     "disk_buffer_slots",
+     "use_page_cache",
+     "disk_io_timeout_s",
++    "disk_io_slot_budget_s",
+     "disk_checksum",
+     "disk_preallocate",
+ )
+@@ -72,6 +73,14 @@ _DISK_ONLY_KEYS = (
+ # miss (kv_connector_extra_config "disk_io_timeout_s"). Queue time does not
+ # count.
+ DEFAULT_DISK_IO_TIMEOUT_S = 15.0
++# Seconds a slot adds to the total bound of a disk transfer: a transfer that
++# runs longer than disk_io_timeout_s plus this for each of its slots, counted
++# from its dequeue, is abandoned even while it makes progress
++# (kv_connector_extra_config "disk_io_slot_budget_s"). 0.02 s is about 87
++# times a 229,376-byte read at 1 GB/s and below the cost of recomputing a
++# 256-token block on DS41 at 500K context (an estimate: about 70 s for
++# 1,960 blocks).
++DEFAULT_DISK_IO_SLOT_BUDGET_S = 0.02
+ 
+ 
+ class SimpleCPUOffloadConnector(
+@@ -154,6 +163,9 @@ class SimpleCPUOffloadConnector(
+         disk_io_timeout_s = float(
+             extra_config.get("disk_io_timeout_s", DEFAULT_DISK_IO_TIMEOUT_S)
+         )
++        disk_io_slot_budget_s = float(
++            extra_config.get("disk_io_slot_budget_s", DEFAULT_DISK_IO_SLOT_BUDGET_S)
++        )
+         # Slot integrity check in the slot padding: "crc32", "sum64" or "none".
+         disk_checksum = str(extra_config.get("disk_checksum", "crc32"))
+         # Reserve the whole tier file at start (posix_fallocate); a start on a
+@@ -173,6 +185,10 @@ class SimpleCPUOffloadConnector(
+                 raise ValueError(
+                     'kv_offload_backend="disk" requires disk_io_timeout_s > 0.'
+                 )
++            if disk_io_slot_budget_s <= 0:
++                raise ValueError(
++                    'kv_offload_backend="disk" requires disk_io_slot_budget_s > 0.'
++                )
+             if self._kv_transfer_config.kv_load_failure_policy != "recompute":
+                 logger.warning_once(
+                     'kv_offload_backend="disk" with kv_load_failure_policy=%r: '
+@@ -240,6 +256,7 @@ class SimpleCPUOffloadConnector(
+                 disk_buffer_slots=disk_buffer_slots,
+                 use_page_cache=use_page_cache,
+                 disk_io_timeout_s=disk_io_timeout_s,
++                disk_io_slot_budget_s=disk_io_slot_budget_s,
+                 disk_checksum=disk_checksum,
+                 disk_preallocate=disk_preallocate,
+             )
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 8a260d0fa..615723494 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -101,6 +101,18 @@ class _Abandoned(Exception):
+     """The worker gave up on this transfer (I/O timeout); skip its copies."""
+ 
+ 
++class RunningTransfer(NamedTuple):
++    """The transfer under I/O on one IO thread, for the worker's I/O timeout."""
++
++    event_idx: int
++    # time.monotonic() when the IO thread took the transfer from its queue
++    started_at: float
++    # time.monotonic() of the last completed slot, or started_at before one
++    progressed_at: float
++    # slots the transfer reads or writes
++    slots: int
++
++
+ class DiskFault(NamedTuple):
+     """The first fault of a backend: once set, the tier on this rank is degraded."""
+ 
+@@ -192,11 +204,11 @@ class DiskBackend:
+         self._current_slot: dict[bool, int] = {True: -1, False: -1}
+         # Progress of each IO thread, for the worker's I/O timeout. The clock
+         # of a transfer starts when its thread takes it from the queue, so
+-        # time in the queue never counts. _running holds the event under I/O
+-        # and the time of its start or of its last completed slot, whichever
+-        # is later; _started is the highest event index taken from the queue
+-        # (events leave each queue in index order).
+-        self._running: dict[bool, tuple[int, float] | None] = {
++        # time in the queue never counts. _running holds the transfer under
++        # I/O: its event, the time of its start, the time of its last
++        # completed slot and its slot count; _started is the highest event
++        # index taken from the queue (events leave each queue in index order).
++        self._running: dict[bool, RunningTransfer | None] = {
+             True: None,
+             False: None,
+         }
+@@ -244,19 +256,19 @@ class DiskBackend:
+         """Whether the IO thread has taken this event from its queue."""
+         return event_idx <= self._started[is_store]
+ 
+-    def running(self, is_store: bool) -> tuple[int, float] | None:
+-        """(event index, time of its start or last completed slot) of the
+-        transfer under I/O on this thread, or None."""
++    def running(self, is_store: bool) -> RunningTransfer | None:
++        """The transfer under I/O on this thread, or None."""
+         return self._running[is_store]
+ 
+-    def _begin(self, is_store: bool, event_idx: int) -> None:
++    def _begin(self, is_store: bool, event_idx: int, slots: int) -> None:
+         self._started[is_store] = max(self._started[is_store], event_idx)
+-        self._running[is_store] = (event_idx, time.monotonic())
++        now = time.monotonic()
++        self._running[is_store] = RunningTransfer(event_idx, now, now, slots)
+ 
+     def _progress(self, is_store: bool) -> None:
+         running = self._running[is_store]
+         if running is not None:
+-            self._running[is_store] = (running[0], time.monotonic())
++            self._running[is_store] = running._replace(progressed_at=time.monotonic())
+ 
+     def _copy_unless_abandoned(
+         self,
+@@ -288,6 +300,7 @@ class DiskBackend:
+         if self._fault is not None:
+             # Degraded: no I/O. The event still completes, as a failure.
+             self._failed_events[is_store].add(event_idx)
++            self._running[is_store] = None
+             return
+         try:
+             if is_store:
+@@ -550,7 +563,7 @@ class DiskBackend:
+             if item is None:
+                 return
+             (src_blocks, dst_blocks, event_idx, events_list, wait_event, keys) = item
+-            self._begin(True, event_idx)
++            self._begin(True, event_idx, len(dst_blocks))
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+             self._run_transfer(True, src_blocks, dst_blocks, stream, event_idx, keys)
+@@ -670,7 +683,7 @@ class DiskBackend:
+             if item is None:
+                 return
+             (src_blocks, dst_blocks, event_idx, events_list, wait_event, keys) = item
+-            self._begin(False, event_idx)
++            self._begin(False, event_idx, len(src_blocks))
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+             self._run_transfer(False, src_blocks, dst_blocks, stream, event_idx, keys)
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index eaace11c1..19c27dc4d 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -42,6 +42,7 @@ class SimpleCPUOffloadWorker:
+         disk_buffer_slots: int = 2,
+         use_page_cache: bool = False,
+         disk_io_timeout_s: float = 15.0,
++        disk_io_slot_budget_s: float = 0.02,
+         disk_checksum: str = "crc32",
+         disk_preallocate: bool = True,
+     ):
+@@ -92,13 +93,17 @@ class SimpleCPUOffloadWorker:
+         # thread took it from the queue or since its last slot) is abandoned
+         # and reported failed; time in the queue does not count. So is every
+         # pending transfer of an IO thread that is not running, and every
+-        # transfer still queued on a rank whose tier has a fault. A
+-        # failed load is still reported finished, so all ranks release the
++        # transfer still queued on a rank whose tier has a fault. A transfer
++        # also fails when it runs longer than disk_io_timeout_s plus
++        # disk_io_slot_budget_s for each of its slots, counted from its
++        # dequeue, however steady its progress (a disk that is slow but not
++        # hung). A failed load is still reported finished, so all ranks release the
+         # request together, and it is also reported in failed_recving, which
+         # the scheduler turns into a cache miss (kv_load_failure_policy
+         # "recompute"). A failed store is reported complete and failed, so
+         # the scheduler drops its blocks instead of publishing them.
+         self.disk_io_timeout_s = disk_io_timeout_s
++        self.disk_io_slot_budget_s = disk_io_slot_budget_s
+         self.disk_checksum = disk_checksum
+         self.disk_preallocate = disk_preallocate
+         self._load_submit_time: dict[int, float] = {}
+@@ -435,8 +440,10 @@ class SimpleCPUOffloadWorker:
+         get_finished call after disk_io_timeout_s with no completed slot,
+         counted from the moment its IO thread took it from the queue or from
+         its last completed slot. Time in the queue does not count, so a burst
+-        of loads queued behind each other does not fail; a transfer that
+-        keeps completing slots is not abandoned however long it runs. Every
++        of loads queued behind each other does not fail. A transfer that
++        keeps completing slots fails at its total bound instead:
++        disk_io_timeout_s plus disk_io_slot_budget_s for each of its slots,
++        from the moment it left the queue. Every
+         pending transfer fails at once when its IO thread is not running, and
+         every transfer still queued fails at once when the rank's tier has a
+         fault (its thread may be blocked in a hung read). Abandoned copies
+@@ -462,18 +469,30 @@ class SimpleCPUOffloadWorker:
+                 backend.record_fault(op, -1, errno.EPIPE, f"the {op} thread stopped")
+             else:
+                 running = backend.running(is_store)
+-                if (
+-                    running is not None
+-                    and running[0] in pending
+-                    and now - running[1] > self.disk_io_timeout_s
+-                ):
+-                    overdue.append(running[0])
++                reason = None
++                if running is not None and running.event_idx in pending:
++                    bound = (
++                        self.disk_io_timeout_s
++                        + running.slots * self.disk_io_slot_budget_s
++                    )
++                    if now - running.progressed_at > self.disk_io_timeout_s:
++                        reason = (
++                            f"made no progress for {self.disk_io_timeout_s:g} s "
++                            "(I/O timeout)"
++                        )
++                    elif now - running.started_at > bound:
++                        reason = (
++                            f"ran past its {bound:g} s bound "
++                            f"({self.disk_io_timeout_s:g} s + {running.slots} "
++                            f"slots x {self.disk_io_slot_budget_s:g} s)"
++                        )
++                if reason is not None:
++                    overdue.append(running.event_idx)
+                     backend.record_fault(
+                         op,
+                         backend.current_slot(is_store),
+                         errno.ETIMEDOUT,
+-                        f"{op} event {running[0]} made no progress for "
+-                        f"{self.disk_io_timeout_s:g} s (I/O timeout)",
++                        f"{op} event {running.event_idx} {reason}",
+                     )
+                 if backend.fault is not None:
+                     overdue.extend(
+-- 
+2.56.1
+

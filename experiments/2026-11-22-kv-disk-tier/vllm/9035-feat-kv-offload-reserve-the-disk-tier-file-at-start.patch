@@ -1,0 +1,259 @@
+From 653a199853923705005ef247afa55b59c143fec6 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:10:43 +0000
+Subject: [PATCH] feat(kv-offload): reserve the disk tier file at start
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9034
+of this series.
+
+Rationale: DiskBackend.init made the tier file with ftruncate, which
+creates a sparse file. On a disk that was filling up, the tier therefore
+started, and the first write past the free space failed later, in the
+middle of serving. This patch reserves the whole file with
+posix_fallocate when preallocate is set, which the new
+kv_connector_extra_config key disk_preallocate controls (true by default
+in the connector and the worker). When the space is not there, init
+closes and removes the file and raises OSError with the errno and the
+message "cannot reserve N GiB for <path>: <reason>; free space on that
+filesystem or lower disk_capacity_bytes" before any IO thread starts, so
+the engine start fails at once.
+
+Quality implications: the patch does not change outputs. ext4 and xfs
+allocate unwritten extents, so reads return zeros and no data is
+written. On a filesystem without fallocate support, glibc falls back to
+writing zeros, which writes the whole file at start.
+
+Tests: tests/v1/simple_kv_offload/test_ds41_tier_prealloc.py checks that
+a preallocated file has every slot allocated and that the sparse option
+allocates nothing. It also checks that an ENOSPC from posix_fallocate
+fails init with that errno and the message, leaves no file behind, and
+starts no thread. On the CPU path, with VLLM_TARGET_DEVICE=cpu, the
+offload suite passed 149 tests, with 2 CUDA-only modules skipped. On DGX
+Spark hardware the patch ran only as part of the whole series.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_prealloc.py                | 105 ++++++++++++++++++
+ .../v1/simple_cpu_offload_connector.py        |   5 +
+ vllm/v1/simple_kv_offload/disk_backend.py     |  23 +++-
+ vllm/v1/simple_kv_offload/worker.py           |   3 +
+ 4 files changed, 135 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_tier_prealloc.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_prealloc.py b/tests/v1/simple_kv_offload/test_ds41_tier_prealloc.py
+new file mode 100644
+index 000000000..29fb71ae5
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_prealloc.py
+@@ -0,0 +1,105 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The disk tier file is reserved in full at start (posix_fallocate), and a start
++without the space fails at once with a clear error and no file left behind."""
++
++from __future__ import annotations
++
++import errno
++import os
++
++import pytest
++import torch
++
++from tests.v1.simple_kv_offload.test_ds41_offload import _odirect_dir
++from tests.v1.simple_kv_offload.test_ds41_tier_faults import _HostStream
++from vllm.v1.simple_kv_offload import disk_backend as disk_backend_mod
++from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++BLOCK = 227840
++SLOT = 229376
++
++
++@pytest.fixture(autouse=True)
++def host_cuda(request):
++    request.getfixturevalue("host_cuda_patch")
++
++
++@pytest.fixture
++def host_cuda_patch(monkeypatch):
++    from types import SimpleNamespace
++
++    from tests.v1.simple_kv_offload.test_ds41_offload import (
++        _host_build_params,
++        _host_copy_blocks,
++        _HostEvent,
++    )
++
++    monkeypatch.setattr(disk_backend_mod, "pin_tensor", lambda t: None)
++    monkeypatch.setattr(disk_backend_mod, "build_params", _host_build_params)
++    monkeypatch.setattr(disk_backend_mod, "copy_blocks", _host_copy_blocks)
++    monkeypatch.setattr(
++        disk_backend_mod,
++        "current_platform",
++        SimpleNamespace(set_device=lambda device: None),
++    )
++    monkeypatch.setattr(torch, "Event", _HostEvent)
++
++
++def _init(path, slots, preallocate):
++    gpu = torch.zeros((2, BLOCK), dtype=torch.int8)
++    backend = DiskBackend()
++    backend.init(
++        {"packed": gpu},
++        torch.device("cpu"),
++        _HostStream(),
++        _HostStream(),
++        str(path),
++        slots,
++        BLOCK,
++        preallocate=preallocate,
++    )
++    return backend
++
++
++@pytest.mark.parametrize("preallocate", [True, False])
++def test_tier_file_reserved_or_sparse(tmp_path, preallocate) -> None:
++    slots = 4096  # 0.88 GiB
++    path = _odirect_dir(tmp_path) / f"tier-{preallocate}"
++    backend = _init(path, slots, preallocate)
++    try:
++        st = os.stat(path)
++        assert st.st_size == slots * SLOT
++        allocated = st.st_blocks * 512
++        if preallocate:
++            assert allocated >= slots * SLOT
++        else:
++            assert allocated < SLOT  # sparse: nothing reserved
++    finally:
++        backend.shutdown()
++
++
++def test_start_without_space_fails_cleanly(tmp_path, monkeypatch) -> None:
++    def no_space(fd, offset, length):
++        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
++
++    monkeypatch.setattr(os, "posix_fallocate", no_space)
++    path = _odirect_dir(tmp_path) / "tier-full"
++    backend = DiskBackend()
++    with pytest.raises(OSError) as info:
++        backend.init(
++            {"packed": torch.zeros((2, BLOCK), dtype=torch.int8)},
++            torch.device("cpu"),
++            _HostStream(),
++            _HostStream(),
++            str(path),
++            936228,
++            BLOCK,
++            preallocate=True,
++        )
++    assert info.value.errno == errno.ENOSPC
++    assert "cannot reserve 200.00 GiB" in str(info.value)
++    assert not path.exists()  # no partial file left
++    assert backend._fd == -1 and backend._load_thread is None  # no IO threads
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 7c4a260c9..ae2d35ca0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -64,6 +64,7 @@ _DISK_ONLY_KEYS = (
+     "use_page_cache",
+     "disk_io_timeout_s",
+     "disk_checksum",
++    "disk_preallocate",
+ )
+ # Seconds a disk transfer may take, from submission, before it is abandoned
+ # and its requests fall back to a cache miss (kv_connector_extra_config
+@@ -153,6 +154,9 @@ class SimpleCPUOffloadConnector(
+         )
+         # Slot integrity check in the slot padding: "crc32", "sum64" or "none".
+         disk_checksum = str(extra_config.get("disk_checksum", "crc32"))
++        # Reserve the whole tier file at start (posix_fallocate); a start on a
++        # filesystem without the space fails at once instead of hours later.
++        disk_preallocate = bool(extra_config.get("disk_preallocate", True))
+ 
+         if disk_mode:
+             if disk_path is None:
+@@ -235,6 +239,7 @@ class SimpleCPUOffloadConnector(
+                 use_page_cache=use_page_cache,
+                 disk_io_timeout_s=disk_io_timeout_s,
+                 disk_checksum=disk_checksum,
++                disk_preallocate=disk_preallocate,
+             )
+ 
+     # --- Worker-side methods ---
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index b191b9d55..4f5d1c495 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -257,6 +257,7 @@ class DiskBackend:
+         num_buffer_slots: int = 2,
+         use_page_cache: bool = False,
+         checksum: str = "none",
++        preallocate: bool = False,
+     ) -> None:
+         self._load_stream = load_stream
+         self._store_stream = store_stream
+@@ -351,7 +352,27 @@ class DiskBackend:
+             flags |= O_DIRECT
+         self._fd = os.open(disk_path, flags, 0o600)
+         self._disk_path = disk_path
+-        os.ftruncate(self._fd, num_disk_slots * self._slot_bytes)
++        size = num_disk_slots * self._slot_bytes
++        if preallocate:
++            # Reserve every slot now: a sparse file on a filling disk fails
++            # hours later, as a write error in the middle of serving. On ext4
++            # and xfs this allocates unwritten extents (reads return zeros)
++            # without writing the data.
++            try:
++                os.posix_fallocate(self._fd, 0, size)
++            except OSError as e:
++                os.close(self._fd)
++                self._fd = -1
++                with contextlib.suppress(OSError):
++                    os.unlink(disk_path)
++                raise OSError(
++                    e.errno,
++                    f"DiskBackend: cannot reserve {size / (1024**3):.2f} GiB for "
++                    f"{disk_path}: {e.strerror}; free space on that filesystem or "
++                    "lower disk_capacity_bytes",
++                ) from e
++        else:
++            os.ftruncate(self._fd, size)
+ 
+         logger.info(
+             "DiskBackend: path=%s, slots=%d, total=%.2f GB, buf=%dx%d bytes, "
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index 8f0a5d02e..1eb5229f9 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -43,6 +43,7 @@ class SimpleCPUOffloadWorker:
+         use_page_cache: bool = False,
+         disk_io_timeout_s: float = 15.0,
+         disk_checksum: str = "crc32",
++        disk_preallocate: bool = True,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -96,6 +97,7 @@ class SimpleCPUOffloadWorker:
+         # the scheduler drops its blocks instead of publishing them.
+         self.disk_io_timeout_s = disk_io_timeout_s
+         self.disk_checksum = disk_checksum
++        self.disk_preallocate = disk_preallocate
+         self._load_submit_time: dict[int, float] = {}
+         self._store_submit_time: dict[int, float] = {}
+         self._forced_failed_loads: set[int] = set()
+@@ -245,6 +247,7 @@ class SimpleCPUOffloadWorker:
+             self.disk_buffer_slots,
+             self.use_page_cache,
+             checksum=self.disk_checksum,
++            preallocate=self.disk_preallocate,
+         )
+ 
+     def _init_cpu_mode(
+-- 
+2.56.1
+
