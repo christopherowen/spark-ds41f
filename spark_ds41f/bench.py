@@ -353,11 +353,15 @@ def cool_nodes(
 
     When any node is at or above the threshold, every target gets the maximum
     fan floor until the last one is below it, so the wait cools them all. Each
-    node's usual fan control then returns. Raises RuntimeError when a node
-    cannot be read or does not cool within timeout_s; the fans are restored on
-    every path.
+    node's usual fan control then returns. A node without the fan-floor control
+    (not installed, or a site with host.fan_control false) cools at its own
+    fans' pace: the wait is the same, and when such a node is still warm after
+    timeout_s the run goes on with a warning, since nothing more can cool it.
+    Raises RuntimeError when a node cannot be read, when an installed fan
+    control cannot select its floor, or when nodes that all have the floor do
+    not cool within timeout_s; the fans are restored on every path.
     """
-    if below_c <= 0 or not targets or not fan_control:
+    if below_c <= 0 or not targets:
         return []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
         def readings() -> list[float | None]:
@@ -374,13 +378,27 @@ def cool_nodes(
         if all(value < below_c for value in temperatures):
             return records
         hot = ", ".join(f"{r['node']} {r['start_c']:.1f} C" for r in records if r["start_c"] >= below_c)
-        print(f"cooling: {hot}; every node at fan floor 12 until all are below {below_c:g} C", flush=True)
-        controls = list(pool.map(lambda node: take_fan_control(nodes, node), targets))
+        if fan_control:
+            controls = list(pool.map(lambda node: take_fan_control(nodes, node), targets))
+        else:
+            controls = [{"service": False, "floor": False} for _ in targets]
+        passive = [node["name"] for node, control in zip(targets, controls) if not control["floor"]]
+        if not passive:
+            print(f"cooling: {hot}; every node at fan floor 12 until all are below {below_c:g} C", flush=True)
+        elif len(passive) == len(targets):
+            print(f"cooling: {hot}; no fan control here, waiting until all are below {below_c:g} C", flush=True)
+        else:
+            print(f"cooling: {hot}; fan floor 12 where it is installed ({', '.join(passive)} "
+                  f"without fan control) until all are below {below_c:g} C", flush=True)
         began = time.monotonic()
+        timed_out = False
         try:
-            missing = [node["name"] for node, control in zip(targets, controls) if not control["floor"]]
-            if missing and any(control["floor"] or control["service"] for control in controls):
-                raise RuntimeError(f"cannot select maximum fan floor on {', '.join(missing)}")
+            # An installed service whose floor cannot be selected is a broken fan control,
+            # not an absent one.
+            broken = [node["name"] for node, control in zip(targets, controls)
+                      if control["service"] and not control["floor"]]
+            if broken:
+                raise RuntimeError(f"cannot select maximum fan floor on {', '.join(broken)}")
             while not all(value is not None and value < below_c for value in temperatures):
                 if time.monotonic() - began > timeout_s:
                     still = ", ".join(
@@ -388,7 +406,12 @@ def cool_nodes(
                         for node, value in zip(targets, temperatures)
                         if value is None or value >= below_c
                     )
-                    raise RuntimeError(f"still at or above {below_c:g} C after {timeout_s:g} s: {still}")
+                    if not passive:
+                        raise RuntimeError(f"still at or above {below_c:g} C after {timeout_s:g} s: {still}")
+                    timed_out = True
+                    print(f"WARN: cooling: still at or above {below_c:g} C after {timeout_s:g} s without fan "
+                          f"control on {', '.join(passive)}: {still}; measuring from there", flush=True)
+                    break
                 time.sleep(poll_s)
                 temperatures = readings()
         finally:
@@ -399,19 +422,22 @@ def cool_nodes(
             for record, value, control, result in zip(records, temperatures, controls, restored):
                 record.update(cooled=True, seconds=seconds, final_c=value,
                               fan_floor=12 if control["floor"] else None, restored=result)
+                if timed_out:
+                    record["timed_out"] = True
             failed = [f"{node['name']}: {result}" for node, result in zip(targets, restored)
                       if str(result).startswith("FAILED")]
             if failed:
                 raise RuntimeError("cannot restore fan control: " + "; ".join(failed))
     print("cooling: " + ", ".join(f"{r['node']} {r['final_c']:.1f} C" for r in records)
-          + f" after {seconds:g} s; fans restored", flush=True)
+          + f" after {seconds:g} s" + ("; fans restored" if len(passive) < len(targets) else ""), flush=True)
     return records
 
 
 # A benchmark measures under one fan policy whatever a site serves with: the
 # dgx-fan-control service's performance curve, started where it is installed but
-# not running and stopped again afterwards. A node that cannot run it stops the
-# benchmark, because its numbers would not be comparable.
+# not running and stopped again afterwards. A node whose installed service does not
+# start stops the benchmark; a node without fan control is measured with a warning,
+# and its numbers are not comparable with a reference that ran the curve.
 def start_fan_curve(nodes: dict, targets: list[dict],
                     fan_control: bool = True) -> list[dict]:
     """Run the dgx-fan-control performance curve on every target for a benchmark."""
@@ -450,6 +476,12 @@ def start_fan_curve(nodes: dict, targets: list[dict],
             states.append(f"{record['node']} failed to start: {record['error']}")
     print("fan curve: " + ", ".join(states), flush=True)
     return records
+
+
+def fan_curve_failed(records: list[dict]) -> bool:
+    """Whether an installed fan service did not start. A node without the service has no
+    fan control to run: it is reported and measured as it is."""
+    return any(record["service"] == "inactive" and not record["started"] for record in records)
 
 
 def fan_curve_problems(records: list[dict]) -> list[str]:
@@ -778,7 +810,7 @@ def bench_suite(args: argparse.Namespace, cluster: dict, nodes: dict, config_nam
         conditions["fan_curve"] = start_fan_curve(nodes, nodes["nodes"], fan_control=fan_control_enabled(cluster))
         missing_curve = fan_curve_problems(conditions["fan_curve"])
         if missing_curve:
-            if not args.allow_mismatch and not all(r["service"] == "absent" for r in conditions["fan_curve"]):
+            if not args.allow_mismatch and fan_curve_failed(conditions["fan_curve"]):
                 print("ERROR: the fan performance curve is not running everywhere: " + "; ".join(missing_curve))
                 return SUITE_REFUSED
             for problem in missing_curve:
@@ -961,7 +993,7 @@ def command_bench(args: argparse.Namespace) -> int:
         save()
         missing_curve = fan_curve_problems(report["fan_curve"])
         if missing_curve:
-            if not args.allow_mismatch and not all(r["service"] == "absent" for r in report["fan_curve"]):
+            if not args.allow_mismatch and fan_curve_failed(report["fan_curve"]):
                 raise BenchAbort("the fan performance curve is not running everywhere: " + "; ".join(missing_curve))
             for problem in missing_curve:
                 print(f"WARN: {problem}", flush=True)

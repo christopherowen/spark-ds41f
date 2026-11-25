@@ -1048,8 +1048,9 @@ def command_cluster_start(args: argparse.Namespace) -> int:
         if refusal:
             print(f"--apply would refuse: {refusal}")
         if unreachable is None:
-            findings = start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
-                                      cluster_config=config_relative)
+            cluster, glp_warnings = without_missing_glp(cluster, nodes)
+            findings = [*glp_warnings, *start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
+                                                       cluster_config=config_relative)]
             print("preflight: " + ("--apply would refuse:" if split_findings(findings)[0] else "clean"))
             report_start_findings(findings, config_relative, sys.stdout)
         print("plan only; pass --apply to start the cluster (--verbose prints each docker command)")
@@ -1058,8 +1059,11 @@ def command_cluster_start(args: argparse.Namespace) -> int:
         print(f"ERROR: {refusal}", file=sys.stderr)
         return 1
 
-    findings = start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
-                              cluster_config=config_relative)
+    # From here the profile is the one this site can serve: without its glp block when a
+    # node lacks the steering file.
+    cluster, glp_warnings = without_missing_glp(cluster, nodes)
+    findings = [*glp_warnings, *start_findings(cluster, nodes, upstreams, allow_existing=args.replace,
+                                               cluster_config=config_relative)]
     if not report_start_findings(findings, config_relative, sys.stderr):
         return 1
 

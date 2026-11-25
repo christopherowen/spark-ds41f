@@ -91,7 +91,8 @@ class ReleaseTest(unittest.TestCase):
             self.assertIn(change["baseline"], self.releases)
             self.assertTrue(change["reason"])
             self.assertTrue(change["qualification"])
-            self.assertTrue(change.get("serve_options") or change.get("serve_flags_added"))
+            self.assertTrue(change.get("serve_options") or change.get("serve_flags_added")
+                            or change.get("site_fields"))
             if change["baseline"] != production["promoted_baseline"]:
                 continue
             for flag, values in change.get("serve_options", {}).items():
@@ -105,6 +106,11 @@ class ReleaseTest(unittest.TestCase):
                 index = frozen["serve_args"].index(flag) + 1
                 self.assertEqual(frozen["serve_args"][index], values["before"])
                 frozen["serve_args"][index] = values["after"]
+            for field, values in change.get("site_fields", {}).items():
+                # Where a site keeps its files, never what the release serves.
+                self.assertEqual(field, "host.home")
+                self.assertEqual(frozen["host"]["home"], values["before"])
+                frozen["host"]["home"] = values["after"]
             for entry in change.get("serve_flags_added", []):
                 flag = entry["flag"]
                 self.assertIn(flag, REPORTING_ARGS)

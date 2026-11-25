@@ -417,6 +417,8 @@ class UnqualifiedShapeTest(unittest.TestCase):
                 mock.patch.object(spark, "expected_command", return_value=TP3), \
                 mock.patch.object(spark, "live_engine", return_value=None), \
                 mock.patch.object(spark, "run_ssh", side_effect=no_ssh), \
+                mock.patch.object(spark, "without_missing_glp",
+                                  side_effect=AssertionError("preflight reached")), \
                 mock.patch.object(spark, "start_findings",
                                   side_effect=AssertionError("preflight reached")), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

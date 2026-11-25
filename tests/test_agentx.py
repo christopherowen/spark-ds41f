@@ -309,7 +309,8 @@ class LabJobTest(unittest.TestCase):
         self.assertEqual(pairs["--model"], "deepseek-v4.1-flash")
         self.assertEqual((pairs["--tokenizer"], pairs["--tokenizer-revision"]),
                          ("deepseek-ai/DeepSeek-V4.1-Flash-1017", REVISION))
-        self.assertEqual(pairs["--hf-hub-cache"], "/home/swank/.cache/huggingface/hub")
+        home = lab.spark.node_home(lab.spark.HOME_VARIABLE, HEAD.get("ssh_user"))
+        self.assertEqual(pairs["--hf-hub-cache"], f"{home}/.cache/huggingface/hub")
         self.assertEqual(pairs["--avoid-cpus"], "5-9,15-19")
         self.assertIn("--require-prepared", inner)
         self.assertNotIn("--", inner)  # no harness arguments unless the job names them

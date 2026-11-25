@@ -51,6 +51,34 @@ class Warn(str):
     """
 
 
+def without_missing_glp(cluster: dict, nodes: dict) -> tuple[dict, list[str]]:
+    """The profile as it can be served here, and a warning when that is without GLP.
+
+    The ``glp`` block serves a steered variant beside the stock model, from a small file of a
+    gated repository that every node needs. A site that has not installed it still serves:
+    when any node lacks the file, every rank starts without the block (ranks must not
+    differ), so only the stock name is served. A file that is present but differs from the
+    pinned one stays an error (node_glp_problems).
+    """
+    source = cluster_recipe.glp_file(cluster)
+    if source is None or not nodes.get("nodes"):
+        return cluster, []
+    path = host_path(cluster, source)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        results = list(pool.map(lambda node: run_ssh(nodes, node, "test", "-e", path), nodes["nodes"]))
+    missing = [node["name"] for node, result in zip(nodes["nodes"], results) if result.returncode == 1]
+    if not missing:
+        return cluster, []
+    steered = cluster["glp"]["served_model_name"]
+    stock = ", ".join(name for name in served_model_names(cluster) if name != steered)
+    return cluster_recipe.without_glp(cluster), [Warn(
+        f"GLP steering file is not installed on {', '.join(missing)} ({path}): the cluster serves "
+        f"{stock} only, and a request for {steered} is refused as an unknown model. To serve it "
+        f"too, on each of those nodes run {cluster_recipe.glp_download(cluster)} "
+        "(docs/setup.md, section 5), then start again"
+    )]
+
+
 def fan_control_enabled(cluster: dict) -> bool:
     """Whether the site runs the fan-floor control (host.fan_control, default true).
 
@@ -540,6 +568,7 @@ printf 'fan_dkms=%s\\n' "$(dkms status -m dgx-spark-fan-control -k "$(uname -r)"
 printf 'fan_module=%s\\n' "$(grep -c '^dgx_ec_fan_control ' /proc/modules)"
 printf 'fan_cooling_device=%s\\n' "$(grep -lx dgx_ec_fan_floor /sys/class/thermal/cooling_device*/type 2>/dev/null | wc -l)"
 printf 'fan_service=%s\\n' "$(systemctl cat dgx-fan-control.service >/dev/null 2>&1 && echo installed || echo absent)"
+printf 'lldpd=%s\\n' "$(systemctl is-active lldpd.service 2>/dev/null || true)"
 printf 'gpu=%s\\n' "$(nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)"
 """
 HOST_FACTS_QUERY += (
@@ -964,6 +993,32 @@ def wireless_warnings(
                 )
             )
     return warnings
+
+
+def lldp_cabled(cluster: dict, nodes: dict) -> bool:
+    """Whether sparknet reads this profile's cables over LLDP: two or more nodes cabled
+    to each other. It reads a switched fabric's rails from sysfs instead."""
+    return len(nodes["nodes"]) > 1 and not topology.switched(topology.transport(cluster))
+
+
+def lldpd_warnings(node_name: str, facts: dict[str, str], cabled: bool = True) -> list[str]:
+    """A warning when a directly cabled node does not run lldpd.
+
+    Nothing that serves reads LLDP. ``sparknet topology discover`` does: it asks
+    each node's lldpd which port every cable ends on, and writes the node map and
+    the netplan addresses from the answer. Without the daemon it finds no cables.
+    """
+    if not cabled or facts.get("lldpd") in (None, "active"):
+        return []
+    return [
+        Warn(
+            f"{node_name}: lldpd is not running ({facts['lldpd'] or 'not installed'}), so "
+            "sparknet topology discover cannot read this node's cables: it reports every port as "
+            "unresolved and cannot write the node map or the netplan addresses, which you then "
+            "write by hand, and a later recabling is not detected. Serving, the launch preflight "
+            "and bench do not use it. To install: sudo apt install lldpd (docs/setup.md, section 3)"
+        )
+    ]
 
 
 FAN_CONTROL_VERSION = "0.1.4"
@@ -1460,7 +1515,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     site_problems = site_node_problems(cluster, nodes)
     if site_problems:
         return site_problems
-    problems: list[str] = []
+    cluster, problems = without_missing_glp(cluster, nodes)
     running_images = {}
     trial_path = kernel_policy_path(cluster)
     trial = json.loads(trial_path.read_text()) if trial_path.exists() else None
@@ -1503,6 +1558,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(nvme_coalescing_warnings(node["name"], facts))
         problems.extend(nvme_apst_warnings(node["name"], facts))
         problems.extend(wireless_warnings(node["name"], facts, node=node, env=cluster.get("environment")))
+        problems.extend(lldpd_warnings(node["name"], facts, cabled=lldp_cabled(cluster, nodes)))
         problems.extend(fan_control_problems(
             node["name"], facts, fan_control=fan_control_enabled(cluster)))
         problems.extend(memory_block_warnings(node["name"], facts))
@@ -1850,6 +1906,14 @@ def command_topology_create(args: argparse.Namespace) -> int:
         candidate = topology.candidate(cluster, nodes, nodes_relative)
     except (ValueError, StopIteration) as error:
         raise SystemExit(f"invalid topology: {error}") from error
+    # A profile that names $HOME keeps it, so the candidate resolves it against its own
+    # node map when it is read.
+    try:
+        written_home = read_json(cluster_config_path(args)[1]).get("host", {}).get("home", HOME_VARIABLE)
+    except SystemExit:
+        written_home = None
+    if written_home and HOME_VARIABLE in written_home:
+        candidate["host"]["home"] = written_home
     output.parent.mkdir(parents=True, exist_ok=True)
     # A new candidate must never overwrite the promoted config or another run.
     with output.open("x") as handle:

@@ -180,9 +180,8 @@ def configuration(
         cluster["deployment"]["launch_enabled"] = launch_enabled
         if branch is not None:
             cluster["deployment"]["branch"] = branch
-    ssh_user = nodes.get("ssh_user")
-    if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
-        cluster["host"]["home"] = f"/home/{ssh_user}"
+    if "host" in cluster:
+        cluster["host"]["home"] = node_home(cluster["host"].get("home"), nodes.get("ssh_user"))
     if (is_recipe_config or (is_overlay_config and not overlay_sets_master)) and cluster.get("distributed", {}).get("master_addr") == "10.0.1.71":
         heads = [n for n in nodes.get("nodes", []) if n.get("head") and (n.get("control_ip") or n.get("management_ip"))]
         if len(heads) == 1:
@@ -421,18 +420,49 @@ def write_remote_file(nodes: dict, node: dict, path: str, text: str) -> subproce
     )
 
 
+HOME_VARIABLE = "$HOME"
+
+
+def node_home(home: str | None, ssh_user: str | None) -> str:
+    """``host.home`` as a path on the nodes. ``$HOME``, the recipe's value, is the home
+    directory of the user the nodes run as: this shell's ``HOME`` when this is a node and
+    that user (or the node map names none), else ``/home/<ssh_user>``, because a controller
+    elsewhere cannot read the nodes' variable. A site whose nodes keep their home somewhere
+    else writes the path itself."""
+    home = home or HOME_VARIABLE
+    if HOME_VARIABLE not in home:
+        return home
+    here = os.environ.get("HOME") or str(Path.home())
+    on_node = sys.platform == "linux" and ssh_user in (None, "", os.environ.get("USER"))
+    return home.replace(HOME_VARIABLE, here if on_node or not ssh_user else f"/home/{ssh_user}")
+
+
+def host_home(cluster: dict) -> str:
+    """The profile's ``host.home`` on the nodes; a profile read without its node map
+    (``read_cluster``) takes the user from the map it names."""
+    home = cluster["host"].get("home")
+    if home and HOME_VARIABLE not in home:
+        return home
+    nodes_path = ROOT / cluster.get("nodes_config", NODES_FILE)
+    try:
+        ssh_user = json.loads(nodes_path.read_text(encoding="utf-8")).get("ssh_user")
+    except (OSError, json.JSONDecodeError):
+        ssh_user = None
+    return node_home(home, ssh_user)
+
+
 def repository_path(cluster: dict) -> str:
     path = cluster["deployment"]["path"]
     if "{checkout}" in path:
         raise SystemExit("deployment.path is the checkout itself: it may name {home}, not {checkout}")
-    return path.format(home=cluster["host"]["home"])
+    return path.format(home=host_home(cluster))
 
 
 def host_path(cluster: dict, template: str) -> str:
     """A node path from the profile: ``{home}`` is ``host.home`` and ``{checkout}`` the
     deployment checkout (``deployment.path``), so what a site keeps in its checkout, such
     as the JIT cache, follows the checkout wherever the site clones it."""
-    fields = {"home": cluster["host"]["home"]}
+    fields = {"home": host_home(cluster)}
     if "{checkout}" in template:
         fields["checkout"] = repository_path(cluster)
     return template.format(**fields)

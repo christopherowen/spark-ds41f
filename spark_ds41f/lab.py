@@ -1515,11 +1515,9 @@ def agentx_target(config: str) -> dict:
     and the cores the serving container is pinned to (the client stays off them)."""
     cluster = spark.read_cluster(config)
     nodes = nodes_config()
-    ssh_user = nodes.get("ssh_user")
-    if cluster.get("host", {}).get("home") == "/home/swank" and ssh_user not in (None, "", "swank", "u"):
-        cluster["host"]["home"] = f"/home/{ssh_user}"
+    home = spark.node_home(cluster["host"].get("home"), nodes.get("ssh_user"))
     head = next(node for node in nodes["nodes"] if node["head"])
-    snapshot = spark.cluster_recipe.model_snapshot(cluster).format(home=cluster["host"]["home"])
+    snapshot = spark.cluster_recipe.model_snapshot(cluster).format(home=home)
     found = re.search(r"(.*)/models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})/?$", snapshot)
     if not found:
         raise SystemExit(f"{config}: the model snapshot {snapshot} is not a hub cache snapshot")
@@ -2171,7 +2169,7 @@ def run_kernel_bundles(step: dict) -> list[dict]:
     cluster, nodes, _ = production_configuration()
     repo = spark.repository_path(cluster)
     run = Path(step["out"]).name
-    home = cluster["host"]["home"]
+    home = spark.host_home(cluster)
 
     def rsync(node: dict, source: Path, destination: str) -> None:
         spark.run_ssh(nodes, node, "mkdir", "-p", str(Path(destination).parent))
