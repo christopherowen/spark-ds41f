@@ -1,0 +1,434 @@
+From 24fd17f911f1ac681735df1f80ebd382effc5041 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 22:16:02 +0100
+Subject: [PATCH] fix(worker): anchor and atomically release contiguous CUDA
+ pool on fallback
+
+Base: vLLM 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 plus the candidate-73
+series (0001..0868).
+
+Rationale:
+1. On PP>1 last stages (such as PP1 in pp2-tp2-ring), GPUModelRunner.__init__
+   initializes the speculator and sampler before _preallocate_contiguous_cuda_pool()
+   runs, leaving >512 MiB of cached-free memory in earlier PyTorch caching-allocator
+   segments. _allocate_soaked_contiguous_pool() only drained up to 256 x 2 MiB
+   (512 MiB) and fell back to anchoring an arbitrary holder outside
+   [pool_ptr, pool_end). Under PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.6,
+   the unanchored 77.5 GiB pool segment was evicted before weight loading.
+2. _resize_contiguous_cuda_pool_for_model() then took its Keeping fast path
+   without verifying cached_free_bytes >= model_bytes, and bind_weight_arena()
+   fell back to allocating a multi-GiB buddy sponge plus weight arena without
+   first releasing _contiguous_pool_anchor -- risking double allocation when
+   an anchor pins a smaller segment or triggering compaction stalls on fallback.
+3. Drain stale cached-free segments with torch.accelerator.empty_cache() before
+   allocating the soaked pool, widen the anchor drain loop to 1024 x 2 MiB, and
+   raise RuntimeError rather than silently anchoring an unrelated segment.
+4. Register Worker._release_contiguous_cuda_pool as release_cb with
+   direct_loader.set_preallocated_cuda_pool_bytes so any fallback in
+   bind_weight_arena() atomically evacuates and releases the pre-allocated pool
+   before buddy-sponge allocation. Gate both Keeping fast paths in
+   _resize_contiguous_cuda_pool_for_model() on actual cached_free_bytes >= model_bytes.
+5. In _compute_desired_pool_bytes(), skip the draft_and_other reservation on
+   non-last PP ranks (pp_size > 1 and not is_last_rank), which hold no drafter.
+
+Quality:
+Bit-identical outputs; changes only CUDA caching-allocator pool anchoring,
+sizing, and fallback cleanup during model startup.
+
+Tests:
+117/117 passed on GB10 (test_contiguous_cuda_pool.py including 3 new regression
+tests, test_direct_loader.py, test_direct_loader_cuda.py, test_engine_grid_sync.py).
+
+Upstream-status: Local deployment patch pending upstream submission.
+---
+ tests/v1/worker/test_contiguous_cuda_pool.py  | 110 ++++++++++++++++++
+ .../model_loader/direct_loader.py             |  27 ++++-
+ vllm/v1/worker/gpu_worker.py                  | 105 ++++++++++++++---
+ 3 files changed, 221 insertions(+), 21 deletions(-)
+
+diff --git a/tests/v1/worker/test_contiguous_cuda_pool.py b/tests/v1/worker/test_contiguous_cuda_pool.py
+index 3593013b0..4084910b3 100644
+--- a/tests/v1/worker/test_contiguous_cuda_pool.py
++++ b/tests/v1/worker/test_contiguous_cuda_pool.py
+@@ -400,3 +400,113 @@ def test_bind_weight_arena_invokes_resize_cb_and_skips_sponge(monkeypatch):
+         assert direct_loader._PREALLOCATED_CUDA_POOL_RESIZE_CB is None
+     finally:
+         direct_loader.set_preallocated_cuda_pool_bytes(0)
++
++
++def test_allocate_soaked_pool_anchors_inside_pool_with_prior_cached_free():
++    """Even when >512 MiB of stale cached-free memory exists before pool
++    allocation (e.g. PP1 speculator/runner init), empty_cache() clears it so
++    the 2 MiB anchor always lands inside [pool_ptr, pool_end) and keeps the
++    pool pinned across subsequent empty_cache() calls."""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++
++    worker = _make_worker(requested_gib=101.5, kv_gib=24.0, tp_size=2)
++    worker.device = torch.device("cuda:0")
++    worker._contiguous_pool_max_bytes = 256 * 1024**2
++    worker._contiguous_pool_finalized = False
++    worker._contiguous_pool_override = False
++    worker._contiguous_pool_front_clean = True
++
++    stale = [torch.empty((4 * 1024**2,), dtype=torch.uint8, device="cuda:0") for _ in range(150)]
++    del stale
++    assert torch.cuda.memory_reserved("cuda:0") >= 512 * 1024**2
++
++    pool_bytes = 256 * 1024**2
++    try:
++        worker._allocate_soaked_contiguous_pool(pool_bytes)
++        pool_ptr, pool_end = worker._contiguous_pool_range
++        anchor = worker._contiguous_pool_anchor
++        assert anchor is not None
++        assert pool_ptr <= int(anchor.data_ptr()) < pool_end
++        torch.cuda.empty_cache()
++        assert torch.cuda.memory_reserved("cuda:0") >= pool_bytes
++    finally:
++        worker._release_contiguous_cuda_pool()
++        torch.cuda.empty_cache()
++
++
++def test_bind_weight_arena_releases_pool_atomically_on_fallback(monkeypatch):
++    """If cached_free_bytes < total_bytes and bind_weight_arena falls back to
++    the buddy sponge, release_cb must run BEFORE sponge allocation so the
++    pre-allocated pool and buddy sponge/arena are never double-held."""
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++
++    class TinyModel(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.dense = torch.nn.Parameter(
++                torch.empty((1024, 1024), dtype=torch.float32, device="cuda")
++            )
++
++    model = TinyModel()
++    events: list[str] = []
++
++    def fake_release():
++        events.append("release")
++        direct_loader.set_preallocated_cuda_pool_bytes(0)
++
++    def fake_sponge(*args, **kwargs):
++        events.append("sponge")
++        assert direct_loader._PREALLOCATED_CUDA_POOL_BYTES == 0
++        return []
++
++    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _dev=None: 2 * 1024**2)
++    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _dev=None: 1 * 1024**2)
++    monkeypatch.setattr(direct_loader, "_allocate_order13_sponge", fake_sponge)
++    direct_loader.set_preallocated_cuda_pool_bytes(
++        64 * 1024**2, front_clean=True, release_cb=fake_release
++    )
++    try:
++        arena = direct_loader.bind_weight_arena(
++            model,
++            device=torch.device("cuda:0"),
++            sponge_min_model_bytes=1024,
++        )
++        assert arena is not None
++        assert events == ["release", "sponge"]
++    finally:
++        direct_loader.set_preallocated_cuda_pool_bytes(0)
++
++
++def test_resize_does_not_keep_pool_when_cached_free_below_model_bytes(monkeypatch):
++    """Fast-keep path must not report Keeping when cached_free_bytes < model_bytes."""
++    worker = _make_worker(requested_gib=101.5, kv_gib=24.0, tp_size=2)
++    old_bytes = 77 * 1024**3 + 512 * 1024**2
++    model_bytes = 70 * 1024**3
++    worker._contiguous_pool_bytes = old_bytes
++    worker._contiguous_pool_max_bytes = old_bytes
++    worker._contiguous_pool_finalized = False
++    worker._contiguous_pool_override = False
++    worker._contiguous_pool_front_clean = True
++    worker._contiguous_pool_range = (0, 0)
++
++    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _dev=None: 1024**3)
++    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _dev=None: 512 * 1024**2)
++    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
++
++    realloc_calls: list[int] = []
++
++    def fake_alloc(desired_bytes: int):
++        realloc_calls.append(desired_bytes)
++        worker._contiguous_pool_bytes = desired_bytes
++        worker._contiguous_pool_front_clean = True
++        return 0, 0, 114 * 1024**3, True
++
++    monkeypatch.setattr(worker, "_allocate_soaked_contiguous_pool", fake_alloc)
++    try:
++        new_bytes, _ = worker._resize_contiguous_cuda_pool_for_model(model_bytes, 0)
++        assert len(realloc_calls) == 1
++        assert new_bytes == realloc_calls[0]
++    finally:
++        direct_loader.set_preallocated_cuda_pool_bytes(0)
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+index fea00e03d..01a4336f4 100644
+--- a/vllm/model_executor/model_loader/direct_loader.py
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -84,6 +84,7 @@ _HELD_SPONGE_STACK: list[list[torch.nn.Module]] = []
+ _PREALLOCATED_CUDA_POOL_BYTES: int = 0
+ _PREALLOCATED_CUDA_POOL_FRONT_CLEAN: bool = True
+ _PREALLOCATED_CUDA_POOL_RESIZE_CB = None
++_PREALLOCATED_CUDA_POOL_RELEASE_CB = None
+ _DEFER_ARENA_WEIGHT_ALLOC: int = 0
+ 
+ 
+@@ -105,17 +106,24 @@ def defer_arena_weight_alloc():
+ 
+ 
+ def set_preallocated_cuda_pool_bytes(
+-    num_bytes: int, *, front_clean: bool = True, resize_cb=None
++    num_bytes: int,
++    *,
++    front_clean: bool = True,
++    resize_cb=None,
++    release_cb=None,
+ ) -> None:
+     """Record whether Worker.init_device pre-allocated a single contiguous CUDA
+-    caching-allocator segment so bind_weight_arena skips redundant buddy soaking
+-    and (when resize_cb is provided) sizes the permanent pool to the model."""
++    caching-allocator segment so bind_weight_arena skips redundant buddy soaking,
++    (when resize_cb is provided) sizes the permanent pool to the model, and
++    (when release_cb is provided) releases the pool atomically on fallback."""
+     global _PREALLOCATED_CUDA_POOL_BYTES
+     global _PREALLOCATED_CUDA_POOL_FRONT_CLEAN
+     global _PREALLOCATED_CUDA_POOL_RESIZE_CB
++    global _PREALLOCATED_CUDA_POOL_RELEASE_CB
+     _PREALLOCATED_CUDA_POOL_BYTES = max(0, int(num_bytes))
+     _PREALLOCATED_CUDA_POOL_FRONT_CLEAN = bool(front_clean)
+     _PREALLOCATED_CUDA_POOL_RESIZE_CB = resize_cb
++    _PREALLOCATED_CUDA_POOL_RELEASE_CB = release_cb
+ 
+ 
+ def _align_up(value: int, alignment: int) -> int:
+@@ -807,8 +815,21 @@ def bind_weight_arena(
+         and total_bytes >= sponge_min_model_bytes
+         and cached_free_bytes >= total_bytes
+     )
++    global _PREALLOCATED_CUDA_POOL_RELEASE_CB
+     if not use_preallocated_pool:
++        release_cb = _PREALLOCATED_CUDA_POOL_RELEASE_CB
++        _PREALLOCATED_CUDA_POOL_RELEASE_CB = None
++        if release_cb is not None and _PREALLOCATED_CUDA_POOL_BYTES > 0:
++            logger.info(
++                "Pre-allocated CUDA pool has %.1f MiB cached free for %.1f MiB "
++                "of weights; releasing pool before buddy-sponge fallback",
++                cached_free_bytes / (1 << 20),
++                total_bytes / (1 << 20),
++            )
++            release_cb()
+         torch.accelerator.empty_cache()
++    else:
++        _PREALLOCATED_CUDA_POOL_RELEASE_CB = None
+     post_load_allowance = max_moe_bytes + min(
+         _SPONGE_POST_LOAD_SCRATCH_BYTES,
+         max(total_bytes // 4, _GPU_HUGEPAGE_BYTES),
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index d60a0f5b7..9fcbb9897 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -506,6 +506,10 @@ class Worker(WorkerBase):
+             else 0
+         )
+ 
++        # Return stale cached-free segments left over from runner/speculator
++        # init before allocating the pool so the 2 MiB anchor lands inside the
++        # newly allocated segment rather than being swallowed by earlier holes.
++        torch.accelerator.empty_cache()
+         soak: torch.Tensor | None = None
+         try:
+             if soak_bytes > 0:
+@@ -524,13 +528,13 @@ class Worker(WorkerBase):
+             pool_end = pool_ptr + pool_bytes if pool_ptr > 0 else 0
+             del pool
+             # A >= 2 MiB allocation lands in PyTorch's large_pool. Drain any
+-            # pre-existing cached free holes in earlier segments so the 2 MiB
+-            # anchor is guaranteed to sit inside the newly allocated pool
+-            # segment and pin it across empty_cache() when soak is released.
++            # remaining cached-free holes in partially-occupied earlier segments
++            # so the 2 MiB anchor is guaranteed to sit inside [pool_ptr, pool_end)
++            # and pin the segment across empty_cache() and GC threshold sweeps.
+             holders: list[torch.Tensor] = []
+             anchor: torch.Tensor | None = None
+             try:
+-                for _ in range(256):
++                for _ in range(1024):
+                     cand = torch.empty(
+                         (2 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+                     )
+@@ -539,10 +543,13 @@ class Worker(WorkerBase):
+                         anchor = cand
+                         break
+                     holders.append(cand)
+-                if anchor is None:
+-                    anchor = holders.pop() if holders else None
+             finally:
+                 holders.clear()
++            if anchor is None:
++                raise RuntimeError(
++                    "Failed to place contiguous CUDA pool anchor inside "
++                    f"[{pool_ptr:#x}, {pool_end:#x})"
++                )
+             self._contiguous_pool_anchor = anchor
+             self._contiguous_pool_bytes = pool_bytes
+             self._contiguous_pool_range = (pool_ptr, pool_end)
+@@ -553,7 +560,7 @@ class Worker(WorkerBase):
+             front_clean = (unmov_sub_bytes - soak_bytes) < (1024**3)
+             self._contiguous_pool_front_clean = front_clean
+             return soak_bytes, unmov_sub_bytes, avail_bytes, front_clean
+-        except torch.OutOfMemoryError:
++        except (torch.OutOfMemoryError, RuntimeError):
+             if soak is not None:
+                 del soak
+             self._contiguous_pool_anchor = None
+@@ -563,6 +570,35 @@ class Worker(WorkerBase):
+             torch.accelerator.empty_cache()
+             raise
+ 
++    def _release_contiguous_cuda_pool(self) -> None:
++        """Atomically release the pre-allocated contiguous CUDA pool (evacuating
++        and restoring any live tensors inside its address range) so fallback paths
++        such as direct_loader's buddy sponge never double-allocate on top of it."""
++        if (
++            getattr(self, "_contiguous_pool_bytes", 0) <= 0
++            and getattr(self, "_contiguous_pool_anchor", None) is None
++        ):
++            return
++        pool_ptr, pool_end = getattr(self, "_contiguous_pool_range", (0, 0))
++        _, evac_groups, evac_snapshots = self._evacuate_tensors_in_pool_range(
++            pool_ptr, pool_end
++        )
++        try:
++            self._contiguous_pool_anchor = None
++            self._contiguous_pool_bytes = 0
++            self._contiguous_pool_range = (0, 0)
++            self._contiguous_pool_front_clean = False
++            self._contiguous_pool_finalized = True
++            from vllm.model_executor.model_loader.direct_loader import (
++                set_preallocated_cuda_pool_bytes,
++            )
++
++            set_preallocated_cuda_pool_bytes(0)
++            gc.collect()
++            torch.accelerator.empty_cache()
++        finally:
++            self._restore_evacuated_tensors(evac_groups, evac_snapshots)
++
+     def _evacuate_tensors_in_pool_range(
+         self, pool_ptr: int, pool_end: int
+     ) -> tuple[
+@@ -668,8 +704,18 @@ class Worker(WorkerBase):
+         block_bytes = 512 * 1024 * 1024
+         spec_cfg = getattr(self, "speculative_config", None)
+         repack_and_ws = max(int(max_moe_bytes), int(1.5 * 1024**3))
+-        if spec_cfg is not None:
+-            par_cfg = getattr(self, "parallel_config", None)
++        par_cfg = getattr(self, "parallel_config", None)
++        pp_size = int(getattr(par_cfg, "pipeline_parallel_size", 1) or 1)
++        has_local_drafter = spec_cfg is not None
++        if has_local_drafter and pp_size > 1:
++            try:
++                from vllm.distributed.parallel_state import get_pp_group
++
++                if torch.distributed.is_initialized():
++                    has_local_drafter = bool(get_pp_group().is_last_rank)
++            except Exception:
++                pass
++        if has_local_drafter:
+             default_tp = int(getattr(par_cfg, "tensor_parallel_size", 1) or 1)
+             draft_tp = int(
+                 getattr(spec_cfg, "draft_tensor_parallel_size", None) or default_tp
+@@ -703,10 +749,24 @@ class Worker(WorkerBase):
+         block_bytes = 512 * 1024 * 1024
+         old_bytes = self._contiguous_pool_bytes
+ 
+-        # Fast path: keep the already-soaked segment when even without extra
+-        # non-arena tensors it is within <= 1 GiB of initial pool.
++        def _cached_free_bytes() -> int:
++            anchor = getattr(self, "_contiguous_pool_anchor", None)
++            try:
++                reserved = int(torch.cuda.memory_reserved(self.device))
++                allocated = int(torch.cuda.memory_allocated(self.device))
++                if reserved > 0 or (isinstance(anchor, torch.Tensor) and anchor.is_cuda):
++                    return max(0, reserved - allocated)
++            except Exception:
++                pass
++            return old_bytes
++
++        # Fast path: keep the already-soaked segment only when it is within
++        # <= 1 GiB of initial pool AND actually has >= model_bytes cached free.
+         est_desired = self._compute_desired_pool_bytes(model_bytes, max_moe_bytes)
+-        if est_desired >= old_bytes - 2 * block_bytes:
++        if (
++            est_desired >= old_bytes - 2 * block_bytes
++            and _cached_free_bytes() >= model_bytes
++        ):
+             logger.info(
+                 "Keeping %.1f GiB contiguous CUDA pool (exact fit for %.1f GiB "
+                 "weights, desired %.1f GiB, front_clean=%s)",
+@@ -727,7 +787,10 @@ class Worker(WorkerBase):
+             desired_bytes = self._compute_desired_pool_bytes(
+                 model_bytes + evac_bytes, max_moe_bytes
+             )
+-            if desired_bytes >= old_bytes - 2 * block_bytes:
++            if (
++                desired_bytes >= old_bytes - 2 * block_bytes
++                and _cached_free_bytes() >= model_bytes
++            ):
+                 logger.info(
+                     "Keeping %.1f GiB contiguous CUDA pool (exact fit for %.1f + %.1f GiB "
+                     "weights, desired %.1f GiB, front_clean=%s)",
+@@ -773,17 +836,21 @@ class Worker(WorkerBase):
+                 soak_bytes, unmov_sub_bytes, avail_bytes, front_clean = (
+                     self._allocate_soaked_contiguous_pool(desired_bytes)
+                 )
+-            except torch.OutOfMemoryError:
++            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                 set_preallocated_cuda_pool_bytes(0)
+                 logger.warning(
+-                    "Resizing contiguous CUDA pool to %.1f GiB hit OOM; "
++                    "Resizing contiguous CUDA pool to %.1f GiB failed (%s); "
+                     "falling back to standard allocator",
+                     desired_bytes / (1024**3),
++                    exc,
+                 )
+                 return 0, False
+ 
+             set_preallocated_cuda_pool_bytes(
+-                desired_bytes, front_clean=front_clean, resize_cb=None
++                desired_bytes,
++                front_clean=front_clean,
++                resize_cb=None,
++                release_cb=self._release_contiguous_cuda_pool,
+             )
+             logger.info(
+                 "Resized contiguous CUDA pool %.1f -> %.1f GiB for %.1f GiB weights "
+@@ -907,11 +974,12 @@ class Worker(WorkerBase):
+             soak_bytes, unmov_sub_bytes, avail_bytes, front_clean = (
+                 self._allocate_soaked_contiguous_pool(pool_bytes)
+             )
+-        except torch.OutOfMemoryError:
++        except (torch.OutOfMemoryError, RuntimeError) as exc:
+             logger.warning(
+-                "Pre-allocation of %.1f GiB contiguous CUDA pool hit OOM; "
++                "Pre-allocation of %.1f GiB contiguous CUDA pool failed (%s); "
+                 "falling back to standard allocator",
+                 pool_bytes / (1024**3),
++                exc,
+             )
+             return 0
+ 
+@@ -923,6 +991,7 @@ class Worker(WorkerBase):
+                 if self._contiguous_pool_override
+                 else self._resize_contiguous_cuda_pool_for_model
+             ),
++            release_cb=self._release_contiguous_cuda_pool,
+         )
+         logger.info(
+             "Pre-allocated %.1f GiB single contiguous CUDA pool in %.2f s "
+-- 
+2.43.0
+
