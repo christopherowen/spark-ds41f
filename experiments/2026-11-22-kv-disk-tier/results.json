@@ -1,0 +1,230 @@
+{
+ "status": "measured",
+ "release": "spark-ds41f-1120",
+ "arm": "The 200 GiB profile tp3-4k-b6144-m1m-kv35-nvme200 ran every check except the slot-reuse check and the fault check, which ran on the 4 GiB profile tp3-4k-b6144-m1m-kv35-nvme4.",
+ "method": "Each check ran once, from 2026-11-24T23:44Z to 2026-11-25T01:00Z, on an engine that served no other request; README.md describes the method under \"Hardware runs\". The raw records are in runs/tier-gates.jsonl, and the field gate holds the number that the check script uses for each check.",
+ "runs": [
+  {
+   "check": "start",
+   "gate": 1,
+   "utc": "2026-11-24T23:49:38Z",
+   "result": "PASS",
+   "what": "The first start of the 200 GiB profile, read for the first time.",
+   "receipt": "runs/tier-gates.jsonl line 1"
+  },
+  {
+   "check": "equivalence",
+   "gate": 3,
+   "utc": "2026-11-25T00:01:18Z",
+   "result": "FAIL",
+   "what": "The first call of the equivalence check failed on the hidden-code prompts, a fault of the check itself (README.md, \"Runs that failed\"); 5 loads had run with 0 load failures.",
+   "receipt": "runs/tier-gates.jsonl line 2"
+  },
+  {
+   "check": "decode during a restore",
+   "gate": 7,
+   "utc": "2026-11-25T00:01:28Z",
+   "result": "NOT RUN",
+   "what": "The check script skipped the decode check after the failed equivalence check.",
+   "receipt": "runs/tier-gates.jsonl line 3"
+  },
+  {
+   "check": "start",
+   "gate": 1,
+   "utc": "2026-11-25T00:07:13Z",
+   "result": "PASS",
+   "what": "The second reading on the same start.",
+   "receipt": "runs/tier-gates.jsonl line 4"
+  },
+  {
+   "check": "equivalence",
+   "gate": 3,
+   "utc": "2026-11-25T00:19:05Z",
+   "result": "PASS",
+   "what": "The second call of the equivalence check.",
+   "token_equal": "7 of 7",
+   "cached_tokens": [
+    130816,
+    130816,
+    130816,
+    131072
+   ],
+   "shared_prefix_cached_tokens": 78848,
+   "shared_prefix_compared": false,
+   "loads": 8,
+   "load_failures": 0,
+   "slowest_load_s": 0.215,
+   "receipt": "runs/tier-gates.jsonl line 5",
+   "shared_prefix_note": "The shared-prefix prompt was sent with max_tokens 16 and was not compared token by token."
+  },
+  {
+   "check": "decode during a restore",
+   "gate": 7,
+   "utc": "2026-11-25T00:19:56Z",
+   "result": "PASS",
+   "receipt": "runs/tier-gates.jsonl line 6",
+   "levels": [
+    {
+     "streams": 2,
+     "restore_s": 1.034,
+     "slots": 1959,
+     "per_slot_ms": 0.53,
+     "request_s": 1.685,
+     "cold_s": 62.415,
+     "decode_tok_s_baseline": 393.49,
+     "share_inside_request": 0.894,
+     "share_added_interval": 1.042,
+     "longest_token_gap_s": {
+      "no_session": 0.092,
+      "disk_hit": 0.369,
+      "pool_hit": 0.412
+     },
+     "deltas": {
+      "prefix_cache_hits_total": 0,
+      "external_prefix_cache_hits_total": 499712,
+      "kv_offload_disk_loads_total": 1,
+      "kv_offload_disk_load_failures_total": 0
+     },
+     "pool_hit_request_s": 0.618,
+     "decode_tok_s_during_restore": 367.68,
+     "share_whole_run": 0.934
+    },
+    {
+     "streams": 4,
+     "restore_s": 1.07,
+     "slots": 1959,
+     "per_slot_ms": 0.55,
+     "request_s": 1.739,
+     "cold_s": 62.015,
+     "decode_tok_s_baseline": 580.46,
+     "share_inside_request": 0.834,
+     "share_added_interval": 0.944,
+     "longest_token_gap_s": {
+      "no_session": 0.104,
+      "disk_hit": 0.378,
+      "pool_hit": 0.38
+     },
+     "deltas": {
+      "prefix_cache_hits_total": 0,
+      "external_prefix_cache_hits_total": 499712,
+      "kv_offload_disk_loads_total": 1,
+      "kv_offload_disk_load_failures_total": 0
+     },
+     "pool_hit_request_s": 0.604,
+     "decode_tok_s_during_restore": 531.14,
+     "share_whole_run": 0.915
+    }
+   ]
+  },
+  {
+   "check": "chat",
+   "gate": 4,
+   "utc": "2026-11-25T00:30:40Z",
+   "result": "PASS",
+   "what": "Disk hits against pool hits for a restore while another request was decoding, an image, and thinking on.",
+   "token_equal": "3 of 3",
+   "loads": 3,
+   "load_failures": 0,
+   "receipt": "runs/tier-gates.jsonl line 7"
+  },
+  {
+   "check": "slot reuse",
+   "gate": 8,
+   "utc": "2026-11-25T00:52:42Z",
+   "result": "PASS",
+   "what": "Slot reuse on the 4 GiB profile after the tier had wrapped.",
+   "blocks_stored": 39118,
+   "slots": 18724,
+   "token_equal": "1 of 1",
+   "request_s": 2.7,
+   "cold_s": 18.05,
+   "slowest_load_s": 0.207,
+   "receipt": "runs/tier-gates.jsonl line 8",
+   "pool_hit_request_s": 2.5
+  },
+  {
+   "check": "fault",
+   "gate": 9,
+   "utc": "2026-11-25T00:54:50Z",
+   "result": "PASS",
+   "what": "The tier file of one rank was truncated to 0 bytes while the engine ran.",
+   "request_s": 18.2,
+   "cold_s": 17.9,
+   "tokens_equal_to_cold": true,
+   "degraded": 1,
+   "io_errors_delta": 1,
+   "load_failures_delta": 1,
+   "receipt": "runs/tier-gates.jsonl line 9"
+  },
+  {
+   "check": "start",
+   "gate": 1,
+   "utc": "2026-11-25T00:59:08Z",
+   "result": "PASS",
+   "what": "The second start of the 200 GiB profile, which then served the lab's traffic.",
+   "receipt": "runs/tier-gates.jsonl line 10"
+  },
+  {
+   "what": "The lab's own traffic in the first 12 hours after the checks.",
+   "from_utc": "2026-11-25T01:00:25Z",
+   "to_utc": "2026-11-25T12:59:23Z",
+   "rows": 1438,
+   "disk_loads": 125,
+   "slowest_load_s": 1.65,
+   "load_failures": 0,
+   "io_errors": 0,
+   "store_failed_blocks": 0,
+   "degraded": 0,
+   "receipt": "runs/kv-soak-12h.tsv"
+  }
+ ],
+ "memory": {
+  "rank0_node_min_mem_available_mib_at_start": [
+   5787,
+   5936
+  ],
+  "rank0_node_min_mem_available_mib_under_load": [
+   4815,
+   4815,
+   4633
+  ],
+  "thresholds_mib": {
+   "start": 5250,
+   "load": 4200
+  },
+  "note": "The node that runs rank 0 was read. The thresholds were lowered before the run, because the base profile without a tier already read below the first thresholds on 2026-11-24.",
+  "base_profile_same_day_mib": {
+   "start": 5403,
+   "after_7.7_h_of_traffic": 4511
+  }
+ },
+ "sink_rejection": {
+  "assertions_or_tracebacks": 0,
+  "draft_zero_rejections_during_checks": 38,
+  "forced_rejection_after_disk_hit": false
+ },
+ "cpu_tests": {
+  "date": "2026-11-25",
+  "base_8fc99ca7": {
+   "offload": "88 passed, 2 skipped",
+   "sink_scheduler": "65 passed"
+  },
+  "series_47e196a2": {
+   "offload": "278 passed, 2 skipped (the 58 new sink tests included)",
+   "new_sink_tests_alone": "58 passed",
+   "sink_scheduler": "65 passed"
+  },
+  "candidate_73_152445b9": {
+   "offload": "278 passed, 2 skipped (the 58 new sink tests included)",
+   "sink_scheduler": "65 passed"
+  }
+ },
+ "summary": {
+  "ttft_seconds": null,
+  "decode_tps_per_stream": null,
+  "decode_tps_aggregate": null,
+  "minimum_host_mem_available_gib": 4.52,
+  "request_failures": null,
+  "quality_gate": "The disk hit equalled the pool hit in tokens in 7 of 7 equivalence prompts, 3 of 3 chat requests, and 1 of 1 request after slot reuse."
+ }
+}
