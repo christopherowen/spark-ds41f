@@ -176,3 +176,11 @@ adds communication hops. Performance is not assumed equal to the three-node
 baseline. The promoted ring (`oneshot-ring4`) keeps one-shot collectives for
 small messages; the NCCL-only profile does not. Record a new baseline only
 after four-node serving and measurements pass and the owner accepts promotion.
+
+## When to use `PP=2` vs `TP`
+
+| Cluster size | Recommended default | When `PP=2` wins |
+| --- | --- | --- |
+| 4 Sparks (switchless ring or switched) | **`tp4-ring` / `tp4-switched`** (`~1.8×` faster decode, `~1.55×` faster prefill, batch-invariant) | When you need more than `20M` tokens of KV capacity (`pp2-tp2-*` supports `24 GiB` KV ≈ `30M` tokens) or are qualifying `PP=2` locally on four nodes. |
+| 6 Sparks (switched) | **`tp6-switched`** for lowest `C1` latency and prefill; **`pp2-tp3-switched`** for larger KV (`24 GiB` KV/node) and host RAM headroom | `pp2-tp3-switched` keeps TP inside `sparknet.oneshot` (`TP=3`) and cuts per-node weight residency so each Spark can dedicate `24 GiB` to KV cache. |
+| 8 Sparks (switched) | **`tp8-switched`** for lowest `C1` latency and fastest prefill; **`pp2-tp4-switched`** for large KV (`36 GiB` KV/node ≈ `68M` tokens, `2.4×` `tp8`), host RAM headroom, or high concurrency (`C16–C32`) | Both `tp8-switched` (with the empty-index-slice decode RoPE fix) and `pp2-tp4-switched` are batch-invariant; `pp2-tp4-switched` keeps TP inside `sparknet.oneshot` (`TP=4`) and leaves `24–29 GiB` free host RAM at `36 GiB` KV vs `12–14 GiB` on `tp8-switched` at `25.5 GiB` KV. |

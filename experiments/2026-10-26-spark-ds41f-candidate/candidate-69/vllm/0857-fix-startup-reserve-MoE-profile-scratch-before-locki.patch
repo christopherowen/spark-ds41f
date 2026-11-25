@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:33:08 +0100
+Subject: [PATCH] fix(startup): reserve MoE profile scratch before locking
+ workspace arena
+
+When patch 0849 skips profile_run under pinned kv_cache_memory_bytes, GPUModelRunner._reserve_profile_scratch previously only visited static_forward_context attention modules. On PP Stage 0 (no CED decoder attention layers) or low-TP/high-batch shapes, MoERunner workspace exceeds attention scratch and fails after WorkspaceManager.lock().
+
+Walk model and draft modules for reserve_profile_scratch (passing max_num_tokens when accepted) and implement MoERunner.reserve_profile_scratch across decode, mid, and prefill tile tiers plus shared_experts and get_moe_output_buffer.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+
+Rationale: Prevents WorkspaceManager locked-growth crashes on PP=2 Stage 0 and low-TP/high-batch shapes while keeping 0849 boot-time savings.
+
+Quality: Startup workspace reservation only; zero numerical change.
+
+Tests: pytest tests/models/test_deepseek_v41_serving_contract.py (all passing on GB10).
+
+Upstream-status: Local startup fix accompanying 0849.
+---
+ .../test_deepseek_v41_serving_contract.py     | 97 +++++++++++++++++++
+ .../layers/fused_moe/runner/moe_runner.py     | 72 ++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            | 30 ++++--
+ 3 files changed, 190 insertions(+), 9 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v41_serving_contract.py b/tests/models/test_deepseek_v41_serving_contract.py
+index 2b0de56ae..917672b09 100644
+--- a/tests/models/test_deepseek_v41_serving_contract.py
++++ b/tests/models/test_deepseek_v41_serving_contract.py
+@@ -50,3 +50,100 @@ def test_dspark_uses_the_targets_vocabulary_head(monkeypatch):
+     assert draft.lm_head is None  # load_dspark_model aliases the target after loading
+     assert not draft.has_own_lm_head
+     assert draft.checkpoint_weight_name_prefixes == ("mtp.",)
++
++
++def test_reserve_profile_scratch_sizes_moe_workspace_before_lock():
++    import pytest
++    import torch
++    from vllm.model_executor.layers.fused_moe import modular_kernel as mk
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
++    from vllm.models.deepseek_v4_1.tilelang.moe import (
++        MoeExpertsV41Plan,
++        workspace_bytes,
++    )
++    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++    from vllm.v1.worker.workspace import (
++        current_workspace_manager,
++        init_workspace_manager,
++    )
++
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required for WorkspaceManager reservation test")
++
++    class FakeExperts:
++        def __init__(self, plan):
++            self._plan = plan
++            self.output_dtype = torch.bfloat16
++            self.quant_dtype = None
++            self.expects_unquantized_inputs = True
++
++        def workspace_dtype(self, in_dtype):
++            return in_dtype
++
++        def workspace_shapes(self, M, N, K, topk, g_exp, l_exp, meta, act):
++            nbytes = workspace_bytes(self._plan.workspace_specs(M))
++            return (0,), ((nbytes + 1) // 2,), (M, K)
++
++    class FakeImpl(mk.FusedMoEKernelModularImpl):
++        def __init__(self, experts):
++            self.fused_experts = experts
++
++    init_workspace_manager(torch.device("cuda:0"), num_ubatches=1, num_lanes=1)
++    plan = MoeExpertsV41Plan(num_experts=384, topk=6, hidden=5120, intermediate=1152)
++    impl = FakeImpl(FakeExperts(plan))
++
++    class FakeMoE(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self._quant_method = SimpleNamespace(moe_kernel=SimpleNamespace(impl=impl))
++            self._shared_experts = SimpleNamespace(
++                workspace_size=lambda x: x.shape[0] * 5120 * 2
++            )
++            self.moe_config = SimpleNamespace(
++                in_dtype=torch.bfloat16,
++                hidden_dim=5120,
++                intermediate_size_per_partition=1152,
++                experts_per_token=6,
++                num_experts=384,
++                num_local_experts=384,
++                activation=MoEActivation.SILU,
++            )
++
++        reserve_profile_scratch = MoERunner.reserve_profile_scratch
++
++    class FakeModel(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.moe = FakeMoE()
++
++    fake_model = FakeModel()
++    fake_runner = SimpleNamespace(
++        get_model=lambda: fake_model,
++        get_draft_model=lambda: None,
++        _draft_workspace_lane=0,
++        max_num_tokens=4096,
++        compilation_config=SimpleNamespace(static_forward_context={}),
++    )
++    GPUModelRunner._reserve_profile_scratch(fake_runner)
++    wm = current_workspace_manager()
++    wm.lock()
++    for rows in (1, 192, 1023, 2047, 4096):
++        impl._allocate_buffers(
++            torch.bfloat16,
++            torch.bfloat16,
++            torch.device("cuda:0"),
++            rows,
++            rows,
++            1152,
++            5120,
++            6,
++            384,
++            384,
++            None,
++            MoEActivation.SILU,
++            shared_workspace_size=rows * 5120 * 2,
++            output_shape=(rows, 5120),
++        )
++        buf = wm.get_moe_output_buffer((rows, 5120), torch.bfloat16)
++        assert buf.shape == (rows, 5120)
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 54dc38807..0e7bac231 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -724,6 +724,78 @@ class MoERunner(MoERunnerInterface):
+             else:
+                 self._shared_experts(shared_experts_input, order, workspace=workspace)
+ 
++    def reserve_profile_scratch(self, max_num_tokens: int) -> None:
++        """Reserve worst-case MoE workspace and output buffers before locking
++        the workspace arena when profile_run is skipped under pinned
++        kv_cache_memory_bytes."""
++        if current_platform.is_cpu() or max_num_tokens <= 0:
++            return
++        from vllm.model_executor.layers.fused_moe import modular_kernel as mk
++        from vllm.v1.worker.workspace import (
++            current_workspace_manager,
++            is_workspace_manager_initialized,
++        )
++
++        if not is_workspace_manager_initialized():
++            return
++        kernel = getattr(self._quant_method, "moe_kernel", None)
++        impl = getattr(kernel, "impl", None)
++        if not isinstance(impl, mk.FusedMoEKernelModularImpl):
++            return
++        workspace_manager = current_workspace_manager()
++        device = workspace_manager._device
++        in_dtype = self.moe_config.in_dtype
++        out_dtype = impl.fused_experts.output_dtype
++        hidden_dim = self.moe_config.hidden_dim
++        alloc_hidden_dim = (
++            hidden_dim // 2
++            if impl.fused_experts.quant_dtype == "nvfp4"
++            and not impl.fused_experts.expects_unquantized_inputs
++            else hidden_dim
++        )
++        candidate_rows: set[int] = {max_num_tokens}
++        plan = getattr(impl.fused_experts, "_plan", None)
++        if plan is not None:
++            topk = getattr(plan, "topk", 0)
++            num_experts = getattr(plan, "num_experts", 0)
++            if topk > 0 and num_experts > 0:
++                for attr in ("decode_block_M", "block_M"):
++                    bm = getattr(plan, attr, 0)
++                    if bm > 0:
++                        tier_max = (bm * num_experts - 1) // topk
++                        if 0 < tier_max < max_num_tokens:
++                            candidate_rows.add(tier_max)
++        for rows in sorted(candidate_rows):
++            shared_size = 0
++            if self._shared_experts is not None:
++                shared_size = self._shared_experts.workspace_size(
++                    torch.empty((rows, hidden_dim), dtype=in_dtype, device="meta")
++                )
++            alloc_variants: list[tuple[int, tuple[int, ...] | None]] = [
++                (0, None),
++                (0, (rows, hidden_dim)),
++            ]
++            if shared_size:
++                alloc_variants.append((shared_size, (rows, hidden_dim)))
++            for shared_ws, out_shape in alloc_variants:
++                impl._allocate_buffers(
++                    in_dtype,
++                    out_dtype,
++                    device,
++                    rows,
++                    rows,
++                    self.moe_config.intermediate_size_per_partition,
++                    alloc_hidden_dim,
++                    self.moe_config.experts_per_token,
++                    self.moe_config.num_experts,
++                    self.moe_config.num_local_experts,
++                    None,
++                    self.moe_config.activation,
++                    shared_workspace_size=shared_ws,
++                    output_shape=out_shape,
++                )
++        workspace_manager.get_moe_output_buffer((max_num_tokens, hidden_dim), out_dtype)
++
+     def _apply_quant_method(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 7e50ac3d4..f54812698 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
+ 
+ import functools
+ import gc
++import inspect
+ import os
+ import time
+ from collections.abc import Callable
+@@ -1907,6 +1908,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+     def _reserve_profile_scratch(self) -> None:
+         model_lanes: dict[int, set[int]] = {}
++        lane_modules: list[tuple[torch.nn.Module, int]] = []
+         for model, lane in (
+             (self.get_model(), 0),
+             (self.get_draft_model(), self._draft_workspace_lane),
+@@ -1914,16 +1916,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if model is not None:
+                 for module in model.modules():
+                     model_lanes.setdefault(id(module), set()).add(lane)
++                    if hasattr(module, "reserve_profile_scratch"):
++                        lane_modules.append((module, lane))
+         seen: set[tuple[int, int]] = set()
+-        for module in self.compilation_config.static_forward_context.values():
+-            for lane in sorted(model_lanes.get(id(module), {0})):
+-                key = (id(module), lane)
+-                if key in seen:
+-                    continue
+-                seen.add(key)
+-                reserve = getattr(module, "reserve_profile_scratch", None)
+-                if reserve is not None:
+-                    with use_workspace_lane(lane):
++        candidates: list[tuple[object, int]] = [
++            (module, lane)
++            for module in self.compilation_config.static_forward_context.values()
++            for lane in sorted(model_lanes.get(id(module), {0}))
++        ]
++        candidates.extend(lane_modules)
++        for module, lane in candidates:
++            key = (id(module), lane)
++            if key in seen:
++                continue
++            seen.add(key)
++            reserve = getattr(module, "reserve_profile_scratch", None)
++            if reserve is not None:
++                with use_workspace_lane(lane):
++                    if inspect.signature(reserve).parameters:
++                        reserve(self.max_num_tokens)
++                    else:
+                         reserve()
+         current_workspace_manager().reserve_by_lane()
+ 
+-- 
+2.43.0
+

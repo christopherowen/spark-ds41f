@@ -1,0 +1,190 @@
+From 8d5315174cb88b84d48305e3418f757b471d7f22 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 10:14:52 +0100
+Subject: [PATCH] fix(tests): restore release-test compatibility for PP2 and
+ scheduler stubs
+
+Fixes 6 release-test failures uncovered by the 174-file gate:
+- scheduler.py: guard optional force_thinking_end, _last_prefill_output_id,
+  and num_verification_tokens attributes on minimal test stubs.
+- model_runner.py: guard optional is_last_pp_rank, pp_handler, and
+  speculative_config attributes on minimal test stubs.
+- test_deepseek_v4_1_engram.py: mock a local Engram decoder layer under
+  0853 local-stage Engram ownership check.
+- test_gpu_model_runner_v2.py: assert 0860 broadcast_drafts confidence kwargs.
+- test_prepare_kernels.py: set speculative_config on is_last_pp_rank=False
+  runner stub under 0860.
+---
+ tests/models/test_deepseek_v4_1_engram.py   | 16 ++++++++++++-
+ tests/v1/worker/test_gpu_model_runner_v2.py |  4 +++-
+ tests/v1/worker/test_prepare_kernels.py     |  1 +
+ vllm/v1/core/sched/scheduler.py             | 17 ++++++++++----
+ vllm/v1/worker/gpu/model_runner.py          | 26 +++++++++++++--------
+ 5 files changed, 48 insertions(+), 16 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 348ed4241..6e57cf7d4 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -960,11 +960,25 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
+         "get_pp_group",
+         lambda: SimpleNamespace(is_first_rank=False, is_last_rank=False),
+     )
++    class _StubLayer(model_module.DeepseekV4DecoderLayer):
++        def __init__(self):
++            nn.Module.__init__(self)
++            self.engram = SimpleNamespace(
++                layer_hash_index=0,
++                embed_tokens=SimpleNamespace(share_hashes=lambda *a: None),
++            )
++            self.attn = SimpleNamespace(swa_cache_layer=SimpleNamespace(prefix="swa"))
++
+     monkeypatch.setattr(model_module.EngramLayout, "from_config", lambda _: layout)
++    monkeypatch.setattr(
++        model_module,
++        "NgramHashState",
++        lambda *a, **k: SimpleNamespace(num_tokens=torch.zeros(1, dtype=torch.int32)),
++    )
+     monkeypatch.setattr(
+         model_module,
+         "make_layers",
+-        lambda *args, **kwargs: (0, 0, nn.ModuleList()),
++        lambda *args, **kwargs: (0, 1, nn.ModuleList([_StubLayer()])),
+     )
+     model = model_module.DeepseekV4Model(vllm_config=vllm_config)
+     hashes = model.prepared_engram_hashes
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2.py b/tests/v1/worker/test_gpu_model_runner_v2.py
+index 2f126ae05..830620045 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2.py
+@@ -1052,7 +1052,9 @@ def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+ 
+     pp.broadcast.assert_called_once()
+     if num_speculative_steps:
+-        pp.broadcast_drafts.assert_called_once_with(states.draft_tokens, batch)
++        pp.broadcast_drafts.assert_called_once_with(
++            states.draft_tokens, batch, confidences=None, is_calibrated=False
++        )
+         runner.draft_tokens_handler.set_draft_tokens.assert_called_once()
+     else:
+         pp.broadcast_drafts.assert_not_called()
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index d6a0f7e5d..1a2875d99 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -155,6 +155,7 @@ def test_adaptive_verification_kernels_are_declared_before_the_manager_exists(
+         get_kv_cache_spec=dict,
+         _register_kv_cache_warmups=lambda *_: None,
+         speculator=SimpleNamespace(enable_adaptive_verification=True),
++        speculative_config=SimpleNamespace(enable_adaptive_verification=True),
+         adaptive_verification=None,
+         copy_drafter=None,
+         batch_sharder=None,
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index a4064377c..6e5c5f57b 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1191,7 +1191,7 @@ class Scheduler(SchedulerInterface):
+         base = self.num_spec_tokens + self.sink_rejection
+         if (
+             request.is_prefill_chunk
+-            or request.force_thinking_end
++            or getattr(request, "force_thinking_end", False)
+             or len(placeholders) < base
+             or placeholders[0] != -1
+             or placeholders[-1] != -1
+@@ -3608,9 +3608,10 @@ class Scheduler(SchedulerInterface):
+ 
+         # Every GPU write enqueued by this and earlier steps has completed, so it is
+         # safe to return deferred-free blocks to the pool.
++        last_prefill_id = getattr(self, "_last_prefill_output_id", None)
+         if (
+-            self._last_prefill_output_id is not None
+-            and id(scheduler_output) == self._last_prefill_output_id
++            last_prefill_id is not None
++            and id(scheduler_output) == last_prefill_id
+         ):
+             self._last_prefill_output_id = None
+ 
+@@ -4288,7 +4289,15 @@ class Scheduler(SchedulerInterface):
+                 thinking_loop_break=self.thinking_loop_break,
+                 forced_reasoning_end_grace=max(
+                     FORCED_REASONING_END_GRACE,
+-                    2 * (self.num_verification_tokens + 1),
++                    2
++                    * (
++                        getattr(
++                            self,
++                            "num_verification_tokens",
++                            getattr(self, "num_spec_tokens", 0),
++                        )
++                        + 1
++                    ),
+                 ),
+             )
+             if not was_suspected and request.output_loop_since >= 0:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2980502d9..508da3d86 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -839,20 +839,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # The speculator clears the flag at load time when the checkpoint has
+         # no confidence head, so it holds the effective value on the last PP rank;
+         # non-last PP ranks follow speculative_config so all stages agree.
++        is_last_pp_rank = getattr(self, "is_last_pp_rank", True)
++        spec_cfg = getattr(self, "speculative_config", None)
+         adaptive_enabled = (
+             getattr(self.speculator, "enable_adaptive_verification", False)
+-            if self.is_last_pp_rank
++            if is_last_pp_rank
+             else bool(
+-                self.speculative_config is not None
+-                and self.speculative_config.enable_adaptive_verification
++                spec_cfg is not None
++                and spec_cfg.enable_adaptive_verification
+             )
+         )
+         planned_confidences_enabled = (
+             self.copy_drafter is not None
+-            if self.is_last_pp_rank
++            if is_last_pp_rank
+             else bool(
+-                self.speculative_config is not None
+-                and self.speculative_config.copy_drafts is not None
++                spec_cfg is not None
++                and spec_cfg.copy_drafts is not None
+             )
+         )
+         self.adaptive_verification = maybe_create_adaptive_verification_manager(
+@@ -912,7 +914,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 and getattr(self.speculator, "use_confidence_head", False)
+             ),
+         )
+-        if self.pp_handler is not None and self.adaptive_verification is not None:
++        if (
++            getattr(self, "pp_handler", None) is not None
++            and self.adaptive_verification is not None
++        ):
+             self.pp_handler.configure_confidence_broadcast(
+                 True, planes=self.adaptive_verification._confidence_buffer.shape[0]
+             )
+@@ -2995,12 +3000,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self._register_kv_cache_warmups(kv_cache_groups, kernel_block_sizes)
+         # The manager is built with the KV cache, after preparation; the
+         # speculator's flag is what decides it exists.
++        spec_cfg = getattr(self, "speculative_config", None)
+         adaptive = bool(
+             getattr(self.speculator, "enable_adaptive_verification", False)
+-            if self.is_last_pp_rank
++            if getattr(self, "is_last_pp_rank", True)
+             else (
+-                self.speculative_config is not None
+-                and self.speculative_config.enable_adaptive_verification
++                spec_cfg is not None
++                and spec_cfg.enable_adaptive_verification
+             )
+         )
+         dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
+-- 
+2.43.0
+

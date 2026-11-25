@@ -1,0 +1,624 @@
+From 466b59302f5fdb11514cf7e136d15dc4dbad48d0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:47:52 +0100
+Subject: [PATCH 860/860] feat(v1): support lockstep PP adaptive verification
+ and PP sink rejection
+
+Allow enable_adaptive_verification=True under pipeline_parallel_size > 1 when
+adaptive_verification_row_cost is pinned, broadcasting per-step draft
+confidences and calibration state via PPHandler and consuming them through
+mirrored pp_size-deep FIFOs on both non-last and last PP ranks so every stage
+computes identical trimmed batch shapes and dead-row cuts. Also allow
+VLLM_SINK_REJECTION=1 on PP > 1 (SinkSampler runs strictly on is_last_pp_rank).
+
+Zero behavior change when pipeline_parallel_size == 1.
+
+Upstream-base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Unlocks adaptive verification and sink rejection on PP > 1 shapes (verified LRU 5/5 and +14.5%..+16.9% prose-c1, +13.7% prose-c4, +15%..+23.6% code-c8 on live PP=2, TP=2).
+Quality: Bit-identical confidence state across PP stages; verified LRU 5/5 with VLLM_SINK_REJECTION=1 on live PP=2, TP=2.
+Tests: pytest tests/v1/spec_decode/test_adaptive_verification.py
+Upstream-status: Local PP adaptive verification and sink rejection support.
+---
+ .../spec_decode/test_adaptive_verification.py |  41 ++++
+ vllm/config/vllm.py                           |  16 +-
+ vllm/v1/worker/gpu/model_runner.py            |  84 ++++++--
+ vllm/v1/worker/gpu/pp_utils.py                | 182 ++++++++++++++++--
+ .../gpu/spec_decode/adaptive_verification.py  |  74 +++++++
+ 5 files changed, 361 insertions(+), 36 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 3dc35c3da..92035577b 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -1496,3 +1496,44 @@ def test_expert_slot_cache_lookahead_skips_dead_padding_rows():
+     assert len(seen_rows) == 1
+     assert torch.equal(seen_rows[0], x[:3])
+     assert next_cache.prefetched == [[3, 4]]
++
++
++def test_pp_adaptive_verification_validation_and_apply_confidences():
++    from vllm.config.vllm import VllmConfig
++
++    cfg_unpinned = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            enable_adaptive_verification=True,
++            adaptive_verification_row_cost=None,
++        ),
++        lora_config=None,
++        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
++    )
++    with pytest.raises(ValueError, match="pinned adaptive_verification_row_cost"):
++        VllmConfig._validate_adaptive_verification(cfg_unpinned)
++
++    cfg_pinned = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            enable_adaptive_verification=True,
++            adaptive_verification_row_cost=0.035,
++        ),
++        lora_config=None,
++        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
++    )
++    VllmConfig._validate_adaptive_verification(cfg_pinned)
++
++    mgr = make_manager(np.ones((2, 5), dtype=np.float32), row_cost=0.035)
++    mgr._confidence_buffer = torch.ones((1, 2, 5), dtype=torch.float32)
++    mgr._confidence_probs = mgr._confidence_buffer[0]
++    mgr._planned_probs = mgr._confidence_buffer[-1]
++    idx = torch.tensor([0, 1], dtype=torch.int64)
++    idx_np = np.array([0, 1], dtype=np.int64)
++    conf_slice = torch.tensor(
++        [[[0.9, 0.8, 0.7, 0.6, 0.5], [0.4, 0.3, 0.2, 0.1, 0.05]]],
++        dtype=torch.float32,
++    )
++    mgr.apply_pp_confidences(idx, idx_np, conf_slice, torch.tensor([1], dtype=torch.int32))
++    assert mgr._is_calibrated() is True
++    np.testing.assert_allclose(
++        mgr._stale_confidences[mgr._stale_idx].np, conf_slice[0].numpy()
++    )
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 2194590b8..3f09f5e4a 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3279,14 +3279,16 @@ class VllmConfig:
+                 "Adaptive verification is not currently compatible with LoRA"
+             )
+ 
+-        if self.parallel_config.pipeline_parallel_size > 1:
+-            # Cost curves and confidences currently only exist on the last PP rank;
+-            # earlier ranks would diverge on the trimmed batch shape.
+-            # TODO: we should be able to support adaptive verification with PP by
+-            # broadcasting the cost curves and confidences to all ranks.
++        if (
++            self.parallel_config.pipeline_parallel_size > 1
++            and spec_config.adaptive_verification_row_cost is None
++        ):
++            # Unpinned cost curves are calibrated only on the last PP rank;
++            # pinned row_cost curves are identical across all PP ranks and
++            # confidences are broadcast via PPHandler.
+             raise ValueError(
+-                "Adaptive verification is not currently compatible "
+-                "with pipeline parallelism"
++                "Adaptive verification with pipeline parallelism requires a "
++                "pinned adaptive_verification_row_cost"
+             )
+ 
+     def _validate_batch_sharded_sampling(self) -> None:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index f54812698..6c1e399b2 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -837,11 +837,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         additional_attn_cg_support = self.model_state.get_additional_cg_support()
+         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
+         # The speculator clears the flag at load time when the checkpoint has
+-        # no confidence head, so it holds the effective value.
++        # no confidence head, so it holds the effective value on the last PP rank;
++        # non-last PP ranks follow speculative_config so all stages agree.
++        adaptive_enabled = (
++            getattr(self.speculator, "enable_adaptive_verification", False)
++            if self.is_last_pp_rank
++            else bool(
++                self.speculative_config is not None
++                and self.speculative_config.enable_adaptive_verification
++            )
++        )
++        planned_confidences_enabled = (
++            self.copy_drafter is not None
++            if self.is_last_pp_rank
++            else bool(
++                self.speculative_config is not None
++                and self.speculative_config.copy_drafts is not None
++            )
++        )
+         self.adaptive_verification = maybe_create_adaptive_verification_manager(
+-            enable_adaptive_verification=getattr(
+-                self.speculator, "enable_adaptive_verification", False
+-            ),
++            enable_adaptive_verification=adaptive_enabled,
+             attn_groups=self.attn_groups,
+             attn_cg_support=attn_cg_support,
+             req_states=self.req_states,
+@@ -876,7 +891,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             ),
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
+-            planned_confidences=self.copy_drafter is not None,
++            planned_confidences=planned_confidences_enabled,
+             tp_invariant_confidence=getattr(
+                 self.speculator, "tp_invariant_confidence", False
+             ),
+@@ -897,6 +912,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 and getattr(self.speculator, "use_confidence_head", False)
+             ),
+         )
++        if self.pp_handler is not None and self.adaptive_verification is not None:
++            self.pp_handler.configure_confidence_broadcast(
++                True, planes=self.adaptive_verification._confidence_buffer.shape[0]
++            )
+         if self.copy_drafter is not None and self.adaptive_verification is None:
+             # The draft budget decides how many of a copy's drafts a step
+             # verifies: a drafter whose checkpoint has no confidence head has
+@@ -2220,12 +2239,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+     def update_pp_decode_requests(self):
+         # For non-last PP ranks, update decode requests with sampler output from
+         # the prior step in which they were scheduled (pp_size steps ago).
++        # With PP adaptive verification, both last and non-last ranks consume
++        # their lockstep pp_size-deep confidence queue here so every stage sees
++        # bit-identical confidences before prepare_inputs().
+         if self.pp_handler is not None:
+-            outputs = self.pp_handler.get_prev_sampled_outputs(
+-                self.req_states.draft_tokens
++            on_conf = (
++                self.adaptive_verification.apply_pp_confidences
++                if self.adaptive_verification is not None
++                else None
+             )
+-            if outputs is not None:
+-                self.postprocess_sampled(**outputs)
++            if self.is_last_pp_rank:
++                self.pp_handler.consume_local_confidences(on_conf)
++            else:
++                outputs = self.pp_handler.get_prev_sampled_outputs(
++                    self.req_states.draft_tokens,
++                    on_confidences=on_conf,
++                )
++                if outputs is not None:
++                    self.postprocess_sampled(**outputs)
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+@@ -2964,7 +2995,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self._register_kv_cache_warmups(kv_cache_groups, kernel_block_sizes)
+         # The manager is built with the KV cache, after preparation; the
+         # speculator's flag is what decides it exists.
+-        adaptive = bool(getattr(self.speculator, "enable_adaptive_verification", False))
++        adaptive = bool(
++            getattr(self.speculator, "enable_adaptive_verification", False)
++            if self.is_last_pp_rank
++            else (
++                self.speculative_config is not None
++                and self.speculative_config.enable_adaptive_verification
++            )
++        )
+         dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
+         samples = self.is_last_pp_rank and not self.is_pooling_model
+         if not samples:
+@@ -3908,7 +3946,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         refuses the configurations it does not handle."""
+         parallel = self.parallel_config
+         unsupported = [
+-            ("pipeline parallelism", self.use_pp),
+             ("batch-sharded sampling", self.batch_sharder is not None),
+             ("prefill context parallelism", parallel.prefill_context_parallel_size > 1),
+             (
+@@ -5030,17 +5067,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     )
+             else:
+                 draft_tokens_for_next_step = draft_tokens
++            pp_conf_slice = None
++            pp_is_cal = False
+             if (
+                 self.adaptive_verification is not None
+                 and num_spec_tokens_to_schedule > 0
+             ):
+-                self.adaptive_verification.record_confidences(
+-                    confidences, input_batch, planned=planned_confidences
+-                )
++                if self.pp_handler is not None:
++                    pp_conf_slice, pp_is_cal = (
++                        self.adaptive_verification.prepare_pp_confidences(
++                            confidences, input_batch, planned=planned_confidences
++                        )
++                    )
++                else:
++                    self.adaptive_verification.record_confidences(
++                        confidences, input_batch, planned=planned_confidences
++                    )
+         elif self.speculator is not None:
++            pp_conf_slice = None
++            pp_is_cal = False
+             draft_tokens_for_next_step = self.req_states.draft_tokens[
+                 : input_batch.num_reqs, :0
+             ]
++        else:
++            pp_conf_slice = None
++            pp_is_cal = False
+ 
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+@@ -5056,7 +5107,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+             if self.pp_handler is not None:
+                 self.pp_handler.broadcast_drafts(
+-                    self.req_states.draft_tokens, input_batch
++                    self.req_states.draft_tokens,
++                    input_batch,
++                    confidences=pp_conf_slice,
++                    is_calibrated=pp_is_cal,
+                 )
+ 
+         if boundary_state is not None:
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index ab1b991d1..807202200 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -3,6 +3,7 @@
+ """Pipeline Parallelism utils for V2 Model Runner."""
+ 
+ from collections import deque
++from collections.abc import Callable
+ from dataclasses import dataclass
+ 
+ import numpy as np
+@@ -32,6 +33,21 @@ class PendingRecv:
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
+     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
++    confidences: torch.Tensor | None = None  # [planes, num_reqs, num_speculative_steps]
++    is_calibrated: torch.Tensor | None = None  # [1] int32
++
++
++@dataclass
++class PendingConf:
++    """Last-rank mirror of PendingRecv for lockstep PP adaptive verification."""
++
++    event: torch.cuda.Event
++    confidences: torch.Tensor  # [planes, num_reqs, num_speculative_steps]
++    is_calibrated: torch.Tensor  # [1] int32
++    idx_mapping: torch.Tensor  # [num_reqs]
++    idx_mapping_np: np.ndarray  # [num_reqs]
++    need_sampled_mask: np.ndarray  # [num_reqs]
++    gen_at_receive_np: np.ndarray  # [num_reqs]
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -86,6 +102,19 @@ class PPHandler:
+             group_desc="pp_broadcast"
+         )
+         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
++        self.broadcast_confidences: bool = False
++        self.confidence_planes: int = 1
++        self.local_conf_queue: deque[PendingConf | None] = deque()
++
++    def configure_confidence_broadcast(
++        self, enabled: bool, *, planes: int = 1
++    ) -> None:
++        self.broadcast_confidences = bool(enabled and self.num_speculative_steps > 0)
++        self.confidence_planes = max(1, int(planes))
++        if self.is_last_rank and self.broadcast_confidences:
++            self.local_conf_queue = deque([None] * get_pp_group().world_size)
++        else:
++            self.local_conf_queue = deque()
+ 
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+@@ -114,7 +143,13 @@ class PPHandler:
+         )
+ 
+     def get_prev_sampled_outputs(
+-        self, draft_tokens_to_update: torch.Tensor | None = None
++        self,
++        draft_tokens_to_update: torch.Tensor | None = None,
++        *,
++        on_confidences: Callable[
++            [torch.Tensor, np.ndarray, torch.Tensor, torch.Tensor], None
++        ]
++        | None = None,
+     ) -> dict[str, torch.Tensor] | None:
+         """Consume the entry from pp_size steps ago and wait for its recv event,
+         then filter out entries whose request was freed since `receive`.
+@@ -141,17 +176,34 @@ class PPHandler:
+             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
+ 
+         self.main_stream.wait_event(slot.event)
++        keep_idx_mapping = slot.idx_mapping
++        keep_idx_mapping_np = slot.idx_mapping_np
++        keep_t = None
++        if exclude_mask.any():
++            keep = ~exclude_mask
++            keep_t = torch.as_tensor(keep, device=self.device)
++            keep_idx_mapping_np = slot.idx_mapping_np[keep]
++            keep_idx_mapping = async_tensor_h2d(
++                keep_idx_mapping_np, device=self.device
++            )
+         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
+-            draft_tokens = slot.draft_tokens
+-            draft_idx_mapping = slot.idx_mapping
+-            if exclude_mask.any():
+-                keep = ~exclude_mask
+-                keep_t = torch.as_tensor(keep, device=self.device)
+-                draft_tokens = draft_tokens[keep_t]
+-                draft_idx_mapping = async_tensor_h2d(
+-                    slot.idx_mapping_np[keep], device=self.device
+-                )
+-            draft_tokens_to_update[draft_idx_mapping] = draft_tokens
++            draft_tokens = (
++                slot.draft_tokens[keep_t] if keep_t is not None else slot.draft_tokens
++            )
++            draft_tokens_to_update[keep_idx_mapping] = draft_tokens
++        if (
++            slot.confidences is not None
++            and slot.is_calibrated is not None
++            and on_confidences is not None
++        ):
++            conf_slice = (
++                slot.confidences[:, keep_t, :]
++                if keep_t is not None
++                else slot.confidences
++            )
++            on_confidences(
++                keep_idx_mapping, keep_idx_mapping_np, conf_slice, slot.is_calibrated
++            )
+ 
+         return dict(
+             sampled_tokens=slot.sampled_tokens,
+@@ -160,13 +212,52 @@ class PPHandler:
+             idx_mapping=idx_mapping,
+         )
+ 
++    def consume_local_confidences(
++        self,
++        on_confidences: Callable[
++            [torch.Tensor, np.ndarray, torch.Tensor, torch.Tensor], None
++        ]
++        | None,
++    ) -> None:
++        """Last-rank mirror of `get_prev_sampled_outputs` for lockstep PP confidences."""
++        if not self.local_conf_queue:
++            return
++        slot = self.local_conf_queue.popleft()
++        self.local_conf_queue.append(None)
++        if slot is None or on_confidences is None:
++            return
++        freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
++        exclude_mask = freed | ~slot.need_sampled_mask
++        if exclude_mask.all():
++            return
++        self.main_stream.wait_event(slot.event)
++        if exclude_mask.any():
++            keep = ~exclude_mask
++            keep_t = torch.as_tensor(keep, device=self.device)
++            keep_idx_np = slot.idx_mapping_np[keep]
++            keep_idx = async_tensor_h2d(keep_idx_np, device=self.device)
++            conf_slice = slot.confidences[:, keep_t, :]
++        else:
++            keep_idx = slot.idx_mapping
++            keep_idx_np = slot.idx_mapping_np
++            conf_slice = slot.confidences
++        on_confidences(keep_idx, keep_idx_np, conf_slice, slot.is_calibrated)
++
+     def broadcast_drafts(
+-        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++        self,
++        draft_tokens: torch.Tensor,
++        input_batch: InputBatch,
++        *,
++        confidences: torch.Tensor | None = None,
++        is_calibrated: bool = False,
+     ) -> None:
+-        """Broadcast draft proposals so non-last ranks can embed real token ids."""
++        """Broadcast draft proposals (and optional adaptive verification confidences)
++        so all PP ranks share identical tokens and trimmed batch shapes."""
+         assert self.is_last_rank
+-        if compute_need_sampled_mask(input_batch) is None:
++        need_sampled_mask = compute_need_sampled_mask(input_batch)
++        if need_sampled_mask is None:
+             return
++        gen_at_send_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
+             send = draft_tokens[input_batch.idx_mapping].contiguous()
+@@ -176,6 +267,44 @@ class PPHandler:
+             torch.distributed.broadcast(
+                 send, src=self.last_rank, group=self.broadcast_group
+             )
++            if self.broadcast_confidences:
++                if confidences is None:
++                    send_conf = torch.ones(
++                        (
++                            self.confidence_planes,
++                            input_batch.num_reqs,
++                            self.num_speculative_steps,
++                        ),
++                        dtype=torch.float32,
++                        device=self.device,
++                    )
++                else:
++                    send_conf = confidences.contiguous()
++                    confidences.record_stream(self.broadcast_stream)
++                send_cal = torch.tensor(
++                    [1 if is_calibrated else 0],
++                    dtype=torch.int32,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    send_conf, src=self.last_rank, group=self.broadcast_group
++                )
++                torch.distributed.broadcast(
++                    send_cal, src=self.last_rank, group=self.broadcast_group
++                )
++                ev = self.broadcast_stream.record_event()
++                send_conf.record_stream(self.main_stream)
++                send_cal.record_stream(self.main_stream)
++                if self.local_conf_queue:
++                    self.local_conf_queue[-1] = PendingConf(
++                        ev,
++                        send_conf,
++                        send_cal,
++                        input_batch.idx_mapping,
++                        input_batch.idx_mapping_np,
++                        need_sampled_mask,
++                        gen_at_send_np,
++                    )
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+@@ -204,6 +333,8 @@ class PPHandler:
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
+             draft_tokens = None
++            confidences = None
++            is_calibrated = None
+             if self.num_speculative_steps > 0:
+                 draft_tokens = torch.empty(
+                     num_reqs,
+@@ -214,6 +345,23 @@ class PPHandler:
+                 torch.distributed.broadcast(
+                     draft_tokens, src=self.last_rank, group=self.broadcast_group
+                 )
++                if self.broadcast_confidences:
++                    confidences = torch.empty(
++                        self.confidence_planes,
++                        num_reqs,
++                        self.num_speculative_steps,
++                        dtype=torch.float32,
++                        device=self.device,
++                    )
++                    is_calibrated = torch.empty(
++                        1, dtype=torch.int32, device=self.device
++                    )
++                    torch.distributed.broadcast(
++                        confidences, src=self.last_rank, group=self.broadcast_group
++                    )
++                    torch.distributed.broadcast(
++                        is_calibrated, src=self.last_rank, group=self.broadcast_group
++                    )
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+@@ -222,6 +370,10 @@ class PPHandler:
+             combined.record_stream(self.main_stream)
+             if draft_tokens is not None:
+                 draft_tokens.record_stream(self.main_stream)
++            if confidences is not None:
++                confidences.record_stream(self.main_stream)
++            if is_calibrated is not None:
++                is_calibrated.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -232,6 +384,8 @@ class PPHandler:
+             need_sampled_mask,
+             gen_at_receive_np,
+             draft_tokens,
++            confidences,
++            is_calibrated,
+         )
+         return bool(need_sampled_mask.all())
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 62285660d..af7495fe2 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -204,6 +204,7 @@ class AdaptiveVerificationManager:
+         # The new requests' confidence rows, set to 1 together (apply_staged_writes).
+         self._new_rows: list[int] = []
+         self._stale_idx = 0
++        self._pp_calibrated_override: bool | None = None
+         init_stale = self._initial_stale_values()
+         for slot in self._stale_confidences:
+             slot.np[:] = init_stale
+@@ -347,7 +348,80 @@ class AdaptiveVerificationManager:
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
++    def prepare_pp_confidences(
++        self,
++        confidence_probs: torch.Tensor,
++        input_batch: "InputBatch",
++        planned: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, bool]:
++        """Prepare TP-agreed per-batch confidence slice for lockstep PP broadcast."""
++        planes = self._confidence_buffer.shape[0]
++        assert (planned is not None) == (planes > 1)
++        if planes > 1:
++            assert planned is not None
++            slice_buf = torch.stack(
++                (confidence_probs.to(torch.float32), planned.to(torch.float32)), dim=0
++            ).contiguous()
++        else:
++            slice_buf = confidence_probs.to(torch.float32).unsqueeze(0).contiguous()
++        if getattr(input_batch, "has_prefill", False):
++            incomplete_prefill_np = (
++                input_batch.num_computed_prefill_tokens_np
++                + input_batch.num_scheduled_tokens
++                < input_batch.prefill_len_np
++            )
++            if incomplete_prefill_np.any():
++                mid_idx = async_tensor_h2d(
++                    np.flatnonzero(incomplete_prefill_np),
++                    dtype=torch.int64,
++                    device=slice_buf.device,
++                )
++                slice_buf[:, mid_idx, :] = 1.0
++        tp_group = get_tp_group()
++        if tp_group.world_size > 1 and not (
++            getattr(self, "tp_invariant_confidence", False)
++            and getattr(
++                getattr(tp_group, "device_communicator", None),
++                "rank_order_reduce_scatter",
++                False,
++            )
++        ):
++            tp_group.broadcast(slice_buf, src=0)
++        calibrated = getattr(self, "calibrated_confidence", False)
++        is_cal = bool(calibrated()) if callable(calibrated) else bool(calibrated)
++        return slice_buf, is_cal
++
++    def apply_pp_confidences(
++        self,
++        idx_mapping: torch.Tensor,
++        idx_mapping_np: np.ndarray,
++        conf_slice: torch.Tensor,
++        is_calibrated_tensor: torch.Tensor,
++    ) -> None:
++        """Apply broadcasted PP confidences identically on every PP stage."""
++        if idx_mapping.is_cuda:
++            tilelang_inputs.scatter_rows(
++                idx_mapping, conf_slice[0], self._confidence_probs
++            )
++            if self._confidence_buffer.shape[0] > 1:
++                tilelang_inputs.scatter_rows(
++                    idx_mapping, conf_slice[-1], self._planned_probs
++                )
++        else:
++            idx_long = idx_mapping.long()
++            self._confidence_probs.index_copy_(0, idx_long, conf_slice[0])
++            if self._confidence_buffer.shape[0] > 1:
++                self._planned_probs.index_copy_(0, idx_long, conf_slice[-1])
++        with gpu_sync_allowed():
++            planned_np = conf_slice[-1].detach().cpu().numpy()
++            cal = bool(int(is_calibrated_tensor.item()))
++        self._stale_confidences[self._stale_idx].np[idx_mapping_np] = planned_np
++        self._pp_calibrated_override = cal
++
+     def _is_calibrated(self) -> bool:
++        override = getattr(self, "_pp_calibrated_override", None)
++        if override is not None:
++            return override
+         calibrated = getattr(self, "calibrated_confidence", False)
+         if callable(calibrated):
+             return bool(calibrated())
+-- 
+2.43.0
+

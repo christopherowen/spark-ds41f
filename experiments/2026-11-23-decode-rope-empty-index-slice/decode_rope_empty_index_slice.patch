@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Meadlock <jmeadlock@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:45:00 -0600
+Subject: [PATCH] fix(dsv41): rotate decode queries on a rank dealt no index
+ rows
+
+Base: vLLM 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 plus the candidate-62 series
+(0001..0829, spark-ds41f-1120). vllm/models/deepseek_v4_1/attention.py and the
+test file are byte-identical under the candidate-69-r2 series (0001..0857), so
+the same diff applies there; the hunks below were cut from that tree.
+
+Rationale:
+1. The overlapped decode path (0767) defers q's RoPE and the shared decode
+   metadata to the aux stream and issues them from inside select_rows' loop
+   over this rank's index chunks, beside the first _index_chunk.
+2. _decode_index_split deals a decode step's index rows across the TP ranks
+   (SPRows(rows, tp, rank): ceil(rows / tp) rows each, in rank order) once the
+   step has 24 rows or more, or on an eager decode past 16,384 tokens.
+3. When (tp - 1) * ceil(rows / tp) >= rows the last rank is dealt no rows.
+   _index_query already returns empty queries for it, select() never reaches
+   the chunk loop, and the deferred RoPE is never issued. forward_mqa then
+   attends with un-rotated queries on that rank's heads, on every layer with
+   an indexer, for every row of the step (rows at position 0 are unaffected:
+   the rotation there is the identity).
+4. The overlap needs rows <= DECODE_CHUNK (64), so with the 24-row threshold
+   the last slice is empty at: TP8 25..28, 33..35, 41, 42, 49; TP7 24, 29, 30,
+   36; TP6 25; TP2..TP5 never. Only TP8 is affected: on TP5..TP7 the trailing
+   ranks own no attention heads after _trim_padded_groups (8 output groups do
+   not divide), and _rope(q) is already skipped there. The eager long-context
+   branch splits from rows >= tp, where smaller worlds would also have an empty
+   last slice (TP3 at 4 rows, TP4 at 5, 6 and 9). It was not reached in the
+   experiment: at TP4 with 20,000 tokens of context every decode step replayed a
+   captured graph.
+5. The deferred work moves into issue_pending_aux(), which runs once per
+   forward: beside the first index chunk as before, or right after select()
+   when this rank scored nothing. The existing wait_stream join is unchanged.
+
+Quality:
+Output-changing only on the affected steps, where it restores the arithmetic
+the same rows get in a step of any other size. Every other step issues the
+same kernels on the same streams in the same order. Measured in
+experiments/2026-11-23-decode-rope-empty-index-slice.
+
+Tests:
+- tests/models/test_deepseek_v4_1_attention.py: the two-stream overlap test
+  also runs a rank-split step where this rank is dealt no rows, and one where
+  it is dealt two. Without the fix: 1 failed, 79 passed (no rope(q) on the
+  empty slice). With it: 80 passed. (candidate-69-r2 image, one GB10.)
+
+Upstream status: local DeepSeek V4.1 TileLang decode overlap; nothing to send
+upstream.
+---
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 8019f38..0d9e4a2 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -1901,6 +1901,40 @@ def test_decode_two_stream_overlap_schedules_disjoint_workspaces(monkeypatch):
+     assert ("index_chunk", "main") in names_reidx
+     assert ("attend", "main") in names_reidx
+ 
++    # A rank-split decode step (24 rows or more, or a long eager decode) deals the
++    # index rows across the ranks. The deferred rope(q) + decode metadata still run
++    # once per forward on a rank dealt none of them, which scores no index chunk:
++    # rank 2 of 4 rows on 3 ranks here, as the last rank of 25..28 rows on 8.
++    module.compressor = comp
++
++    class _FakeSplit:
++        local_rows = 2
++
++        def __init__(self, start, real_rows):
++            self.start, self.real_rows = start, real_rows
++
++        def gather(self, x):
++            return torch.zeros(4, 512, dtype=torch.int32)
++
++    for split in (_FakeSplit(4, 0), _FakeSplit(0, 2)):
++        events.clear()
++        for key in [k for k in vars(ctx) if k != "attn_metadata"]:
++            delattr(ctx, key)  # per-forward caches (index pages, decode metadata)
++        monkeypatch.setattr(
++            cls, "_decode_index_split", lambda self, *a, _split=split: _split
++        )
++        module._forward(
++            torch.arange(4, dtype=torch.int64),
++            torch.zeros(4, 32, dtype=torch.bfloat16),
++        )
++        real = split.real_rows
++        assert [e for e in events if e[:2] == ("rope", "q")] == [
++            ("rope", "q", "aux")
++        ], real
++        assert events.count(("decode_metadata", "aux")) == 1, real
++        assert events.count(("index_chunk", "main")) == (1 if real else 0), real
++        assert events[-1] == ("attend", "main"), real
++
+ 
+ @pytest.mark.parametrize("is_decode", [False, True])
+ @pytest.mark.parametrize("n_real", [4, 2, 0])
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 8802e42..dd56325 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -2006,6 +2006,45 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 score_width if lsa_enabled else None,
+             )
+ 
++            aux_issued = pending_aux is None
++
++            def issue_pending_aux():
++                # The overlapped decode path leaves q's RoPE and the shared decode
++                # metadata to run on the aux stream beside this rank's index
++                # scoring. They are due once per forward even when a rank-split
++                # step deals this rank no rows and it scores nothing (the last
++                # rank of 25..28 rows on 8 ranks), so the caller issues them
++                # after ``select`` as well.
++                nonlocal aux_issued
++                if aux_issued:
++                    return
++                aux_issued = True
++                main_stream = torch.cuda.current_stream(q.device)
++                main_stream.wait_stream(pending_aux)
++                main_meta = (
++                    self._query_metadata(metadata[self._owner().prefix])
++                    if self.compress_ratio
++                    else None
++                )
++                decode_specs = self._attention_workspace_specs["decode"]
++                q.record_stream(pending_aux)
++                with torch.cuda.stream(pending_aux):
++                    if self.n_local_heads > 0:
++                        self._rope(q, positions, "q")
++                    if self.n_local_heads > 0 and not decode_rows:
++                        meta_bufs = self._shared_decode_metadata(
++                            swa,
++                            main_meta,
++                            rows,
++                            decode_specs,
++                            q.device,
++                            is_padding=pad_mask,
++                        )
++                    else:
++                        meta_bufs = ()
++                for buf in meta_bufs:
++                    buf.record_stream(main_stream)
++
+             def select(query, first, selected):
+                 # Decode requests' rows (global rows below decode_rows) take the
+                 # decode index mode, as in a step of decode requests alone.
+@@ -2094,34 +2133,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                             candidate_indices=source._candidates[row:row_end],
+                             candidate_lengths=source._candidate_lens[row:row_end],
+                         )
+-                    if pending_aux is not None:
+-                        main_stream = torch.cuda.current_stream(q.device)
+-                        main_stream.wait_stream(pending_aux)
+-                        main_meta = (
+-                            self._query_metadata(
+-                                metadata[self._owner().prefix]
+-                            )
+-                            if self.compress_ratio
+-                            else None
+-                        )
+-                        decode_specs = self._attention_workspace_specs["decode"]
+-                        q.record_stream(pending_aux)
+-                        with torch.cuda.stream(pending_aux):
+-                            if self.n_local_heads > 0:
+-                                self._rope(q, positions, "q")
+-                            if self.n_local_heads > 0 and not decode_rows:
+-                                meta_bufs = self._shared_decode_metadata(
+-                                    swa,
+-                                    main_meta,
+-                                    rows,
+-                                    decode_specs,
+-                                    q.device,
+-                                    is_padding=pad_mask,
+-                                )
+-                            else:
+-                                meta_bufs = ()
+-                        for buf in meta_bufs:
+-                            buf.record_stream(main_stream)
++                    issue_pending_aux()
+                     self._index_chunk(
+                         index_mode,
+                         count,
+@@ -2137,6 +2149,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+             if split is None:
+                 select(query, 0, self.topk_indices_buffer)
++                issue_pending_aux()
+                 if pending_aux is not None:
+                     torch.cuda.current_stream(device).wait_stream(pending_aux)
+                     pending_aux = None
+@@ -2172,6 +2185,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         self._candidates[local].fill_(-2)
+                         self._candidate_lens[local].fill_(-2)
+                 select(query, split.start, selected)
++                issue_pending_aux()
+                 if reference is not None:
+                     self._check_index_split(
+                         split, selected, expected, repeat, expected_candidates

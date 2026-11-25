@@ -542,6 +542,29 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
         "sonar": sonar.revision(),
         "nodes": {},
     }
+    glp = cluster.get("glp")
+    if isinstance(glp, dict) and glp:
+        glp_identity = {
+            "served_model_name": glp.get("served_model_name"),
+            "repo": glp.get("repo"),
+            "revision": glp.get("revision"),
+            "file": glp.get("file"),
+            "sha256": glp.get("sha256"),
+            "alpha": glp.get("alpha"),
+            "generation_defaults": glp.get("generation_defaults"),
+            "boot_lines": [],
+        }
+        head = next((node for node in nodes["nodes"] if node.get("head")), nodes["nodes"][0])
+        logs = run_ssh(
+            nodes,
+            head,
+            "sh",
+            "-c",
+            f"docker logs {shlex.quote(name)} 2>&1 | grep -E 'GLP (file|steering on)' | head -n 4 || true",
+        )
+        if logs.returncode == 0 and logs.stdout.strip():
+            glp_identity["boot_lines"] = [line.strip() for line in logs.stdout.splitlines() if line.strip()]
+        identity["glp"] = glp_identity
     for node in nodes["nodes"]:
         container = run_ssh(nodes, node, "docker", "inspect", "--format", "{{.Image}} {{.State.StartedAt}}", name)
         checkout = run_ssh(nodes, node, "git", "-C", repository_path(cluster), "rev-parse", "HEAD")

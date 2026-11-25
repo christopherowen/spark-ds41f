@@ -1,0 +1,45 @@
+{
+  "notes": "candidate-73 at pp2-tp2-switched: vLLM 0001..0868 (tree 0aa091fa2b3d), sparknet one-shot P2P (sparknet v0.6.0 tree 173940770627), async zero-sync PP adaptive verification (row_cost=0.25) + VLLM_SINK_REJECTION=1 + SPARK_DS41F_PP_USE_ENGINE_REQS=1 + intra-stage SP (0859) + TileLang down_num_stages=3 (0864); PR #1319 GLP-27 alpha=2.0 / 0.3/0.95 defaults",
+  "extends": {
+    "config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-69/pp2-tp2-switched.json"
+  },
+  "set": {
+    "container": {
+      "image": "spark-ds41f:candidate-73",
+      "expected_labels": {
+        "local.spark-ds41f.vllm.tree": "0aa091fa2b3dc5ab239816682a4b0f84e209cc58",
+        "local.spark-ds41f.sparknet.tree": "1739407706277142da7a12c95fca3c503c8cb11c"
+      }
+    },
+    "upstreams_config": "experiments/2026-10-26-spark-ds41f-candidate/candidate-73/upstreams.lock.json",
+    "speculative": {
+      "enable_adaptive_verification": true,
+      "adaptive_verification_row_cost": 0.25
+    },
+    "environment": {
+      "VLLM_PP_SPARKNET_P2P": "1",
+      "VLLM_SINK_REJECTION": "1",
+      "SPARK_DS41F_PP_USE_ENGINE_REQS": "1"
+    },
+    "glp": {
+      "served_model_name": "deepseek-v4.1-flash-weightless",
+      "alpha": 2.0,
+      "repo": "msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-27-L11-37-a3.5",
+      "revision": "4d570926e9dd4fa7247d126072c34e249c89abd7",
+      "file": "glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf",
+      "sha256": "24e97d41a9a4f77adad78ff4cb888cb4e339eb62151dbf37a7fcd3ea30eb442e",
+      "notes": "The GLP spec-3 vector for v41-flash-1017 (27 layers L11-37, alpha_default 3.5; public repository). Served at alpha 2.0; stock name beside it is unchanged."
+    },
+    "generation_defaults": {
+      "temperature": 0.3,
+      "top_p": 0.95
+    },
+    "sizing": {
+      "kv_cache_memory_bytes": 25769803776
+    }
+  },
+  "serve_options": {
+    "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":2,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.25}",
+    "--kv-cache-memory-bytes": "25769803776"
+  }
+}
