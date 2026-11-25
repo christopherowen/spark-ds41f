@@ -93,7 +93,8 @@ revert it.
 | NVMe APST: no sleep state of 5 ms or more to wake before 1 s idle, nor of 20 ms or more before 30 s | warn | the first Engram read after a pause waits for the drive to wake (11 ms from PS3, 46 ms from PS4) | `nvme_core apst_primary_timeout_ms=2000 apst_secondary_timeout_ms=60000` ([setup](setup.md#nvme-power-states-apst)) |
 | Onboard Wi-Fi radio off and control plane (`management_ip` / `control_ip`, `*_SOCKET_IFNAME`) not on a wireless interface | warn | the control plane sends packets every decode step; Wi-Fi tail latency stalls the step ([#712](https://github.com/christopherowen/spark-ds41f/issues/712)) | `sudo nmcli radio wifi off`, or move `control_ip` / `*_SOCKET_IFNAME` onto wired or ConnectX-7 links |
 | Fan-floor control: DKMS module (version 0.1.4), loaded module, cooling device | warn, first missing layer | `bin/spark bench` and kernel-lab jobs pre-cool through it; serving does not need it | the printed `dkms autoinstall` or `modprobe` command ([dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)) |
-| `dgx-fan-control.service` installed | warn | `bin/spark bench` runs its performance curve while measuring and refuses to measure without it. Whether it also runs while serving is the site's choice and is not checked | the printed `install` and `daemon-reload` commands |
+| `dgx-fan-control.service` installed | warn | `bin/spark bench` runs its performance curve while measuring. Without it the bench warns and measures on NVIDIA's curve, so its numbers are not comparable with a reference that ran the performance curve. Whether it also runs while serving is the site's choice and is not checked | the printed `install` and `daemon-reload` commands |
+| `lldpd` running, on nodes cabled to each other | warn | `sparknet topology discover` asks each node's lldpd which port every cable ends on. Without it discovery reports every port as unresolved and cannot write the node map or the netplan addresses, which you then write by hand ([setup](setup.md#3-fabric-cabling-and-addressing)), and a later recabling is not detected. Serving, the launch preflight and bench do not use it | `sudo apt install lldpd` |
 
 ### Kernel and memory saver
 
@@ -154,11 +155,18 @@ image ID, layers, labels and content fingerprint alongside any validation errors
 
 ### GLP steering file
 
-A profile with a `glp` block needs its file on every node, in the hub cache at the
-block's pinned revision: vLLM reads it at startup and refuses to start without it.
-The check runs whether or not the service is up. A missing or unreadable file, or
-one whose sha256 is not `glp.sha256`, is an error, and the error prints the
-`hf download` command for the pinned revision ([setup](setup.md#glp-steering-file)).
+A profile with a `glp` block serves the steered model from a file every node keeps
+in its hub cache at the block's pinned revision. The check runs whether or not the
+service is up.
+
+A node without the file is a warning, not an error. The start then leaves the block
+out on every rank (ranks must not differ), so the cluster serves the stock model
+name only and a request for the steered name is refused as an unknown model. The
+warning names the nodes and prints the `hf download` command for the pinned revision
+([setup](setup.md#glp-steering-file)); `doctor --live` compares a running cluster
+with the same profile, so one started without the file passes with the same warning.
+A file that is present and whose sha256 is not `glp.sha256` is an error: the
+engine would steer with something other than the pinned vector.
 
 On the head, the profile's image then reads the file with its own GLP reader
 (`python3 -m vllm.models.deepseek_v4_1.glp`), mounted at `/glp/vector.gguf` as the
@@ -246,9 +254,9 @@ a start cannot survive, on every node, and refuses to launch on any failure:
   it the start could not tell a triangle from a ring;
 - `bin/spark doctor` passes on the node itself;
 - every mount source exists (writable for read-write mounts);
-- the `glp` file, if the profile has one, is readable and has `glp.sha256`, with
-  its download command when it is not, and the image's own GLP reader accepts it on
-  the head (above);
+- the `glp` file, if the profile has one: where a node lacks it the start warns and
+  serves the stock model only; where it is present it has `glp.sha256` and the
+  image's own GLP reader accepts it on the head (above);
 - the image is present with the expected tree labels;
 - no container with the serving name exists unless you pass `--replace`;
 - passwordless `sudo` works (the memory guards need it).

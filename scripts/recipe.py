@@ -317,6 +317,16 @@ def _with_glp(cluster: dict, previous: dict | None = None) -> None:
     mounts.append(mount)
 
 
+def without_glp(cluster: dict) -> dict:
+    """The profile serving its stock model only: a copy without the ``glp`` block and
+    without the served name, variables and mount the block renders."""
+    result = copy.deepcopy(cluster)
+    glp = result.pop("glp", None)
+    if glp:
+        _with_glp(result, previous=glp)
+    return result
+
+
 def _with_generation_defaults(cluster: dict) -> None:
     """Render ``generation_defaults`` (the sampling a request that sets none gets) as
     vLLM's ``--override-generation-config``, beside ``--generation-config``."""

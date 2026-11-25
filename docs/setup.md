@@ -259,10 +259,13 @@ key, and the memory saver's install script in [stage 2](#2-kernel-64-kib-profile
 signs with the same key.
 
 Install its `dgx-fan-control.service` as well; `doctor --live` warns until it
-is installed. `bin/spark bench` requires it: it starts the
+is installed. `bin/spark bench` starts the
 service's performance curve on every node while it measures, so every
 benchmark runs under the same fan policy, and stops it again where it started
-it. Whether it also runs while serving is your choice. The curve raises the fan floor from 50 °C, well before
+it. Without fan control the bench still runs: it waits for the nodes to cool
+by themselves (up to `--cool-timeout`, then measures from where they are, with
+a warning) and measures on NVIDIA's curve, so its numbers are not comparable
+with a reference that ran the performance curve. Whether it also runs while serving is your choice. The curve raises the fan floor from 50 °C, well before
 NVIDIA's curve, so nodes run cooler and louder under load; serving does not
 need it. Pick either
 [startup mode](https://github.com/christopherowen/dgx-spark-fan-control/blob/v0.1.4/docs/installation.md#5-choose-your-startup-mode),
@@ -404,7 +407,12 @@ both the node map and each node's netplan from the actual cabling. Install
 its CPU tooling on the head node (`pip install` from a clone; see its
 [integration guide](https://github.com/christopherowen/dgx-spark-networking/blob/main/docs/integration.md#21-install)).
 Discovery reads each node's LLDP neighbours over SSH with `sudo -n lldpctl`,
-so every node needs `lldpd` running. It changes nothing on a host:
+so every node needs `lldpd` running (`sudo apt install lldpd`); without it
+discovery reports every port as unresolved and writes no node map. Nothing that
+serves uses LLDP: a site that addresses its cables another way (by hand, or with
+NVIDIA Sync) writes the node map itself in [stage 4](#4-site-configuration), and
+`bin/spark doctor --live` then only warns that lldpd is missing. Discovery changes
+nothing on a host:
 
 ```sh
 sparknet topology discover dgx1 dgx2 dgx3 --out site --management-ip dgx1=<ip> ...
@@ -474,7 +482,9 @@ Two files describe your site and stay out of git:
   `config/site.json`, which `cluster sync` copies to every node. Every command
   then resolves the recipe at that shape; `--shape NAME` overrides it. A site
   that names none gets the recipe's `default_shape`, `tp4-ring`.
-- **The recipe.** In `config/cluster.json`, set `distributed.master_addr` to the head's management IP, `host.home`,
+- **The recipe.** In `config/cluster.json`, set `distributed.master_addr` to the head's management IP,
+  `host.home` only if the nodes' home directory is not the node user's own (it is `$HOME`: on a node,
+  the shell's home directory; from a controller elsewhere, `/home/<ssh_user>` of the node map),
   `deployment.path` if every node keeps this checkout somewhere other than
   `{home}/projects/spark-ds41f`, `deployment.repository` if you use a fork (the launch checks every node's
   `origin` against it), and the interface names in `GLOO_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`,
@@ -575,7 +585,9 @@ name, `deepseek-v4.1-flash-weightless` (the
 The block names the GLP file it steers with: a Hugging Face `repo`, its pinned
 `revision`, the `file` and its `sha256`. The recipe renders the second served name, vLLM's
 `WEIGHTLESS_STEER_PATH` and `WEIGHTLESS_STEER_MODEL`, and a read-only mount of the file
-from the node's hub cache; a profile does not set those itself. Every node needs the file
+from the node's hub cache; a profile does not set those itself. The file is optional: when
+a node lacks it, `cluster start` warns, leaves the block out on every rank and serves
+`deepseek-v4.1-flash` alone. To serve the steered name too, every node needs the file
 (785 KiB). The repository is gated. With the Hugging Face account whose token is on the node, accept
 its agreement once on the
 [repository page](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75),
@@ -591,7 +603,7 @@ The file is 803,392 bytes, sha256
 `9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. A node without a
 token can take a copy from another node instead: the snapshot path and the
 `hub/blobs` file it links to. `bin/spark doctor --live` and the launch preflight
-report a node whose file is missing or differs, with this command, and run the
+warn about a node whose file is missing and refuse one whose file differs, with this command, and run the
 image's own GLP reader on the head's copy, so a vector the image cannot read is
 refused before a boot ([doctor](doctor.md#glp-steering-file)).
 
