@@ -459,6 +459,91 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.inspect_count.read_text(encoding="utf-8").strip(), "2")
 
+    def test_transient_unreadable_meminfo_retries_before_failing_closed(self) -> None:
+        # An empty /proc/meminfo read under compaction pressure should retry before killing.
+        self._write_command(
+            "sleep",
+            """#!/usr/bin/env bash
+set -eu
+counter="$FAKE_STATE.sleeps"
+pauses=$(cat "$counter" 2>/dev/null || printf '0')
+pauses=$((pauses + 1))
+printf '%s\n' "$pauses" >"$counter"
+if ((pauses == 1)); then
+  printf 'MemTotal:       131072000 kB\nMemAvailable:   16777216 kB\n' >"$MEMGUARD_MEMINFO_FILE"
+else
+  printf 'false\n' >"$FAKE_STATE"
+fi
+""",
+        )
+        self.state.write_text("true\n", encoding="utf-8")
+        self.meminfo.write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{self.bin}:{environment['PATH']}",
+                "CONTAINER_NAME": "candidate",
+                "THRESHOLD_GIB": "5",
+                "INTERVAL": "0.25",
+                "MEMGUARD_PHASE": "startup",
+                "WAIT_FOR_CONTAINER_SECONDS": "0",
+                "READY_FILE": str(self.ready),
+                "MEMGUARD_EVIDENCE_DIR": str(self.evidence),
+                "MEMGUARD_PROC_DIR": str(self.proc),
+                "MEMGUARD_MEMINFO_FILE": str(self.meminfo),
+                "FAKE_STATE": str(self.state),
+                "FAKE_ACTIONS": str(self.actions),
+                "FAKE_INSPECT_COUNT": str(self.inspect_count),
+            }
+        )
+        result = subprocess.run(
+            [str(MEMGUARD)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.ready.exists())
+        self.assertFalse(self.actions.exists())
+
+    def test_persistent_unreadable_meminfo_still_fails_closed(self) -> None:
+        # Three consecutive unreadable /proc/meminfo attempts must still fail closed.
+        self._write_command("sleep", "#!/usr/bin/env bash\nexit 0\n")
+        self.state.write_text("true\n", encoding="utf-8")
+        self.meminfo.write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{self.bin}:{environment['PATH']}",
+                "CONTAINER_NAME": "candidate",
+                "THRESHOLD_GIB": "5",
+                "INTERVAL": "0.25",
+                "MEMGUARD_PHASE": "startup",
+                "WAIT_FOR_CONTAINER_SECONDS": "0",
+                "READY_FILE": str(self.ready),
+                "MEMGUARD_EVIDENCE_DIR": str(self.evidence),
+                "MEMGUARD_PROC_DIR": str(self.proc),
+                "MEMGUARD_MEMINFO_FILE": str(self.meminfo),
+                "FAKE_STATE": str(self.state),
+                "FAKE_ACTIONS": str(self.actions),
+                "FAKE_INSPECT_COUNT": str(self.inspect_count),
+            }
+        )
+        result = subprocess.run(
+            [str(MEMGUARD)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 1)
+        actions = self.actions.read_text(encoding="utf-8")
+        self.assertIn("cannot read MemAvailable during startup; failing closed", actions)
+        self.assertIn("kill kill --signal KILL candidate", actions)
+
 
 if __name__ == "__main__":
     unittest.main()

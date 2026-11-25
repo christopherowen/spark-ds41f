@@ -132,7 +132,16 @@ while true; do
     exit 1
   fi
 
-  read_mem_available_kib || available_kib=
+  available_kib=
+  for ((read_try = 0; read_try < 3; read_try++)); do
+    read_mem_available_kib || available_kib=
+    if [[ -n "$available_kib" && "$available_kib" =~ ^[0-9]+$ ]]; then
+      break
+    fi
+    if ((read_try < 2)); then
+      sleep 0.05
+    fi
+  done
   if [[ -z "$available_kib" || ! "$available_kib" =~ ^[0-9]+$ ]]; then
     logger -t spark-memguard \
       "cannot read MemAvailable during $MEMGUARD_PHASE; failing closed"
