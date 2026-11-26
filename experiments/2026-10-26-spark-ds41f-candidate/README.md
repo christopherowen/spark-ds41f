@@ -5,11 +5,13 @@ series on `next-candidate` (head c579b3fe1). This folder is that candidate: its 
 manifest, lock, arms, image, release tests and the specs that qualify it. It is modelled on
 spark-ds41f-1025's [rc6/](../2026-10-25-spark-ds41f-candidate/rc6).
 
-**Released (2026-11-20):** [candidate-62/](candidate-62) is `spark-ds41f-1120` across all twelve topologies
-(`tp1`, `tp2-direct`, `tp2-switched`..`tp8-switched`, `tp3-triangle`, `tp3-triangle-4k`, `tp4-ring`;
-[below](#spark-ds41f-1120-candidate-62), [release notes](release-notes.md)). Previously released (2026-11-07):
-[1107/](1107) (`spark-ds41f-1107` across eight topologies) and (2026-10-30) candidate 14 (`spark-ds41f-1030`
-on the ring and triangle; [below](#candidate-14-rc14)).
+**Released (2026-11-26):** [candidate-74/](candidate-74) is `spark-ds41f-1126` across sixteen
+configured topologies (`tp4-ring`, `pp2-tp2-ring`, `tp2-direct`, and `tp1` freshly qualified across
+two rebooted boots each on `dgx1..dgx4`; [release notes](release-notes.md)). Previously released:
+(2026-11-20) [candidate-62/](candidate-62) (`spark-ds41f-1120` across twelve topologies;
+[below](#spark-ds41f-1120-candidate-62)), (2026-11-07) [1107/](1107) (`spark-ds41f-1107` across
+eight topologies), and (2026-10-30) candidate 14 (`spark-ds41f-1030` on the ring and triangle;
+[below](#candidate-14-rc14)).
 
 **Frozen candidates (from 2026-11-10):** each merged base verified on all three testbeds is frozen,
 recorded in `manifests/frozen/`, tagged `candidate-<N>` and published as a GitHub pre-release; the

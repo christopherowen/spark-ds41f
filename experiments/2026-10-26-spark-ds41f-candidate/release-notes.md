@@ -1,3 +1,45 @@
+# spark-ds41f-1126: release notes
+
+`spark-ds41f-1126` ([manifests/baselines/2026-11-26-spark-ds41f-1126.json](../../manifests/baselines/2026-11-26-spark-ds41f-1126.json),
+[releases/spark-ds41f-1126/](../../releases/spark-ds41f-1126/)) is `candidate-74`, promoted on 2026-11-26.
+The model is DeepSeek-V4.1-Flash-1017, DeepSeek's checkpoint, with native weights.
+
+It advances `spark-ds41f-1120` with vLLM `0830..0869` (`742` active patches in
+[candidate-74/vllm/series](candidate-74/vllm/series); `patch_head` `d8784b84`, `expected_tree`
+`f3783b0e`), upstream `dgx-spark-networking v0.6.0` (`0` local patches, `expected_tree` `17394077`,
+one-shot PP P2P + proxy ABI 10), and `scripts/memguard.sh` transient `/proc/meminfo` read retry.
+Image `spark-ds41f:1126` (built on `dgx4` as `spark-ds41f:candidate-74`,
+`sha256:94fff0b0b6ffa8ecd7bca576abf1d6c6be17f10c75bfc243b04d0479d356a4e7`), ring-copied identically
+across `dgx1..dgx4`.
+
+## Highlights (`spark-ds41f-1126` vs `spark-ds41f-1120`, 2 fresh-rebooted boots each)
+
+- **`tp4-ring` ([manifests/suites/2026-11-26-spark-ds41f-1126-tp4](../../manifests/suites/2026-11-26-spark-ds41f-1126-tp4/)) — `0` `worse` verdicts, `9` `better`:**
+  - Engine decode grid (20 shapes): **`-0.71% ±0.10%`** (repeat `+0.19%`, **better**).
+  - Paired decode: `c16` **`+0.86% ±0.36%`** (**better**), `c8` **`+0.67% ±0.41%`** (**better**), `single-stream c1` **`+0.62% ±0.15%`** (**better**), `sampled c1` **`+0.61% ±0.36%`** (**better**; `c8`/`c16` `same`).
+  - Source-text prefill `131K / 262K / 524K / 1M`: **`+1.62% / +1.95% / +2.38% / +3.07%`** (all **better**; `32K +1.19%` `same`).
+  - Warm boot: **`+78.5 s`** (vs `1120`'s `+113–116 s`), `min MemAvailable 13.68–16.09 GiB`, `0.0 GiB` swap.
+  - Wide determinism: **`0` token diffs, `0` logprob diffs**, bit-identical golden hashes to `spark-ds41f-1120` (`18d619615e51` / `d65686498eb8` / `0a2dacdde6ff` / `12fd825767d2`).
+  - `tool_gate` (`T=0.0, 0.3`, stock + `deepseek-v4.1-flash-weightless` under `GLP-27 alpha=2.0`): **`80/80` strict PASS (`0` derailments)**.
+- **`pp2-tp2-ring` (new qualified shape, [manifests/benchmarks/2026-11-26-spark-ds41f-1126-pp2tp2ring.json](../../manifests/benchmarks/2026-11-26-spark-ds41f-1126-pp2tp2ring.json)):**
+  - `PP=2, TP=2` over `oneshot-pp2-ring4` + `sparknet v0.6.0` one-shot P2P, `24.0 GiB` KV (`30.70M` tokens = `29.28x` 1M contexts), async zero-sync PP adaptive verification (`row_cost=0.25`), `VLLM_SINK_REJECTION=1`, `SPARK_DS41F_PP_USE_ENGINE_REQS=1`, intra-stage SP (`0859`).
+  - Patch `0869` anchors the `77.5 GiB` contiguous CUDA pool inside `[pool_ptr, pool_end)` on `PP1` ranks (`dgx3`/`dgx4`), shrinks `PP0` to `74.0 GiB` (saving `3.5 GiB`), and eliminates buddy-sponge fallback across all 4 ranks (`min MemAvailable 10.22–13.27 GiB`, `0.0 GiB` swap).
+  - Wide determinism: `0` token diffs across all 6 scenarios, bit-identical hashes to `tp2-direct` (`7278cd22ed16` / `1dd5b1dbdb63`).
+  - Decode `prose-c1..c16` `48.1–48.3 / 85.3–86.9 / 142.9–146.5 / 238.2–256.0 / 421.1–433.2 tok/s`, `code-c16` `438.8–449.4 tok/s`, source-text prefill `32K..1M` `6,173–6,513` / `6,059–6,084 tok/s`.
+- **`tp2-direct` ([manifests/benchmarks/2026-11-26-spark-ds41f-1126-direct2.json](../../manifests/benchmarks/2026-11-26-spark-ds41f-1126-direct2.json)):**
+  - Decode **`+41.0%..+75.5%`** faster (`prose-c1/c2/c4` `28.1–28.3 / 49.5–49.6 / 92.7–92.9 tok/s`, `code-c4` `93.5–94.3 tok/s`; step times `-37.6%..-55.6%`).
+  - Prefill **`+1,695%..+1,975%`** faster (`32K 4,646–4,668`, `131K 4,873–4,888 tok/s` via expert-centric prefill streaming `0858/0865`, bundled multidomain hotlist, and BF16 fast lookahead `0863`).
+  - `min MemAvailable 9.54–11.65 GiB`, `0.0 GiB` swap, `LRU 5/5`, `prefix hit 0.99`, `admission 4×64K pass`, `0` determinism diffs.
+- **`tp1` ([manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp1.json](../../manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp1.json)):**
+  - Decode **`+74.6%..+177.2%`** faster (`prose-c1/c2/c4` `9.2–9.3 / 15.8 / 30.2–30.3 tok/s`, `code-c4` `28.2–28.4 tok/s`; step times `-50.6%..-71.3%`), bit-identical across `dgx3` and `dgx4` (`min MemAvailable 9.07–9.17 GiB`, `0.0 GiB` swap).
+- **Correctness, steering, & test gates:**
+  - Reworked empty-index-slice decode RoPE fix (`0868`, PR `#1323` by James Meadlock).
+  - `GLP-27 alpha=2.0` (`0855`, PR `#1254`/`#1319`) with per-model `0.3/0.95` defaults for `deepseek-v4.1-flash-weightless` (`0856`).
+  - Full `174`-file in-image `release-tests` bundle (`dgx2`): **`12,082 passed, 356 skipped, 0 failed`** (`exit 0`); Linux repo unit suite (`dgx1`): **`950/950 passed`**.
+  - Triangle and switched shapes retain their `spark-ds41f-1120` references pending recabling / community switched qualification ([docs/switched-qualification.md](../../docs/switched-qualification.md)).
+
+---
+
 # spark-ds41f-1120: release notes
 
 `spark-ds41f-1120` ([manifests/baselines/2026-11-20-spark-ds41f-1120.json](../../manifests/baselines/2026-11-20-spark-ds41f-1120.json),

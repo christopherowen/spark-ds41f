@@ -1,7 +1,35 @@
 # Current state
 
-Production is **spark-ds41f-1120** ([config/cluster.json](../config/cluster.json), frozen in
-[releases/spark-ds41f-1120](../releases/spark-ds41f-1120/)), serving DeepSeek-V4.1-Flash-1017 across
+Production is **spark-ds41f-1126** ([config/cluster.json](../config/cluster.json), frozen in
+[releases/spark-ds41f-1126](../releases/spark-ds41f-1126/)), serving DeepSeek-V4.1-Flash-1017 across
+16 configured hardware shapes (`tp4-ring` by default on dgx1-dgx4; `pp2-tp2-ring`, `tp2-direct`,
+and `tp1` freshly qualified across two rebooted boots each; `tp3-triangle`, `tp3-triangle-4k`, and
+switched shapes retaining their `spark-ds41f-1120` references pending recabling / community Spaceport
+qualification). It was promoted 2026-11-26 as
+[`2026-11-26-spark-ds41f-1126`](../manifests/baselines/2026-11-26-spark-ds41f-1126.json)
+([release record](../experiments/2026-10-26-spark-ds41f-candidate/candidate-74/README.md),
+[release notes](../experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)): image
+`spark-ds41f:1126` (`sha256:94fff0b0b6ffa8ecd7bca576abf1d6c6be17f10c75bfc243b04d0479d356a4e7`, built
+on `dgx4` as `spark-ds41f:candidate-74` and ring-copied identically to `dgx1..dgx4`), vLLM
+`0830-0869` (`742` active patches in `candidate-74/vllm/series`, `patch_head` `d8784b84`, tree
+`f3783b0e`), upstream `sparknet v0.6.0` (`0` local patches, tree `17394077`, one-shot PP P2P + proxy
+ABI 10), CUDA `13.5.37`, TileLang `2123e412ce22` (`14` patches, tree `741806c7`), TileKernels `2.0.0`
+(`1` patch, tree `cb2fa41c`), and `scripts/memguard.sh` transient `/proc/meminfo` read retry.
+In-image gate (`dgx2`): `12,082` passed, `356` skipped, `0` failed across `174` files; Linux repo
+unit suite (`dgx1`): `950/950` passed; `tp4-ring` wide determinism `0` token / `0` logprob diffs
+matching `1120` golden hashes; `tool_gate` `80/80` strict PASS (`T=0.0, 0.3`, stock + weightless at
+`GLP-27 alpha=2.0`, `0.3/0.95` defaults). Against `spark-ds41f-1120` across 2 fresh-rebooted boots:
+`tp4-ring` decode grid `-0.71%` (`better`), paired `c16 +0.86%` (`better`), `c8 +0.67%` (`better`),
+`single-stream c1 +0.62%` (`better`), `sampled c1 +0.61%` (`better`), prefill `131K..1M`
+`+1.62%..+3.07%` (all `better`), `0` worse verdicts, warm startup `+78.5 s`; `pp2-tp2-ring`
+qualified with `24.0 GiB` KV (`30.70M` tokens), wide determinism `0` diffs (bit-identical hashes to
+`tp2-direct`), and `6,059–6,513 tok/s` prefill through `1M`; `tp2-direct` decode `+41.0%..+75.5%`
+(`prose-c4 92.7–92.9 tok/s`) and prefill `+1,695%..+1,975%` (`4,646–4,888 tok/s`); `tp1` decode
+`+74.6%..+177.2%` (`prose-c4 30.2–30.3 tok/s`). `spark-ds41f-1120` (frozen in
+[releases/spark-ds41f-1120](../releases/spark-ds41f-1120/), image `spark-ds41f:1120`) is the
+rollback.
+
+Before spark-ds41f-1126, production was **spark-ds41f-1120** ([releases/spark-ds41f-1120](../releases/spark-ds41f-1120/)), serving DeepSeek-V4.1-Flash-1017 across
 all 12 hardware shapes (`tp4-ring` by default on dgx1-dgx4; `tp1`, `tp2-direct`, `tp3-triangle`,
 `tp3-triangle-4k`; and `tp2-switched` through `tp8-switched` on sp1-sp8). It was promoted 2026-11-20 as
 [`2026-11-20-spark-ds41f-1120`](../manifests/baselines/2026-11-20-spark-ds41f-1120.json)
@@ -326,24 +354,24 @@ rollback.
 <!-- BEGIN GENERATED: active-settings -->
 | Setting | Active value |
 | --- | --- |
-| Promoted baseline | `2026-11-20-spark-ds41f-1120` (`spark-ds41f-1120`, frozen in `releases/spark-ds41f-1120/`); default shape `tp4-ring` |
-| Served models | `deepseek-v4.1-flash` (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, revision `1bae0e10`) and per-request GLP-steered `deepseek-v4.1-flash-weightless` (`msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75`, revision `2715ffd5`) |
-| Kernel backend | TileLang only (`kernel_backend: tilelang`, vLLM 0493-0496): TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (`741806c7`), DeepSeek TileKernels 2.0.0 (`cb2fa41c`), sparknet 0.5.0 (`e06f6a06`) one-shot RoCE collectives; every serving kernel is TileLang including the vision tower, CED row selection, RoPE, compressor, KV writers, Engram gate/hash/gather, sparse MLA, WO projection, drafter context-KV, sampling and block verification |
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/candidate-62/vllm/series` (702 patches, patch head `9b251a18`, tree `8fc99ca7`), TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (14 patches), TileKernels 2.0.0 (1 patch), sparknet 0.5.0 (3 patches), NCCL 2.30.7 (4 patches, tree `6af10aa7`), CUDA 13.5.37; direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
-| Image | `spark-ds41f:1120` (built as `spark-ds41f:candidate-62`, `sha256:5c12472565a7`), one digest on all ranks, built by `bin/spark build` |
+| Promoted baseline | `2026-11-26-spark-ds41f-1126` (`spark-ds41f-1126`, frozen in `releases/spark-ds41f-1126/`); default shape `tp4-ring` |
+| Served models | `deepseek-v4.1-flash` (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, revision `1bae0e10`) and per-request GLP-steered `deepseek-v4.1-flash-weightless` (`msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-27-L11-37-a3.5`, revision `4d570926`) |
+| Kernel backend | TileLang only (`kernel_backend: tilelang`, vLLM 0493-0496): TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (`741806c7`), DeepSeek TileKernels 2.0.0 (`cb2fa41c`), sparknet 0.6.0 (`17394077`) one-shot RoCE collectives; every serving kernel is TileLang including the vision tower, CED row selection, RoPE, compressor, KV writers, Engram gate/hash/gather, sparse MLA, WO projection, drafter context-KV, sampling and block verification |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + `experiments/2026-10-26-spark-ds41f-candidate/candidate-74/vllm/series` (742 patches, patch head `d8784b84`, tree `f3783b0e`), TileLang 0.1.15+snapshot.35f15411cf3af0fc06a1cb0097215b1372a40464 (14 patches), TileKernels 2.0.0 (1 patch), sparknet 0.6.0 (None patches), NCCL 2.30.7 (4 patches, tree `6af10aa7`), CUDA 13.5.37; direct checkpoint loader (`--load-format direct`, vLLM 0499, `VLLM_PLUGINS` empty) |
+| Image | `spark-ds41f:1126` (built as `spark-ds41f:candidate-74`, `sha256:94fff0b0b6ff`), one digest on all ranks, built by `bin/spark build` |
 | Decode tiles & PDL | block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count and split-K tiles up to 128 rows for 16-stream steps, programmatic dependent launch (PDL) along the decode chain (vLLM 0520-0525), attention front in one launch (0543-0544), 64-row prefill MoE tiles and panel rasterization past L2 (0043) |
-| Batch invariance | temperature-0 outputs do not depend on the batch: rank-order FP32 reductions with one rounding, compressor projection one TileLang arithmetic at every row count, aligned prefill chunks (`--long-prefill-token-threshold` 16,192 on `tp4-ring`, 6,096 on `tp3-triangle`, 4,048 on `tp3-triangle-4k`), CED replays a prompt's last 128 rows wherever its chunks end (0526-0527), and mixed steps run sparse MLA per request |
+| Batch invariance | temperature-0 outputs do not depend on the batch: rank-order FP32 reductions with one rounding, compressor projection one TileLang arithmetic at every row count, aligned prefill chunks (`--long-prefill-token-threshold` 16,192 on `tp4-ring`, 6,048 on `tp3-triangle`, 4,048 on `tp3-triangle-4k`), CED replays a prompt's last 128 rows wherever its chunks end (0526-0527), and mixed steps run sparse MLA per request |
 | Hosts | DGX Spark 26.09.2 (dgx-spark-ota-update-meta), kernel `7.0.0-1019-nvidia-64k with kho=off`, driver 580.178.04, `multi-user.target (no desktop)`, `--cpuset-cpus=5-9,15-19`, glibc malloc pinned (`MALLOC_ARENA_MAX=2`, `MALLOC_MMAP_THRESHOLD_=1048576`) |
-| Tensor parallel ranks & transport | `tp4-ring` (4 ranks, `oneshot-ring4`); `tp4-switched` (4 ranks, `oneshot-switched`); `tp5-switched` (5 ranks, `oneshot-switched`); `tp6-switched` (6 ranks, `oneshot-switched`); `tp7-switched` (7 ranks, `oneshot-switched`); `tp8-switched` (8 ranks, `oneshot-switched`); `tp3-triangle` (3 ranks, `oneshot-direct`); `tp3-switched` (3 ranks, `oneshot-switched`); `tp3-triangle-4k` (3 ranks, `oneshot-direct`); `tp2-direct` (2 ranks, `oneshot-direct`); `tp2-switched` (2 ranks, `oneshot-switched`); `tp1` (1 rank, `local`) |
-| Maximum model length | `tp4-ring`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`, `tp3-triangle`, `tp3-switched`: 1,048,576 tokens; `tp3-triangle-4k`, `tp2-direct`, `tp2-switched`, `tp1`: 262,144 tokens |
-| Maximum sequences | `tp4-ring`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`: 32; `tp3-triangle`, `tp3-switched`, `tp3-triangle-4k`: 8; `tp2-direct`, `tp2-switched`, `tp1`: 4 |
+| Tensor parallel ranks & transport | `tp4-ring` (4 ranks, `oneshot-ring4`); `tp4-switched` (4 ranks, `oneshot-switched`); `tp5-switched` (5 ranks, `oneshot-switched`); `tp6-switched` (6 ranks, `oneshot-switched`); `tp7-switched` (7 ranks, `oneshot-switched`); `tp8-switched` (8 ranks, `oneshot-switched`); `tp3-triangle` (3 ranks, `oneshot-direct`); `tp3-switched` (3 ranks, `oneshot-switched`); `tp3-triangle-4k` (3 ranks, `oneshot-direct`); `tp2-direct` (2 ranks, `oneshot-direct`); `tp2-switched` (2 ranks, `oneshot-switched`); `tp1` (1 rank, `local`); `pp2-tp2-ring` (4 ranks, `oneshot-pp2-ring4`); `pp2-tp2-switched` (4 ranks, `oneshot-switched`); `pp2-tp3-switched` (6 ranks, `oneshot-switched`); `pp2-tp4-switched` (8 ranks, `oneshot-switched`) |
+| Maximum model length | `tp4-ring`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`, `tp3-triangle`, `tp3-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`, `pp2-tp3-switched`, `pp2-tp4-switched`: 1,048,576 tokens; `tp3-triangle-4k`, `tp2-direct`, `tp2-switched`, `tp1`: 262,144 tokens |
+| Maximum sequences | `tp4-ring`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`, `pp2-tp3-switched`, `pp2-tp4-switched`: 32; `tp3-triangle`, `tp3-switched`: 16; `tp3-triangle-4k`: 8; `tp2-direct`, `tp2-switched`, `tp1`: 4 |
 | Maximum parallel prefills | 1 (`--max-parallel-prefills 1`) |
-| Batched-token budget | `tp4-ring`, `tp4-switched`: 16,384; `tp5-switched`, `tp7-switched`, `tp8-switched`: 32,768; `tp6-switched`: 24,576 (`spark-ds41f-1120`); `tp3-triangle`, `tp3-switched`: 6,144; `tp3-triangle-4k`, `tp2-direct`, `tp2-switched`, `tp1`: 4,096 |
+| Batched-token budget | `tp4-ring`, `tp4-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`: 16,384; `tp5-switched`, `tp7-switched`, `tp8-switched`, `pp2-tp4-switched`: 32,768; `tp6-switched`, `pp2-tp3-switched`: 24,576; `tp3-triangle`, `tp3-switched`: 6,144; `tp3-triangle-4k`: 4,096 (`spark-ds41f-1120`); `tp2-direct`, `tp2-switched`, `tp1`: 8,192 |
 | Prefill yield & late admission | prefill yield enabled (`--prefill-yield short`, `--prefill-yield-limit-s 10`, vLLM 0545) so waiting short requests take the next step from a long prefill; late admission at decoder layer 30 (`VLLM_LATE_ADMISSION_LAYER=30`, vLLM 0222, 0226) |
 | Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the one-shot RoCE all-reduce; CED encoder layers with non-final row skip (vLLM 0014-0018, 0229-0255) |
 | Indexer under sequence parallelism | each rank scores and selects its own rows and all-gathers the top-k positions (patch 0025), ties broken by lowest logical position in TileLang |
-| Explicit KV memory | `tp4-ring`, `tp4-switched`: 16.5 GiB (17,716,740,096 B); `tp5-switched`: 24.0 GiB (25,769,803,776 B); `tp6-switched`: 13.0 GiB (13,958,643,712 B); `tp7-switched`: 16.0 GiB (17,179,869,184 B); `tp8-switched`: 25.5 GiB (27,380,416,512 B); `tp3-triangle`, `tp3-switched`: 4.9062 GiB (5,268,045,824 B); `tp3-triangle-4k`: 2.2 GiB (2,362,232,012 B); `tp2-direct`, `tp2-switched`, `tp1`: 8.0 GiB (8,589,934,592 B) per rank; no per-allocation KV zeroing (vLLM 0502-0503) |
-| KV capacity | `tp4-ring`: 18,711,942 startup tokens (17.85x; holds 17 full 1M contexts or 32 x 579,840); `tp3-triangle`: 5,488,353 startup tokens (5.23x; holds 5 full 1M contexts or 8 x 682,240); `tp3-triangle-4k`: holds 8 full 256K contexts ([KV capacity](memory-profiles.md#kv-capacity)) |
+| Explicit KV memory | `tp4-ring`, `tp4-switched`: 16.5 GiB (17,716,740,096 B); `tp5-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`, `pp2-tp3-switched`: 24.0 GiB (25,769,803,776 B); `tp6-switched`: 13.0 GiB (13,958,643,712 B); `tp7-switched`: 16.0 GiB (17,179,869,184 B); `tp8-switched`: 25.5 GiB (27,380,416,512 B); `tp3-triangle`, `tp3-switched`: 4.9062 GiB (5,268,045,824 B); `tp3-triangle-4k`: 2.2 GiB (2,362,232,012 B); `tp2-direct`, `tp2-switched`, `tp1`: 6.0 GiB (6,442,450,944 B); `pp2-tp4-switched`: 36.0 GiB (38,654,705,664 B) per rank; no per-allocation KV zeroing (vLLM 0502-0503) |
+| KV capacity | `tp4-ring`: 18,711,942 startup tokens (17.85x; holds 17 full 1M contexts or 32 x 579,840); `tp3-triangle`: 5,488,353 startup tokens (5.23x; holds 5 full 1M contexts or 16 x 335,360); `tp3-triangle-4k`: holds 8 full 256K contexts ([KV capacity](memory-profiles.md#kv-capacity)) |
 | Expert scale codes | routed experts' UE8M0 weight scales as a per-row base exponent and 4-bit deltas (vLLM 0182-0183), with 2-bit deltas for narrow experts stored in the 4-bit codes' buffer (0563-0564, 0566) |
 | Memory-saver | signed DKMS 0.4.1 (`dgx-spark-memory-saver`) on all nodes; loaded UVM leaf-table packing enabled (`uvm_leaf_packing: Y`) |
 | Page-size profiles | 64 KiB selected (11 shapes); 4 KiB (`tp3-triangle-4k`) retains 2.2 GiB KV and a 262,144-token limit |
@@ -351,8 +379,8 @@ rollback.
 | Reference precision | DeepSeek's `inference/model.py` term for term: FP32 logits, exact FP32 mHC stream projection (three TF32 parts per weight), shared expert SwiGLU in FP32 with one rounding, MoE partials rounded once per rank, and WO-A's input through `act_quant` (E4M3, UE8M0 per 32, vLLM 0177, 0179) |
 | Image input | TileLang vision tower loaded (`--limit-mm-per-prompt '{"image":67}'`, `VLLM_MAX_IMAGE_PIXELS=16777216`, `--mm-processor-cache-gb 0`; [below](#images-per-request)) |
 | DSpark speculative decoding | 5 draft tokens, draft TP = node count, fixed linear step cost budget (`adaptive_verification_row_cost: 0.035` on TP4..8; TP3 calibrated piecewise curve on `tp3-*`; adaptive verification off on `tp2-*`/`tp1`; vLLM 0184, nothing timed at boot), dead verification rows below survival 0.2 (`0504`), block rejection with fresh draws per round (`0228`), sink draft-zero rejection on by default (`0221, 0223`), vocabulary-parallel greedy drafts and shard argmax verification (`0112-0114`) |
-| Collectives | sparknet 0.5.0 one-shot RoCE all-reduce (up to 2 MiB) and all-gather (`oneshot-ring4` on TP4 ring, `oneshot-direct` on TP3/TP2 direct, `oneshot-switched` on TP2..TP8 switched; `tp1` runs local `uni` without RDMA), TP broadcast on one-shot all-gather (`0185`), GPU-clock timeout 10 s (`SPARKNET_ROCE_TIMEOUT_MS=10000`), no fallback (`0142`) |
-| CUDA graphs & warmup | `FULL_AND_PIECEWISE` capture sizes 1-192 on `tp4-ring`/`tp4..8-switched` (1-48 on `tp3-*`) and `PIECEWISE` 1-24 on `tp2-*`/`tp1`; all declared TileLang calls prepared and cache frozen before memory profiling (`--jit-monitor-mode off`) |
+| Collectives | sparknet 0.6.0 one-shot RoCE all-reduce (up to 2 MiB) and all-gather (`oneshot-ring4` on TP4 ring, `oneshot-direct` on TP3/TP2 direct, `oneshot-switched` on TP2..TP8 switched; `tp1` runs local `uni` without RDMA), TP broadcast on one-shot all-gather (`0185`), GPU-clock timeout 10 s (`SPARKNET_ROCE_TIMEOUT_MS=10000`), no fallback (`0142`) |
+| CUDA graphs & warmup | `FULL_AND_PIECEWISE` capture sizes 1-192 on `tp4-ring`/`tp4..8-switched` (1-96 on `tp3-*`) and `PIECEWISE` 1-24 on `tp2-*`/`tp1`; all declared TileLang calls prepared and cache frozen before memory profiling (`--jit-monitor-mode off`) |
 | Engram projection & rows | sharded across ranks (`projection_tp`); one native reader thread reads both tables in layer order from interleaved whole hash columns (`table_memory=disk` on TP1..TP5, `device` on `tp6..tp8-switched`); host hashes prefill tokens a step early except drafted-prefill requests, which the GPU hashes (vLLM 0145-0154, 0180, 0567) |
 | Memory guards | 5 GiB startup (0.25 s), 3 GiB steady (2 s), each killing on its first sample below; hosts set `vm.watermark_boost_factor=0` |
 | Prefix caching & API semantics | 256-token blocks (`--enable-prefix-caching`, `--enable-prompt-tokens-details`, `--enable-per-request-metrics`); thinking enabled by default, top-level `thinking` switch, effort aliases, `response_format`, `tool_choice: none`, assistant prefix, and generation defaults `temperature: 1.0, top_p: 1.0` |
