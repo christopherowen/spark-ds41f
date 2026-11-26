@@ -136,9 +136,9 @@ See [docs/current-state.md](docs/current-state.md) and [switchle.ss](https://swi
 | `tp6-switched` | TP6 `oneshot-switched` (64 KiB) | 1,048,576 | 32 (up to 432,384 tok each) | 24,576 | 13.0 GiB | 5.38 / 7.58 GiB | 13 (13.41x; startup `6,497,522` / `6.20x`) | [`spark-ds41f-1120`](manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched6.json) |
 | `tp7-switched` | TP7 `oneshot-switched` (64 KiB) | 1,048,576 | 32 (up to 530,176 tok each) | 32,768 | 16.0 GiB | 5.63 / 7.78 GiB | 16 (16.36x; startup `6,696,516` / `6.39x`) | [`spark-ds41f-1120`](manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched7.json) |
 | `tp8-switched` | TP8 `oneshot-switched` (64 KiB) | 1,048,576 | 32 (up to 888,320 tok each) | 32,768 | 25.5 GiB | 8.99 / 11.07 GiB | 27 (27.17x; startup `10,672,526` / `10.18x`) | [`spark-ds41f-1120`](manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched8.json) |
-| `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 16 (up to 335,360 tok each) | 6,144 | 4.9062 GiB | 6.38 / 8.60 GiB | 5 (5.24x; startup `4,354,971` / `4.15x`) | [`spark-ds41f-1120`](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/) |
+| `tp3-triangle` | TP3 `oneshot-direct` (64 KiB) | 1,048,576 | 16 (up to 335,360 tok each) | 6,144 | 4.9062 GiB | 6.16 / 7.72 GiB | 5 (5.24x; startup `5,488,353` / `5.23x`) | [`spark-ds41f-1126`](manifests/suites/2026-11-26-spark-ds41f-1126-tp3/) |
 | `tp3-switched` | TP3 `oneshot-switched` (64 KiB) | 1,048,576 | 16 (up to 335,360 tok each) | 6,144 | 4.9062 GiB | 6.34 / 7.92 GiB | 5 (5.24x; startup `4,354,971` / `4.15x`) | [`spark-ds41f-1120`](manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched3.json) |
-| `tp3-triangle-4k` | TP3 `oneshot-direct` (4 KiB) | 262,144 | 8 (up to 262,144 tok each) | 4,096 | 2.2 GiB | 11.28 / 13.17 GiB | 8 (8.80x; startup `1,348,708` / `5.14x`) | [`spark-ds41f-1120`](manifests/benchmarks/2026-11-20-spark-ds41f-1120-tp34k.json) |
+| `tp3-triangle-4k` | TP3 `oneshot-direct` (4 KiB) | 262,144 | 8 (up to 262,144 tok each) | 4,096 | 2.2 GiB | 11.30 / 13.09 GiB | 8 (8.80x; startup `2,304,107` / `8.79x`) | [`spark-ds41f-1126`](manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp34k.json) |
 | `tp2-direct` | TP2 `oneshot-direct` (64 KiB) | 262,144 | 4 (up to 262,144 tok each) | 8,192 | 6.0 GiB | 9.82 / 11.65 GiB | 24 (24.64x; startup `6,455,516` / `24.63x`) | [`spark-ds41f-1126`](manifests/benchmarks/2026-11-26-spark-ds41f-1126-direct2.json) |
 | `tp2-switched` | TP2 `oneshot-switched` (64 KiB) | 262,144 | 4 (up to 262,144 tok each) | 8,192 | 6.0 GiB | 6.61 / 8.27 GiB | 24 (24.64x; startup `2,491,557` / `9.50x`) | [`spark-ds41f-1120`](manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched2.json) |
 | `tp1` | TP1 `local` (64 KiB) | 262,144 | 4 (up to 262,144 tok each) | 8,192 | 6.0 GiB | 9.17 / 9.17 GiB | 24 (24.64x; startup `6,455,516` / `24.63x`) | [`spark-ds41f-1126`](manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp1.json) |
@@ -213,21 +213,21 @@ To reproduce the deployment on your own Sparks, follow
 <!-- BEGIN GENERATED: performance-summary -->
 Current qualified reference runs by shape (from `config/cluster.json` and `manifests/suites/`):
 
-| Metric | `tp4-ring` ([`spark-ds41f-1126`](manifests/suites/2026-11-26-spark-ds41f-1126-tp4/)) | `tp3-triangle` ([`spark-ds41f-1120`](manifests/suites/2026-11-20-spark-ds41f-1120-tp3/)) |
+| Metric | `tp4-ring` ([`spark-ds41f-1126`](manifests/suites/2026-11-26-spark-ds41f-1126-tp4/)) | `tp3-triangle` ([`spark-ds41f-1126`](manifests/suites/2026-11-26-spark-ds41f-1126-tp3/)) |
 | --- | ---: | ---: |
-| Decode step geometric mean (20 TP4 / 15 TP3 shapes) | 19.21 ms | 25.52 ms |
+| Decode step geometric mean (20 TP4 / 15 TP3 shapes) | 19.21 ms | 19.10 ms |
 | Decode, 16 streams (`c16` output tok/s) | 283.3 | — |
-| Decode, 8 streams (`c8` output tok/s) | 215.3 | 170.7 |
-| Decode, 4 streams (`c4` output tok/s) | — | 131.6 |
-| One conversation at a time (`single-stream` `c1` output tok/s) | 89.5 | 70.4 |
-| Sampled decode (`temp=1.0, top_p=1.0`), c16 / c8 / c1 (tok/s) | 277.1 / 211.2 / 87.7 | 167.2 / 167.6 / 68.3 |
-| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s), output (tok/s) | 180.1 | 119.5 |
-| Source-text prefill, 32K (tok/s) | 9,729 | 7,270 |
-| Prefill, 131K (tok/s) | 10,272 | 7,502 |
-| Prefill, 262K (tok/s) | 10,253 | 7,445 |
-| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | 10,067 | 7,259 |
-| Prefill, 1M (tok/s) | 9,686 | 6,922 |
-| Short-request TTFT p50 during 131K prefill, 3 / 11 (TP4) or 3 / 6 (TP3) streams | 1.65 s / 1.42 s | 0.80 s / 1.76 s |
+| Decode, 8 streams (`c8` output tok/s) | 215.3 | 172.3 |
+| Decode, 4 streams (`c4` output tok/s) | — | 133.9 |
+| One conversation at a time (`single-stream` `c1` output tok/s) | 89.5 | 71.3 |
+| Sampled decode (`temp=1.0, top_p=1.0`), c16 / c8 / c1 (tok/s) | 277.1 / 211.2 / 87.7 | 219.9 / 167.1 / 69.1 |
+| Poisson arrivals (0.7 TP4 / 0.42 TP3 req/s), output (tok/s) | 180.1 | 119.6 |
+| Source-text prefill, 32K (tok/s) | 9,729 | 7,327 |
+| Prefill, 131K (tok/s) | 10,272 | 7,582 |
+| Prefill, 262K (tok/s) | 10,253 | 7,544 |
+| Prefill, 524K (TP4) / 500K (TP3) (tok/s) | 10,067 | 7,398 |
+| Prefill, 1M (tok/s) | 9,686 | 7,120 |
+| Short-request TTFT p50 during 131K prefill, 3 / 11 (TP4) or 3 / 6 (TP3) streams | 1.65 s / 1.42 s | 0.84 s / 0.91 s |
 <!-- END GENERATED: performance-summary -->
 
 The comparisons earlier releases were promoted on are in
@@ -240,21 +240,27 @@ over 8 streams on stock `4 KiB` kernels) are archived in
 ## Release history
 
 Production is **spark-ds41f-1126**, serving DeepSeek-V4.1-Flash-1017 across sixteen configured
-topologies (`tp4-ring`, `pp2-tp2-ring`, `tp2-direct`, `tp1` freshly qualified across two rebooted
-boots each on `dgx1..dgx4`; [release record](experiments/2026-10-26-spark-ds41f-candidate/candidate-74/README.md),
+topologies (all six switchless shapes — `tp4-ring`, `pp2-tp2-ring`, `tp3-triangle`,
+`tp3-triangle-4k`, `tp2-direct`, and `tp1` — freshly qualified across two rebooted boots each on
+`dgx1..dgx4`; [release record](experiments/2026-10-26-spark-ds41f-candidate/candidate-74/README.md),
 [release notes](experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)). It advances
 `spark-ds41f-1120` through vLLM `0869` (`742` active patches, `patch_head` `d8784b84`, tree
 `f3783b0e`) and upstream `sparknet v0.6.0` (`0` local patches, tree `17394077`), passes `12,082`
 in-image release tests (`356` skipped, `0` failed across `174` files), `950/950` Linux repo tests,
-`0/0` bit-identical `tp4-ring` determinism matching `1120` golden hashes, and `80/80` strict
-`tool_gate`. Against `spark-ds41f-1120` across 2 fresh-rebooted boots: `tp4-ring` decode grid
-`-0.71%` (`better`), paired `c16 +0.86%` (`better`), `c8 +0.67%` (`better`), `single-stream c1
-+0.62%` (`better`), `sampled c1 +0.61%` (`better`), prefill `131K..1M +1.62%..+3.07%` (all
-`better`), `0` worse verdicts, warm startup `+78.5 s` (vs `1120`'s `+113–116 s`); `pp2-tp2-ring`
-qualified with `24.0 GiB` KV (`30.70M` tokens), `0` diffs wide determinism matching `tp2-direct`,
-and `6,059–6,513 tok/s` prefill through `1M`; `tp2-direct` decode `+41.0%..+75.5%` (`prose-c4
-92.7–92.9 tok/s`) and prefill `+1,695%..+1,975%` (`4,646–4,888 tok/s`); `tp1` decode
-`+74.6%..+177.2%` (`prose-c4 30.2–30.3 tok/s`). Frozen in
+`0/0` bit-identical determinism on `tp4-ring` and `tp3-triangle`/`tp3-triangle-4k`, and `80/80`
+strict `tool_gate` on both `tp4-ring` and `tp3-triangle`. Against `spark-ds41f-1120` across 2
+fresh-rebooted boots: `tp4-ring` decode grid `-0.71%` (`better`), paired `c16 +0.86%` (`better`),
+`c8 +0.67%` (`better`), `single-stream c1 +0.62%` (`better`), `sampled c1 +0.61%` (`better`),
+prefill `131K..1M +1.62%..+3.07%` (all `better`), `0` worse verdicts, warm startup `+78.5 s` (vs
+`1120`'s `+113–116 s`); `tp3-triangle` decode grid `-25.19%` (`better`), paired `c8 +0.77%`,
+`c4 +1.34%`, `single-stream c1 +1.30%` (`71.32 tok/s`), `sampled c1 +1.39%` (all `better`),
+`sampled c16 +31.53%` aggregate output (`220.0 tok/s`, `-96.5%` TTFT from `max_num_seqs 8 -> 16`),
+and prefill `131K..1M +1.06%..+2.86%` (all `better`); `tp3-triangle-4k` prefill `32K..262K`
+`+22.0%..+24.2%` (`8,337–8,471 tok/s`); `pp2-tp2-ring` qualified with `24.0 GiB` KV (`30.70M`
+tokens), `0` diffs wide determinism matching `tp2-direct`, and `6,059–6,513 tok/s` prefill through
+`1M`; `tp2-direct` decode `+41.0%..+75.5%` (`prose-c4 92.7–92.9 tok/s`) and prefill
+`+1,695%..+1,975%` (`4,646–4,888 tok/s`); `tp1` decode `+74.6%..+177.2%` (`prose-c4 30.2–30.3
+tok/s`) and prefill `512/1024 +816%..+1,232%`. Frozen in
 [releases/spark-ds41f-1126](releases/spark-ds41f-1126/); `spark-ds41f-1120`, the rollback, in
 [releases/spark-ds41f-1120](releases/spark-ds41f-1120/).
 

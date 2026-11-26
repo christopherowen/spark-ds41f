@@ -2,10 +2,10 @@
 
 Production is **spark-ds41f-1126** ([config/cluster.json](../config/cluster.json), frozen in
 [releases/spark-ds41f-1126](../releases/spark-ds41f-1126/)), serving DeepSeek-V4.1-Flash-1017 across
-16 configured hardware shapes (`tp4-ring` by default on dgx1-dgx4; `pp2-tp2-ring`, `tp2-direct`,
-and `tp1` freshly qualified across two rebooted boots each; `tp3-triangle`, `tp3-triangle-4k`, and
-switched shapes retaining their `spark-ds41f-1120` references pending recabling / community Spaceport
-qualification). It was promoted 2026-11-26 as
+16 configured hardware shapes (`tp4-ring` by default on dgx1-dgx4; all six switchless shapes —
+`tp4-ring`, `pp2-tp2-ring`, `tp3-triangle`, `tp3-triangle-4k`, `tp2-direct`, and `tp1` — freshly
+qualified across two rebooted boots each; switched shapes retaining their `spark-ds41f-1120`
+references pending community switched qualification). It was promoted 2026-11-26 as
 [`2026-11-26-spark-ds41f-1126`](../manifests/baselines/2026-11-26-spark-ds41f-1126.json)
 ([release record](../experiments/2026-10-26-spark-ds41f-candidate/candidate-74/README.md),
 [release notes](../experiments/2026-10-26-spark-ds41f-candidate/release-notes.md)): image
@@ -16,18 +16,22 @@ on `dgx4` as `spark-ds41f:candidate-74` and ring-copied identically to `dgx1..dg
 ABI 10), CUDA `13.5.37`, TileLang `2123e412ce22` (`14` patches, tree `741806c7`), TileKernels `2.0.0`
 (`1` patch, tree `cb2fa41c`), and `scripts/memguard.sh` transient `/proc/meminfo` read retry.
 In-image gate (`dgx2`): `12,082` passed, `356` skipped, `0` failed across `174` files; Linux repo
-unit suite (`dgx1`): `950/950` passed; `tp4-ring` wide determinism `0` token / `0` logprob diffs
-matching `1120` golden hashes; `tool_gate` `80/80` strict PASS (`T=0.0, 0.3`, stock + weightless at
-`GLP-27 alpha=2.0`, `0.3/0.95` defaults). Against `spark-ds41f-1120` across 2 fresh-rebooted boots:
-`tp4-ring` decode grid `-0.71%` (`better`), paired `c16 +0.86%` (`better`), `c8 +0.67%` (`better`),
-`single-stream c1 +0.62%` (`better`), `sampled c1 +0.61%` (`better`), prefill `131K..1M`
-`+1.62%..+3.07%` (all `better`), `0` worse verdicts, warm startup `+78.5 s`; `pp2-tp2-ring`
-qualified with `24.0 GiB` KV (`30.70M` tokens), wide determinism `0` diffs (bit-identical hashes to
-`tp2-direct`), and `6,059–6,513 tok/s` prefill through `1M`; `tp2-direct` decode `+41.0%..+75.5%`
-(`prose-c4 92.7–92.9 tok/s`) and prefill `+1,695%..+1,975%` (`4,646–4,888 tok/s`); `tp1` decode
-`+74.6%..+177.2%` (`prose-c4 30.2–30.3 tok/s`). `spark-ds41f-1120` (frozen in
-[releases/spark-ds41f-1120](../releases/spark-ds41f-1120/), image `spark-ds41f:1120`) is the
-rollback.
+unit suite (`dgx1`): `950/950` passed; `tp4-ring`, `tp3-triangle`, and `tp3-triangle-4k` wide
+determinism `0` token / `0` logprob diffs; `tool_gate` `80/80` strict PASS (`T=0.0, 0.3`, stock +
+weightless at `GLP-27 alpha=2.0`, `0.3/0.95` defaults) on both `tp4-ring` and `tp3-triangle`.
+Against `spark-ds41f-1120` across 2 fresh-rebooted boots: `tp4-ring` decode grid `-0.71%`
+(`better`), paired `c16 +0.86%` (`better`), `c8 +0.67%` (`better`), `single-stream c1 +0.62%`
+(`better`), `sampled c1 +0.61%` (`better`), prefill `131K..1M +1.62%..+3.07%` (all `better`), `0`
+worse verdicts, warm startup `+78.5 s`; `tp3-triangle` decode grid `-25.19%` (`better`), paired
+`c8 +0.77%`, `c4 +1.34%`, `single-stream c1 +1.30%` (`71.32 tok/s`), `sampled c1 +1.39%` (all
+`better`), `sampled c16 +31.53%` aggregate output (`220.0 tok/s`, `-96.5%` TTFT from `max_num_seqs
+8 -> 16`), prefill `131K..1M +1.06%..+2.86%` (all `better`); `tp3-triangle-4k` prefill `32K..262K`
+`+22.0%..+24.2%` (`8,337–8,471 tok/s`); `pp2-tp2-ring` qualified with `24.0 GiB` KV (`30.70M`
+tokens), wide determinism `0` diffs (bit-identical hashes to `tp2-direct`), and `6,059–6,513 tok/s`
+prefill through `1M`; `tp2-direct` decode `+41.0%..+75.5%` (`prose-c4 92.7–92.9 tok/s`) and prefill
+`+1,695%..+1,975%` (`4,646–4,888 tok/s`); `tp1` decode `+74.6%..+177.2%` (`prose-c4 30.2–30.3
+tok/s`). `spark-ds41f-1120` (frozen in [releases/spark-ds41f-1120](../releases/spark-ds41f-1120/),
+image `spark-ds41f:1120`) is the rollback.
 
 Before spark-ds41f-1126, production was **spark-ds41f-1120** ([releases/spark-ds41f-1120](../releases/spark-ds41f-1120/)), serving DeepSeek-V4.1-Flash-1017 across
 all 12 hardware shapes (`tp4-ring` by default on dgx1-dgx4; `tp1`, `tp2-direct`, `tp3-triangle`,
@@ -366,7 +370,7 @@ rollback.
 | Maximum model length | `tp4-ring`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`, `tp3-triangle`, `tp3-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`, `pp2-tp3-switched`, `pp2-tp4-switched`: 1,048,576 tokens; `tp3-triangle-4k`, `tp2-direct`, `tp2-switched`, `tp1`: 262,144 tokens |
 | Maximum sequences | `tp4-ring`, `tp4-switched`, `tp5-switched`, `tp6-switched`, `tp7-switched`, `tp8-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`, `pp2-tp3-switched`, `pp2-tp4-switched`: 32; `tp3-triangle`, `tp3-switched`: 16; `tp3-triangle-4k`: 8; `tp2-direct`, `tp2-switched`, `tp1`: 4 |
 | Maximum parallel prefills | 1 (`--max-parallel-prefills 1`) |
-| Batched-token budget | `tp4-ring`, `tp4-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`: 16,384; `tp5-switched`, `tp7-switched`, `tp8-switched`, `pp2-tp4-switched`: 32,768; `tp6-switched`, `pp2-tp3-switched`: 24,576; `tp3-triangle`, `tp3-switched`: 6,144; `tp3-triangle-4k`: 4,096 (`spark-ds41f-1120`); `tp2-direct`, `tp2-switched`, `tp1`: 8,192 |
+| Batched-token budget | `tp4-ring`, `tp4-switched`, `pp2-tp2-ring`, `pp2-tp2-switched`: 16,384; `tp5-switched`, `tp7-switched`, `tp8-switched`, `pp2-tp4-switched`: 32,768; `tp6-switched`, `pp2-tp3-switched`: 24,576; `tp3-triangle`, `tp3-switched`: 6,144; `tp3-triangle-4k`: 4,096 (`spark-ds41f-1126`); `tp2-direct`, `tp2-switched`, `tp1`: 8,192 |
 | Prefill yield & late admission | prefill yield enabled (`--prefill-yield short`, `--prefill-yield-limit-s 10`, vLLM 0545) so waiting short requests take the next step from a long prefill; late admission at decoder layer 30 (`VLLM_LATE_ADMISSION_LAYER=30`, vLLM 0222, 0226) |
 | Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the one-shot RoCE all-reduce; CED encoder layers with non-final row skip (vLLM 0014-0018, 0229-0255) |
 | Indexer under sequence parallelism | each rank scores and selects its own rows and all-gathers the top-k positions (patch 0025), ties broken by lowest logical position in TileLang |

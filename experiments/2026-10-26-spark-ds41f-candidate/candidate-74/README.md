@@ -73,6 +73,30 @@ All other build inputs are identical to `candidate-73` (`sparknet v0.6.0` tree `
     [`receipts/benchmarks/pp2-tp2-ring-b2.json`](receipts/benchmarks/pp2-tp2-ring-b2.json)):
     `LRU 5/5`, `prose-c1..c16` `48.1–48.3 / 85.3–86.9 / 142.9–146.5 / 238.2–256.0 / 421.1–433.2 tok/s`,
     `code-c16` `438.8–449.4 tok/s`, prefill `32K..1M` `6,173–6,513` / `6,059–6,084 tok/s`.
+- **`tp3-triangle` (`b1` + `b2` on recabled `dgx1..dgx3`, clean reboot before each boot, vs `1120`)**:
+  - Pool logs ([`b1`](receipts/tp3-triangle/startup-pool-mem.txt), [`b2`](receipts/tp3-triangle/startup-pool-mem-b2.txt)):
+    all 3 ranks kept `96.5 GiB` contiguous CUDA pool (`front_clean=True`), skipping buddy sponge on
+    both main (`98,297.9 MiB` free for `95,092.9 MiB`) and draft (`5,179–5,382 MiB` free for
+    `2,542.7 MiB`) weights, plus `905.6 MiB` display carve-out; `min MemAvailable 6.16–9.62 GiB`,
+    `0.0 GiB` swap.
+  - Wide determinism ([`logprobs`](receipts/tp3-triangle/determinism-wide.jsonl),
+    [`no-logprobs`](receipts/tp3-triangle/determinism-wide-nologprobs.jsonl)): `identical: true`,
+    `0` token diffs, `0` logprob diffs (`5c22ce41c1b5` / `bce6092e0128` / `26a739a99bca` /
+    `12cfee9b740e`).
+  - `tool_gate` ([`receipts/tp3-triangle/tool-gate.txt`](receipts/tp3-triangle/tool-gate.txt)):
+    **`80/80` strict PASS (`0` derailments)** across `T=0.0, 0.3` on stock and `weightless`.
+  - Sonar verdicts (`manifests/suites/2026-11-26-spark-ds41f-1126-tp3/`): `grid -25.19% ±0.10%`
+    (`better`), paired `c8 +0.77%` (`better`), `c4 +1.34%` (`better`), `single-stream c1 +1.30%`
+    (`71.32 tok/s`, `better`), `sampled c1 +1.39%` (`better`), `sampled c8 +0.00%` (`same`),
+    `sampled c16 +31.53%` aggregate output (`220.0 tok/s`, `-96.5%` TTFT from `max_num_seqs
+    8 -> 16`), prefill `131K..1M +1.06%..+2.86%` (all `better`; `32K +0.78%` `same`).
+- **`tp3-triangle-4k` (`b1` + `b2` on recabled `dgx1..dgx3`, clean reboot before each boot, vs `1120`)**:
+  - Wide determinism ([`logprobs`](receipts/tp3-triangle-4k/determinism-wide.jsonl),
+    [`no-logprobs`](receipts/tp3-triangle-4k/determinism-wide-nologprobs.jsonl)): `identical: true`,
+    `0` token / `0` logprob diffs, bit-identical hashes to `tp3-triangle`.
+  - Matrix (`manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp34k.json`): `LRU 5/5`, prefill
+    `32K / 131K / 262K` **`8,337–8,377 / 8,417–8,471 / 8,363–8,431 tok/s`** (`+22.0%..+24.2%`),
+    all decode points `same`/`faster`, `min MemAvailable 11.30–13.33 GiB`, `0.0 GiB` swap.
 - **`tp2-direct` (`b1` + `b2` on `dgx1`+`dgx2`, clean reboot before each boot, vs `1120`)**:
   - Pool logs ([`b1`](receipts/pool-logs/tp2-direct-b1-pool.log), [`b2`](receipts/pool-logs/tp2-direct-b2-pool.log)):
     resized `95.5 -> 10.5 GiB`, skipping buddy sponge on both main and draft weights, `min

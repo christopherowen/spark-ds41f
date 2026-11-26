@@ -26,17 +26,26 @@ across `dgx1..dgx4`.
   - Patch `0869` anchors the `77.5 GiB` contiguous CUDA pool inside `[pool_ptr, pool_end)` on `PP1` ranks (`dgx3`/`dgx4`), shrinks `PP0` to `74.0 GiB` (saving `3.5 GiB`), and eliminates buddy-sponge fallback across all 4 ranks (`min MemAvailable 10.22–13.27 GiB`, `0.0 GiB` swap).
   - Wide determinism: `0` token diffs across all 6 scenarios, bit-identical hashes to `tp2-direct` (`7278cd22ed16` / `1dd5b1dbdb63`).
   - Decode `prose-c1..c16` `48.1–48.3 / 85.3–86.9 / 142.9–146.5 / 238.2–256.0 / 421.1–433.2 tok/s`, `code-c16` `438.8–449.4 tok/s`, source-text prefill `32K..1M` `6,173–6,513` / `6,059–6,084 tok/s`.
+- **`tp3-triangle` ([manifests/suites/2026-11-26-spark-ds41f-1126-tp3](../../manifests/suites/2026-11-26-spark-ds41f-1126-tp3/)):**
+  - Engine decode grid (15 shapes): **`-25.19% ±0.10%`** (`repeat -0.01%`, **better** — also recovers `1120`'s `1x*` dummy-padding grid regression).
+  - Paired decode: `c8` **`+0.77% ±0.53%`** (**better**), `c4` **`+1.34% ±0.88%`** (**better**), `single-stream c1` **`+1.30% ±0.11%`** (`71.32 tok/s`, **better**), `sampled c1` **`+1.39% ±0.38%`** (**better**), `sampled c8` **`+0.00%`** (`same`).
+  - Sampled `c16`: **`+31.53% ±1.36%`** aggregate `output tok/s` (`167.2 → 220.0 tok/s`, **better**; `TTFT p50` `12.67 s → 0.45 s`, `-96.5%`) from raising `max_num_seqs` `8 → 16` (per-stream paired decode naturally splits across 16 concurrent streams instead of 8 queued behind 8).
+  - Source-text prefill `131K / 262K / 524K / 1M`: **`+1.06% / +1.32% / +1.93% / +2.86%`** (all **better**; `32K +0.78%` `same`).
+  - `0869` kept the `96.5 GiB` contiguous CUDA pool (`front_clean=True`) across all 3 ranks skipping buddy sponge on both main and draft weights (`min MemAvailable 6.16–9.62 GiB`, `0.0 GiB` swap), `0/0` wide determinism diffs, and `80/80` strict `tool_gate` PASS (`T=0.0, 0.3`).
+- **`tp3-triangle-4k` ([manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp34k.json](../../manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp34k.json)):**
+  - Prefill `32K / 131K / 262K`: **`8,337–8,377 / 8,417–8,471 / 8,363–8,431 tok/s`** (**`+22.0%..+24.2%`** faster than `1120`).
+  - Decode `same`/`faster` across all 8 points (`LRU 5/5`), `0/0` wide determinism diffs (bit-identical hashes to `tp3-triangle`), `min MemAvailable 11.30–13.33 GiB`, `0.0 GiB` swap.
 - **`tp2-direct` ([manifests/benchmarks/2026-11-26-spark-ds41f-1126-direct2.json](../../manifests/benchmarks/2026-11-26-spark-ds41f-1126-direct2.json)):**
   - Decode **`+41.0%..+75.5%`** faster (`prose-c1/c2/c4` `28.1–28.3 / 49.5–49.6 / 92.7–92.9 tok/s`, `code-c4` `93.5–94.3 tok/s`; step times `-37.6%..-55.6%`).
   - Prefill **`+1,695%..+1,975%`** faster (`32K 4,646–4,668`, `131K 4,873–4,888 tok/s` via expert-centric prefill streaming `0858/0865`, bundled multidomain hotlist, and BF16 fast lookahead `0863`).
   - `min MemAvailable 9.54–11.65 GiB`, `0.0 GiB` swap, `LRU 5/5`, `prefix hit 0.99`, `admission 4×64K pass`, `0` determinism diffs.
 - **`tp1` ([manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp1.json](../../manifests/benchmarks/2026-11-26-spark-ds41f-1126-tp1.json)):**
-  - Decode **`+74.6%..+177.2%`** faster (`prose-c1/c2/c4` `9.2–9.3 / 15.8 / 30.2–30.3 tok/s`, `code-c4` `28.2–28.4 tok/s`; step times `-50.6%..-71.3%`), bit-identical across `dgx3` and `dgx4` (`min MemAvailable 9.07–9.17 GiB`, `0.0 GiB` swap).
+  - Decode **`+74.6%..+177.2%`** faster (`prose-c1/c2/c4` `9.2–9.3 / 15.8 / 30.2–30.3 tok/s`, `code-c4` `28.2–28.4 tok/s`; step times `-50.6%..-71.3%`), prefill `512/1024` **`219.4 / 324.5 tok/s`** (**`+816% / +1,232%`**), bit-identical across `dgx3` and `dgx4` (`min MemAvailable 9.07–9.17 GiB`, `0.0 GiB` swap).
 - **Correctness, steering, & test gates:**
   - Reworked empty-index-slice decode RoPE fix (`0868`, PR `#1323` by James Meadlock).
   - `GLP-27 alpha=2.0` (`0855`, PR `#1254`/`#1319`) with per-model `0.3/0.95` defaults for `deepseek-v4.1-flash-weightless` (`0856`).
   - Full `174`-file in-image `release-tests` bundle (`dgx2`): **`12,082 passed, 356 skipped, 0 failed`** (`exit 0`); Linux repo unit suite (`dgx1`): **`950/950 passed`**.
-  - Triangle and switched shapes retain their `spark-ds41f-1120` references pending recabling / community switched qualification ([docs/switched-qualification.md](../../docs/switched-qualification.md)).
+  - Switched shapes retain their `spark-ds41f-1120` references pending community switched qualification ([docs/switched-qualification.md](../../docs/switched-qualification.md)).
 
 ---
 
