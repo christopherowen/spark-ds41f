@@ -583,24 +583,31 @@ A profile with a `glp` block also serves a steered variant of the model under a 
 name, `deepseek-v4.1-flash-weightless` (the
 [GLP dual-serving candidate](../experiments/2026-10-28-glp-dual-serving/README.md)).
 The block names the GLP file it steers with: a Hugging Face `repo`, its pinned
-`revision`, the `file` and its `sha256`. The recipe renders the second served name, vLLM's
-`WEIGHTLESS_STEER_PATH` and `WEIGHTLESS_STEER_MODEL`, and a read-only mount of the file
-from the node's hub cache; a profile does not set those itself. The file is optional: when
+`revision`, the `file` and its `sha256`, and optionally the serve-time `alpha` and the
+`generation_defaults` for the steered name. The recipe renders the second served name,
+vLLM's `WEIGHTLESS_STEER_PATH`, `WEIGHTLESS_STEER_MODEL`, `WEIGHTLESS_STEER_ALPHA` and
+`WEIGHTLESS_STEER_GENERATION_DEFAULTS`, and a read-only mount of the file
+from the node's hub cache; a profile does not set those itself. The promoted `glp` block in
+[config/cluster.json](../config/cluster.json) is the authority: this page tracks it, and a
+profile names its own vector. The file is optional: when
 a node lacks it, `cluster start` warns, leaves the block out on every rank and serves
 `deepseek-v4.1-flash` alone. To serve the steered name too, every node needs the file
-(785 KiB). The repository is gated. With the Hugging Face account whose token is on the node, accept
+(544 KiB). The repository is gated. With the Hugging Face account whose token is on the node, accept
 its agreement once on the
-[repository page](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75),
+[repository page](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-27-L11-37-a3.5),
 then download the pinned revision on every node:
 
 ```sh
-hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75 \
-  glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf \
-  --revision 2715ffd51f59899115853e1118db080536966c44
+hf download msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-27-L11-37-a3.5 \
+  glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf \
+  --revision 4d570926e9dd4fa7247d126072c34e249c89abd7
 ```
 
-The file is 803,392 bytes, sha256
-`9c66d47701e0ceb42c33906f2d3789c0f1f16b21e7d97185f20f7f3f09fbf5cf`. A node without a
+The file is 556,672 bytes, sha256
+`24e97d41a9a4f77adad78ff4cb888cb4e339eb62151dbf37a7fcd3ea30eb442e`. The promoted recipe
+steers it at `alpha` 2.0, and requests to `deepseek-v4.1-flash-weightless` default to
+temperature 0.3 and top-p 0.95; the stock name beside it keeps the profile's own
+generation defaults. A node without a
 token can take a copy from another node instead: the snapshot path and the
 `hub/blobs` file it links to. `bin/spark doctor --live` and the launch preflight
 warn about a node whose file is missing and refuse one whose file differs, with this command, and run the
