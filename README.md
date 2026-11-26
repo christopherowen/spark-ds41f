@@ -457,7 +457,8 @@ bin/spark --cluster-config config/cluster.json cache clear
 bin/spark bench
 bin/spark upstream list
 bin/spark upstream prepare vllm
-bin/spark upstream prepare b12x
+bin/spark upstream prepare tilelang
+bin/spark upstream prepare sparknet
 bin/spark build prepare
 bin/spark build check
 bin/spark build image
@@ -677,23 +678,44 @@ it promotes: `<baseline>.json`, plus a suffixed run such as
 ## Upstreams
 
 Canonical upstreams, contribution forks, tracking branches, pinned commits, and
-applied upstream fixes live in [upstreams.lock.json](upstreams.lock.json). Local
+local patch series live in [upstreams.lock.json](upstreams.lock.json). Local
 changes are kept as ordered patch series rather than edits to copied source
 trees. `upstream` always means the canonical project; `origin` is Christopher's
-fork when one exists; this deployment repository is neither. See
-[docs/upstreams.md](docs/upstreams.md). Repositories that are useful for ideas
-but are not build inputs are kept separately in
+fork when one exists; this deployment repository is neither.
+
+Active serving and build upstreams (see [docs/upstreams.md](docs/upstreams.md) for
+the full diagram, lock keys, and contribution flow):
+
+- **vLLM**: `local-inference-lab/vllm` (`integration/karmic-kraken-beta`; canonical
+  `vllm-project/vllm` main is parked) + the release's ordered vLLM patch series.
+- **Kernels & compiler**: `tile-ai/tilelang` (`0.1.15`, SM120/SM121 patches) and
+  `deepseek-ai/TileKernels` (`2.0.0`); B12X (`local-inference-lab/b12x`) was retired
+  completely in `spark-ds41f-1120` (`vLLM 0802`).
+- **Networking**: [dgx-spark-networking](https://github.com/christopherowen/dgx-spark-networking)
+  (`sparknet`, one-shot RoCE collectives and PP P2P) and `NVIDIA/nccl` (`v2.30.7-1`,
+  SM121 rebuild with `patches/nccl`).
+- **CUDA / CUTLASS foundation**: `docker.io/vllm/vllm-openai` runtime base, hash-locked
+  `CUDA 13.5.37` `.deb` toolkit layer, `NVIDIA/cutlass` `v4.7.1`, and locked ARM64
+  CuTe DSL wheels.
+- **Weights & host tools**: unchanged `deepseek-ai/DeepSeek-V4.1-Flash` (`1017`),
+  optional pinned `msuiche` GLP-27 steering vector (`config/cluster.json`),
+  [dgx-spark-memory-saver](https://github.com/christopherowen/dgx-spark-memory-saver)
+  (64 KiB DKMS module), and [Sonar](https://github.com/christopherowen/Sonar)
+  (`config/sonar.json`).
+
+Repositories that are useful for ideas but are not build inputs are kept separately in
 [docs/inspiration.md](docs/inspiration.md).
 
-## Transition status
+## Build and runtime identity
 
 `bin/spark build` builds the promoted image from the pinned sources in
 `upstreams.lock.json` and the patch series ([docker/README.md](docker/README.md)),
-and one content digest runs on all three nodes.
+and one content-addressed OCI digest runs across every node of the configured shape
+(one to eight Sparks).
 
 Canonical vLLM main is parked; the serving sources are Local Inference Lab's
-`integration/karmic-kraken-beta` vLLM and B12X, TileLang, DeepSeek's
-TileKernels and sparknet, with the local patch series
+`integration/karmic-kraken-beta` vLLM, TileLang, DeepSeek's TileKernels, sparknet,
+and NCCL 2.30.7, with the ordered local patch series
 ([docs/upstreams.md](docs/upstreams.md)).
 
 ## License
