@@ -231,7 +231,11 @@ Current qualified reference runs by shape (from `config/cluster.json` and `manif
 <!-- END GENERATED: performance-summary -->
 
 The comparisons earlier releases were promoted on are in
-[docs/benchmarks.md](docs/benchmarks.md).
+[docs/benchmarks.md](docs/benchmarks.md). Independent community quality
+evaluations (starting with `j0n`'s 8-hour, 5.8M-token GPQA Diamond run on
+`tp3-triangle-4k`: **`0.922 ± 0.017`** across `792/792` samples at ~`200 tok/s`
+over 8 streams on stock `4 KiB` kernels) are archived in
+[manifests/evals/](manifests/evals/README.md).
 
 ## Release history
 

@@ -7,6 +7,17 @@ release was promoted on, newest first. They are records: every table names the
 releases, the date and the suite run it comes from, and none is measured again.
 [Release history](../README.md#release-history) says what each release changed.
 
+## Independent quality evaluations
+
+Community end-to-end evaluations archived with verbatim receipts under
+[manifests/evals/](../manifests/evals/README.md):
+
+| Benchmark | Release & Shape | Score | Soak / Throughput | Receipt |
+| --- | --- | ---: | --- | --- |
+| GPQA Diamond (`inspect_ai`, 4 epochs × 198, `T=1.0`, `reasoning_effort=100`) | `spark-ds41f-1120`, `tp3-triangle-4k` (stock 4 KiB kernel `7.0.0-1025-nvidia`) | **`0.922 ± 0.017`** (`792/792`) | `8h 04m`, `5.80M` tok (`5.47M` reasoning), ~`192–209 tok/s` at 8 streams, `0` errors | [`header.json`](../manifests/evals/2026-11-25-spark-ds41f-1120-tp34k-gpqa-diamond.json) ([forum #210](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438/210), [#212](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438/212)) |
+
+## Earlier release comparisons
+
 spark-ds41f-1030 against spark-ds41f-1025 on four nodes, both serving
 DeepSeek-V4.1-Flash-1017 (2026-10-29), measured with the `release`, `single-stream` and
 `sampled` suites in one session (candidate 12, spark-ds41f-1025, candidate 12 again;
