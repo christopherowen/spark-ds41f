@@ -700,7 +700,8 @@ class RecipeTest(unittest.TestCase):
                 else:
                     self.assertNotIn(key, env, (name, key))
         # TP4..8 switched shapes render identical environments; TP3 differs only on carve-out,
-        # WO band, and the 4 MiB collective cap; TP2 further adds the io_uring expert-slot cache.
+        # WO band, and the 4 MiB collective cap; TP2 further adds the io_uring expert-slot cache
+        # and its calibrated TP2 dead-row threshold (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU=0.45).
         tp4_env = resolved_envs["tp4-switched"]
         for name in ("tp5-switched", "tp6-switched", "tp7-switched", "tp8-switched"):
             self.assertEqual(resolved_envs[name], tp4_env, name)
@@ -710,9 +711,12 @@ class RecipeTest(unittest.TestCase):
             {k: v for k, v in resolved_envs["tp3-switched"].items() if k not in tp3_diff},
             {k: v for k, v in tp4_env.items() if k not in tp3_diff},
         )
+        self.assertEqual(resolved_envs["tp2-switched"]["SPARK_DS41F_DSPARK_DEAD_ROWS_TAU"], "0.45")
         self.assertEqual(
-            {k: v for k, v in resolved_envs["tp2-switched"].items() if not k.startswith("VLLM_DS41_EXPERT_")},
-            resolved_envs["tp3-switched"],
+            {k: v for k, v in resolved_envs["tp2-switched"].items()
+             if not k.startswith("VLLM_DS41_EXPERT_") and k != "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU"},
+            {k: v for k, v in resolved_envs["tp3-switched"].items()
+             if k != "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU"},
         )
         # Mutating tp3-triangle's environment does not move tp3-switched's direct profile.
         mutated = json.loads(json.dumps(self.recipe))
