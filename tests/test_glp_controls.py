@@ -33,14 +33,20 @@ class GlpAlphaRecipeAndReaderTest(unittest.TestCase):
 
     def test_glp_alpha_renders_env_and_reader_command(self):
         base = self._resolved()
-        self.assertNotIn("WEIGHTLESS_STEER_ALPHA", base["environment"])
-        self.assertNotIn("--env", spark_config.glp_reader_command(base, "/host/v.gguf"))
+        self.assertEqual(base["environment"]["WEIGHTLESS_STEER_ALPHA"], "2.0")
+        base_cmd = spark_config.glp_reader_command(base, "/host/v.gguf")
+        self.assertIn("--env", base_cmd)
+        self.assertIn("WEIGHTLESS_STEER_ALPHA=2.0", base_cmd)
 
-        dosed = self._resolved(lambda r: r["glp"].update(alpha=2.0))
-        self.assertEqual(dosed["environment"]["WEIGHTLESS_STEER_ALPHA"], "2.0")
+        unpinned = self._resolved(lambda r: r["glp"].pop("alpha", None))
+        self.assertNotIn("WEIGHTLESS_STEER_ALPHA", unpinned["environment"])
+        self.assertNotIn("--env", spark_config.glp_reader_command(unpinned, "/host/v.gguf"))
+
+        dosed = self._resolved(lambda r: r["glp"].update(alpha=1.5))
+        self.assertEqual(dosed["environment"]["WEIGHTLESS_STEER_ALPHA"], "1.5")
         cmd = spark_config.glp_reader_command(dosed, "/host/v.gguf")
         self.assertIn("--env", cmd)
-        self.assertIn("WEIGHTLESS_STEER_ALPHA=2.0", cmd)
+        self.assertIn("WEIGHTLESS_STEER_ALPHA=1.5", cmd)
 
     def test_glp_alpha_rejects_invalid_and_hand_written_values(self):
         for bad in ("2.0", 0, -1, True, float("inf"), float("nan")):
