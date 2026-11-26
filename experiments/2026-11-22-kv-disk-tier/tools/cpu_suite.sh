@@ -2,7 +2,8 @@
 # cpu_suite.sh TREE: run the CPU tests of the disk tier and of sink rejection in a vLLM tree.
 #
 # TREE  a vLLM tree with vllm/series applied: WORK/vllm after tools/make_overlay.sh WORK (tree
-#       47e196a2), or the candidate-73 series with 9030 to 9046 applied on top.
+#       47e196a2, or e45d318c after RELEASE=1126 tools/make_overlay.sh WORK), or the candidate-73
+#       series with 9030 to 9046 applied on top.
 #
 # Runs three pytest commands, one after the other, on the CPU path:
 #   tests/v1/simple_kv_offload/test_ds41_tier_sink.py (the tests of 9046),

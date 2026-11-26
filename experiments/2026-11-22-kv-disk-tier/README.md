@@ -39,6 +39,17 @@ Every hardware run used an image of the release, `spark-ds41f:1120`, which the l
 release's lock, with the eight engine files that the series changes mounted over the image's copies.
 These files are in `overlay/`. No image has been built from the series.
 
+The same 17 patches apply without change after the 742 patches of the later release
+`spark-ds41f-1126` (candidate-74), and `vllm/series-1126` names that list and the 17. Of the eight
+overlay files, only `model_runner.py` differs between the two releases, because nine of the patches that
+1126 adds change it, two of them for kernels with 64 KiB pages. The folder `overlay-1126/` therefore
+holds that one file, built from 1126 and the series (tree `e45d318c`), and the profiles whose names end
+in `-1126` mount it in place of the copy in `overlay/`. Those profiles extend the release's own recipe,
+`releases/spark-ds41f-1126/cluster.json`, so they name the 1126 image and lock from any checkout. The
+profiles without that suffix extend `config/cluster.json` and belong to a checkout of 1120. Started from a checkout of 1126, they mount the 1120 copy of `model_runner.py` over the
+1126 image, so the engine runs without those nine patches. On 1126 the series has passed the CPU tests
+only, and it has not run on hardware there.
+
 ## Terms
 
 A disk hit is a request whose cached prefix the engine loaded from the tier file, and a pool hit is the
@@ -102,7 +113,8 @@ covers a case that the reading missed, the most likely symptom is an assertion i
 scheduler.
 
 All eight overlay files replace the image's copies whole, so the two profiles with a tier assume an image
-whose vLLM tree is `8fc99ca7`. The two files outside the connector, `model_runner.py` and `sink.py`,
+whose vLLM tree is `8fc99ca7`, and the profiles that end in `-1126` assume the tree `f3783b0e` of 1126 in
+the same way. The two files outside the connector, `model_runner.py` and `sink.py`,
 carry the larger risk, because the whole engine runs them and later candidates change them:
 `candidate-73` changes `model_runner.py`. The lab's check before the start therefore compared those two
 files with the base tree. The other six are files of the connector that, between `8fc99ca7` and
@@ -133,8 +145,14 @@ serves.
 
 ### Slot layout
 
-The packed block of this model is 227,840 bytes, which is not a multiple of 4096, so O_DIRECT refused it.
-Patch 9030 therefore stores each block in a slot of 229,376 bytes, padded to a multiple of 4096 bytes.
+The packed block of this model is 227,840 bytes, which is not a multiple of 4096. Before the series, the
+disk backend refused that size at start with a check of its own, which required a multiple of 4096 under
+O_DIRECT; the refusal did not come from the kernel. The NVMe drives of the lab's three nodes have 512-byte
+logical blocks, and every unpadded slot offset is a multiple of 512, so Linux would have accepted those
+slots there. A drive with 4096-byte logical blocks refuses an O_DIRECT offset, length, or buffer address
+that is not a multiple of 4096 with `EINVAL`, and an unpadded slot after the first one starts at such an
+offset. That case was not reproduced, because no drive in the lab has 4096-byte logical blocks. Patch 9030
+therefore stores each block in a slot of 229,376 bytes, padded to a multiple of 4096 bytes.
 The padding holds a 40-byte header with a magic number, a version, the checksum kind, the slot id, a
 generation count, an 8-byte block key, and a checksum of the block bytes, which is CRC32 by default
 (patches 9034 and 9039). The block key is a BLAKE2b digest of the block hash and the KV cache group, so a
@@ -283,11 +301,15 @@ equal to the files that ran on the hardware.
 | Path | Content |
 |---|---|
 | `vllm/series`, `vllm/90*.patch` | the patch list and the 17 patches of the series |
+| `vllm/series-1126` | the patch list of 1126 (742 patches) and the same 17 patches |
 | `overlay/` | the eight files that the series changes, at tree `47e196a2`, with `SHA256SUMS` |
+| `overlay-1126/` | `model_runner.py` from 1126 and the series, at tree `e45d318c`, with `SHA256SUMS`; the other seven files of 1126 equal those of `overlay/` |
 | `tp3-4k-b6144-m1m-kv35.json` | the base profile, with no tier |
 | `tp3-4k-b6144-m1m-kv35-nvme200.json` | the base profile with a tier of 200 GiB a rank |
 | `tp3-4k-b6144-m1m-kv35-nvme4.json` | a test profile with a tier of 4 GiB a rank, a context of 262,144 tokens, and a KV pool of 0.75 GiB |
-| `tools/make_overlay.sh` | rebuilds the vLLM tree from the series and compares it with `overlay/` |
+| `tp3-4k-b6144-m1m-kv35-1126.json` | the base profile on 1126, with no tier, which extends `releases/spark-ds41f-1126/cluster.json` and so pins the 1126 image and lock |
+| `tp3-4k-b6144-m1m-kv35-nvme200-1126.json`, `tp3-4k-b6144-m1m-kv35-nvme4-1126.json` | the two profiles with a tier on 1126, which extend that base and mount `overlay-1126/vllm/v1/worker/gpu/model_runner.py` |
+| `tools/make_overlay.sh` | rebuilds the vLLM tree from the series and compares it with `overlay/`, or with `overlay-1126/` and `overlay/` when `RELEASE=1126` |
 | `tools/cpu_suite.sh` | runs the CPU tests of the series in a prepared tree |
 | `base.json` | the release, the lock, the trees, and the lab's differences from the tag |
 | `candidate.json` | the source identifiers |
@@ -297,7 +319,7 @@ equal to the files that ran on the hardware.
 | `decision.md` | what the lab decided, and what is still open |
 
 The 4 GiB profile exists so that the tier fills and starts to reuse its slots within minutes. The file
-`runs/kv-soak-12h.tsv` holds the rows from 01:00:25Z to 12:59:23Z on 2026-11-25. Each overlay file keeps
+`runs/kv-soak-12h.tsv` holds the rows from 01:00:25Z to 12:59:23Z on 2026-11-25. Each file of `overlay/` and `overlay-1126/` keeps
 its vLLM licence header (Apache-2.0).
 
 ## Commands
@@ -311,7 +333,10 @@ bin/spark --cluster-config experiments/2026-11-22-kv-disk-tier/tp3-4k-b6144-m1m-
 ```
 
 The first command fetches the vLLM fork, applies the release's patches and the series, checks the tree
-after each against its recorded hash, and compares the eight files with `overlay/`. The CPU tests need
+after each against its recorded hash, and compares the eight files with `overlay/`. With `RELEASE=1126`
+in front of it, the command builds 1126 and the series from `vllm/series-1126`, checks the trees
+`f3783b0e` and `e45d318c`, and compares `model_runner.py` with `overlay-1126/`. On a checkout of 1126, the
+last command takes the profile `tp3-4k-b6144-m1m-kv35-nvme200-1126.json` instead. The CPU tests need
 Python 3.12 with a CPU build of torch, the packages in the tree's `requirements/common.txt`, pytest, and
 the config of `facebook/opt-125m` in the Hugging Face cache, because many of the tests build a model
 config for that model with `HF_HUB_OFFLINE=1`. The last command uses `bin/spark`, the repository's
@@ -322,7 +347,7 @@ needs 200 GiB of free space under `{checkout}/cache` on every node.
 
 ## CPU tests
 
-Each suite ran on 2026-11-25 with `VLLM_TARGET_DEVICE=cpu`, on an x86-64 machine with no GPU, with Python
+Each suite ran on 2026-11-25, and on 2026-11-26 for the 1126 tree, with `VLLM_TARGET_DEVICE=cpu`, on an x86-64 machine with no GPU, with Python
 3.12 and torch 2.13.0+cpu, and with one pytest command at a time, so that the timing tests of the series
 did not share the CPU with another suite.
 
@@ -331,6 +356,7 @@ did not share the CPU with another suite.
 | the release's 702 patches (`8fc99ca7`) | 88 passed, 2 skipped | not present | 65 passed |
 | the series (`47e196a2`) | 278 passed, 2 skipped | 58 passed | 65 passed |
 | `candidate-73` and the 17 patches (`152445b9`) | 278 passed, 2 skipped | not run alone | 65 passed |
+| `spark-ds41f-1126` and the 17 patches (`e45d318c`) | 278 passed, 2 skipped | 58 passed | 65 passed |
 
 The offload suite is `tests/v1/simple_kv_offload` together with the connector's unit test, and the sink
 scheduler suite is `tests/v1/core/test_sink_draft_zero.py`. The difference between 88 and 278 is the
@@ -481,6 +507,15 @@ image and the same overlay. In the first 12 hours, a script that read the tier's
 (`runs/kv-soak-12h.tsv`) counted 125 disk loads, and the gauge put the slowest at 1.650 s. The counters
 of load failures, I/O errors, and failed stores stayed at 0, and the tier was never degraded.
 
+Over the same 12 hours the counter of stored blocks rose from 1,413 to 154,961. The counter counts a block
+once, and every rank stores its own slot of 229,376 bytes for it, so each rank wrote 153,548 slots, about
+35.2 GB (32.8 GiB), while the 125 loads read sessions back. Most of what the eager store writes is never
+read, and the volume grows with the rate of new prompt tokens, so on a busy engine it is a cost in drive
+wear and in write bandwidth. The setting `lazy_offload: true` stores a cached block only when it nears
+eviction from the GPU pool, and it also turns off partial hash hits. Most of the series' tests use the
+eager store, one parametrized test of 9046 also runs the lazy store, and the lazy store has not run on the
+hardware, so the two have not been compared.
+
 ## Runs that failed
 
 In an earlier outage on 2026-11-24, the 200 GiB profile with patches 9030 to 9045 did not start. Every
@@ -526,7 +561,8 @@ stored hold the right tokens.
 The tier is lost at every engine start, because the worker removes the file and the index lives only in
 the scheduler on the node that runs rank 0. Only the shape `tp3-triangle-4k` ran on the hardware, with
 the 200 GiB profile and the 4 GiB test profile, and the figures of each profile come from one boot. Other
-shapes, pipeline parallelism, the `candidate-73` image, and an image that holds the series have not run.
+shapes, pipeline parallelism, the `candidate-73` image, the 1126 image, and an image that holds the series
+have not run.
 The cost of the checksum on the ARM cores of a GB10 was not measured on its own, although it is included
 in the restore times above.
 
