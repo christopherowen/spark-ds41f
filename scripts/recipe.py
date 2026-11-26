@@ -47,6 +47,9 @@ SITE_FILE = "config/site.json"
 # /blobs, or a whole Hugging Face hub cache at /hub (a snapshot whose blobs link on into
 # a shared store resolves only inside the hub it was laid out in).
 MODEL_MOUNTS = ("/models", "/blobs", "/hub")
+# Where a standalone speculative drafter checkpoint (``drafter``, one of ``drafters``) is
+# mounted when it does not share the target model's ``/hub`` cache root.
+DRAFTER_MOUNTS = ("/drafter", "/drafter-blobs", "/drafter-hub")
 # GLP steering (``glp``): where the file is mounted, the variables vLLM reads, and the hub
 # cache on each node that ``hf download`` fills.
 GLP_TARGET = "/glp/vector.gguf"
@@ -234,6 +237,132 @@ def _with_model_mounts(cluster: dict) -> None:
     if not cluster["serve_args"] or not cluster["serve_args"][0].startswith("/"):
         raise SystemExit("serve_args must start with the model path")
     cluster["serve_args"] = [path, *cluster["serve_args"][1:]]
+
+
+def _drafter_profile(cluster: dict) -> dict | None:
+    name = cluster.get("drafter")
+    if not name:
+        return None
+    drafters = cluster.get("drafters", {})
+    if name not in drafters:
+        raise SystemExit(
+            f"unknown drafter {name!r}; the recipe defines {', '.join(sorted(drafters))}"
+        )
+    return drafters[name]
+
+
+def drafter_mounts(cluster: dict) -> tuple[list[list[str]], str] | None:
+    """The mounts of the selected standalone drafter (``drafter``, one of ``drafters``) and the
+    container path vLLM loads it from, or None when no standalone drafter is selected. When the
+    drafter uses the same Hugging Face ``hub`` root as the target model, ``/hub`` is reused
+    without a duplicate bind mount."""
+    profile = _drafter_profile(cluster)
+    if profile is None:
+        return None
+    if "hub" in profile:
+        if "snapshot" not in profile:
+            raise SystemExit("drafter profile with hub must define snapshot")
+        same_hub = ("models" in cluster and _model_profile(cluster).get("hub") == profile["hub"]) or any(
+            mount[:2] == [profile["hub"], "/hub"]
+            for mount in cluster.get("container", {}).get("mounts", [])
+        )
+        if same_hub:
+            return [], f"/hub/{profile['snapshot']}"
+        return [[profile["hub"], "/drafter-hub", "ro"]], f"/drafter-hub/{profile['snapshot']}"
+    if "snapshot" not in profile or "blobs" not in profile:
+        raise SystemExit("drafter profile must define hub+snapshot or snapshot+blobs")
+    return (
+        [[profile["snapshot"], "/drafter", "ro"], [profile["blobs"], "/drafter-blobs", "ro"]],
+        "/drafter",
+    )
+
+
+def drafter_snapshot(cluster: dict) -> str | None:
+    """The selected standalone drafter's snapshot directory on the host (``{home}`` unexpanded),
+    or None when no standalone drafter is selected."""
+    profile = _drafter_profile(cluster)
+    if profile is None:
+        return None
+    return f"{profile['hub']}/{profile['snapshot']}" if "hub" in profile else profile["snapshot"]
+
+
+def drafter_download(cluster: dict) -> str | None:
+    """The ``hf download`` command for a standalone drafter with ``repo`` and ``revision``."""
+    profile = _drafter_profile(cluster)
+    if profile is None or not profile.get("repo") or not profile.get("revision"):
+        return None
+    return shlex.join(["hf", "download", profile["repo"], "--revision", profile["revision"]])
+
+
+def _recompute_draft_derived_args(cluster: dict, drafts: int) -> None:
+    args = list(cluster["serve_args"])
+    streams = _argument(args, "--max-num-seqs")
+    if streams is None:
+        return
+    rows = int(streams) * (1 + drafts)
+    current_max = _argument(args, "--max-cudagraph-capture-size")
+    if current_max == str(rows):
+        return
+    if "--max-cudagraph-capture-size" in args:
+        args[args.index("--max-cudagraph-capture-size") + 1] = str(rows)
+    if "--compilation-config" in args:
+        at = args.index("--compilation-config") + 1
+        comp = json.loads(args[at])
+        if "cudagraph_capture_sizes" in comp:
+            comp["cudagraph_capture_sizes"] = capture_sizes(rows)
+            args[at] = json.dumps(comp, separators=(",", ":"))
+    batched = _argument(args, "--max-num-batched-tokens")
+    if batched is not None and "--long-prefill-token-threshold" in args:
+        args[args.index("--long-prefill-token-threshold") + 1] = str(int(batched) - rows)
+    cluster["serve_args"] = args
+
+
+def _with_drafter(cluster: dict, previous: dict | None = None) -> None:
+    """Render ``drafter`` (one of ``drafters``) into ``container.mounts`` and
+    ``--speculative-config`` while preserving the shape's attention backend, TP size and
+    adaptive-verification cost curve."""
+    mounts = cluster["container"].setdefault("mounts", [])
+    mounts[:] = [mount for mount in mounts if mount[1] not in DRAFTER_MOUNTS]
+    profile = _drafter_profile(cluster)
+    if profile is None:
+        if previous and "--speculative-config" in cluster["serve_args"]:
+            args = list(cluster["serve_args"])
+            at = args.index("--speculative-config") + 1
+            if at < len(args):
+                spec = json.loads(args[at])
+                spec.pop("model", None)
+                if spec.get("method") == previous.get("method", "dfly2"):
+                    spec["method"] = "dspark"
+                args[at] = json.dumps(spec, separators=(",", ":"))
+                cluster["serve_args"] = args
+        return
+    resolved = drafter_mounts(cluster)
+    assert resolved is not None
+    extra_mounts, path = resolved
+    if extra_mounts:
+        insert_at = 0
+        while insert_at < len(mounts) and mounts[insert_at][1] in MODEL_MOUNTS:
+            insert_at += 1
+        mounts[insert_at:insert_at] = extra_mounts
+    args = list(cluster["serve_args"])
+    if "--speculative-config" not in args:
+        raise SystemExit("drafter requires --speculative-config in serve_args")
+    at = args.index("--speculative-config") + 1
+    spec = json.loads(args[at])
+    spec["method"] = profile.get("method", "dfly2")
+    spec["model"] = path
+    if "drafts" in profile:
+        drafts = int(profile["drafts"])
+        spec["num_speculative_tokens"] = drafts
+    for key, value in (profile.get("speculative") or {}).items():
+        if value is None:
+            spec.pop(key, None)
+        else:
+            spec[key] = value
+    args[at] = json.dumps(spec, separators=(",", ":"))
+    cluster["serve_args"] = args
+    if "drafts" in profile:
+        _recompute_draft_derived_args(cluster, int(profile["drafts"]))
 
 
 def glp_file(cluster: dict) -> str | None:
@@ -491,6 +620,8 @@ def resolve(recipe: dict, name: str) -> dict:
         cluster["benchmark_reference"] = shape["benchmark_reference"]
     if "models" in recipe:
         _with_model_mounts(cluster)
+    if "drafters" in recipe and recipe.get("drafter"):
+        _with_drafter(cluster)
     if "generation_defaults" in recipe:
         _with_generation_defaults(cluster)
     if "glp" in recipe:
@@ -568,8 +699,7 @@ def overlay(arm: dict, base: dict) -> dict:
             cluster.get("environment", {}).pop("VLLM_LATE_ADMISSION_LAYER", None)
         if "--speculative-config" in cluster["serve_args"]:
             _with_speculative(cluster, {"speculative": {"draft_tensor_parallel_size": tp}})
-    if "speculative" in sets:
-        _with_speculative(cluster, {"speculative": cluster.pop("speculative")})
+    speculative_override = cluster.pop("speculative") if "speculative" in sets else None
     for dotted in arm.get("unset", []):
         parts = dotted.split(".")
         node = cluster
@@ -586,6 +716,10 @@ def overlay(arm: dict, base: dict) -> dict:
         if not isinstance(node, dict) or last not in node:
             raise SystemExit(f"the arm unsets {dotted}, which its base does not set")
         del node[last]
+    if base.get("drafter") or cluster.get("drafter"):
+        _with_drafter(cluster, previous=_drafter_profile(base) if base.get("drafter") else None)
+    if speculative_override is not None:
+        _with_speculative(cluster, {"speculative": speculative_override})
     for key in ("shape", "benchmark_reference"):
         cluster.pop(key, None)
     if "notes" in arm:

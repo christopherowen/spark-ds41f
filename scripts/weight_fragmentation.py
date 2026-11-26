@@ -63,9 +63,25 @@ def measure(root):
     }
 
 
+def measure_many(roots):
+    started = time.monotonic()
+    shards = []
+    seen = set()
+    for root in roots:
+        for shard in measure(root)["shards"]:
+            if shard["path"] not in seen:
+                seen.add(shard["path"])
+                shards.append(shard)
+    return {
+        "shards": shards,
+        "elapsed_seconds": time.monotonic() - started,
+    }
+
+
 if __name__ == "__main__":
     try:
-        print(json.dumps(measure(sys.argv[1])))
+        roots = sys.argv[1:]
+        print(json.dumps(measure(roots[0]) if len(roots) == 1 else measure_many(roots)))
     except subprocess.CalledProcessError as error:
         print(json.dumps({"error": error.stderr.strip() or "e4defrag check failed"}))
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:

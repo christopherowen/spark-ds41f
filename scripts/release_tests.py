@@ -38,7 +38,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE.parent / "config/release-tests.json"
 STACK = re.compile(
-    r"v4_1|v41|ds41|deepseek_v4|b12x|tilelang|engram|dspark|dflash|test_ced|_ced_|"
+    r"v4_1|v41|ds41|deepseek_v4|b12x|tilelang|engram|dspark|dflash|dfly|test_ced|_ced_|"
     r"startup_rendezvous|prepare_kernels|jit_monitor|sparknet|roce_|_roce",
     re.IGNORECASE,
 )

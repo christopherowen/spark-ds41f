@@ -465,6 +465,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         elif sha256(candidate) != wanted:
             problems.append(f"deployment artifact differs from manifest: {relative}")
     problems.extend(glp_problems(cluster))
+    problems.extend(drafter_problems(cluster))
     problems.extend(tracked_secret_problems())
     return problems
 
@@ -1577,6 +1578,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
         problems.extend(roce_gid_findings(cluster, node, gids.stdout, hcas=hcas))
         problems.extend(node_glp_problems(cluster, nodes, node))
+        problems.extend(node_drafter_problems(cluster, nodes, node))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
             detail = docker_error_detail(node["name"], result.stderr)
@@ -2004,14 +2006,17 @@ def weight_fragmentation_findings(cluster: dict, nodes: dict, commands: bool = F
     )
     if source is None:
         return [Warn("cannot check weight fragmentation: no model mount")]
-    root = host_path(cluster, source)
+    roots = [host_path(cluster, source)]
+    drafter_source = cluster_recipe.drafter_snapshot(cluster)
+    if drafter_source is not None:
+        roots.append(host_path(cluster, drafter_source))
     code = (ROOT / "scripts/weight_fragmentation.py").read_text()
 
     def inspect(node: dict) -> dict:
         try:
             result = subprocess.run(
                 ["ssh", *ssh_options(), ssh_target(nodes, node),
-                 shlex.join(["python3", "-c", code, root])],
+                 shlex.join(["python3", "-c", code, *roots])],
                 capture_output=True, text=True, timeout=30, check=True,
             )
             return json.loads(result.stdout)

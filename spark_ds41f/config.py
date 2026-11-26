@@ -634,6 +634,133 @@ def node_glp_problems(cluster: dict, nodes: dict, node: dict) -> list[str]:
     return glp_reader_problems(cluster, nodes, node, path) if node.get("head") else []
 
 
+DRAFTER_PATTERNS = {
+    "repo": re.compile(r"[\w.-]+/[\w.-]+"),
+    "revision": re.compile(r"[0-9a-f]{40}"),
+    "config_sha256": re.compile(r"[0-9a-f]{64}"),
+    "index_sha256": re.compile(r"[0-9a-f]{64}"),
+}
+
+_NODE_DRAFTER_CHECK = """
+import hashlib, json, os, sys
+root = sys.argv[1]
+if not os.path.isdir(root):
+    print(json.dumps({"missing": root})); raise SystemExit(0)
+def h(p):
+    if not os.path.isfile(p): return None
+    d = hashlib.sha256()
+    with open(p, "rb") as f:
+        for c in iter(lambda: f.read(1 << 20), b""): d.update(c)
+    return d.hexdigest()
+cfg_sha = h(os.path.join(root, "config.json"))
+idx_path = os.path.join(root, "model.safetensors.index.json")
+idx_sha = h(idx_path)
+missing_shards = []
+if idx_sha is not None:
+    idx = json.loads(open(idx_path, encoding="utf-8").read())
+    for shard in sorted(set(idx.get("weight_map", {}).values())):
+        sp = os.path.join(root, shard)
+        if not os.path.isfile(sp) or os.path.getsize(sp) <= 0:
+            missing_shards.append(shard)
+print(json.dumps({"config_sha256": cfg_sha, "index_sha256": idx_sha, "missing_shards": missing_shards}))
+"""
+
+
+def drafter_problems(cluster: dict) -> list[str]:
+    """Validate ``drafters`` and ``drafter`` against ``serve_args`` and ``container.mounts``."""
+    name = cluster.get("drafter")
+    if not name:
+        return []
+    drafters = cluster.get("drafters")
+    if not isinstance(drafters, dict) or name not in drafters:
+        return [f"unknown drafter {name!r}; drafters defines {', '.join(sorted(drafters or ())) or 'none'}"]
+    profile = drafters[name]
+    if not isinstance(profile, dict):
+        return [f"drafters.{name} must be an object"]
+    problems: list[str] = []
+    if "hub" in profile:
+        if not profile.get("hub") or not profile.get("snapshot"):
+            problems.append(f"drafters.{name} with hub must define non-empty hub and snapshot")
+    elif not profile.get("snapshot") or not profile.get("blobs"):
+        problems.append(f"drafters.{name} must define hub+snapshot or snapshot+blobs")
+    for key, pattern in DRAFTER_PATTERNS.items():
+        if key in profile and not pattern.fullmatch(str(profile[key])):
+            problems.append(f"drafters.{name}.{key} is {profile[key]!r}, invalid format")
+    resolved = cluster_recipe.drafter_mounts(cluster)
+    if resolved is None:
+        return problems
+    extra_mounts, container_path = resolved
+    mounts = cluster.get("container", {}).get("mounts", [])
+    mount_targets = {m[1] for m in mounts if isinstance(m, (list, tuple)) and len(m) >= 2}
+    if extra_mounts:
+        for _, target, _ in extra_mounts:
+            if target not in mount_targets:
+                problems.append(f"drafters.{name} requires container mount {target}")
+    elif "/hub" not in mount_targets:
+        problems.append(f"drafters.{name} reuses /hub, which is missing from container.mounts")
+    args = cluster.get("serve_args", [])
+    if "--speculative-config" not in args:
+        problems.append(f"drafter {name!r} requires --speculative-config in serve_args")
+    else:
+        at = args.index("--speculative-config") + 1
+        try:
+            spec = json.loads(args[at]) if at < len(args) else {}
+        except ValueError:
+            spec = {}
+        wanted_method = profile.get("method", "dfly2")
+        if spec.get("method") != wanted_method:
+            problems.append(
+                f"drafter {name!r} requires speculative method {wanted_method!r}, got {spec.get('method')!r}"
+            )
+        if spec.get("model") != container_path:
+            problems.append(
+                f"drafter {name!r} requires speculative model {container_path!r}, got {spec.get('model')!r}"
+            )
+    return problems
+
+
+def node_drafter_problems(cluster: dict, nodes: dict, node: dict) -> list[str]:
+    """Verify the standalone drafter snapshot, metadata digests, and shard presence on one node."""
+    source = cluster_recipe.drafter_snapshot(cluster)
+    if source is None:
+        return []
+    name = cluster["drafter"]
+    profile = cluster["drafters"][name]
+    path = host_path(cluster, source)
+    result = run_ssh(nodes, node, "python3", "-c", _NODE_DRAFTER_CHECK, path)
+    if result.returncode == 255:
+        return [f"{node['name']}: cannot check drafter {name!r}: {result.stderr.strip()}"]
+    dl = cluster_recipe.drafter_download(cluster)
+    fix = f"run `{dl}`" if dl else f"sync {path}"
+    try:
+        report = json.loads(result.stdout.strip())
+    except ValueError:
+        return [f"{node['name']}: cannot inspect drafter {name!r} at {path}: {result.stderr.strip() or result.stdout.strip()}"]
+    if "missing" in report:
+        return [f"{node['name']}: drafter snapshot is missing: {path}; {fix}"]
+    problems: list[str] = []
+    if report.get("config_sha256") is None:
+        problems.append(f"{node['name']}: drafter {path}/config.json is missing; {fix}")
+    elif "config_sha256" in profile and report["config_sha256"] != profile["config_sha256"]:
+        problems.append(
+            f"{node['name']}: drafter {path}/config.json has sha256 {report['config_sha256']}, "
+            f"expected {profile['config_sha256']}; {fix}"
+        )
+    if report.get("index_sha256") is None:
+        problems.append(f"{node['name']}: drafter {path}/model.safetensors.index.json is missing; {fix}")
+    elif "index_sha256" in profile and report["index_sha256"] != profile["index_sha256"]:
+        problems.append(
+            f"{node['name']}: drafter {path}/model.safetensors.index.json has sha256 "
+            f"{report['index_sha256']}, expected {profile['index_sha256']}; {fix}"
+        )
+    if report.get("missing_shards"):
+        problems.append(
+            f"{node['name']}: drafter {path} is missing weight shards "
+            f"{', '.join(report['missing_shards'])}; {fix}"
+        )
+    return problems
+
+
 def repository_revision(revision: str = "HEAD") -> str:
     result = subprocess.run(
         ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
