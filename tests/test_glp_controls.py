@@ -62,7 +62,12 @@ class GlpAlphaRecipeAndReaderTest(unittest.TestCase):
 
     def test_glp_generation_defaults_render_validate_and_unset(self):
         base = self._resolved()
-        self.assertNotIn("WEIGHTLESS_STEER_GENERATION_DEFAULTS", base["environment"])
+        self.assertEqual(
+            json.loads(base["environment"]["WEIGHTLESS_STEER_GENERATION_DEFAULTS"]),
+            {"temperature": 0.3, "top_p": 0.95},
+        )
+        unset_only = recipe.overlay({"extends": {}, "unset": ["glp.generation_defaults"]}, base)
+        self.assertNotIn("WEIGHTLESS_STEER_GENERATION_DEFAULTS", unset_only["environment"])
 
         dosed = recipe.overlay(
             {"extends": {}, "set": {"glp": {"generation_defaults": {"temperature": 0.3, "top_p": 0.95}}}},

@@ -15,8 +15,8 @@
     }
   },
   "generation_defaults": {
-    "temperature": 0.3,
-    "top_p": 0.95
+    "temperature": 1.0,
+    "top_p": 1.0
   },
   "glp": {
     "served_model_name": "deepseek-v4.1-flash-weightless",
@@ -25,7 +25,11 @@
     "revision": "4d570926e9dd4fa7247d126072c34e249c89abd7",
     "file": "glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf",
     "sha256": "24e97d41a9a4f77adad78ff4cb888cb4e339eb62151dbf37a7fcd3ea30eb442e",
-    "notes": "The GLP spec-3 vector for v41-flash-1017 (27 layers L11-37, alpha_default 3.5; public repository). Served at alpha 2.0; stock name beside it is unchanged."
+    "notes": "The GLP spec-3 vector for v41-flash-1017 (27 layers L11-37, alpha_default 3.5; public repository). Served at alpha 2.0; stock name beside it is unchanged.",
+    "generation_defaults": {
+      "temperature": 0.3,
+      "top_p": 0.95
+    }
   },
   "container": {
     "name": "spark-ds41f",
@@ -515,13 +519,59 @@
         "topology": "switched"
       },
       "environment": {
-        "NCCL_BUFFSIZE": "1048576",
+        "NCCL_ALGO": "Ring",
+        "NCCL_BUFFSIZE": "8388608",
+        "NCCL_CROSS_NIC": "1",
         "NCCL_CUMEM_ENABLE": "0",
-        "NCCL_MAX_NCHANNELS": "8",
+        "NCCL_DEBUG": "WARN",
+        "NCCL_DEBUG_SUBSYS": "INIT",
+        "NCCL_IB_ADDR_FAMILY": "AF_INET",
+        "NCCL_IB_DISABLE": "0",
+        "NCCL_IB_GID_INDEX": "3",
+        "NCCL_IB_MERGE_NICS": "1",
+        "NCCL_IB_ROCE_VERSION_NUM": "2",
+        "NCCL_IB_SUBNET_AWARE_ROUTING": "1",
+        "NCCL_IGNORE_CPU_AFFINITY": "1",
+        "NCCL_LL128_BUFFSIZE": "262144",
+        "NCCL_MAX_NCHANNELS": "6",
+        "NCCL_MIN_NCHANNELS": "6",
+        "NCCL_MIN_TRAFFIC_PER_CHANNEL": "512",
+        "NCCL_NET": "IB",
+        "NCCL_NET_PLUGIN": "none",
+        "NCCL_NVLS_ENABLE": "0",
+        "NCCL_P2P_DISABLE": "1",
+        "NCCL_P2P_NET_CHUNKSIZE": "262144",
+        "NCCL_PROTO": "^LL128",
+        "NCCL_SHM_DISABLE": "1",
+        "NCCL_SOCKET_IFNAME": "enP7s7",
+        "NCCL_THREAD_THRESHOLDS": "-2 -2 -2 1 1 1",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304",
-        "SPARKNET_ROCE_MAX_COLLECTIVE_BYTES": "4194304"
+        "SPARKNET_ROCE_MAX_COLLECTIVE_BYTES": "4194304",
+        "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS": "1",
+        "VLLM_DISABLE_PYNCCL": "0",
+        "VLLM_DS41_EXPERT_CACHE_DIR": "/cache/ds41_expert_slots",
+        "VLLM_DS41_EXPERT_DYNAMIC_SLOTS": "64",
+        "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": "24",
+        "VLLM_DS41_EXPERT_SLOTS": "240",
+        "VLLM_DS41_L2_PREFETCH_WO_BANDS": "17-32=12",
+        "SPARK_DS41F_DSPARK_DEAD_ROWS_TAU": "0.45",
+        "PYTORCH_CUDA_ALLOC_CONF": "garbage_collection_threshold:0.6",
+        "VLLM_DS41_EXPERT_FAST_LOOKAHEAD": "1",
+        "VLLM_DS41_EXPERT_HOTLIST": "multidomain",
+        "VLLM_DS41_EXPERT_HOTLIST_MODE": "pure"
       },
-      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched2.json"
+      "benchmark_reference": "manifests/benchmarks/2026-11-20-spark-ds41f-1120-switched2.json",
+      "sizing": {
+        "max_model_len": 262144,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 8192,
+        "kv_cache_memory_bytes": 6442450944,
+        "prefix_cache_retention_interval": 8192
+      },
+      "speculative": {
+        "enable_adaptive_verification": true,
+        "adaptive_verification_row_cost": 0.25
+      }
     },
     "tp1": {
       "notes": "Single DGX Spark (local uni executor, no RoCE); 256K ctx, 4 streams, PIECEWISE graphs to 24 rows, 6.00 GiB KV (6.44M tok, 24.58x 256K), 8K batched, adaptive verification (row_cost=0.5, DEAD_ROWS_TAU=0.6), expert-centric prefill streaming (0858), 108/48 io_uring expert slot cache with bundled multidomain hotlist and BF16 fast lookahead (0863).",
