@@ -1,0 +1,2141 @@
+From 4dd9e3b9f2e6f53d872b3595105d141a6e48492b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:42:00 +0000
+Subject: [PATCH] config: add Spark DS4.1 environment knobs, config fields,
+ utils, and TileLang v0.1.16 pin
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Add configuration fields, environment variables, sampling/output schema extensions, utility helpers, and requirements/cuda.txt TileLang v0.1.16 pin required by the Spark DS4.1 stack.
+Quality impact: none (tree-identical squash of qualified candidate-77 vLLM tree 58f9b11080cf8ebeccd80c0ce1d9bb7a6ff4ae58).
+Tests: candidate-77 release-tests (12,082 passed, 0 failed) and 2-boot tp3-triangle screen.
+Upstream status: local squashed subsystem patch (tree-identical to candidate-77 0001..0871).
+---
+ docs/design/streaming_weight_loading.md |   4 +
+ docs/features/tool_calling.md           |   6 +
+ docs/serving/offline_inference.md       |   4 +
+ requirements/cuda.txt                   |   2 +-
+ vllm/_custom_ops.py                     |  15 +-
+ vllm/config/engram.py                   |  22 +-
+ vllm/config/kernel.py                   |   5 +
+ vllm/config/load.py                     |  10 +-
+ vllm/config/model.py                    |  31 +-
+ vllm/config/observability.py            |   7 +-
+ vllm/config/scheduler.py                |  33 ++
+ vllm/config/speculative.py              | 147 ++++++-
+ vllm/config/vllm.py                     | 130 ++++++-
+ vllm/env_override.py                    |  37 ++
+ vllm/envs.py                            | 224 +++++++++--
+ vllm/outputs.py                         |   9 +-
+ vllm/sampling_params.py                 |   4 +
+ vllm/utils/b12x.py                      |  22 +-
+ vllm/utils/cpu_affinity.py              | 492 ++++++++++++++++++++++++
+ vllm/utils/gc_utils.py                  |   4 +
+ vllm/utils/jit_monitor.py               |  49 ++-
+ vllm/utils/mem_utils.py                 | 150 +++++++-
+ vllm/utils/torch_utils.py               |  17 +-
+ 23 files changed, 1297 insertions(+), 127 deletions(-)
+ create mode 100644 vllm/utils/cpu_affinity.py
+
+diff --git a/docs/design/streaming_weight_loading.md b/docs/design/streaming_weight_loading.md
+index 8fb55df61b94ad2064483d3d24810fddff95987e..1d85ccfe1731876dd0dae39f626052387777d598 100644
+--- a/docs/design/streaming_weight_loading.md
++++ b/docs/design/streaming_weight_loading.md
+@@ -1,5 +1,9 @@
+ # Proposal: bounded streaming weight loading
+ 
++In this tree the `b12x` load format and its adapter are gone: `--load-format
++direct` (`vllm/model_executor/model_loader/direct_loader.py`) is the bounce-ring
++path below, ported into vLLM. The rest of this proposal is kept as written.
++
+ Status: the C99 O_DIRECT transport and b12x vLLM adapter load ordinary
+ PyTorch CUDA tensors. The loader owns bounded I/O buffers and retains destination
+ references until completion. Models use their normal allocation paths.
+diff --git a/docs/features/tool_calling.md b/docs/features/tool_calling.md
+index 2e8178d392adb72311025f1f917dc57b7ea34b2e..5d7b0a90688251e2ff88eeffd843e2815230275d 100644
+--- a/docs/features/tool_calling.md
++++ b/docs/features/tool_calling.md
+@@ -380,6 +380,12 @@ DeepSeek-specific role, not a standard OpenAI message role. Other unknown roles
+ remain invalid. The encoding contract follows the
+ [DeepSeek V4.1 reference](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/encoding/README.md).
+ 
++With `--tool-call-parser deepseek_v41`, output token IDs distinguish genuine DSML markers from copies spelled with ordinary tokens, including inside string arguments. This guard also works without a reasoning parser. Without token IDs, DSML matching remains text-based. In token-ID mode, text between and after tool-call blocks is returned as content.
++
++When auto tool choice is enabled and both `--tool-call-parser deepseek_v41` and `--reasoning-parser deepseek_v41` are selected, one engine parses reasoning and tools together, preserving token provenance across the transition. Text-spelled markers remain text in reasoning too. Requests without tools, or with `tool_choice="none"`, preserve DSML call markup as content instead of dropping it, with or without token IDs. Prompt reasoning-state detection stops at assistant, user and system role boundaries: a prompt that already closes reasoning starts in content, while a closing marker from an earlier turn does not disable reasoning.
++
++Under strict required and named tool choices, token-origin provenance remains enforced inside `<think>...</think>` while post-`</think>` constrained DSML output accepts markers spelled with ordinary tokens so string-based structural tags always extract as tool calls.
++
+ ### OpenAI OSS Models (`openai`)
+ 
+ Supported models:
+diff --git a/docs/serving/offline_inference.md b/docs/serving/offline_inference.md
+index 9a71612f262b5ff27d8e85043998758d530bad96..eecf1b01756a519c28607497a6a437ac72a75603 100644
+--- a/docs/serving/offline_inference.md
++++ b/docs/serving/offline_inference.md
+@@ -73,6 +73,10 @@ For further details on Weight Transfer, please refer to [this page](../training/
+ - `LLM.collective_rpc` - Executes a method or callable collectively across all workers.
+ - `LLM.apply_model` - Applies a function directly to the model inside each worker.
+ 
++## Model Inspection APIs
++
++- `LLM.get_model_inspection` - Returns a hierarchical view of the model, querying workers on the first call and caching the result.
++
+ ## API Reference
+ 
+ [Offline Inference](../api/README.md#offline-inference)
+diff --git a/requirements/cuda.txt b/requirements/cuda.txt
+index 213b8ed08f71615156543bc6ece35c2d42b9885f..ce8e692bd3fb8f7c6991bad9a510d14572b4091b 100644
+--- a/requirements/cuda.txt
++++ b/requirements/cuda.txt
+@@ -19,7 +19,7 @@ PyNvVideoCodec==2.0.4
+ flashinfer-python==0.7.1
+ flashinfer-cubin==0.7.1
+ apache-tvm-ffi==0.1.11
+-tilelang==0.1.12
++tilelang==0.1.16
+ nvidia-cudnn-frontend>=1.19.1
+ # Required for LLM_NVTX_SCOPES_FOR_PROFILING=1
+ nvtx==0.2.15
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 3311215016a728fc4bfc46ff2c7bdf97b1a0f3a5..33553884f214746a776bf0871ebc95b59dbfb250 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -255,6 +255,7 @@ def vocab_parallel_embedding(
+     num_org_vocab_padding: int,
+     added_vocab_start_index: int,
+     added_vocab_end_index: int,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Gather the embedding rows owned by this rank, zeros for the others.
+ 
+@@ -265,16 +266,18 @@ def vocab_parallel_embedding(
+     Args:
+         input_ids: ``[num_tokens]`` int32 or int64 token ids.
+         weight: ``[num_embeddings_per_partition, embedding_dim]`` shard.
++        out: optional contiguous ``[num_tokens, embedding_dim]`` destination.
+ 
+     Returns:
+         ``[num_tokens, embedding_dim]`` partial embeddings.
+     """
+-    out = torch.empty(
+-        input_ids.shape[0],
+-        weight.shape[1],
+-        dtype=weight.dtype,
+-        device=weight.device,
+-    )
++    if out is None:
++        out = torch.empty(
++            input_ids.shape[0],
++            weight.shape[1],
++            dtype=weight.dtype,
++            device=weight.device,
++        )
+     torch.ops._C.vocab_parallel_embedding(
+         out,
+         input_ids,
+diff --git a/vllm/config/engram.py b/vllm/config/engram.py
+index 404ba0e9f1670e9de84fc136edcdb8015c4ed010..7d523f9e46aa3ab432cdf1c877ef17000c861326 100644
+--- a/vllm/config/engram.py
++++ b/vllm/config/engram.py
+@@ -77,14 +77,14 @@ class EngramConfig:
+     """Native V4.1 table storage: resident CUDA rows, mapped pinned host RAM,
+     or SSD io_uring staging. Independent of the legacy cpu_offload option."""
+ 
+-    disk_resident_scales: bool = False
+-    """Keep original E8M0 scale bytes in mapped host RAM for disk tables.
+-    Weights still use io_uring. Requires about 5.72 GiB total host RAM on V4.1."""
+-
+     projection_tp: bool = False
+     """Shard Engram WKV output columns over TP and gather the BF16 result.
+     Opt-in pending matched whole-serving performance and precision checks."""
+ 
++    disk_resident_scales: bool = False
++    """Removed: the disk reader reads scales from disk. Accepted only as False, so a
++    deployment that still passes it starts; to be dropped once none does."""
++
+     _ram_budget_checked_nbytes: int | None = field(default=None, init=False, repr=False)
+     """Preflight state carried to workers; never re-charge allocated TP peers."""
+ 
+@@ -92,6 +92,8 @@ class EngramConfig:
+     def _validate_shared_memory(self) -> Self:
+         if self.dp_shared_memory and not self.cpu_offload:
+             raise ValueError("dp_shared_memory requires cpu_offload=True")
++        if self.disk_resident_scales:
++            raise ValueError("disk_resident_scales was removed: the disk reader reads scales from disk")
+         return self
+ 
+     def verify_model_config(
+@@ -116,25 +118,15 @@ class EngramConfig:
+                 "embeddings, non-empty n-gram layer ids, and CUDA."
+             )
+ 
+-        if self.table_memory != "disk" and self.disk_resident_scales:
+-            raise ValueError("disk Engram controls require table_memory='disk'")
+         if self.table_memory == "ram":
+             self._verify_ram_budget(model_config.hf_text_config, tp_size)
+-        elif self.disk_resident_scales:
+-            self._verify_ram_budget(
+-                model_config.hf_text_config, tp_size, scales_only=True
+-            )
+ 
+-    def _verify_ram_budget(
+-        self, hf_config, tp_size: int, *, scales_only: bool = False
+-    ) -> None:
++    def _verify_ram_budget(self, hf_config, tp_size: int) -> None:
+         from vllm.model_executor.model_loader.weight_utils import (
+             _get_available_ram_bytes,
+         )
+ 
+         planned = _ram_table_nbytes(hf_config, tp_size)
+-        if scales_only:
+-            planned = planned // 264 * 8
+         if self._ram_budget_checked_nbytes == planned:
+             return
+         reserve = _RAM_RESERVE_BYTES
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index 9178ff08561f924551293f8cfc73609af0977840..41a9096ed07a13d3f0cff08c2f916968a4c86172 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -135,6 +135,7 @@ MoEBackend = Literal[
+     "flashinfer_cutedsl",
+     "flashinfer_b12x",
+     "b12x",
++    "tilelang",
+     "flashinfer_moe_ep_mega_deep_gemm",
+     "flashinfer_moe_ep_mega_cutedsl",
+     "marlin",
+@@ -208,6 +209,7 @@ LinearBackend = Literal[
+     "flashinfer_cudnn",
+     "flashinfer_b12x",
+     "b12x",
++    "tilelang",
+     "marlin",
+     "humming",
+     "triton",
+@@ -274,6 +276,7 @@ class KernelConfig:
+     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
+       (RTX Pro 6000 / DGX Spark)
+     - "b12x": Use b12x FP4 and MXFP8 MoE kernels on SM12x
++    - "tilelang": Use TileLang FP8 x FP4 MoE kernels on SM12x (DeepSeek V4.1)
+     - "flashinfer_moe_ep_mega_deep_gemm": Use the FlashInfer moe_ep
+       expert-parallel mega-MoE with the DeepGEMM megakernel, which consumes an
+       MXFP4 checkpoint verbatim (Blackwell, requires expert parallel;
+@@ -325,6 +328,8 @@ class KernelConfig:
+     - "flashinfer_cudnn": Use FlashInfer with cuDNN kernels
+     - "flashinfer_b12x": Use FlashInfer b12x CuteDSL NVFP4 GEMM (SM120+)
+     - "b12x": Use native B12X FP8 and FP4 linear kernels on SM12x
++    - "tilelang": Use TileLang MXFP8 and BF16 linear kernels on SM12x
++      (DeepSeek V4.1)
+     - "marlin": Use Marlin kernels
+     - "triton": Use Triton-based kernels
+     - "deep_gemm": Use DeepGEMM kernels
+diff --git a/vllm/config/load.py b/vllm/config/load.py
+index d9f03707e01fbbbe01cedf2fba9a146764e65864..f64dd7d378807201fd4516cedc9348413201c928 100644
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -35,10 +35,12 @@ class LoadConfig:
+       back to the pytorch bin format if safetensors format is not available.
+     - "pt" will load the weights in the pytorch bin format.
+     - "safetensors" will load the weights in the safetensors format.
+-    - "b12x" will load safetensors weights directly into CUDA tensors using
+-      the b12x checkpoint loader provided by `flashinfer-python[b12x]`.
+-    - "mxfp4_csf" reads losslessly compressed Kimi/DS4.1/DS4-Flash
+-      MXFP4 expert scales and retains file-backed loading for Engram tables.
++    - "direct" will read safetensors weights with O_DIRECT through a
++      registered host ring straight into CUDA tensors, without the page cache.
++      It needs a GPU that reads pageable memory through the host page tables,
++      such as GB10.
++    - "mxfp4_csf" reads losslessly compressed Kimi/DS4-Flash MXFP4 expert
++      scales and retains file-backed loading for Engram tables.
+     - "instanttensor" will load the Safetensors weights on CUDA devices using
+       InstantTensor, which enables distributed loading with pipelined prefetching
+       and fast direct I/O.
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index de5b345fa481f16486aad9e7ee9aaf3b48971205..445e18bf1a98bb153d5691d8d5336d48117c3af3 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -856,7 +856,8 @@ class ModelConfig:
+ 
+             # Rebuild after multimodal_config exists so text-only mm_prefix
+             # clearing is applied (and cached for later with_hf_config calls).
+-            self.model_arch_config = self.get_model_arch_config()
++            if self.model_arch_config.is_mm_prefix_lm:
++                self.model_arch_config = self.get_model_arch_config()
+ 
+         if self.disable_sliding_window:
+             # Set after get_and_verify_max_len to ensure that max_model_len
+@@ -914,9 +915,10 @@ class ModelConfig:
+             self.hf_text_config,
+             revision=getattr(self, "revision", None),
+         )
+-        return convertor.convert(
+-            supports_multimodal=self._supports_multimodal_for_mm_prefix()
+-        )
++        arch_config = convertor.convert(supports_multimodal=True)
++        if arch_config.is_mm_prefix_lm and not self._supports_multimodal_for_mm_prefix():
++            return convertor.convert(supports_multimodal=False)
++        return arch_config
+ 
+     @field_validator("tokenizer", "max_model_len", mode="wrap")
+     @classmethod
+@@ -1270,6 +1272,8 @@ class ModelConfig:
+             # `override_quantization_method` method) must be checked in order
+             # of preference (this is particularly important for GPTQ).
+             overrides = [
++                "deepseek_v4_fp8",
++                "deepseek_v41_fp8",
+                 "auto_gptq",
+                 "gptq",
+                 "gptq_marlin",
+@@ -1284,26 +1288,25 @@ class ModelConfig:
+                 "modelopt_mxfp8",
+                 "mxfp8",
+                 "modelopt_mixed",
+-                "exl3",
+                 "mxfp4_csf",
+                 # Ensure heavy backends are probed last to avoid unnecessary
+                 # imports during override detection (e.g., MXFP4 imports Triton)
+                 "mxfp4",
+                 "gpt_oss_mxfp4",
+-                "deepseek_v4_fp8",
+-                "deepseek_v41_fp8",
+                 "humming",
+             ]
+             # if the user specifies humming, we should always use humming
+             if self.quantization == "humming":
+                 overrides = ["humming"] + overrides
+-            quantization_methods = [
+-                q for q in supported_quantization if q not in overrides
++            builtin_methods = set(get_args(me_quant.QuantizationMethods))
++            custom_overrides = [
++                q
++                for q in supported_quantization
++                if q not in builtin_methods and q not in overrides
+             ]
+-            # Any custom overrides will be in quantization_methods so we place
+-            # them at the start of the list so custom overrides have preference
+-            # over the built-in ones.
+-            quantization_methods = quantization_methods + overrides
++            # Any custom overrides are placed at the start of the list so
++            # custom overrides have preference over the built-in ones.
++            quantization_methods = custom_overrides + overrides
+ 
+             # Detect which checkpoint is it
+             for name in quantization_methods:
+@@ -1781,6 +1784,8 @@ class ModelConfig:
+             "top_p",
+             "min_p",
+             "max_new_tokens",
++            "repetition_detection",
++            "thinking_token_budget",
+         ]
+         if any(p in config for p in available_params):
+             diff_sampling_param = {
+diff --git a/vllm/config/observability.py b/vllm/config/observability.py
+index 0394245f3cf255c21136dd426e63eb76f8b7b972..80ad0c82411480981bfeef8277ce81c2fd202485 100644
+--- a/vllm/config/observability.py
++++ b/vllm/config/observability.py
+@@ -88,8 +88,11 @@ class ObservabilityConfig:
+     This includes number of context/generation requests and tokens
+     and the elapsed cpu time for the iteration."""
+ 
+-    jit_monitor_mode: Literal["warn", "error"] = "warn"
+-    """How to handle post-warmup JIT compilation events."""
++    jit_monitor_mode: Literal["off", "warn", "error"] = "warn"
++    """How to handle post-warmup JIT compilation events. ``off`` installs no
++    hooks: where every kernel is prepared and the kernel caches are frozen, a
++    compile fails by name anyway, and the TileLang hook re-parses each eager
++    launch's cache key."""
+ 
+     jit_monitor_verbose: bool = False
+     """Log every monitored JIT compile with runtime details. This can emit many
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index f00b8dae2b4bb655052e32c7d1497eb4eb4e5898..ef98fad4fd3a8f3bea61e113b14bcfcecaeed85e 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -28,6 +28,7 @@ PrefillComputeHalfLife = (
+ MaxParallelPrefills = Annotated[int, Field(ge=1)] | Literal["auto"]
+ PrefillPolicy = Literal["round-robin", "decode-aware"]
+ DecodeRefillTarget = Annotated[int, Field(ge=1)] | Literal["auto"]
++PrefillYield = Literal["off", "short"]
+ 
+ 
+ @config
+@@ -79,6 +80,12 @@ class SchedulerConfig:
+     """For chunked prefill, a request is considered long if the prompt is
+     longer than this number of tokens. 0 disables the cap (default)."""
+ 
++    align_prefill_chunks: bool = False
++    """Prefill chunks end at absolute multiples of `long_prefill_token_threshold`,
++    whatever else the step holds; otherwise a chunk takes whatever budget the
++    step's other requests leave. Set by models whose temperature-0 determinism
++    needs it (DeepSeek V4.1)."""
++
+     max_num_queued_reqs: int | None = Field(default=None, ge=0)
+     """Maximum number of requests that can be in-flight (waiting or running)
+     at the same time, or None for no limit. When the limit is reached, new
+@@ -245,6 +252,23 @@ class SchedulerConfig:
+     This setting is ignored by ``round-robin`` when left at ``auto``.
+     """
+ 
++    prefill_yield: PrefillYield = "off"
++    """Which work a long prompt's prefill chunk yields its step to.
++
++    With aligned prefill chunks a long prompt's whole chunk takes the step's
++    budget beside the decode rows, so a request that arrives while it prefills
++    waits for its last chunk. ``short`` lets a step that would carry such a
++    chunk carry instead the waiting prompts whose prefill finishes within one
++    chunk, and, with sink rejection, the first decode step of a prompt that
++    just finished prefilling (it releases the held first token). The long
++    prompt's chunks keep their boundaries; only the step a chunk runs in
++    changes. ``off`` keeps first-come-first-served prefill.
++    """
++
++    prefill_yield_limit_s: float = Field(default=10.0, gt=0)
++    """With ``prefill_yield``: a long prefill that has yielded this long stops
++    yielding until its next chunk runs."""
++
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+     avoid gaps in GPU utilization, leading to better latency and throughput.
+@@ -370,6 +394,15 @@ class SchedulerConfig:
+             and self.decode_refill_target > self.max_num_seqs
+         ):
+             raise ValueError("decode_refill_target cannot exceed max_num_seqs")
++        if self.prefill_yield != "off" and (
++            interleaving_enabled
++            or self.prefill_compute_share is not None
++            or self.prefill_schedule_interval > 1
++        ):
++            raise ValueError(
++                "prefill_yield replaces prefill lanes, compute sharing and the "
++                "prefill schedule interval; set none of them with it"
++            )
+         if (
+             self.prefill_policy != "decode-aware"
+             and self.decode_refill_target != "auto"
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index cdeab3895e4d3dc4453bef2d19abac1da5dc8a6c..b99baaa60bf8e79a05210d180af1994475d8f158 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -4,6 +4,7 @@
+ import copy
+ import functools
+ from collections.abc import Callable, Mapping
++from dataclasses import field
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Literal, get_args
+ 
+@@ -374,6 +375,56 @@ def _validate_qwen3_omni_dspark(
+         )
+ 
+ 
++@config
++class CopyDraftsConfig:
++    """Copy drafts beside DSpark: a request's own earlier text proposes the tokens
++    that follow the longest suffix match of its context.
++
++    Each step, a request whose context ends with the same ``min_match`` tokens
++    (or 2, 4, ... times as many, up to ``MAX_LEVEL``) as an earlier position of
++    its own prompt and output is offered a continuation in place of DSpark's
++    drafts. Among equally strong matches prefer a full lookahead, then recency;
++    if only short continuations exist, take the longest available. DSpark drafts
++    everywhere else.
++    The search reads only the request's own history: nothing is shared between
++    requests. Drafts never change what is committed, only how many tokens a
++    step verifies.
++
++    Not an option: DSpark with greedy drafts and adaptive verification always
++    copies, at these defaults (``SpeculativeConfig.copy_drafts``). The fields
++    parametrize the kernels and their tests."""
++
++    MAX_LEVEL = 256
++    """The longest suffix compared: a match of 256 tokens ranks above every
++    shorter one, and longer matches rank as 256."""
++
++    min_match: int = Field(default=16, ge=1)
++    """The shortest suffix that proposes a copy."""
++
++    max_drafts: int = Field(default=16, ge=1)
++    """The most copy drafts a step verifies for one request: the verification
++    lookahead, which every buffer a verified row touches is sized for."""
++
++    initial_drafts: int = Field(default=8, ge=1)
++    """A copy's first proposal offers at most this many drafts; each step whose
++    copy drafts were all accepted doubles it, up to ``max_drafts``, and a
++    rejected copy draft returns it here."""
++
++    def levels(self) -> tuple[int, ...]:
++        """The suffix lengths compared, shortest first: ``min_match`` doubling
++        up to ``MAX_LEVEL``."""
++        out = []
++        level = self.min_match
++        while level <= self.MAX_LEVEL:
++            out.append(level)
++            level *= 2
++        return tuple(out)
++
++    def compute_hash(self) -> str:
++        factors = [self.min_match, self.max_drafts, self.initial_drafts]
++        return safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
++
++
+ @config
+ class SpeculativeConfig:
+     """Configuration for speculative decoding."""
+@@ -558,11 +609,32 @@ class SpeculativeConfig:
+     """Whether to adaptively size the draft-verification budget from per-request
+     confidence. Currently only supported for method="dspark"."""
+ 
+-    adaptive_verification_cost_scale: float = Field(default=1.0, gt=0.0)
+-    """Scale the incremental target-verification cost used by DSpark adaptive
+-    verification. Values above 1.0 trim more aggressively; values below 1.0
+-    retain more drafts. The unavoidable zero-draft verification cost is not
+-    scaled."""
++    adaptive_verification_row_cost: float = Field(default=0.02, gt=0.0, lt=1.0)
++    """DSpark adaptive verification sizes each step's draft budget to maximise
++    expected tokens (sampling requests plus the admitted drafts' survival
++    probabilities) per unit of step cost, the cost being ``1 + row_cost * rows``:
++    this is one verification row's cost as a fraction of a step's fixed cost.
++    A recipe constant, so the draft schedule is a rule of the inputs, the same
++    on every build and boot, with no measured costs."""
++
++    adaptive_verification_single_req_row_cost_scale: float = Field(
++        default=2.5, gt=0.0
++    )
++    """Scale applied to ``adaptive_verification_row_cost`` for single-request
++    calibrated DSpark verification (e.g. to price cold-L2 MoE routing)."""
++
++    adaptive_verification_high_row_cost_scale: float = Field(default=0.65, gt=0.0)
++    """Marginal row-cost multiplier above ``HIGH_ROW_COST_KNEE`` (16 rows) up
++    to ``adaptive_verification_wide_row_cost_knee`` for multi-request calibrated
++    DSpark verification."""
++
++    adaptive_verification_wide_row_cost_knee: int = Field(default=32, ge=16)
++    """Row threshold separating the high-row band from the wide-row band in
++    multi-request calibrated DSpark verification."""
++
++    adaptive_verification_wide_row_cost_scale: float = Field(default=0.50, gt=0.0)
++    """Marginal row-cost multiplier above ``adaptive_verification_wide_row_cost_knee``
++    for multi-request calibrated DSpark verification."""
+ 
+     @staticmethod
+     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
+@@ -621,6 +693,23 @@ class SpeculativeConfig:
+     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
+     top-k base-logit candidates. Requires draft tensor parallel size 1."""
+ 
++    copy_drafts: CopyDraftsConfig | None = field(default=None, init=False)
++    """Copy drafts from the request's own history beside DSpark
++    (``CopyDraftsConfig``), derived, not an option: on wherever DSpark verifies
++    greedy drafts adaptively, unless the engine cannot carry them
++    (``VllmConfig``: async scheduling on the V2 model runner). Its
++    ``max_drafts`` is the verification lookahead (``num_verification_tokens``);
++    ``num_speculative_tokens`` stays DSpark's block."""
++
++    @property
++    def num_verification_tokens(self) -> int:
++        """The most drafts one request verifies in a step: what sizes every
++        buffer a verified row touches. DSpark's block (``num_speculative_tokens``)
++        unless copy drafts widen it."""
++        if self.copy_drafts is None:
++            return self.num_speculative_tokens
++        return max(self.num_speculative_tokens, self.copy_drafts.max_drafts)
++
+     def compute_hash(self) -> str:
+         """
+         WARNING: Whenever a new field is added to this config,
+@@ -665,6 +754,10 @@ class SpeculativeConfig:
+                 )
+             )
+ 
++        if self.copy_drafts is not None:
++            # The verification lookahead sizes the decode graphs' query width.
++            factors.append(self.copy_drafts.compute_hash())
++
+         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
+         return hash_str
+ 
+@@ -1660,15 +1753,15 @@ class SpeculativeConfig:
+                                 "dspark_draft_topk must be between 1 and the "
+                                 f"draft vocabulary size ({draft_vocab_size})"
+                             )
+-                        if (
+-                            "Qwen3DSparkModel"
+-                            not in self.draft_model_config.architectures
+-                            and _QWEN3_OMNI_DSPARK_ARCHITECTURE
+-                            not in self.draft_model_config.architectures
+-                        ):
++                        if not {
++                            "Qwen3DSparkModel",
++                            _QWEN3_OMNI_DSPARK_ARCHITECTURE,
++                            "DSparkV41DraftModel",
++                        } & set(self.draft_model_config.architectures):
+                             raise ValueError(
+                                 "dspark_draft_topk is only supported by "
+-                                "Qwen3DSparkModel and Qwen3OmniDSparkModel"
++                                "Qwen3DSparkModel, Qwen3OmniDSparkModel and "
++                                "DSparkV41DraftModel"
+                             )
+                         hf_config.dspark_draft_topk = dspark_draft_topk
+ 
+@@ -1720,11 +1813,33 @@ class SpeculativeConfig:
+                 "materializes. Disable one of them."
+             )
+ 
+-        if self.adaptive_verification_cost_scale != 1.0 and (
+-            self.method != "dspark" or not self.enable_adaptive_verification
++        for field_name, default_value in (
++            ("adaptive_verification_row_cost", 0.02),
++            ("adaptive_verification_single_req_row_cost_scale", 2.5),
++            ("adaptive_verification_high_row_cost_scale", 0.65),
++            ("adaptive_verification_wide_row_cost_knee", 32),
++            ("adaptive_verification_wide_row_cost_scale", 0.50),
+         ):
+-            raise ValueError(
+-                "adaptive_verification_cost_scale requires DSpark adaptive verification"
++            if getattr(self, field_name) != default_value and (
++                self.method != "dspark" or not self.enable_adaptive_verification
++            ):
++                raise ValueError(
++                    f"{field_name} requires DSpark adaptive verification"
++                )
++
++        if (
++            self.method == "dspark"
++            and self.enable_adaptive_verification
++            and self.draft_sample_method == "greedy"
++        ):
++            # The draft budget decides how many of a copy's drafts a step
++            # verifies; copy drafts are one-hot proposals, as greedy DSpark
++            # drafts are, so no draft logits exist for them. The lookahead is at
++            # least DSpark's block.
++            self.copy_drafts = CopyDraftsConfig(
++                max_drafts=max(
++                    CopyDraftsConfig().max_drafts, self.num_speculative_tokens
++                )
+             )
+ 
+         if (
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index c26c1369eac65c9f2d80d3b6406cab09f733b637..3f09f5e4a149235eedc9a6e712f58a5129f4a55f 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -767,6 +767,30 @@ class VllmConfig:
+             return self.diffusion_config.canvas_length
+         return 0
+ 
++    @property
++    def num_verification_tokens(self) -> int:
++        """The most drafts one request verifies in a step, which sizes every
++        buffer a verified row touches: ``num_speculative_tokens`` unless copy
++        drafts widen it (``SpeculativeConfig.num_verification_tokens``)."""
++        if (
++            self.speculative_config is not None
++            and self.speculative_config.num_speculative_tokens is not None
++        ):
++            return self.speculative_config.num_verification_tokens
++        return self.num_speculative_tokens
++
++    @property
++    def max_decode_rows(self) -> int:
++        """The most rows a step's decoding requests hold: every running request
++        at the uniform decode width, plus one request's verification beyond it
++        (copy drafts). The scheduler keeps a step's decode rows within it, so an
++        aligned prefill chunk always fits beside them."""
++        return (
++            self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
++            + self.num_verification_tokens
++            - self.num_speculative_tokens
++        )
++
+     @property
+     def num_lookahead_tokens(self) -> int:
+         """KV slots to reserve past the tokens the target model is scheduled for.
+@@ -1763,6 +1787,21 @@ class VllmConfig:
+             )
+             self.model_config.disable_cascade_attn = True
+ 
++        if (
++            self.speculative_config is not None
++            and self.speculative_config.copy_drafts is not None
++            and not (
++                self.scheduler_config.async_scheduling and self.use_v2_model_runner
++            )
++        ):
++            # The scheduler lays out a copying request's rows from the copy
++            # state the V2 runner returns with each step's output, a step ahead.
++            logger.info_once(
++                "Copy drafts are off: they need async scheduling on the V2 model "
++                "runner; DSpark drafts alone."
++            )
++            self.speculative_config.copy_drafts = None
++
+         if (
+             self.observability_config.per_request_spec_decode_metrics != "none"
+             and self.speculative_config is None
+@@ -2365,6 +2404,7 @@ class VllmConfig:
+         worker is configured to handle.
+         """
+         if self.speculative_config is not None:
++            self._fit_copy_decode_rows()
+             scheduled_token_delta = (
+                 self.speculative_config.max_num_new_slots_for_drafting
+             )
+@@ -2398,6 +2438,67 @@ class VllmConfig:
+                     f" Got {max_num_batched_tokens=} and {scheduled_token_delta=}."
+                 )
+ 
++    def _fit_copy_decode_rows(self) -> None:
++        """Copy drafts widen a step's decode rows (``max_decode_rows``) past every
++        request at the uniform decode width. A budget sized for an aligned
++        prefill chunk beside the uniform rows grows by the difference, so a
++        whole chunk still fits beside them and the chunks still end where
++        ``long_prefill_token_threshold`` puts them (temperature-0 determinism)."""
++        scheduler = self.scheduler_config
++        uniform_rows = scheduler.max_num_seqs * self.uniform_decode_query_len
++        threshold = scheduler.long_prefill_token_threshold
++        budget = scheduler.max_num_batched_tokens
++        if not (
++            scheduler.align_prefill_chunks
++            and threshold > 0
++            and threshold + uniform_rows <= budget < threshold + self.max_decode_rows
++        ):
++            return
++        widened = threshold + self.max_decode_rows
++        scheduler.max_num_batched_tokens = widened
++        # The encoder budgets default to the token budget (SchedulerConfig).
++        if scheduler.max_num_encoder_input_tokens == budget:
++            scheduler.max_num_encoder_input_tokens = widened
++        if scheduler.encoder_cache_size == budget:
++            scheduler.encoder_cache_size = widened
++        logger.info_once(
++            "Copy drafts widen max_num_batched_tokens from %d to %d: an aligned "
++            "%d-token prefill chunk beside %d decode rows.",
++            budget,
++            widened,
++            threshold,
++            self.max_decode_rows,
++        )
++
++    def _fit_copy_capture_sizes(self) -> None:
++        """A CUDA-graph capture range that ends at every request at the uniform
++        decode width extends to the decode rows copy drafts widen a step to
++        (``max_decode_rows``), on the default ladder's stride of 8 and ending at
++        them, so a step with a copying request replays a full graph too."""
++        compilation = self.compilation_config
++        uniform_rows = (
++            self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
++        )
++        rows = self.max_decode_rows
++        sizes = compilation.cudagraph_capture_sizes
++        largest = compilation.max_cudagraph_capture_size
++        if largest is None and sizes:
++            largest = max(sizes)
++        if rows <= uniform_rows or largest != uniform_rows:
++            return
++        compilation.max_cudagraph_capture_size = rows
++        if sizes:
++            compilation.cudagraph_capture_sizes = [
++                *sizes,
++                *range(uniform_rows // 8 * 8 + 8, rows, 8),
++                rows,
++            ]
++        logger.info_once(
++            "Copy drafts widen the CUDA-graph capture range from %d to %d rows.",
++            uniform_rows,
++            rows,
++        )
++
+     def _set_cudagraph_sizes(self):
+         """
+         vLLM defines the default candidate list of batch sizes for CUDA graph
+@@ -2453,6 +2554,7 @@ class VllmConfig:
+             and not self.model_config.enforce_eager
+             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+         ):
++            self._fit_copy_capture_sizes()
+             # determine the initial max_cudagraph_capture_size
+             max_cudagraph_capture_size = (
+                 self.compilation_config.max_cudagraph_capture_size
+@@ -2469,8 +2571,11 @@ class VllmConfig:
+                 )
+                 decode_query_len = self.uniform_decode_query_len
+                 max_num_seqs = self.scheduler_config.max_num_seqs
++                # At least every decode row a step may hold (copy drafts widen
++                # one request past the uniform width).
+                 max_cudagraph_capture_size = min(
+-                    max_num_seqs * decode_query_len * 2, default_max_graph_size
++                    max(max_num_seqs * decode_query_len * 2, self.max_decode_rows),
++                    default_max_graph_size,
+                 )
+                 if decode_query_len > 1:
+                     # A uniform decode batch is decode_query_len tokens per
+@@ -3174,21 +3279,16 @@ class VllmConfig:
+                 "Adaptive verification is not currently compatible with LoRA"
+             )
+ 
+-        if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+-            raise ValueError(
+-                "Adaptive verification requires full CUDA graphs. Use cudagraph "
+-                "mode FULL, FULL_DECODE_ONLY, or FULL_AND_PIECEWISE, or disable "
+-                "adaptive verification."
+-            )
+-
+-        if self.parallel_config.pipeline_parallel_size > 1:
+-            # Cost curves and confidences currently only exist on the last PP rank;
+-            # earlier ranks would diverge on the trimmed batch shape.
+-            # TODO: we should be able to support adaptive verification with PP by
+-            # broadcasting the cost curves and confidences to all ranks.
++        if (
++            self.parallel_config.pipeline_parallel_size > 1
++            and spec_config.adaptive_verification_row_cost is None
++        ):
++            # Unpinned cost curves are calibrated only on the last PP rank;
++            # pinned row_cost curves are identical across all PP ranks and
++            # confidences are broadcast via PPHandler.
+             raise ValueError(
+-                "Adaptive verification is not currently compatible "
+-                "with pipeline parallelism"
++                "Adaptive verification with pipeline parallelism requires a "
++                "pinned adaptive_verification_row_cost"
+             )
+ 
+     def _validate_batch_sharded_sampling(self) -> None:
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index a6b3c373facec6df126c4fbe7947e99a44d445be..a9e58ae2278968c23f599e0fb28898cdfcd933a6 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -920,6 +920,43 @@ def _patch_inductor_fallback_allow_list() -> None:
+ 
+ _patch_inductor_fallback_allow_list()
+ 
++# ============================================================
++# torch custom-op fill_defaults: one read of the schema
++# ============================================================
++# The ADInplaceOrView kernel that torch.library.custom_op registers for ops
++# with mutates_args calls torch._library.utils.fill_defaults on every eager
++# call. It reads schema.arguments, a property that builds a new list of every
++# argument, once per argument: quadratic in the argument count. A 64-argument
++# mutating op (B12X's dynamic MoE launch) spends about 0.8 ms of host time per
++# call there, which leaves the GPU idle through short prefills. PyTorch main
++# still reads it in the loop; remove this once upstream reads it once.
++
++
++def _fill_defaults_one_read(schema, args, kwargs):
++    """torch._library.utils.fill_defaults, reading ``schema.arguments`` once."""
++    new_args = []
++    new_kwargs = {}
++    for i, info in enumerate(schema.arguments):
++        if info.kwarg_only:
++            if info.name in kwargs:
++                new_kwargs[info.name] = kwargs[info.name]
++            else:
++                new_kwargs[info.name] = info.default_value
++        elif i < len(args):
++            new_args.append(args[i])
++        else:
++            new_args.append(info.default_value)
++    return tuple(new_args), new_kwargs
++
++
++def _patch_custom_op_fill_defaults() -> None:
++    import torch._library.utils as library_utils
++
++    library_utils.fill_defaults = _fill_defaults_one_read
++
++
++_patch_custom_op_fill_defaults()
++
+ # ============================================================
+ # Triton Autotuner determinism
+ # ============================================================
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 41bb5de8fd75cad89617eb8640575edfeb16d3f1..3c16b2e8d0bb9e956ffb5531e8b6ff620a79b419 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -179,6 +179,7 @@ if TYPE_CHECKING:
+     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+     VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
+     VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
++    VLLM_LATE_ADMISSION_LAYER: int = -1
+     VLLM_MLA_DISABLE: bool = False
+     VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
+     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
+@@ -218,10 +219,32 @@ if TYPE_CHECKING:
+     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
+     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
+     VLLM_MTP_NVFP4_LM_HEAD: bool = True
+-    VLLM_DS41_MARKOV_NVFP4: bool = False
+-    VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+-    VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+-    VLLM_DS41_ENGRAM_OVERLAP: bool = True
++    VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
++    VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
++    VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
++    VLLM_DS41_IKET: str | None = None
++    VLLM_DS41_IKET_CTAS: int = 0
++    VLLM_DS41_IKET_ITERS: int = 0
++    VLLM_DS41_IKET_SKIP: str = ""
++    VLLM_DS41_IKET_GRANULARITY: Literal["fine", "phase"] = "fine"
++    VLLM_DS41_IKET_WARPS: int = 0
++    VLLM_DS41_IKET_PAYLOADS: bool = False
++    VLLM_DS41_IKET_CACHE_DIR: str | None = None
++    VLLM_DS41_EXPERT_SLOTS: int = 0
++    VLLM_DS41_EXPERT_STATIC_SLOTS: int = -1
++    VLLM_DS41_EXPERT_DYNAMIC_SLOTS: int = 48
++    VLLM_DS41_EXPERT_CACHE_DIR: str | None = None
++    VLLM_DS41_EXPERT_HALF_LIFE: float = 64.0
++    VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS: int = 24
++    VLLM_DS41_EXPERT_PREFILL_MODE: str = "expert"
++    VLLM_DS41_EXPERT_HOTLIST: str | None = None
++    VLLM_DS41_EXPERT_HOTLIST_MODE: str = "pure"
++    VLLM_DS41_EXPERT_FAST_LOOKAHEAD: bool = False
++    VLLM_PP_SPARKNET_P2P: bool = False
++    WEIGHTLESS_STEER_PATH: str | None = None
++    WEIGHTLESS_STEER_MODEL: str | None = None
++    WEIGHTLESS_STEER_ALPHA: str | None = None
++    WEIGHTLESS_STEER_GENERATION_DEFAULTS: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+     VLLM_MIMO_L2_PREFETCH: bool = False
+@@ -284,8 +307,6 @@ if TYPE_CHECKING:
+     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
+     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+-    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+-    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
+     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+     VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
+     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
+@@ -320,6 +341,12 @@ if TYPE_CHECKING:
+     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
+     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+     VLLM_RAISE_ON_LOGIT_NANS: bool = False
++    VLLM_KV_CACHE_POISON: bool = False
++    VLLM_SINK_DETECTOR_COLUMN: int | None = None
++    VLLM_SINK_DETECTOR_THRESHOLD: float | None = None
++    VLLM_SINK_REJECTION: bool | None = None
++    VLLM_SINK_REJECTION_MAX_RETRIES: int = 3
++    VLLM_SINK_DETECTOR_CHECK_RANKS: bool = False
+     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
+         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
+     ] = "NONE"
+@@ -1560,6 +1587,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
+         os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
+     ),
++    # Late admission (async scheduling): decide each step when the step in flight
++    # reaches the start of this decoder layer, so requests that arrived meanwhile
++    # join the next step instead of the one after it. -1 decides each step as soon
++    # as the previous one is under way.
++    "VLLM_LATE_ADMISSION_LAYER": lambda: int(
++        os.getenv("VLLM_LATE_ADMISSION_LAYER", "-1")
++    ),
+     # If set, vLLM will disable the MLA attention optimizations.
+     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+     # Keep dense MLA split partials in FP32 until the merge when requested.
+@@ -1864,31 +1898,101 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
+         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+     ),
+-    # Quantize the DeepSeek V4.1 DSpark Markov transition head to NVFP4 (fits
+-    # the GB10 L2; draft graph 3.57 -> 3.0 ms). Off until its effect on
+-    # acceptance is measured.
+-    "VLLM_DS41_MARKOV_NVFP4": lambda: bool(
+-        int(os.getenv("VLLM_DS41_MARKOV_NVFP4", "0"))
+-    ),
+-    # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
+-    "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
+-        int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
+-    ),
+-    # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
+-    # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
+-    # BF16 P, FP32 accumulation) with split-K decode; "reference" also runs
+-    # decode rows single-pass, which reproduces the reference kernel's
+-    # tile-ordered softmax bit for bit at some low-concurrency decode speed;
+-    # "auto" lets the b12x tuner pick FP8 internals (Q and P quantized, KV
+-    # re-encoded; about 3% relative error) or BF16 per plan.
+-    "VLLM_DS41_ATTENTION_COMPUTE": env_with_choices(
+-        "VLLM_DS41_ATTENTION_COMPUTE",
+-        "bf16",
+-        ["bf16", "reference", "auto"],
+-    ),
+-    # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+-    "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+-        int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
++    # Store the DeepSeek V4/V4.1 target vocabulary head (which the DSpark
++    # drafter shares) in the exact 12-bit packed BF16 form: every weight bit
++    # is kept, in 75% of the bytes.
++    "VLLM_DS41_PACKED_BF16_LM_HEAD": lambda: bool(
++        int(os.getenv("VLLM_DS41_PACKED_BF16_LM_HEAD", "0"))
++    ),
++    # Default output-head dtype of DeepSeek V4.1 and its DSpark drafter when
++    # hf_overrides names none. "float32" computes the logits in FP32 like
++    # DeepSeek's reference head; "model" keeps the model dtype, which the exact
++    # packed BF16 and TileLang vocabulary projections require. The drafter
++    # takes no dict hf_overrides from the target, so this sets both.
++    "VLLM_DS41_HEAD_DTYPE": env_with_choices(
++        "VLLM_DS41_HEAD_DTYPE",
++        "float32",
++        ["float32", "model"],
++    ),
++    # A startup rendezvous waits for the other ranks as long as they are alive,
++    # however long they take to load and prepare kernels. A missing rank whose
++    # heartbeat (a daemon thread, every 2 s) has not changed for this long is dead
++    # or hung, and the rendezvous fails naming it.
++    "VLLM_STARTUP_HEARTBEAT_TIMEOUT_S": lambda: float(
++        os.getenv("VLLM_STARTUP_HEARTBEAT_TIMEOUT_S", "120")
++    ),
++    # Debug only: instrument every TileLang kernel with IKET phase ranges and keep
++    # TileLang's caches under this directory (models/deepseek_v4_1/tilelang/iket.py).
++    # Traces need the process to run under NVIDIA's run-iket profiler.
++    "VLLM_DS41_IKET": lambda: os.getenv("VLLM_DS41_IKET") or None,
++    # With VLLM_DS41_IKET: record ranges in about this many CTAs of each launch, evenly
++    # spread (0: all); run-iket still records every warp's lifetime.
++    "VLLM_DS41_IKET_CTAS": lambda: int(os.getenv("VLLM_DS41_IKET_CTAS", "0")),
++    # With VLLM_DS41_IKET: ranges inside a loop record in at most this many of its
++    # iterations, evenly spread (0: all), so no warp's record sizes run-iket's buffer.
++    "VLLM_DS41_IKET_ITERS": lambda: int(os.getenv("VLLM_DS41_IKET_ITERS", "0")),
++    # With VLLM_DS41_IKET: TileLang kernels whose name this regex matches compile
++    # without ranges (run-iket still records their warps' lifetimes).
++    "VLLM_DS41_IKET_SKIP": lambda: os.getenv("VLLM_DS41_IKET_SKIP", ""),
++    # With VLLM_DS41_IKET: range granularity ("fine" default, or "phase" to coalesce
++    # consecutive waits and internal block barriers across same-phase siblings).
++    "VLLM_DS41_IKET_GRANULARITY": lambda: os.getenv(
++        "VLLM_DS41_IKET_GRANULARITY", "fine"
++    ),
++    # With VLLM_DS41_IKET: record ranges in about this many warps per traced CTA,
++    # evenly spaced across warp groups (0: all).
++    "VLLM_DS41_IKET_WARPS": lambda: int(os.getenv("VLLM_DS41_IKET_WARPS", "0")),
++    # With VLLM_DS41_IKET: attach uint32 payloads (innermost loop variable or CTA
++    # index) to range start events.
++    "VLLM_DS41_IKET_PAYLOADS": lambda: bool(
++        int(os.getenv("VLLM_DS41_IKET_PAYLOADS", "0"))
++    ),
++    # With VLLM_DS41_IKET: optional persistent cache root for instrumented TileLang
++    # kernels and their site manifests, keyed by a digest of iket.py and sampling.
++    "VLLM_DS41_IKET_CACHE_DIR": lambda: os.getenv("VLLM_DS41_IKET_CACHE_DIR") or None,
++    # DeepSeek V4.1 per-layer resident MoE expert slot cache budget (0 = off,
++    # < 0 = auto UMA MemAvailable budget, > 0 = explicit per-layer average slots).
++    "VLLM_DS41_EXPERT_SLOTS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_SLOTS", "0")
++    ),
++    "VLLM_DS41_EXPERT_STATIC_SLOTS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_STATIC_SLOTS", "-1")
++    ),
++    "VLLM_DS41_EXPERT_DYNAMIC_SLOTS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_DYNAMIC_SLOTS", "48")
++    ),
++    "VLLM_DS41_EXPERT_CACHE_DIR": lambda: os.getenv("VLLM_DS41_EXPERT_CACHE_DIR")
++    or None,
++    "VLLM_DS41_EXPERT_HALF_LIFE": lambda: float(
++        os.getenv("VLLM_DS41_EXPERT_HALF_LIFE", "64.0")
++    ),
++    "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS", "24")
++    ),
++    "VLLM_DS41_EXPERT_PREFILL_MODE": lambda: os.getenv(
++        "VLLM_DS41_EXPERT_PREFILL_MODE", "expert"
++    ),
++    "VLLM_DS41_EXPERT_HOTLIST": lambda: os.getenv("VLLM_DS41_EXPERT_HOTLIST") or None,
++    "VLLM_DS41_EXPERT_HOTLIST_MODE": lambda: os.getenv(
++        "VLLM_DS41_EXPERT_HOTLIST_MODE", "pure"
++    ),
++    "VLLM_DS41_EXPERT_FAST_LOOKAHEAD": lambda: bool(
++        int(os.getenv("VLLM_DS41_EXPERT_FAST_LOOKAHEAD", "0"))
++    ),
++    "VLLM_PP_SPARKNET_P2P": lambda: bool(int(os.getenv("VLLM_PP_SPARKNET_P2P", "0"))),
++    # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file and
++    # the served model name whose requests alone it steers (vllm/weightless.py),
++    # set together or not at all. Part of the compile key, as every variable here
++    # is: steering adds its launch to every covered layer.
++    "WEIGHTLESS_STEER_PATH": lambda: os.getenv("WEIGHTLESS_STEER_PATH") or None,
++    "WEIGHTLESS_STEER_MODEL": lambda: os.getenv("WEIGHTLESS_STEER_MODEL") or None,
++    # Serve-time alpha replacing the file's glp.alpha_default when set;
++    # the reader refuses values that are not positive finite numbers.
++    "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
++    # Optional JSON object of sampling defaults (e.g. {"temperature":0.3,"top_p":0.95})
++    # applied only to requests targeting WEIGHTLESS_STEER_MODEL when the caller omits them.
++    "WEIGHTLESS_STEER_GENERATION_DEFAULTS": lambda: (
++        os.getenv("WEIGHTLESS_STEER_GENERATION_DEFAULTS") or None
+     ),
+     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+@@ -2146,6 +2250,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
+         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
+     ),
++    # Debug only, never in serving: fill newly allocated KV cache blocks with
++    # all-ones bytes (NaN in FP32, BF16, FP16, FP8 E4M3/E5M2 and UE8M0) instead
++    # of zeros, compressor rings included, so a kernel that reads a slot it has
++    # not written, or masks one arithmetically, turns its output NaN. Forces the
++    # fill on for caches that skip zeroing.
++    "VLLM_KV_CACHE_POISON": lambda: bool(int(os.getenv("VLLM_KV_CACHE_POISON", "0"))),
++    # Attention-sink detector and rejection (vllm.v1.sample.sink). On by
++    # default for the models in its SINK_CHANNELS table, which holds each
++    # one's watched residual column and threshold; off for every other model.
++    # VLLM_SINK_REJECTION=0 turns both off. The column and threshold settings
++    # replace the model's numbers (lab); with VLLM_SINK_REJECTION=0 an
++    # explicit column runs the detector alone, counting without correcting.
++    "VLLM_SINK_DETECTOR_COLUMN": lambda: maybe_convert_int(
++        os.getenv("VLLM_SINK_DETECTOR_COLUMN", None)
++    ),
++    "VLLM_SINK_DETECTOR_THRESHOLD": lambda: (
++        float(os.environ["VLLM_SINK_DETECTOR_THRESHOLD"])
++        if "VLLM_SINK_DETECTOR_THRESHOLD" in os.environ
++        else None
++    ),
++    # Never commit a token sampled from a sunk row: each step's last sampled
++    # token is verified by the request's next step as draft zero and replaced
++    # by the next alternate of its draw when its own row is sunk; a sunk
++    # drafter token cuts the verification. Unset: the model's default.
++    "VLLM_SINK_REJECTION": lambda: maybe_convert_bool(
++        os.getenv("VLLM_SINK_REJECTION", None)
++    ),
++    # Alternates kept per provisional token, so rejections per position; past
++    # them the sunk token is committed as it is (counted as a fallthrough).
++    "VLLM_SINK_REJECTION_MAX_RETRIES": lambda: int(
++        os.getenv("VLLM_SINK_REJECTION_MAX_RETRIES", "3")
++    ),
++    # Lab check of the detector's cross-rank agreement: every step all-gathers
++    # the tensor-parallel ranks' flags and raises if they differ. Off in
++    # serving (one collective a step).
++    "VLLM_SINK_DETECTOR_CHECK_RANKS": lambda: bool(
++        int(os.getenv("VLLM_SINK_DETECTOR_CHECK_RANKS", "0"))
++    ),
+     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
+     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
+         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
+@@ -2220,19 +2362,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+         "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
+     ),
+-    # Maximum input sizes dispatched to the low-latency one-shot kernels.
+-    # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
++    # Selected b12x's one-shot RoCE all-reduce, which is gone: tensor-parallel
++    # groups refuse it (sparknet's one-shot collectives serve multi-node TP).
+     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+     ),
+-    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+-        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+-    ),
+-    # Largest per-rank shard routed to the RoCE all-gather
+-    # (e.g. logits [rows, vocab/tp]).
+-    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+-        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+-    ),
++    # Maximum input sizes dispatched to the low-latency one-shot kernels.
+     "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+         "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+     ),
+@@ -2693,6 +2828,7 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
+         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
+         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
++        "VLLM_LATE_ADMISSION_LAYER",
+         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
+         "VLLM_IMAGE_FETCH_TIMEOUT",
+@@ -2729,6 +2865,12 @@ def compile_factors() -> dict[str, object]:
+         "CUDA_VISIBLE_DEVICES",
+         "NO_COLOR",
+         "VLLM_SKIP_VERSION_SUFFIX",
++        # Sampling-only settings of the sink detector: the compiled forward
++        # depends on whether it keeps the column, which the column and the
++        # switch decide (vllm.v1.sample.sink.SinkConfig.for_model).
++        "VLLM_SINK_DETECTOR_THRESHOLD",
++        "VLLM_SINK_REJECTION_MAX_RETRIES",
++        "VLLM_SINK_DETECTOR_CHECK_RANKS",
+     }
+ 
+     from vllm.config.utils import normalize_value
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index 84b9fccdc88d01740872b47bf94319ac5489e993..a71e1fafa77376014d56f1e54fd9ec86d1f08cdd 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -13,7 +13,11 @@ from typing_extensions import TypeVar
+ from vllm.logger import init_logger
+ from vllm.logprobs import PromptLogprobs, SampleLogprobs
+ from vllm.lora.request import LoRARequest
+-from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
++from vllm.v1.metrics.stats import (
++    RequestSinkMetrics,
++    RequestSpecDecodeMetrics,
++    RequestStateStats,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -66,6 +70,9 @@ class CompletionOutput:
+     lora_request: LoRARequest | None = None
+     sampling_mask: SamplingMask | None = None
+     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
++    # Attention-sink events of this sequence, attached on finish when the
++    # engine's sink detector is on.
++    sink_metrics: RequestSinkMetrics | None = None
+ 
+     def finished(self) -> bool:
+         return self.finish_reason is not None
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index c0ab45ced7027794dd29ed395a2b4d432cd9dca0..ab9c0133c341123dcaa43e54c3a0fee5d12230c9 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -501,6 +501,10 @@ class SamplingParams(
+         self.thinking_token_budget = validate_thinking_token_budget(
+             self.thinking_token_budget
+         )
++        if isinstance(self.repetition_detection, dict):
++            self.repetition_detection = RepetitionDetectionParams(
++                **self.repetition_detection
++            )
+ 
+         if self.stop is None:
+             self.stop = []
+diff --git a/vllm/utils/b12x.py b/vllm/utils/b12x.py
+index c119b1f588bd608bdb53ab9cdac13233aaad5d2c..4fcd9514fbd42911de734845e7ea0a7647a355a2 100644
+--- a/vllm/utils/b12x.py
++++ b/vllm/utils/b12x.py
+@@ -292,6 +292,7 @@ def build_moe_prefill_metadata(
+ 
+ 
+ _HAS_B12X = importlib.util.find_spec("b12x") is not None
++_UNLOADED = object()
+ 
+ 
+ def _import_submodule(module_name: str) -> ModuleType | None:
+@@ -303,8 +304,8 @@ def _import_submodule(module_name: str) -> ModuleType | None:
+         return None
+ 
+ 
+-_B12X_SUBMODULES = {
+-    module_name: _import_submodule(module_name)
++_B12X_SUBMODULES: dict[str, Any] = {
++    module_name: (_UNLOADED if _HAS_B12X else None)
+     for module_name in (
+         "b12x.attention.paged",
+         "b12x.attention.paged_decode",
+@@ -316,6 +317,7 @@ _B12X_SUBMODULES = {
+         "b12x.gemm.bf16_vocab_projection",
+         "b12x.gemm.blockscaled",
+         "b12x.gemm.mla_query_projection",
++        "b12x.gemm.packed_bf16_vocab_projection",
+         "b12x.gemm.wo_projection",
+         "b12x.norm.mhc",
+         # TODO: Remove once B12X exposes the scale-swizzle API publicly.
+@@ -340,8 +342,18 @@ def has_b12x() -> bool:
+     return _HAS_B12X
+ 
+ 
++@torch.compiler.disable
++def _load_submodule(module_name: str) -> ModuleType | None:
++    module = _import_submodule(module_name)
++    _B12X_SUBMODULES[module_name] = module
++    return module
++
++
+ def _get_submodule(module_name: str) -> ModuleType | None:
+-    return _B12X_SUBMODULES.get(module_name)
++    entry = _B12X_SUBMODULES.get(module_name)
++    if entry is _UNLOADED:
++        return _load_submodule(module_name)
++    return entry
+ 
+ 
+ def get_b12x_blockscaled() -> ModuleType | None:
+@@ -356,6 +368,10 @@ def get_b12x_bf16_vocab_projection() -> ModuleType | None:
+     return _get_submodule("b12x.gemm.bf16_vocab_projection")
+ 
+ 
++def get_b12x_packed_bf16_vocab_projection() -> ModuleType | None:
++    return _get_submodule("b12x.gemm.packed_bf16_vocab_projection")
++
++
+ def get_b12x_mla_query_projection() -> ModuleType | None:
+     return _get_submodule("b12x.gemm.mla_query_projection")
+ 
+diff --git a/vllm/utils/cpu_affinity.py b/vllm/utils/cpu_affinity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..699ce6a8604300716b5e81601b3e7744630589ef
+--- /dev/null
++++ b/vllm/utils/cpu_affinity.py
+@@ -0,0 +1,492 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Deterministic CPU core affinity partitioning for heterogeneous ARMv9 / GB10 nodes.
++
++On NVIDIA GB10 (20 ARMv9 cores across two L3 clusters: 10x Cortex-A725 efficiency
++cores cpu0..4, cpu10..14 at 2.808 GHz / 512 KiB L2 and 10x Cortex-X925 performance
++cores cpu5..9, cpu15..19 at 3.900 GHz / 2048 KiB L2), running the Rank-0 API server,
++EngineCore, GPU worker main thread, 25+ worker background threads (gloo_tcp_loop,
++pt_nccl_watchdg, engram-reader, OpenMP), and the sparknet RoCE proxy thread in a
++shared unpartitioned pool causes frequent context-switch preemption of both
++sparknet-proxy and VLLM::Worker_TP0 across the 116 per-step one-shot RoCE
++collectives.
++
++This module discovers fast performance cores and efficiency cores dynamically from
++sysfs (`cpufreq/cpuinfo_max_freq`, `cpu_capacity`, `cache/index2/size`) intersected
++with the container's allowed cpuset (`sched_getaffinity`), and partitions them into
++mutually disjoint core sets for:
++- `proxy_cpus`: dedicated fast core (CPU 19 on GB10) for `sparknet-proxy`
++- `worker_main_cpus`: dedicated fast core in the same L3 cluster (CPU 18 on GB10)
++  for the latency-critical `VLLM::Worker_TP*` main thread
++- `worker_aux_cpus`: disjoint fast cores (CPUs 5..9 on GB10) for worker background
++  threads (`engram-reader`, OpenMP, `gloo_tcp_loop`, `pt_nccl_watchdg`)
++- `engine_core_cpus`: disjoint core (CPU 17 on GB10) for `VLLM::EngineCore`
++- `api_server_cpus`: disjoint cores (CPUs 15..16 plus any allowed efficiency cores
++  0..4, 10..14 on GB10) for the Rank-0 API server, ZMQ frontend, and tokenizers.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import threading
++from collections.abc import Iterable, Set
++from dataclasses import dataclass
++from pathlib import Path
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENV_ROCE_CPU_AFFINITY = "VLLM_ROCE_CPU_AFFINITY"
++ENV_CONTAINER_CPUSET = "VLLM_CONTAINER_CPUSET"
++ENV_SPARKNET_PROXY_CPU = "SPARKNET_ROCE_PROXY_CPU"
++ENV_ENGRAM_CPU_AFFINITY = "SPARK_DS41F_ENGRAM_CPU_AFFINITY"
++_SYMBOLIC_PROXY_VALUES = {"", "big", "fast", "auto", "dedicated"}
++
++
++@dataclass(frozen=True)
++class CpuAffinityPlan:
++    allowed_cpus: tuple[int, ...]
++    fast_cpus: tuple[int, ...]
++    efficiency_cpus: tuple[int, ...]
++    proxy_cpus: tuple[int, ...]
++    worker_main_cpus: tuple[int, ...]
++    worker_aux_cpus: tuple[int, ...]
++    engine_core_cpus: tuple[int, ...]
++    api_server_cpus: tuple[int, ...]
++
++
++def parse_cpu_list(spec: str) -> list[int]:
++    """Parse a Linux CPU list string such as `'5-9,15-19'` into sorted unique ints."""
++    cpus: set[int] = set()
++    for raw_part in spec.split(","):
++        part = raw_part.strip()
++        if not part:
++            continue
++        if "-" in part:
++            start_s, stop_s = part.split("-", 1)
++            start, stop = int(start_s), int(stop_s)
++            if start < 0 or stop < start:
++                raise ValueError(f"invalid CPU range {part!r} in {spec!r}")
++            cpus.update(range(start, stop + 1))
++        else:
++            cpu = int(part)
++            if cpu < 0:
++                raise ValueError(f"invalid CPU number {part!r} in {spec!r}")
++            cpus.add(cpu)
++    return sorted(cpus)
++
++
++def format_cpu_list(cpus: Iterable[int]) -> str:
++    """Format a set/sequence of CPU IDs into compact range notation (`'5-9,15-19'`)."""
++    ordered = sorted(set(int(c) for c in cpus))
++    if not ordered:
++        return ""
++    ranges: list[str] = []
++    start = prev = ordered[0]
++    for cpu in ordered[1:]:
++        if cpu == prev + 1:
++            prev = cpu
++            continue
++        ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
++        start = prev = cpu
++    ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
++    return ",".join(ranges)
++
++
++def _parse_cache_kib(raw: str) -> int:
++    text = raw.strip().upper()
++    if not text:
++        return 0
++    if text.endswith("K"):
++        return int(text[:-1])
++    if text.endswith("M"):
++        return int(text[:-1]) * 1024
++    if text.endswith("G"):
++        return int(text[:-1]) * 1024 * 1024
++    return max(1, int(text) // 1024)
++
++
++def _read_int(path: Path) -> int:
++    try:
++        return int(path.read_text(encoding="utf-8").strip())
++    except (OSError, ValueError):
++        return -1
++
++
++def _cpu_metric_map(root: Path) -> dict[int, int]:
++    """Return a host-wide performance metric per CPU from sysfs.
++
++    Prefers `cpufreq/cpuinfo_max_freq` (kHz), then `cpu_capacity`, then
++    `cache/index2/size` (KiB).
++    """
++    if not root.is_dir():
++        return {}
++    cpus: list[int] = []
++    for entry in root.iterdir():
++        name = entry.name
++        if name.startswith("cpu") and name[3:].isdigit():
++            cpus.append(int(name[3:]))
++    cpus.sort()
++    if not cpus:
++        return {}
++
++    freqs = {
++        cpu: _read_int(root / f"cpu{cpu}" / "cpufreq" / "cpuinfo_max_freq")
++        for cpu in cpus
++    }
++    if any(v > 0 for v in freqs.values()):
++        return {cpu: val for cpu, val in freqs.items() if val > 0}
++
++    caps = {
++        cpu: _read_int(root / f"cpu{cpu}" / "cpu_capacity")
++        for cpu in cpus
++    }
++    if any(v > 0 for v in caps.values()):
++        return {cpu: val for cpu, val in caps.items() if val > 0}
++
++    l2s: dict[int, int] = {}
++    for cpu in cpus:
++        size_path = root / f"cpu{cpu}" / "cache" / "index2" / "size"
++        try:
++            kib = _parse_cache_kib(size_path.read_text(encoding="utf-8"))
++        except OSError:
++            continue
++        if kib > 0:
++            l2s[cpu] = kib
++    return l2s
++
++
++def get_container_cpuset(*, record_env: bool = True) -> set[int]:
++    """Return the container/process initial allowed CPU set before role narrowing."""
++    env_spec = os.environ.get(ENV_CONTAINER_CPUSET, "").strip()
++    if env_spec:
++        with contextlib.suppress(ValueError):
++            parsed = parse_cpu_list(env_spec)
++            if parsed:
++                return set(parsed)
++    allowed: set[int] = set()
++    if hasattr(os, "sched_getaffinity"):
++        with contextlib.suppress(OSError):
++            allowed = set(os.sched_getaffinity(0))
++    if not allowed:
++        count = os.cpu_count() or 1
++        allowed = set(range(count))
++    if record_env and ENV_CONTAINER_CPUSET not in os.environ:
++        os.environ[ENV_CONTAINER_CPUSET] = format_cpu_list(allowed)
++    return allowed
++
++
++def _cpu_l3_topology(root: Path) -> tuple[dict[int, int], dict[int, frozenset[int]]]:
++    """Return `(l3_size_kib_by_cpu, l3_shared_siblings_by_cpu)` from sysfs `cache/index3`."""
++    if not root.is_dir():
++        return {}, {}
++    l3_kib: dict[int, int] = {}
++    l3_group: dict[int, frozenset[int]] = {}
++    for entry in root.iterdir():
++        name = entry.name
++        if not (name.startswith("cpu") and name[3:].isdigit()):
++            continue
++        cpu = int(name[3:])
++        idx3 = root / name / "cache" / "index3"
++        with contextlib.suppress(OSError, ValueError):
++            kib = _parse_cache_kib((idx3 / "size").read_text(encoding="utf-8"))
++            if kib > 0:
++                l3_kib[cpu] = kib
++        with contextlib.suppress(OSError, ValueError):
++            grp = frozenset(parse_cpu_list((idx3 / "shared_cpu_list").read_text(encoding="utf-8")))
++            if grp:
++                l3_group[cpu] = grp
++    return l3_kib, l3_group
++
++
++def discover_cpu_topology(
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    allowed: Set[int] | None = None,
++) -> tuple[tuple[int, ...], tuple[int, ...]]:
++    """Classify allowed CPUs into `(fast_cpus, efficiency_cpus)`.
++
++    The threshold is computed across all online CPUs in `sysfs_root` first so that
++    containers started with `--cpuset-cpus=5-9,15-19` on GB10 still recognize all
++    10 Cortex-X925 cores as fast performance cores.
++    """
++    root = Path(sysfs_root)
++    allowed_set = (
++        set(int(c) for c in allowed)
++        if allowed is not None
++        else get_container_cpuset()
++    )
++    metrics = _cpu_metric_map(root)
++    if not metrics:
++        ordered = tuple(sorted(allowed_set))
++        return ordered, ()
++
++    best = max(metrics.values())
++    worst = min(metrics.values())
++    threshold = (best + worst) // 2
++
++    candidates = sorted(allowed_set) if allowed_set else sorted(metrics)
++    fast: list[int] = []
++    efficiency: list[int] = []
++    for cpu in candidates:
++        score = metrics.get(cpu)
++        if score is None:
++            continue
++        if best == worst or score > threshold:
++            fast.append(cpu)
++        else:
++            efficiency.append(cpu)
++
++    if not fast and efficiency:
++        # Allowed cpuset contains only efficiency cores; treat them as the usable pool.
++        return tuple(efficiency), ()
++    if not fast and not efficiency:
++        ordered = tuple(sorted(allowed_set))
++        return ordered, ()
++    l3_kib, _ = _cpu_l3_topology(root)
++    if l3_kib:
++        # Order fast cores ascending by (L3 cache size, perf metric, CPU ID) so the
++        # highest-ranked cores (selected for proxy, worker_main, engine_core) always
++        # reside in the largest L3 cache cluster (16 MiB Cluster 1 on GB10).
++        fast.sort(key=lambda c: (l3_kib.get(c, 0), metrics.get(c, 0), c))
++    return tuple(fast), tuple(efficiency)
++
++
++def partition_cpu_affinity(
++    allowed: Set[int] | None = None,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    proxy_cpu_spec: str | None = None,
++) -> CpuAffinityPlan:
++    """Compute a deterministic, non-overlapping CPU core partition across roles."""
++    allowed_set = (
++        set(int(c) for c in allowed)
++        if allowed is not None
++        else get_container_cpuset()
++    )
++    fast_cpus, efficiency_cpus = discover_cpu_topology(
++        sysfs_root=sysfs_root, allowed=allowed_set
++    )
++    ordered_allowed = tuple(sorted(allowed_set)) if allowed_set else fast_cpus
++    if not fast_cpus:
++        fast_cpus = ordered_allowed
++
++    if proxy_cpu_spec is None:
++        proxy_cpu_spec = os.environ.get(ENV_SPARKNET_PROXY_CPU, "").strip()
++    else:
++        proxy_cpu_spec = proxy_cpu_spec.strip()
++
++    explicit_proxy: list[int] = []
++    if proxy_cpu_spec and proxy_cpu_spec not in _SYMBOLIC_PROXY_VALUES and proxy_cpu_spec != "none":
++        with contextlib.suppress(ValueError):
++            parsed = [c for c in parse_cpu_list(proxy_cpu_spec) if c in fast_cpus or c in ordered_allowed]
++            if parsed:
++                explicit_proxy = [parsed[-1]]
++
++    if explicit_proxy:
++        proxy_cpus = (explicit_proxy[0],)
++        remaining_fast = tuple(c for c in fast_cpus if c != proxy_cpus[0]) or fast_cpus
++    else:
++        proxy_cpus = (fast_cpus[-1],)
++        remaining_fast = fast_cpus[:-1] if len(fast_cpus) > 1 else fast_cpus
++
++    _, l3_groups = _cpu_l3_topology(Path(sysfs_root))
++    hot_l3_siblings: set[int] = set()
++    for c in (*proxy_cpus, *(remaining_fast[-2:] if len(remaining_fast) >= 2 else remaining_fast)):
++        hot_l3_siblings.update(l3_groups.get(c, ()))
++    isolated_eff = tuple(c for c in efficiency_cpus if c not in hot_l3_siblings)
++    bg_eff_cpus = isolated_eff if isolated_eff else efficiency_cpus
++
++    n_rem = len(remaining_fast)
++    if n_rem >= 5:
++        # GB10 (10 fast cores -> 9 remaining after proxy=19):
++        # worker_main = (18,) (same L3 cluster 15..19 as proxy=19)
++        # engine_core = (17,)
++        # api_server_fast = (15, 16) (when n_rem >= 6) or (16,)
++        # worker_aux = (5, 6, 7, 8, 9) (Cluster 0 fast cores)
++        worker_main_cpus = (remaining_fast[-1],)
++        engine_core_cpus = (remaining_fast[-2],)
++        api_fast_count = 2 if n_rem >= 6 else 1
++        api_fast = remaining_fast[-(2 + api_fast_count):-2]
++        worker_aux_cpus = remaining_fast[:-(2 + api_fast_count)]
++        api_server_cpus = tuple(sorted(set(bg_eff_cpus) | set(api_fast)))
++    elif n_rem == 4:
++        worker_main_cpus = (remaining_fast[-1],)
++        engine_core_cpus = (remaining_fast[-2],)
++        api_server_cpus = tuple(sorted(set(bg_eff_cpus) | {remaining_fast[-3]}))
++        worker_aux_cpus = (remaining_fast[0],)
++    elif n_rem == 3:
++        worker_main_cpus = (remaining_fast[-1],)
++        engine_core_cpus = (remaining_fast[-2],)
++        worker_aux_cpus = (remaining_fast[0],)
++        api_server_cpus = (
++            tuple(bg_eff_cpus)
++            if bg_eff_cpus
++            else (remaining_fast[-2],)
++        )
++    elif n_rem == 2:
++        worker_main_cpus = (remaining_fast[-1],)
++        worker_aux_cpus = (remaining_fast[0],)
++        engine_core_cpus = (
++            tuple(bg_eff_cpus) if bg_eff_cpus else (remaining_fast[0],)
++        )
++        api_server_cpus = (
++            tuple(bg_eff_cpus) if bg_eff_cpus else (remaining_fast[0],)
++        )
++    else:
++        worker_main_cpus = remaining_fast
++        worker_aux_cpus = remaining_fast
++        engine_core_cpus = tuple(bg_eff_cpus) if bg_eff_cpus else remaining_fast
++        api_server_cpus = tuple(bg_eff_cpus) if bg_eff_cpus else remaining_fast
++
++    return CpuAffinityPlan(
++        allowed_cpus=ordered_allowed,
++        fast_cpus=fast_cpus,
++        efficiency_cpus=efficiency_cpus,
++        proxy_cpus=proxy_cpus,
++        worker_main_cpus=worker_main_cpus,
++        worker_aux_cpus=worker_aux_cpus,
++        engine_core_cpus=engine_core_cpus,
++        api_server_cpus=api_server_cpus,
++    )
++
++
++def is_affinity_enabled() -> bool:
++    return os.environ.get(ENV_ROCE_CPU_AFFINITY, "1").strip() not in ("0", "false", "none")
++
++
++def configure_worker_cpu_affinity(
++    local_rank: int = 0,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++) -> CpuAffinityPlan | None:
++    """Prepare worker CPU environment variables and default thread affinity before
++    distributed/communicator initialization."""
++    del local_rank
++    if not is_affinity_enabled() or not hasattr(os, "sched_setaffinity"):
++        return None
++    plan = partition_cpu_affinity(sysfs_root=sysfs_root)
++    if not plan.fast_cpus:
++        return None
++
++    raw_proxy = os.environ.get(ENV_SPARKNET_PROXY_CPU, "").strip()
++    if raw_proxy in _SYMBOLIC_PROXY_VALUES and plan.proxy_cpus:
++        os.environ[ENV_SPARKNET_PROXY_CPU] = format_cpu_list(plan.proxy_cpus)
++
++    if ENV_ENGRAM_CPU_AFFINITY not in os.environ and plan.worker_aux_cpus:
++        os.environ[ENV_ENGRAM_CPU_AFFINITY] = format_cpu_list(plan.worker_aux_cpus)
++
++    # Set the worker process mask to worker_aux_cpus while distributed groups and
++    # helper threads (gloo_tcp_loop, pt_nccl_watchdg, pt_tcpstore_uv) spawn so
++    # they inherit worker_aux_cpus instead of the main worker core or proxy core.
++    if plan.worker_aux_cpus:
++        with contextlib.suppress(OSError):
++            os.sched_setaffinity(0, set(plan.worker_aux_cpus))
++    return plan
++
++
++def apply_worker_thread_affinity(
++    plan: CpuAffinityPlan | None = None,
++    *,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    task_root: str | os.PathLike[str] = "/proc/self/task",
++    main_tid: int | None = None,
++) -> dict[str, tuple[int, ...]]:
++    """Pin the worker main thread, sparknet-proxy, and auxiliary worker threads to
++    their disjoint core partitions."""
++    if not is_affinity_enabled() or not hasattr(os, "sched_setaffinity"):
++        return {}
++    if plan is None:
++        plan = partition_cpu_affinity(sysfs_root=sysfs_root)
++    if not plan.fast_cpus:
++        return {}
++
++    if main_tid is None:
++        main_tid = threading.main_thread().native_id or os.getpid()
++
++    applied: dict[str, tuple[int, ...]] = {}
++    task_dir = Path(task_root)
++    if task_dir.is_dir():
++        for entry in sorted(task_dir.iterdir(), key=lambda p: p.name):
++            if not entry.name.isdigit():
++                continue
++            tid = int(entry.name)
++            comm = ""
++            with contextlib.suppress(OSError):
++                comm = (entry / "comm").read_text(encoding="utf-8").strip()
++            if comm == "sparknet-proxy":
++                target = plan.proxy_cpus
++                key = f"sparknet-proxy:{tid}"
++            elif tid == main_tid:
++                target = plan.worker_main_cpus
++                key = f"worker-main:{tid}"
++            else:
++                target = plan.worker_aux_cpus
++                key = f"{comm or 'worker-aux'}:{tid}"
++            if target:
++                with contextlib.suppress(OSError):
++                    os.sched_setaffinity(tid, set(target))
++                    applied[key] = target
++    else:
++        with contextlib.suppress(OSError):
++            os.sched_setaffinity(0, set(plan.worker_main_cpus))
++            applied[f"worker-main:{main_tid}"] = plan.worker_main_cpus
++    return applied
++
++
++def apply_role_cpu_affinity(
++    role: str,
++    *,
++    sysfs_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
++    task_root: str | os.PathLike[str] = "/proc/self/task",
++) -> tuple[int, ...]:
++    """Pin an `engine_core` or `api_server` process (and its threads) to its
++    disjoint CPU core set."""
++    if not is_affinity_enabled() or not hasattr(os, "sched_setaffinity"):
++        return ()
++    plan = partition_cpu_affinity(sysfs_root=sysfs_root)
++    if role == "engine_core":
++        target = plan.engine_core_cpus
++    elif role == "api_server":
++        target = plan.api_server_cpus
++    else:
++        raise ValueError(f"unknown CPU affinity role: {role!r}")
++    if not target:
++        return ()
++
++    target_set = set(target)
++    task_dir = Path(task_root)
++    if task_dir.is_dir():
++        for entry in task_dir.iterdir():
++            if entry.name.isdigit():
++                with contextlib.suppress(OSError):
++                    os.sched_setaffinity(int(entry.name), target_set)
++    with contextlib.suppress(OSError):
++        os.sched_setaffinity(0, target_set)
++    logger.debug(
++        "Pinned %s (pid=%d) to CPUs %s (proxy=%s, worker_main=%s, worker_aux=%s)",
++        role,
++        os.getpid(),
++        format_cpu_list(target),
++        format_cpu_list(plan.proxy_cpus),
++        format_cpu_list(plan.worker_main_cpus),
++        format_cpu_list(plan.worker_aux_cpus),
++    )
++    return target
++
++
++__all__ = [
++    "CpuAffinityPlan",
++    "ENV_CONTAINER_CPUSET",
++    "ENV_ENGRAM_CPU_AFFINITY",
++    "ENV_ROCE_CPU_AFFINITY",
++    "ENV_SPARKNET_PROXY_CPU",
++    "apply_role_cpu_affinity",
++    "apply_worker_thread_affinity",
++    "configure_worker_cpu_affinity",
++    "discover_cpu_topology",
++    "format_cpu_list",
++    "get_container_cpuset",
++    "is_affinity_enabled",
++    "parse_cpu_list",
++    "partition_cpu_affinity",
++]
+diff --git a/vllm/utils/gc_utils.py b/vllm/utils/gc_utils.py
+index 32bdfb764861ad3d3ab36f34368147cfaa803994..71c3adfa8df82f12a5f25c9cdde63a048f1d2235 100644
+--- a/vllm/utils/gc_utils.py
++++ b/vllm/utils/gc_utils.py
+@@ -9,6 +9,7 @@ from typing import Any
+ 
+ import vllm.envs as envs
+ from vllm.logger import init_logger
++from vllm.utils.mem_utils import trim_host_heap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -103,6 +104,7 @@ def freeze_gc_for_cudagraph_capture():
+     """
+     gc_was_enabled = gc.isenabled()
+     gc.collect()
++    trim_host_heap()
+     should_freeze = not envs.VLLM_ENABLE_CUDAGRAPH_GC
+     if should_freeze:
+         gc.freeze()
+@@ -114,6 +116,7 @@ def freeze_gc_for_cudagraph_capture():
+             try:
+                 gc.unfreeze()
+                 gc.collect()
++                trim_host_heap()
+             finally:
+                 if gc_was_enabled:
+                     gc.enable()
+@@ -132,6 +135,7 @@ def freeze_gc_heap() -> None:
+     gc.collect(0)
+     gc.collect(1)
+     gc.collect(2)
++    trim_host_heap()
+     # Freeze all GC tracked objects
+     gc.freeze()
+ 
+diff --git a/vllm/utils/jit_monitor.py b/vllm/utils/jit_monitor.py
+index bb0bb8df9a1e10a6f8f953f9d360a8a7a1088d4c..95e286ea5a7cb189b81ef619f56ec8793c0da37e 100644
+--- a/vllm/utils/jit_monitor.py
++++ b/vllm/utils/jit_monitor.py
+@@ -34,7 +34,7 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils.importing import HAS_TRITON
+ 
+ logger = init_logger(__name__)
+-JitMonitorMode = Literal["warn", "error"]
++JitMonitorMode = Literal["off", "warn", "error"]
+ 
+ _active: bool = False
+ _mode: JitMonitorMode = "warn"
+@@ -42,6 +42,7 @@ _verbose: bool = False
+ _cutedsl_hook_installed: bool = False
+ _tilelang_hook_installed: bool = False
+ _tilelang_jitimpl_compile_depth: int = 0
++_dynamo_hook_installed: bool = False
+ 
+ 
+ def is_active() -> bool:
+@@ -57,14 +58,15 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
+     compilation or autotuning benchmark that happens during inference will be
+     logged as a warning or raised as an error, depending on ``mode``.
+ 
+-    Safe to call multiple times; subsequent calls are no-ops.
++    Safe to call multiple times; subsequent calls are no-ops. ``off`` installs
++    nothing.
+ 
+     If the user has explicitly set ``TRITON_PRINT_AUTOTUNING=0`` in
+     their environment, autotuning printing is left disabled; the JIT
+     compilation hook is still registered regardless.
+     """
+     global _active, _mode, _verbose
+-    if _active:
++    if _active or mode == "off":
+         return
+     if mode not in ("warn", "error"):
+         raise ValueError(f"Unsupported JIT monitor mode: {mode!r}")
+@@ -75,6 +77,7 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
+     _setup_triton_autotuning_print()
+     _setup_triton_jit_hook()
+     _setup_cutedsl_jit_hook()
++    _setup_dynamo_compile_hook()
+ 
+     # Refer to #51159. tilelang ships broken symbols
+     # on rocm.
+@@ -111,6 +114,46 @@ def _setup_triton_autotuning_print() -> None:
+     knobs.autotuning.print = True
+ 
+ 
++# ------------------------------------------------------------------
++# torch.compile (Dynamo) compilation hook
++# ------------------------------------------------------------------
++
++
++def _setup_dynamo_compile_hook() -> None:
++    """Report torch.compile compilations during inference.
++
++    A function compiled during serving also loads its kernels there, from the
++    compile cache too, where no Triton compilation is seen. Inductor's launcher
++    loads a module (cuModuleLoad) holding the GIL while it waits for the device:
++    a latency spike, and a deadlock if the device is waiting for a host thread
++    that needs the GIL. ``torch._dynamo.reset()`` drops the callback; vLLM does
++    not reset Dynamo after activation.
++    """
++    global _dynamo_hook_installed
++    if _dynamo_hook_installed:
++        return
++    try:
++        from torch._dynamo.callback import on_compile_start
++    except Exception:
++        logger.debug(
++            "torch._dynamo callbacks are unavailable; skipping the Dynamo monitor."
++        )
++        return
++
++    def _on_compile_start(*args, **kwargs) -> None:
++        if _active:
++            detail = _safe_repr(args[0]) if args else None
++            _handle_jit_event(
++                backend="torch.compile",
++                event="compilation",
++                fn_name="Dynamo frame",
++                detail=detail,
++            )
++
++    on_compile_start(_on_compile_start)
++    _dynamo_hook_installed = True
++
++
+ # ------------------------------------------------------------------
+ # Triton JIT compilation hook
+ # ------------------------------------------------------------------
+diff --git a/vllm/utils/mem_utils.py b/vllm/utils/mem_utils.py
+index c092dff41045c642a126d1f349cf5e6c05ecc494..025153b03a0cd929fb14c3648d503bd047191503 100644
+--- a/vllm/utils/mem_utils.py
++++ b/vllm/utils/mem_utils.py
+@@ -1,11 +1,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import contextlib
++import ctypes
+ import gc
++import struct
++import sys
+ import time
+-from collections.abc import Generator
++from collections.abc import Callable, Generator
+ from dataclasses import dataclass, field
+ from functools import cache
++from pathlib import Path
+ 
+ import psutil
+ import torch
+@@ -47,6 +51,142 @@ _UMA_PRESSURE_THRESHOLD = 0.8
+ _UMA_MIN_RELEASE_BYTES = 512 * MiB_bytes
+ 
+ 
++@cache
++def _get_malloc_trim() -> Callable[[int], int] | None:
++    if sys.platform != "linux":
++        return None
++    with contextlib.suppress(Exception):
++        libc = ctypes.CDLL("libc.so.6")
++        malloc_trim = libc.malloc_trim
++        malloc_trim.argtypes = [ctypes.c_size_t]
++        malloc_trim.restype = ctypes.c_int
++        return malloc_trim
++    return None
++
++
++@cache
++def _get_c10_mi_collect() -> Callable[[bool], None] | None:
++    """Resolve mimalloc's ``mi_collect(bool force)`` inside ``libc10.so`` when
++    PyTorch's CPU tensor allocator (``c10::alloc_cpu`` / ``c10::free_cpu``) is
++    built with statically linked mimalloc.
++    """
++    if sys.platform != "linux":
++        return None
++    with contextlib.suppress(Exception):
++        libc10_path = Path(torch.__file__).resolve().parent / "lib" / "libc10.so"
++        if not libc10_path.is_file():
++            return None
++        lib = ctypes.CDLL(str(libc10_path))
++        mi_collect = getattr(lib, "mi_collect", None)
++        if mi_collect is not None:
++            mi_collect.argtypes = [ctypes.c_bool]
++            mi_collect.restype = None
++            return mi_collect
++
++        free_cpu_ptr = ctypes.cast(lib._ZN3c108free_cpuEPv, ctypes.c_void_p).value
++        if not free_cpu_ptr:
++            return None
++
++        with libc10_path.open("rb") as f:
++            ident = f.read(64)
++            if (
++                len(ident) < 64
++                or ident[:4] != b"\x7fELF"
++                or ident[4] != 2
++                or ident[5] != 1
++            ):
++                return None
++            e_shoff = struct.unpack_from("<Q", ident, 40)[0]
++            e_shentsize, e_shnum = struct.unpack_from("<HH", ident, 58)
++            if e_shoff == 0 or e_shnum == 0 or e_shentsize < 64:
++                return None
++            f.seek(e_shoff)
++            shdrs = f.read(e_shentsize * e_shnum)
++            symtab_hdr = None
++            for idx in range(e_shnum):
++                sh = struct.unpack_from("<IIQQQQIIQQ", shdrs, idx * e_shentsize)
++                if sh[1] == 2:  # SHT_SYMTAB
++                    symtab_hdr = sh
++                    break
++            if symtab_hdr is None:
++                return None
++            _, _, _, _, sh_offset, sh_size, sh_link, _, _, sh_entsize = symtab_hdr
++            if sh_entsize != 24 or sh_link >= e_shnum:
++                return None
++            strtab_sh = struct.unpack_from(
++                "<IIQQQQIIQQ", shdrs, sh_link * e_shentsize
++            )
++            str_offset, str_size = strtab_sh[4], strtab_sh[5]
++            f.seek(str_offset)
++            strtab = f.read(str_size)
++            f.seek(sh_offset)
++            symtab = f.read(sh_size)
++
++        target_free = b"_ZN3c108free_cpuEPv\x00"
++        target_mi = b"mi_collect\x00"
++        free_val = 0
++        mi_val = 0
++        for offset in range(0, len(symtab) - 23, 24):
++            st_name, st_info, _, _, st_value, _ = struct.unpack_from(
++                "<IBBHQQ", symtab, offset
++            )
++            if st_value == 0 or (st_info & 0xF) != 2:  # STT_FUNC
++                continue
++            if strtab[st_name : st_name + 20] == target_free:
++                free_val = st_value
++            elif strtab[st_name : st_name + 11] == target_mi:
++                mi_val = st_value
++            if free_val and mi_val:
++                break
++
++        if free_val and mi_val:
++            fn_type = ctypes.CFUNCTYPE(None, ctypes.c_bool)
++            return fn_type(free_cpu_ptr - free_val + mi_val)
++    return None
++
++
++def trim_host_heap() -> bool:
++    """Return unused host heap pages from PyTorch's CPU tensor allocator and
++    glibc's malloc arenas back to the OS.
++
++    On Unified Memory Architecture (UMA) platforms such as GB10, freed CPU
++    tensor segments in ``libc10`` (mimalloc) and freed heap chunks in ``glibc``
++    (ptmalloc) remain committed against the shared physical memory pool until
++    explicitly purged.
++    """
++    trimmed = False
++    mi_collect = _get_c10_mi_collect()
++    if mi_collect is not None:
++        with contextlib.suppress(Exception):
++            mi_collect(True)
++            trimmed = True
++    malloc_trim = _get_malloc_trim()
++    if malloc_trim is not None:
++        with contextlib.suppress(Exception):
++            malloc_trim(0)
++            trimmed = True
++    return trimmed
++
++
++def reclaim_uma_memory(
++    device: torch.types.Device | None = None,
++    *,
++    synchronize: bool = False,
++) -> None:
++    """Collect unreachable Python objects, release cached device allocator
++    blocks, and return unused host heap pages to the OS.
++    """
++    gc.collect()
++    if torch.cuda.is_available():
++        if synchronize:
++            if device is None:
++                torch.accelerator.synchronize()
++            else:
++                torch.accelerator.synchronize(device)
++        torch.accelerator.empty_cache()
++    trim_host_heap()
++
++
+ def release_device_memory_under_pressure(device: torch.device) -> bool:
+     """On integrated (UMA) GPUs, release caching-allocator memory back to the
+     OS when system memory pressure is high. The OS may start thrashing before
+@@ -69,8 +209,10 @@ def release_device_memory_under_pressure(device: torch.device) -> bool:
+     if mem.available > (1 - _UMA_PRESSURE_THRESHOLD) * mem.total:
+         return False
+ 
++    gc.collect()
+     torch.accelerator.synchronize(device)
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+     logger.debug(
+         "Released %sGiB of cached device memory under memory pressure",
+         format_gib(releasable),
+@@ -85,6 +227,7 @@ class DeviceMemoryProfiler:
+     def current_memory_usage(self) -> float:
+         # Return the memory usage in bytes.
+         gc.collect()
++        trim_host_heap()
+         return current_platform.get_current_memory_usage(self.device)
+ 
+     def __enter__(self):
+@@ -96,8 +239,9 @@ class DeviceMemoryProfiler:
+         self.final_memory = self.current_memory_usage()
+         self.consumed_memory = self.final_memory - self.initial_memory
+ 
+-        # Force garbage collection
++        # Force garbage collection and return host arena slack to the OS.
+         gc.collect()
++        trim_host_heap()
+ 
+ 
+ @dataclass
+@@ -283,6 +427,7 @@ def memory_profiling(
+     """
+     gc.collect()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+     torch.accelerator.reset_peak_memory_stats(baseline_snapshot.device_)
+ 
+     result = MemoryProfilingResult(
+@@ -297,6 +442,7 @@ def memory_profiling(
+ 
+     gc.collect()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+ 
+     result.after_profile.measure()
+ 
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index 0b330edf00387e9e0981e6d41af2ac364a955707..42f96859c01239ae5a43b975a19779e6193ede43 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -866,7 +866,11 @@ def aux_stream() -> torch.cuda.Stream | None:
+     from vllm.platforms import current_platform
+ 
+     if _aux_stream is None and current_platform.is_cuda_alike():
+-        _aux_stream = torch.cuda.Stream()
++        try:
++            _, high_priority = torch.cuda.Stream.priority_range()
++            _aux_stream = torch.cuda.Stream(priority=high_priority)
++        except Exception:
++            _aux_stream = torch.cuda.Stream()
+ 
+     return _aux_stream
+ 
+@@ -892,14 +896,17 @@ def weak_ref_tensors(
+ ) -> torch.Tensor | list[Any] | tuple[Any] | Any:
+     """
+     Convenience function to create weak references to tensors,
+-    for single tensor, list of tensors or tuple of tensors.
++    for single tensor, possibly nested list/tuple of tensors, or
++    IntermediateTensors. Ints and LayerNames are returned as is.
+     """
+     if isinstance(tensors, torch.Tensor):
+         return weak_ref_tensor(tensors)
+     if isinstance(tensors, list):
+-        return [weak_ref_tensor(t) for t in tensors]
++        return [weak_ref_tensors(t) for t in tensors]
+     if isinstance(tensors, tuple):
+-        return tuple(weak_ref_tensor(t) for t in tensors)
++        return tuple(weak_ref_tensors(t) for t in tensors)
++    if isinstance(tensors, (int, LayerName)):
++        return tensors
+ 
+     # For IntermediateTensors used in pipeline parallelism
+     from vllm.sequence import IntermediateTensors
+@@ -909,7 +916,7 @@ def weak_ref_tensors(
+             {key: weak_ref_tensor(val) for key, val in tensors.tensors.items()}
+         )
+         return ret
+-    raise ValueError("Invalid type for tensors")
++    raise ValueError(f"Invalid type for tensors: {type(tensors)}")
+ 
+ 
+ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tensor:

@@ -1,0 +1,3747 @@
+From a51a3db09d1ad6cb82dae24e97839a6b2e1a15ac Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:48:00 +0000
+Subject: [PATCH] layers: quantization, attention backend registration,
+ sampling ops, and sink calibration
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Add MXFP4/NVFP4 quantization hooks, TileLang attention backend registration, custom sampling ops, and sink handling.
+Quality impact: none (tree-identical squash of qualified candidate-77 vLLM tree 58f9b11080cf8ebeccd80c0ce1d9bb7a6ff4ae58).
+Tests: candidate-77 release-tests (12,082 passed, 0 failed) and 2-boot tp3-triangle screen.
+Upstream status: local squashed subsystem patch (tree-identical to candidate-77 0001..0871).
+---
+ .../model_executor/kernels/linear/__init__.py |   3 +
+ .../layers/fused_moe/fused_moe_method_base.py |  30 +-
+ vllm/model_executor/layers/fused_moe/layer.py |   7 +
+ .../layers/fused_moe/modular_kernel.py        | 136 +++--
+ .../layers/fused_moe/oracle/mxfp4.py          |  26 +-
+ .../layers/fused_moe/routed_experts.py        |   2 +-
+ .../layers/fused_moe/runner/moe_runner.py     | 332 +++++++++++-
+ .../layers/fused_moe/runner/shared_experts.py |  20 +-
+ .../layers/fused_moe/tilelang.py              | 471 ++++++++++++++++++
+ .../model_executor/layers/logits_processor.py | 188 ++++++-
+ .../layers/quantization/__init__.py           | 189 +++----
+ .../layers/quantization/kimi_mxfp4_csf.py     |   2 +-
+ .../layers/quantization/mxfp4.py              | 143 ++++--
+ .../layers/quantization/mxfp4_csf.py          |  11 +-
+ .../layers/quantization/mxfp4_csf_moe.py      | 191 +++++++
+ .../layers/quantization/online/nvfp4.py       |  87 +++-
+ .../layers/quantization/online/packed_bf16.py | 207 ++++++++
+ .../quantization/utils/humming_utils.py       |  63 ++-
+ .../layers/vocab_parallel_embedding.py        | 159 +++++-
+ vllm/model_executor/models/config.py          | 118 ++++-
+ vllm/model_executor/models/qwen3_dspark.py    |  77 ++-
+ vllm/v1/attention/backend.py                  |   7 +-
+ vllm/v1/attention/backends/flash_attn.py      |   2 +
+ vllm/v1/attention/backends/registry.py        |   3 +
+ vllm/v1/sample/ops/topk_topp_triton.py        |  16 +
+ vllm/v1/sample/sink.py                        | 227 +++++++++
+ 26 files changed, 2408 insertions(+), 309 deletions(-)
+ create mode 100644 vllm/model_executor/layers/fused_moe/tilelang.py
+ create mode 100644 vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+ create mode 100644 vllm/model_executor/layers/quantization/online/packed_bf16.py
+ create mode 100644 vllm/v1/sample/sink.py
+
+diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
+index 39d48e0cab05a293a82745a4136fba258abacf4f..b6a645dd524dde734808f623b3f4b22bab84e1e9 100644
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -252,6 +252,9 @@ def _get_linear_backend(*, quantization: str) -> str:
+ 
+ # Kernel classes covered by each --linear-backend value.
+ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
++    # DS4.1's TileLang family runs its projections as DS4.1 linear methods;
++    # the online-quantized vocabulary heads keep B12X's shared kernels.
++    "tilelang": {B12xMxfp8LinearKernel, B12xNvFp4LinearKernel},
+     "b12x": {
+         B12xFp8BlockScaledMMKernel,
+         B12xMxFp4LinearKernel,
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+index d380bc73a0789401d40df20d58f80fccc97578ec..81c2882df53ac8c61b64b40af8c17918efb504aa 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+@@ -35,7 +35,7 @@ class _WorkspaceMoEApply(Protocol):
+         shared_experts: "SharedExperts | None",
+         shared_experts_input: torch.Tensor | None,
+         *,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+     ) -> torch.Tensor: ...
+ 
+ 
+@@ -60,9 +60,27 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+             self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
+         )
+ 
++    @property
++    def modular_experts(self) -> "mk.FusedMoEExperts | None":
++        """A modular kernel's experts, else None."""
++        impl = getattr(self.moe_kernel, "impl", None)
++        if isinstance(impl, mk.FusedMoEKernelModularImpl):
++            return impl.fused_experts
++        return None
++
++    def declare_layer_kernels(self, layer: "RoutedExperts") -> None:
++        """Let a modular kernel's experts declare their JIT kernels, after loading
++        (DeepSeek V4.1's kernel preparation calls this on every layer's method)."""
++        declare = getattr(self.modular_experts, "declare_kernels", None)
++        if declare is not None:
++            declare()
++
+     @property
+     def output_dtype(self) -> torch.dtype:
+-        """Dtype produced by the routed experts."""
++        """Dtype produced by the routed experts: a modular kernel's experts say."""
++        impl = getattr(self.moe_kernel, "impl", None)
++        if isinstance(impl, mk.FusedMoEKernelModularImpl):
++            return impl.fused_experts.output_dtype
+         return self.moe.in_dtype
+ 
+     @abstractmethod
+@@ -163,12 +181,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+ 
+     def prepare_workspace(
+         self, hidden_states: torch.Tensor, shared_workspace_size: int
+-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
++    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor]:
+         """Reserve disjoint routed/shared scratch before either branch runs.
+ 
+         Any modular kernel leases both from the workspace manager in one call,
+         so the shared experts never draw a view that overlaps the routed
+         experts' buffers while the two branches run on different streams.
++        The layer's output is a tensor of its own, shaped as ``hidden_states``,
++        so when the experts write it in place the lease holds no output buffer
++        (the third view is None).
+         """
+         kernel = self.moe_kernel
+         impl = getattr(kernel, "impl", None)
+@@ -198,6 +219,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+             None,
+             self.moe.activation,
+             shared_workspace_size,
++            output_shape=tuple(hidden_states.shape),
+         )
+         assert shared_workspace is not None
+         return workspace, shared_workspace
+@@ -210,7 +232,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+         topk_ids: torch.Tensor,
+         shared_experts: "SharedExperts | None",
+         shared_experts_input: torch.Tensor | None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+     ) -> torch.Tensor:
+         apply = cast(_WorkspaceMoEApply, self.apply)
+         return apply(
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 02149fe7f34611da51621d3f646dea2001dd55be..f1a0b628bf835addd6319f028768ece7f7f6ff72 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -407,6 +407,13 @@ def FusedMoEFactory(
+     if runner_cls is None:
+         runner_cls = MoERunner
+ 
++    # Propagate non-module routing metadata to routed_experts without adding a
++    # submodule (which would alter state_dict keys) so backends like TileLang
++    # declare dispatch kernels only for the router's actual index dtype.
++    routed_experts._router_indices_dtype = getattr(router, "indices_dtype", None)
++    if (router_max_rows := getattr(router, "max_rows", None)) is not None:
++        routed_experts._router_max_rows = router_max_rows
++
+     runner = runner_cls(
+         layer_name=layer_name,
+         moe_config=moe_config,
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 00fe916b46bc6a74f0fa3836bcd2c42dbe991d9d..ad3f573796fa37723e5437993ee972e7a4b9a946 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -10,6 +10,7 @@ from typing import final
+ import torch
+ 
+ import vllm.envs as envs
++from vllm.forward_context import is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.activation import (
+     ApplyMoEActivationConfig,
+@@ -41,7 +42,10 @@ from vllm.v1.worker.ubatching import (
+     dbo_register_recv_hook,
+     dbo_yield,
+ )
+-from vllm.v1.worker.workspace import current_workspace_manager
++from vllm.v1.worker.workspace import (
++    current_workspace_manager,
++    is_workspace_manager_initialized,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -1134,13 +1138,20 @@ class FusedMoEKernelModularImpl:
+         expert_tokens_meta: ExpertTokensMetadata | None,
+         activation: MoEActivation,
+         shared_workspace_size: int = 0,
+-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None]:
++        output_shape: tuple[int, ...] | None = None,
++    ) -> tuple[
++        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor | None
++    ]:
+         """
+         Allocate temporary and output buffers for the fused experts op.
+         Inputs:
+         - in_dtype: input type used for workspace tensors.
+         - out_dtype: output type of the fused experts tensor.
+         - device: the device of the workspace and output tensors.
++        - output_shape: the shape of the output the caller will pass as
++          ``output_alias`` (an ``out_dtype`` tensor of its own), if any. When the
++          experts will write it directly, no output buffer is leased and the
++          third routed view is None.
+         See `workspace_shapes` for a description of the remainder of arguments.
+         Returns routed views and an optional disjoint shared-expert scratch view.
+         """
+@@ -1172,10 +1183,19 @@ class FusedMoEKernelModularImpl:
+             activation,
+         )
+ 
++        # The caller's own output, written in place, makes the arena's output
++        # buffer dead weight: it would hold M_full x K for nothing.
++        lease_output = not (
++            output_shape is not None
++            and tuple(output_shape) == tuple(fused_out_shape)
++            and self._experts_write_output_alias()
++        )
+         shared_output_storage = out_dtype is in_dtype or out_dtype is workspace_dtype
+         specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]
+         if shared_output_storage:
+-            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
++            max_shape_size = max(
++                prod(workspace13_shape), prod(fused_out_shape) if lease_output else 0
++            )
+             specs = (
+                 ((max_shape_size,), workspace_dtype),
+                 (workspace2_shape, workspace_dtype),
+@@ -1184,7 +1204,7 @@ class FusedMoEKernelModularImpl:
+             specs = (
+                 (workspace13_shape, workspace_dtype),
+                 (workspace2_shape, workspace_dtype),
+-                (fused_out_shape, out_dtype),
++                *(((fused_out_shape, out_dtype),) if lease_output else ()),
+             )
+         if shared_workspace_size:
+             specs = (*specs, ((shared_workspace_size,), torch.uint8))
+@@ -1199,15 +1219,29 @@ class FusedMoEKernelModularImpl:
+             )
+         else:
+             buffers = current_workspace_manager().get_simultaneous(*specs)
++        fused_out: torch.Tensor | None = None
+         if shared_output_storage:
+             workspace13 = _resize_cache(buffers[0], workspace13_shape)
+             workspace2 = buffers[1]
+-            fused_out = _resize_cache(buffers[0], fused_out_shape)
++            if lease_output:
++                fused_out = _resize_cache(buffers[0], fused_out_shape)
+         else:
+-            workspace13, workspace2, fused_out = buffers[:3]
++            workspace13, workspace2 = buffers[:2]
++            if lease_output:
++                fused_out = buffers[2]
+         shared_workspace = buffers[-1] if shared_workspace_size else None
+         return (workspace13, workspace2, fused_out), shared_workspace
+ 
++    @staticmethod
++    def _experts_write_output_alias() -> bool:
++        """Whether the experts write a matching ``output_alias`` directly rather
++        than an output buffer of their own (which the finalize then copies)."""
++        if current_platform.is_rocm():
++            from vllm._aiter_ops import rocm_aiter_ops
++
++            return rocm_aiter_ops.is_fused_moe_enabled()
++        return True
++
+     def _maybe_apply_shared_experts(
+         self,
+         shared_experts: SharedExperts | None,
+@@ -1326,7 +1360,7 @@ class FusedMoEKernelModularImpl:
+         apply_router_weight_on_input: bool,
+         expert_tokens_meta: ExpertTokensMetadata | None,
+         output_alias: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
+             a1q, w1, w2, topk_ids
+@@ -1342,6 +1376,16 @@ class FusedMoEKernelModularImpl:
+         if M_full == 0:
+             return torch.empty_like(a1q, dtype=output_dtype)
+ 
++        # The caller's output, if the experts could write it in place: a lease
++        # sized for it holds no output buffer (_allocate_buffers).
++        alias_shape = (
++            tuple(output_alias.shape)
++            if output_alias is not None
++            and output_alias.dtype == output_dtype
++            and output_alias.device == a1q.device
++            and output_alias.is_contiguous()
++            else None
++        )
+         if workspace is None:
+             workspace, _ = self._allocate_buffers(
+                 in_dtype,
+@@ -1356,28 +1400,42 @@ class FusedMoEKernelModularImpl:
+                 local_num_experts,
+                 expert_tokens_meta,
+                 activation,
++                output_shape=alias_shape,
+             )
+         workspace13, workspace2, fused_out = workspace
+ 
+-        use_output_alias = (
+-            output_alias is not None
+-            and output_alias.shape == fused_out.shape
+-            and output_alias.dtype == fused_out.dtype
+-            and output_alias.device == fused_out.device
+-            and output_alias.is_contiguous()
+-        )
+-
+-        # If caller's output buffer already matches fused_out shape/dtype, alias
+-        # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
+-        # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
+-        # double-copy MoE write-back path).
+-        if current_platform.is_rocm():
+-            from vllm._aiter_ops import rocm_aiter_ops
+-
+-            if use_output_alias and rocm_aiter_ops.is_fused_moe_enabled():
+-                fused_out = output_alias
+-        elif use_output_alias:
++        if fused_out is None:
++            _, _, fused_out_shape = self.fused_experts.workspace_shapes(
++                M_full,
++                N,
++                K,
++                top_k,
++                global_num_experts,
++                local_num_experts,
++                expert_tokens_meta,
++                activation,
++            )
++            if alias_shape != tuple(fused_out_shape):
++                raise ValueError(
++                    "The MoE workspace holds no output buffer, but the caller's "
++                    f"output ({alias_shape}) is not the experts' "
++                    f"{tuple(fused_out_shape)} {output_dtype} output"
++                )
+             fused_out = output_alias
++        else:
++            use_output_alias = (
++                output_alias is not None
++                and output_alias.shape == fused_out.shape
++                and output_alias.dtype == fused_out.dtype
++                and output_alias.device == fused_out.device
++                and output_alias.is_contiguous()
++            )
++            # If caller's output buffer already matches fused_out shape/dtype,
++            # alias to skip the redundant copy in TopKWeightAndReduceNoOP.apply
++            # downstream. This eliminates ~94% of __amd_rocclr_copyBuffer events
++            # (Copy 2 of the double-copy MoE write-back path).
++            if use_output_alias and self._experts_write_output_alias():
++                fused_out = output_alias
+ 
+         self.fused_experts.apply(
+             output=fused_out,
+@@ -1480,7 +1538,7 @@ class FusedMoEKernelModularImpl:
+         apply_router_weight_on_input: bool = False,
+         shared_experts: SharedExperts | None = None,
+         shared_experts_input: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         """
+         This function computes a Mixture of Experts (MoE) layer using two sets
+@@ -1510,11 +1568,25 @@ class FusedMoEKernelModularImpl:
+         Returns:
+         - torch.Tensor: The output tensor after applying the MoE layer.
+         """
+-        output = (
+-            workspace[2]
+-            if workspace is not None
+-            else torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
+-        )
++        # The layer's output outlives this call, so it never lives in the workspace
++        # arena: the arena's views are valid only until its next lease, and the next
++        # consumer leases scratch from the same bytes (at TP1, where no all-reduce
++        # copies the output, the next decoder layer's mHC entry overwrote it as it
++        # read it). In a model forward pass, lease a dedicated MoE output buffer
++        # separate from ``get_simultaneous`` so sequential MoE layers reuse one
++        # buffer without ping-ponging two allocations.
++        if (
++            not current_platform.is_cpu()
++            and is_workspace_manager_initialized()
++            and is_forward_context_available()
++        ):
++            output = current_workspace_manager().get_moe_output_buffer(
++                tuple(hidden_states.shape), self.fused_experts.output_dtype
++            )
++        else:
++            output = torch.empty_like(
++                hidden_states, dtype=self.fused_experts.output_dtype
++            )
+ 
+         local_num_experts = w1.shape[0]
+         if global_num_experts == -1:
+@@ -1766,7 +1838,7 @@ class FusedMoEKernel:
+         apply_router_weight_on_input: bool,
+         shared_experts: SharedExperts | None = None,
+         shared_experts_input: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         assert isinstance(self.impl, FusedMoEKernelModularImpl)
+         return self.impl.apply(
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+index 1c38e4378b26e4651cd80af22d2c78fe730c679d..4315c4c1685f75214002d00e908adc51586e80a1 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -104,6 +104,8 @@ class Mxfp4MoeBackend(Enum):
+     # b12x backends
+     B12X_MXFP4_MXFP8 = "B12X_MXFP4_MXFP8"
+     B12X_MXFP4_BF16 = "B12X_MXFP4_BF16"
++    # TileLang backend (SM12x, DeepSeek V4.1)
++    TILELANG_MXFP4_MXFP8 = "TILELANG_MXFP4_MXFP8"
+     # DeepGEMM FP8xFP4 backend (SM100+)
+     DEEPGEMM_MXFP4 = "DEEPGEMM_MXFP4"
+     # FlashInfer TRTLLM backends
+@@ -164,6 +166,11 @@ def backend_to_kernel_cls(
+ 
+         return [B12xExperts]
+ 
++    elif backend == Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8:
++        from vllm.model_executor.layers.fused_moe.tilelang import TileLangExperts
++
++        return [TileLangExperts]
++
+     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+         from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+             DeepGemmFP4Experts,
+@@ -293,6 +300,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
+     """
+     mapping: dict[str, list[Mxfp4MoeBackend]] = {
+         "b12x": list(B12X_BACKENDS),
++        "tilelang": [Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8],
+         "deep_gemm": [Mxfp4MoeBackend.DEEPGEMM_MXFP4],
+         "flashinfer_trtllm": [
+             Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+@@ -385,7 +393,10 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
+     """Map backend to its activation key (FP8, MXFP8, or None for BF16)."""
+     if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+         return kFp8Dynamic128Sym
+-    if backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
++    if backend in (
++        Mxfp4MoeBackend.B12X_MXFP4_MXFP8,
++        Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8,
++    ):
+         return kMxfp8Dynamic
+     if backend in (
+         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+@@ -727,9 +738,9 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
+     activation: MoEActivation | None = None,
+ ) -> tuple[int, int]:
+     """Round up hidden_size and intermediate_size based on backend requirements."""
+-    if backend in B12X_BACKENDS:
+-        # b12x plans for the exact model dimensions. B12xExperts validates the
+-        # required MXFP4 block alignment before selecting the backend.
++    if backend in (*B12X_BACKENDS, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
++        # b12x and TileLang plan for the exact model dimensions; their experts
++        # validate the required block alignment before the backend is selected.
+         return hidden_size, intermediate_size
+     if backend == Mxfp4MoeBackend.EMULATION:
+         # Emulation has no kernel tile; it only needs OCP MX block alignment so the
+@@ -1383,7 +1394,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
+ 
+         is_gfx1250 = on_gfx1250()
+ 
+-    if mxfp4_backend in B12X_BACKENDS:
++    if mxfp4_backend in (*B12X_BACKENDS, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
+         return (
+             w13_weight.data,
+             w2_weight.data,
+@@ -1853,7 +1864,10 @@ def make_mxfp4_moe_quant_config(
+     layer: "RoutedExperts | None" = None,
+ ) -> FusedMoEQuantConfig | None:
+     """Create a FusedMoEQuantConfig for the given MXFP4 backend."""
+-    if mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
++    if mxfp4_backend in (
++        Mxfp4MoeBackend.B12X_MXFP4_MXFP8,
++        Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8,
++    ):
+         return mxfp4_mxfp8_moe_quant_config(
+             w1_bias=w1_bias,
+             w2_bias=w2_bias,
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index 64769e8f543d08542f130ecbdb43b041109f4e2d..0d4865766aaea924209b42ebad142634d6181247 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -1221,7 +1221,7 @@ class RoutedExperts(PluggableLayer):
+         topk_ids: torch.Tensor,
+         shared_experts: "SharedExperts | None" = None,
+         shared_experts_input: torch.Tensor | None = None,
+-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
+     ) -> torch.Tensor:
+         """
+         Execute routed experts using the quantization method's apply function.
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 8cbc31204f763aa6bdbd6730433b6790577033f5..0e7bac23114258a0ce07720b23aa25c83af8884e 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -13,6 +13,7 @@ from vllm.distributed import (
+     get_ep_group,
+     get_pcp_group,
+     tensor_model_parallel_all_reduce,
++    tensor_model_parallel_reduce_scatter,
+ )
+ from vllm.distributed.communication_op import tensor_model_parallel_all_reduce_in_place
+ from vllm.distributed.eplb.eplb_state import EplbLayerState
+@@ -93,6 +94,8 @@ def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
+ if TYPE_CHECKING:
+     from typing import TypeAlias
+ 
++    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++
+     _layer_name_type: TypeAlias = str | LayerName
+ else:
+     _layer_name_type = LayerName if _USE_LAYERNAME else str
+@@ -425,6 +428,38 @@ class MoERunner(MoERunnerInterface):
+                 shared_output *= 1.0 / self.routed_scaling_factor
+         return shared_output, fused_output
+ 
++    def _shared_output_fold(
++        self, shared_experts_input: torch.Tensor | None
++    ) -> "mk.FusedMoEExperts | None":
++        """The routed experts whose combine adds the shared expert's output, or None.
++
++        When the shared expert runs before the routed experts on this stream (no
++        overlap), or on the aux stream (multi-stream overlap) and the experts can
++        wait for it just before their combine, nothing scales, trims or transforms
++        the routed output before the add, and the experts would otherwise write a
++        wider partial for the add and one rounding here: they do both in the
++        combine, with the same bits.
++        """
++        if (
++            self._shared_experts is None
++            or shared_experts_input is None
++            or self.routed_scaling_factor != 1.0
++            or self.routed_output_transform is not None
++            or self._fused_output_is_reduced
++        ):
++            return None
++        experts = self._quant_method.modular_experts
++        order = self._shared_experts._determine_shared_experts_order(
++            shared_experts_input
++        )
++        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
++            supported = getattr(experts, "folds_deferred_shared_output", False)
++        else:
++            supported = order == SharedExpertsOrder.NO_OVERLAP
++        if not supported:
++            return None
++        return experts if getattr(experts, "folds_shared_output", False) else None
++
+     @property
+     def _fused_output_is_reduced(self) -> bool:
+         return (
+@@ -533,6 +568,79 @@ class MoERunner(MoERunnerInterface):
+ 
+         return states[..., :trunc_size] if trunc_size is not None else states
+ 
++    def _reduce_scatter_final_output(
++        self,
++        shared_output: torch.Tensor | None,
++        fused_output: torch.Tensor,
++        padded_rows: int,
++        trunc_size: int | None,
++        output_is_reduced: bool,
++        combine: Callable[[int, int, torch.Tensor], None] | None = None,
++    ) -> torch.Tensor:
++        """Sequence-parallel replacement for the late all-reduce.
++
++        The combined output is written into a ``padded_rows`` buffer whose
++        trailing rows are zero and reduce-scattered along dim 0, so TP rank r
++        receives rows ``[r * padded_rows // tp, (r + 1) * padded_rows // tp)``.
++        ``combine(start, stop, out)`` is the experts' deferred combine (shared
++        output folded in): ``fused_output`` is then unwritten, and the model's
++        reduce-scatter hook has the combine write its buffers' rows itself.
++        """
++        if (
++            output_is_reduced
++            or self.moe_config.is_sequence_parallel
++            or self.moe_config.skip_final_all_reduce
++            or isinstance(self.router, ZeroExpertRouter)
++        ):
++            raise NotImplementedError("MoE reduce-scatter needs an unreduced output")
++        rows = fused_output.shape[0]
++        # A routed output wider than the layer's dtype (TileLang's FP32 combine)
++        # is added to the shared expert in FP32 and rounds once into the buffer.
++        dtype = (
++            fused_output.dtype
++            if shared_output is None
++            else torch.result_type(shared_output, fused_output)
++        )
++        if dtype != self.moe_config.in_dtype:
++            dtype = self.moe_config.in_dtype
++        # The same model-installed callback the all-reduce path fires.
++        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
++        # A model-installed replacement for the buffer and reduce-scatter below:
++        # hook(write, rows, padded_rows, row_shape, dtype, device, then), where
++        # write(start, stop, out) fills rows start:stop of the combined output:
++        # the deferred combine, writing straight into the hook's buffers.
++        _reduce = getattr(self, "_sp_project_reduce_scatter_hook", None)
++        if _reduce is not None:
++            if trunc_size is not None:
++                raise NotImplementedError(
++                    "MoE reduce-scatter hook with a trimmed output"
++                )
++            if combine is None:
++                raise NotImplementedError(
++                    "MoE reduce-scatter hook needs the experts' deferred combine"
++                )
++            return _reduce(
++                combine,
++                rows,
++                padded_rows,
++                fused_output.shape[1:],
++                dtype,
++                fused_output.device,
++                None if _hook is None else lambda: _hook(rows),
++            )
++        states = fused_output.new_empty(
++            (padded_rows, *fused_output.shape[1:]), dtype=dtype
++        )
++        states[rows:].zero_()
++        if shared_output is None:
++            states[:rows].copy_(fused_output)
++        else:
++            torch.add(shared_output, fused_output, out=states[:rows])
++        if _hook is not None:
++            _hook(rows)
++        states = tensor_model_parallel_reduce_scatter(states, dim=0)
++        return states[..., :trunc_size] if trunc_size is not None else states
++
+     def _encode_layer_name(self) -> str | LayerName:
+         if _USE_LAYERNAME:
+             return LayerName(self.layer_name)
+@@ -616,6 +724,78 @@ class MoERunner(MoERunnerInterface):
+             else:
+                 self._shared_experts(shared_experts_input, order, workspace=workspace)
+ 
++    def reserve_profile_scratch(self, max_num_tokens: int) -> None:
++        """Reserve worst-case MoE workspace and output buffers before locking
++        the workspace arena when profile_run is skipped under pinned
++        kv_cache_memory_bytes."""
++        if current_platform.is_cpu() or max_num_tokens <= 0:
++            return
++        from vllm.model_executor.layers.fused_moe import modular_kernel as mk
++        from vllm.v1.worker.workspace import (
++            current_workspace_manager,
++            is_workspace_manager_initialized,
++        )
++
++        if not is_workspace_manager_initialized():
++            return
++        kernel = getattr(self._quant_method, "moe_kernel", None)
++        impl = getattr(kernel, "impl", None)
++        if not isinstance(impl, mk.FusedMoEKernelModularImpl):
++            return
++        workspace_manager = current_workspace_manager()
++        device = workspace_manager._device
++        in_dtype = self.moe_config.in_dtype
++        out_dtype = impl.fused_experts.output_dtype
++        hidden_dim = self.moe_config.hidden_dim
++        alloc_hidden_dim = (
++            hidden_dim // 2
++            if impl.fused_experts.quant_dtype == "nvfp4"
++            and not impl.fused_experts.expects_unquantized_inputs
++            else hidden_dim
++        )
++        candidate_rows: set[int] = {max_num_tokens}
++        plan = getattr(impl.fused_experts, "_plan", None)
++        if plan is not None:
++            topk = getattr(plan, "topk", 0)
++            num_experts = getattr(plan, "num_experts", 0)
++            if topk > 0 and num_experts > 0:
++                for attr in ("decode_block_M", "block_M"):
++                    bm = getattr(plan, attr, 0)
++                    if bm > 0:
++                        tier_max = (bm * num_experts - 1) // topk
++                        if 0 < tier_max < max_num_tokens:
++                            candidate_rows.add(tier_max)
++        for rows in sorted(candidate_rows):
++            shared_size = 0
++            if self._shared_experts is not None:
++                shared_size = self._shared_experts.workspace_size(
++                    torch.empty((rows, hidden_dim), dtype=in_dtype, device="meta")
++                )
++            alloc_variants: list[tuple[int, tuple[int, ...] | None]] = [
++                (0, None),
++                (0, (rows, hidden_dim)),
++            ]
++            if shared_size:
++                alloc_variants.append((shared_size, (rows, hidden_dim)))
++            for shared_ws, out_shape in alloc_variants:
++                impl._allocate_buffers(
++                    in_dtype,
++                    out_dtype,
++                    device,
++                    rows,
++                    rows,
++                    self.moe_config.intermediate_size_per_partition,
++                    alloc_hidden_dim,
++                    self.moe_config.experts_per_token,
++                    self.moe_config.num_experts,
++                    self.moe_config.num_local_experts,
++                    None,
++                    self.moe_config.activation,
++                    shared_workspace_size=shared_ws,
++                    output_shape=out_shape,
++                )
++        workspace_manager.get_moe_output_buffer((max_num_tokens, hidden_dim), out_dtype)
++
+     def _apply_quant_method(
+         self,
+         hidden_states: torch.Tensor,
+@@ -646,8 +826,55 @@ class MoERunner(MoERunnerInterface):
+         self._maybe_apply_shared_experts(
+             shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
+         )
++        experts = self._quant_method.modular_experts
++        overlap_fold = False
++        launch_shared = None
++        if getattr(experts, "fold_shared", False):
++            assert self._shared_experts is not None
++            assert shared_experts_input is not None
++            overlap_fold = (
++                self._shared_experts._determine_shared_experts_order(
++                    shared_experts_input
++                )
++                == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
++            )
++            if not overlap_fold:
++                # The shared expert ran first: the combine adds its output (forward).
++                experts.combine_addend = self._shared_experts.peek_output()
++            else:
++                # The shared expert runs on the aux stream beside the routed
++                # experts; their combine waits for it, then adds its output.
++                # When the router runs a single-tile decode gate projection
++                # itself (<= 16 rows, 48 CTAs at TP4), defer the aux-stream
++                # launch until immediately after the gate GEMM so shared
++                # gate_up_proj overlaps top-k routing and routed experts instead
++                # of contending with the critical-path gate GEMM and FFN L2
++                # prefetch. Above 16 rows shared_down switches to smaller block_N
++                # tiles (160 CTAs) where launching pre-gate wins.
++                if not shared_experts_overlapping:
++                    shared_experts = self._shared_experts
++
++                    def _launch_shared() -> None:
++                        nonlocal launch_shared
++                        if launch_shared is None:
++                            return
++                        launch_shared = None
++                        launched = shared_experts.maybe_forward_async(
++                            shared_experts_input, shared_workspace
++                        )
++                        assert launched
++
++                    launch_shared = _launch_shared
++                    if (
++                        not getattr(self.router, "routes_hidden_states", False)
++                        or hidden_states.shape[0] > 16
++                    ):
++                        launch_shared()
++                experts.combine_addend = self._shared_experts.wait_output
+ 
+         if self.routed_experts.quant_method.is_monolithic:
++            if launch_shared is not None:
++                launch_shared()
+             # Monolithic kernels: pass router_logits to routed_experts
+             fused_out = self.routed_experts.forward_monolithic(
+                 x=hidden_states,
+@@ -656,12 +883,20 @@ class MoERunner(MoERunnerInterface):
+             )
+         else:
+             # Modular kernels: select experts first, then call routed_experts
+-            topk_weights, topk_ids = self.router.select_experts(
+-                hidden_states=hidden_states,
+-                router_logits=router_logits,
+-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
+-                input_ids=input_ids,
+-            )
++            if launch_shared is not None:
++                self.router._post_gate_hook = launch_shared
++            try:
++                topk_weights, topk_ids = self.router.select_experts(
++                    hidden_states=hidden_states,
++                    router_logits=router_logits,
++                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
++                    input_ids=input_ids,
++                )
++            finally:
++                if launch_shared is not None:
++                    self.router._post_gate_hook = None
++            if launch_shared is not None:
++                launch_shared()
+ 
+             if workspace is None:
+                 fused_out = self.routed_experts.forward_modular(
+@@ -681,7 +916,12 @@ class MoERunner(MoERunnerInterface):
+                     workspace=workspace,
+                 )
+ 
+-        if shared_experts_overlapping:
++        if overlap_fold:
++            # The combine already waited; waiting again on the same event keeps
++            # the aux stream joined (CUDA graph capture needs it) at no cost.
++            assert self._shared_experts is not None
++            self._shared_experts.wait()
++        elif shared_experts_overlapping:
+             assert self._shared_experts is not None
+             self._shared_experts.wait()
+         else:
+@@ -733,15 +973,19 @@ class MoERunner(MoERunnerInterface):
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+         shared_experts_input: torch.Tensor | None = None,
++        *,
++        reduce_scatter_rows: int | None = None,
+     ) -> torch.Tensor:
+         """Invoke the fused moe layer.
+ 
+         Input:
+         - hidden_states
+         - router_logits
++        - reduce_scatter_rows: sequence parallelism; reduce-scatter the output,
++          zero-padded to this many rows, along dim 0 instead of all-reducing
+ 
+         Output:
+-        - The new hidden_states.
++        - The new hidden_states (this rank's rows with reduce_scatter_rows).
+ 
+         Calling sequence
+         - forward
+@@ -777,17 +1021,43 @@ class MoERunner(MoERunnerInterface):
+             )
+         )
+ 
+-        result = self._forward_entry(
+-            hidden_states,
+-            router_logits,
+-            shared_experts_input,
+-            input_ids,
+-            self._encode_layer_name(),
+-            self.moe_config.hidden_dim_unpadded
+-            if self._quant_method.has_unpadded_output
+-            else 0,
+-            self._quant_method.output_dtype,
++        fold = (
++            self._shared_output_fold(shared_experts_input)
++            if og_hidden_dim_pre_xform is None and og_hidden_dim_post_xform is None
++            else None
++        )
++        # A folded combine bound for the model's sequence-parallel exchange is left
++        # to the exchange, which has it write each destination's rows in place.
++        defer = (
++            fold is not None
++            and reduce_scatter_rows is not None
++            and getattr(self, "_sp_project_reduce_scatter_hook", None) is not None
+         )
++        combine = None
++        if fold is not None:
++            fold.fold_shared = True
++            fold.defer_combine = defer
++        try:
++            result = self._forward_entry(
++                hidden_states,
++                router_logits,
++                shared_experts_input,
++                input_ids,
++                self._encode_layer_name(),
++                self.moe_config.hidden_dim_unpadded
++                if self._quant_method.has_unpadded_output
++                else 0,
++                self._quant_method.output_dtype,
++            )
++            if defer:
++                combine = fold.deferred_combine
++                assert combine is not None, "the experts did not defer their combine"
++        finally:
++            if fold is not None:
++                fold.fold_shared = False
++                fold.combine_addend = None
++                fold.defer_combine = False
++                fold.deferred_combine = None
+ 
+         #
+         # Note: there are two all-reduce points below. They are mutually
+@@ -801,6 +1071,8 @@ class MoERunner(MoERunnerInterface):
+         # Extract outputs from result
+         shared_output, fused_output = _unpack(result)
+         fused_output = cast(torch.Tensor, fused_output)
++        if fold is not None:
++            shared_output = None  # the combine added it
+ 
+         if og_hidden_dim_pre_xform is not None:
+             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+@@ -861,6 +1133,15 @@ class MoERunner(MoERunnerInterface):
+         if output_transform_is_tp_partial:
+             fused_output_is_reduced = False
+ 
++        if reduce_scatter_rows is not None:
++            return self._reduce_scatter_final_output(
++                shared_output,
++                fused_output,
++                reduce_scatter_rows,
++                og_hidden_dim_post_xform,
++                fused_output_is_reduced,
++                combine,
++            )
+         if shared_output is not None:
+             result = (
+                 fused_output.add_(shared_output)
+@@ -869,6 +1150,11 @@ class MoERunner(MoERunnerInterface):
+             )
+         else:
+             result = fused_output
++        if result.dtype != self.moe_config.in_dtype and not fused_output_is_reduced:
++            # A TP partial kept unrounded through its combine (TileLang MoE): the
++            # rank's partial, shared expert included, rounds once before the
++            # reduction, as a row-parallel linear rounds its partial.
++            result = result.to(self.moe_config.in_dtype)
+ 
+         if reuse_output:
+             result = self._maybe_reduce_final_output(
+@@ -981,9 +1267,15 @@ class MoERunner(MoERunnerInterface):
+         self.routed_experts._ensure_moe_quant_config_init()
+ 
+         # If using multi-stream overlap for shared experts, we must launch it
+-        # before routed expert dispatch.
++        # before routed expert dispatch unless folded shared-expert execution
++        # defers the launch to _apply_quant_method (where _post_gate_hook may
++        # hold it until right after the decode gate GEMM).
+         shared_experts_overlapping = False
+-        if self._shared_experts is not None:
++        if self._shared_experts is not None and not getattr(
++            getattr(self._quant_method, "modular_experts", None),
++            "fold_shared",
++            False,
++        ):
+             assert shared_experts_input is not None
+             if self._shared_experts.workspace_size(shared_experts_input):
+                 # Dispatch determines routed scratch sizes. Reserve both branches
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index a2a2495318480d273b6490a329ffab2599c88fbe..b7c9aa40137f0e599126d7338716a4511f12b8af 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -140,11 +140,16 @@ class SharedExperts(torch.nn.Module):
+         else:
+             return SharedExpertsOrder.NO_OVERLAP
+ 
+-    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
++    def maybe_forward_async(
++        self,
++        shared_experts_input: torch.Tensor,
++        workspace: torch.Tensor | None = None,
++    ) -> bool:
+         """Enqueue shared experts on the aux stream without waiting for them.
+ 
+         Returns true if the shared experts were enqueued, false otherwise. Call
+         `wait` to wait for the shared experts to finish if this returns true.
++        ``workspace`` binds an arena-backed MLP's scratch, as ``forward`` does.
+         """
+         if (
+             self._determine_shared_experts_order(shared_experts_input)
+@@ -156,7 +161,7 @@ class SharedExperts(torch.nn.Module):
+         assert self._output[idx] is None
+         shared_experts_input.record_stream(self._stream)
+         self._input_ready_event[idx].record(current_stream())
+-        with torch.cuda.stream(self._stream):
++        with torch.cuda.stream(self._stream), use_preallocated_workspace(workspace):
+             self._input_ready_event[idx].wait(self._stream)
+             self._output[idx] = self._layer(shared_experts_input)
+             self._output_ready_event[idx].record(self._stream)
+@@ -204,10 +209,21 @@ class SharedExperts(torch.nn.Module):
+         assert output is not None
+         output.record_stream(current_stream())
+ 
++    def wait_output(self) -> torch.Tensor:
++        """``wait``, then the finished output, left in place for ``output``."""
++        self.wait()
++        output = self.peek_output()
++        assert output is not None
++        return output
++
+     @property
+     def _output_idx(self) -> int:
+         return dbo_current_ubatch_id() if self.enable_dbo else 0
+ 
++    def peek_output(self) -> torch.Tensor | None:
++        """The finished output, left in place for ``output`` to take."""
++        return self._output[self._output_idx]
++
+     @property
+     def output(self) -> torch.Tensor:
+         assert self._output[self._output_idx] is not None
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2777df81949f38bd294a135327e86a82b26c2b04
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -0,0 +1,471 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang MXFP4 x MXFP8 routed experts for SM12x (``--moe-backend tilelang``).
++
++One layer runs, all from the modular kernel's workspace:
++
++1. dispatch: routes grouped by expert in the contiguous grouped-GEMM layout;
++2. grouped gate/up GEMM over the dispatched rows, gathering the tokens' MXFP8
++   rows with ``cp.async`` from tile-major expert weights; the kernel that produced
++   the tokens wrote that cast (the mHC entry, ``linear.MXFP8Rows``) and hands it
++   over for the call (``linear.provide_mxfp8``);
++3. SwiGLU with DeepSeek's clamp, the route weight and the MXFP8 cast of the
++   down projection's input, fused (TileKernels' arithmetic);
++4. grouped down GEMM;
++5. combine: each token's expert outputs summed in slot order in FP32.
++
++Route weights are applied before the down projection, as DeepSeek does. No
++step uses atomics on results, so a token's output does not depend on the
++rest of the batch.
++"""
++
++from collections.abc import Callable
++from pathlib import Path
++
++import torch
++
++import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.model_executor.layers.fused_moe.config import (
++    FusedMoEParallelConfig,
++    FusedMoEQuantConfig,
++)
++from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
++    TopKWeightAndReduceNoOP,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    QuantKey,
++    kMxfp4Static,
++    kMxfp8Dynamic,
++)
++from vllm.model_executor.utils import replace_parameter
++from vllm.platforms import current_platform
++from vllm.utils.import_utils import has_tilelang
++
++# Output columns come in 128-wide tiles; K blocks are multiples of 64.
++_BLOCK_N = 128
++_K_ALIGN = 64
++
++
++def _kernels():
++    from vllm.models.deepseek_v4_1.tilelang import moe
++
++    return moe
++
++
++def _provided_mxfp8(hidden_states: torch.Tensor):
++    from vllm.models.deepseek_v4_1.tilelang.linear import provided_mxfp8
++
++    return provided_mxfp8(hidden_states)
++
++
++def _output_dtype() -> torch.dtype:
++    from vllm.models.deepseek_v4_1.kernels import moe_output_dtype
++
++    return moe_output_dtype()
++
++
++class TileLangExperts(mk.FusedMoEExpertsModular):
++    """MXFP4 experts with MXFP8 activations, in TileLang and TileKernels."""
++
++    def __init__(
++        self,
++        moe_config: mk.FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++    ):
++        super().__init__(moe_config, quant_config)
++        self._plan = None
++        # The 64-wide K tails of each GEMM's tile-major weights (None without one).
++        self._tails: tuple[torch.Tensor | None, ...] = (None, None)
++        # 2-bit scale codes (contiguous uint8, tile order) and the per-expert
++        # uint8 flag (1 = 2-bit). The GEMM loads these when the flag is 1 and
++        # the 4-bit codes otherwise.
++        self._codes_2bit: tuple[torch.Tensor | None, ...] = (None, None)
++        self._narrow: tuple[torch.Tensor | None, ...] = (None, None)
++        self._slot_cache = None
++        self._next_lookahead = None
++
++    # -- support --------------------------------------------------------
++
++    @staticmethod
++    def _supports_current_device() -> bool:
++        return (
++            current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++            and has_tilelang()
++        )
++
++    @staticmethod
++    def _supports_no_act_and_mul() -> bool:
++        return False
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None, activation_key: QuantKey | None
++    ) -> bool:
++        return (weight_key, activation_key) == (kMxfp4Static, kMxfp8Dynamic)
++
++    @staticmethod
++    def _supports_activation(activation: MoEActivation) -> bool:
++        return activation == MoEActivation.SILU
++
++    @staticmethod
++    def _supports_parallel_config(
++        moe_parallel_config: FusedMoEParallelConfig,
++    ) -> bool:
++        return (
++            not moe_parallel_config.use_ep
++            and moe_parallel_config.ep_size == 1
++            and not moe_parallel_config.use_all2all_kernels
++            and not moe_parallel_config.enable_eplb
++        )
++
++    @staticmethod
++    def _supports_batch_invariance() -> bool:
++        return True
++
++    @staticmethod
++    def is_supported_config(
++        cls: type[mk.FusedMoEExperts],
++        moe_config: mk.FusedMoEConfig,
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++        activation_format: mk.FusedMoEActivationFormat,
++    ) -> tuple[bool, str | None]:
++        if moe_config.has_bias:
++            return False, "kernel does not support expert biases"
++        if moe_config.in_dtype != torch.bfloat16:
++            return False, f"kernel does not support {moe_config.in_dtype} activations"
++        intermediate = moe_config.intermediate_size_per_partition
++        # Hidden is the down projection's N; the gate/up N is 2 * intermediate.
++        if moe_config.hidden_dim % _BLOCK_N or intermediate % _K_ALIGN:
++            reason = (
++                f"hidden size must be a multiple of {_BLOCK_N} and per-rank "
++                f"intermediate size a multiple of {_K_ALIGN}"
++            )
++            return False, reason
++        return mk.FusedMoEExperts.is_supported_config(
++            cls, moe_config, weight_key, activation_key, activation_format
++        )
++
++    @staticmethod
++    def activation_format() -> mk.FusedMoEActivationFormat:
++        return mk.FusedMoEActivationFormat.Standard
++
++    @property
++    def expects_unquantized_inputs(self) -> bool:
++        return True
++
++    def supports_expert_map(self) -> bool:
++        return False
++
++    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
++        return TopKWeightAndReduceNoOP()
++
++    # Set by the MoE runner around one call whose shared expert runs before the
++    # routed experts, or beside them on the aux stream: the combine adds
++    # ``combine_addend`` (the shared expert's output, or a callable that waits for
++    # it and returns it) to the FP32 sum and rounds the rank's partial once, in
++    # BF16 out.
++    fold_shared: bool = False
++    combine_addend: torch.Tensor | Callable[[], torch.Tensor] | None = None
++    # The plan resolves a callable addend just before its combine launch, so an
++    # aux-stream shared expert overlaps the routed experts' GEMMs.
++    folds_deferred_shared_output: bool = True
++    # Set by the MoE runner around one folded call whose output goes straight into
++    # a sequence-parallel exchange: ``apply`` leaves ``output`` unwritten and keeps
++    # the combine as ``deferred_combine(start, stop, out)``, which writes the
++    # output's rows ``start:stop`` into ``out`` (the exchange's blocks).
++    defer_combine: bool = False
++    deferred_combine: Callable[[int, int, torch.Tensor], None] | None = None
++    _slot_cache = None
++    _next_lookahead = None
++
++    @property
++    def folds_shared_output(self) -> bool:
++        """Whether the combine can add the shared expert's output itself: when it
++        would otherwise write an FP32 partial for the runner to add and round."""
++        return _output_dtype() == torch.float32
++
++    @property
++    def output_dtype(self) -> torch.dtype:
++        """FP32 under the MoE FP32 combine switch: the runner adds the shared
++        expert in FP32 and rounds the rank's partial once before the reduction.
++        With the shared output folded into the combine, the layer's dtype."""
++        return self.moe_config.in_dtype if self.fold_shared else _output_dtype()
++
++    # -- weights ----------------------------------------------------------
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if layer.apply_router_weight_on_input:
++            raise ValueError("TileLang MoE applies route weights inside the experts")
++        moe = _kernels()
++        w13, w2 = layer.w13_weight, layer.w2_weight  # [E, 2I, H/2], [E, H, I/2]
++        limit = self.quant_config.gemm1_clamp_limit
++        router = getattr(layer, "router", None)
++        idx_dtype = getattr(router, "indices_dtype", None)
++        if idx_dtype is None:
++            idx_dtype = getattr(layer, "_router_indices_dtype", None)
++        max_rows = getattr(router, "max_rows", None)
++        if max_rows is None:
++            max_rows = getattr(layer, "_router_max_rows", None)
++        slot_cfg = getattr(layer, "slot_cache_config", None)
++        plan_kw = (
++            {"num_slots": int(slot_cfg["num_slots"]), "narrow_codes": False}
++            if slot_cfg is not None
++            else {}
++        )
++        # The plan's geometry; its kernels are declared when the worker prepares
++        # kernels (``declare_kernels``).
++        self._plan = moe.MoeExpertsV41Plan(
++            w13.shape[0],
++            self.moe_config.experts_per_token,
++            w2.shape[1],
++            w2.shape[2] * 2,
++            swiglu_limit=self.moe_config.swiglu_limit if limit is None else limit,
++            out_dtype=self.output_dtype,
++            idx_dtypes=(idx_dtype,)
++            if idx_dtype is not None
++            else (torch.int32, torch.int64),
++            max_rows=max_rows,
++            **plan_kw,
++        )
++        if slot_cfg is not None:
++            from vllm.models.deepseek_v4_1.expert_slots import (
++                PACK_HEADER_BYTES,
++                ExpertDiskCache,
++                ExpertPackMeta,
++                ExpertSlotCache,
++            )
++
++            meta = ExpertPackMeta.from_plan(self._plan)
++            pack_path = Path(slot_cfg["pack_path"])
++            router_bias = slot_cfg.get("router_bias")
++            if router_bias is None:
++                router_bias = getattr(layer, "e_score_correction_bias", None)
++            disk_cache = slot_cfg.get("disk_cache")
++            is_legacy_headerless = (
++                pack_path.is_file()
++                and pack_path.stat().st_size == meta.num_experts * meta.expert_stride
++                and disk_cache is None
++                and not slot_cfg.get("spot_check", False)
++            )
++            if is_legacy_headerless:
++                device = w13.device
++                del w13, w2
++                self._slot_cache = ExpertSlotCache(
++                    meta,
++                    pack_path,
++                    num_slots=int(slot_cfg["num_slots"]),
++                    static_slots=int(slot_cfg["static_slots"]),
++                    initial_experts=slot_cfg.get("initial_experts"),
++                    router_bias=router_bias,
++                    gate_weight=slot_cfg.get("gate_weight"),
++                    hotlist_counts=slot_cfg.get("hotlist_counts"),
++                    half_life_steps=float(slot_cfg.get("half_life_steps", 64.0)),
++                    prefill_protect_rows=int(slot_cfg.get("prefill_protect_rows", 24)),
++                    device=device,
++                )
++            else:
++                own_disk_cache = disk_cache is None
++                if own_disk_cache:
++                    disk_cache = ExpertDiskCache(
++                        pack_path.parent,
++                        min_free_bytes=int(
++                            slot_cfg.get("min_free_bytes", 8 * (1 << 30))
++                        ),
++                        chunk_experts=int(slot_cfg.get("chunk_experts", 64)),
++                    )
++                self._slot_cache = disk_cache.build_or_load_layer(
++                    str(pack_path),
++                    meta,
++                    self._plan,
++                    w13,
++                    layer.w13_weight_scale,
++                    w2,
++                    layer.w2_weight_scale,
++                    num_slots=int(slot_cfg["num_slots"]),
++                    static_slots=int(slot_cfg["static_slots"]),
++                    initial_experts=slot_cfg.get("initial_experts"),
++                    router_bias=router_bias,
++                    gate_weight=slot_cfg.get("gate_weight"),
++                    hotlist_counts=slot_cfg.get("hotlist_counts"),
++                    half_life_steps=float(slot_cfg.get("half_life_steps", 64.0)),
++                    prefill_protect_rows=int(slot_cfg.get("prefill_protect_rows", 24)),
++                    device=w13.device,
++                    checkpoint_key=str(slot_cfg.get("checkpoint_key", "")),
++                    spot_check_seed=slot_cfg.get("spot_check_seed"),
++                    static_only_on_cached_start=bool(
++                        slot_cfg.get("static_only_on_cached_start", False)
++                    ),
++                    background_write=bool(
++                        slot_cfg.get("background_write", not own_disk_cache)
++                    ),
++                )
++                del w13, w2
++                if own_disk_cache:
++                    disk_cache.loading_done()
++            replace_parameter(layer, "w13_weight", self._slot_cache.w13_tiles)
++            replace_parameter(layer, "w13_weight_scale", self._slot_cache.w13_codes)
++            replace_parameter(layer, "w2_weight", self._slot_cache.w2_tiles)
++            replace_parameter(layer, "w2_weight_scale", self._slot_cache.w2_codes)
++            self._tails = (self._slot_cache.w13_tails, self._slot_cache.w2_tails)
++            self._bases = (self._slot_cache.w13_base, self._slot_cache.w2_base)
++            self._codes_2bit = (None, None)
++            self._narrow = (None, None)
++            self.quant_config._w1.scale = layer.w13_weight_scale
++            self.quant_config._w2.scale = layer.w2_weight_scale
++            torch.cuda.empty_cache()
++            return
++        # Tile-major copies replace the checkpoint layout, so each GEMM tile's
++        # weights and scale codes are contiguous. A K that ends 64 past a multiple
++        # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
++        # ``codes`` and ``byte`` are uint16 and uint8 views of one compact buffer
++        # where narrow experts (``narrow & 1`` = 1) take one ``block_N``-byte unit
++        # a tile row (2-bit codes) and wide experts take two (4-bit codes);
++        # ``narrow >> 1`` is each expert's starting unit in that buffer.
++        # With the display carve-out on, a decode-only plan's slabs (a row cap
++        # below the mid tiles: DSpark's draft layers, which read each active
++        # expert's slab at most once a step) move into it. Off the carve-out the
++        # preparation is unchanged and asks nothing more of the plan.
++        from vllm.v1.worker import display_carveout
++
++        decode_only = display_carveout.required() and (
++            self._plan.max_rows is not None and not self._plan._has_mid_tiles()
++        )
++        t13, tail13, codes13, byte13, narrow13, base13 = self._plan.prepare_weight(
++            w13, layer.w13_weight_scale
++        )
++        del w13
++        if decode_only:
++            t13 = display_carveout.move(t13)
++        replace_parameter(layer, "w13_weight", t13)
++        replace_parameter(layer, "w13_weight_scale", codes13)
++        del t13, codes13
++        t2, tail2, codes2, byte2, narrow2, base2 = self._plan.prepare_weight(
++            w2, layer.w2_weight_scale
++        )
++        del w2
++        if decode_only:
++            t2 = display_carveout.move(t2)
++        replace_parameter(layer, "w2_weight", t2)
++        replace_parameter(layer, "w2_weight_scale", codes2)
++        del t2, codes2
++        self._tails = (tail13, tail2)
++        self._bases = (base13, base2)
++        self._codes_2bit = (byte13, byte2)
++        self._narrow = (narrow13, narrow2)
++        self.quant_config._w1.scale = layer.w13_weight_scale
++        self.quant_config._w2.scale = layer.w2_weight_scale
++
++    def declare_kernels(self) -> None:
++        """Declare the plan's kernels (the layer's MoE method calls this after
++        loading, when the worker prepares kernels)."""
++        self._plan.declare_kernels()
++
++    # -- execution ----------------------------------------------------------
++
++    def moe_problem_size(
++        self,
++        a1: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        topk_ids: torch.Tensor,
++    ) -> tuple[int, int, int, int, int]:
++        # The weights are tile-major; report the logical geometry.
++        plan = self._plan
++        tokens = int(a1.shape[0] if a1.ndim == 2 else a1.shape[1])
++        return (
++            plan.num_experts,
++            tokens,
++            2 * plan.intermediate,
++            plan.hidden,
++            int(topk_ids.shape[1]),
++        )
++
++    def workspace_shapes(
++        self,
++        M: int,
++        N: int,
++        K: int,
++        topk: int,
++        global_num_experts: int,
++        local_num_experts: int,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        activation: MoEActivation,
++    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
++        del N, topk, global_num_experts, local_num_experts, expert_tokens_meta
++        nbytes = _kernels().workspace_bytes(self._plan.workspace_specs(M))
++        itemsize = self.moe_config.in_dtype.itemsize
++        return (0,), ((nbytes + itemsize - 1) // itemsize,), (M, K)
++
++    def apply(
++        self,
++        output: torch.Tensor,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        a2_scale: torch.Tensor | None,
++        workspace13: torch.Tensor | None,
++        workspace2: torch.Tensor | None,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        apply_router_weight_on_input: bool | None,
++    ) -> None:
++        del global_num_experts, a1q_scale, a2_scale, workspace13, expert_tokens_meta
++        if expert_map is not None:
++            raise ValueError("TileLang TP MoE does not support expert maps")
++        if apply_router_weight_on_input:
++            raise ValueError("TileLang MoE applies route weights inside the experts")
++        if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
++            raise TypeError("TileLang MoE topk_weights must be contiguous float32")
++        if not topk_ids.is_contiguous():
++            raise TypeError("TileLang MoE topk_ids must be contiguous")
++        tail13, tail2 = self._tails
++        base13, base2 = self._bases
++        byte13, byte2 = self._codes_2bit
++        narrow13, narrow2 = self._narrow
++        weights = (
++            (w1, tail13, self.w1_scale, byte13, narrow13, base13),
++            (w2, tail2, self.w2_scale, byte2, narrow2, base2),
++        )
++        workspace = workspace2.view(-1).view(torch.uint8)
++        shared = None
++        if self.fold_shared:
++            assert self.combine_addend is not None, "the shared output must be given"
++            shared = self.combine_addend
++        if self.defer_combine:
++            assert self.fold_shared, "only a folded combine is deferred"
++        slot_cache = getattr(self, "_slot_cache", None)
++        if slot_cache is not None:
++            combine = slot_cache.run(
++                self._plan,
++                _provided_mxfp8(hidden_states),
++                topk_ids,
++                topk_weights,
++                None if self.defer_combine else output,
++                workspace,
++                shared,
++                next_lookahead=getattr(self, "_next_lookahead", None),
++                lookahead_hidden=hidden_states,
++            )
++        else:
++            combine = self._plan.run(
++                _provided_mxfp8(hidden_states),
++                topk_ids,
++                topk_weights,
++                weights,
++                None if self.defer_combine else output,
++                workspace,
++                shared,
++            )
++        if self.defer_combine:
++            self.deferred_combine = combine
++
++    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
++        raise NotImplementedError("LoRA is not supported for TileLangExperts")
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 5a5b8cd3b1d899d9ee5ebc1676dec725e3ff4799..ee8a38de739a9b7f2def665c7a3b97aad9aecb03 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -2,8 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A layer that compute logits from hidden_stats."""
+ 
++from __future__ import annotations
++
+ from collections.abc import Callable, Sequence
+ from functools import cache
++from typing import TYPE_CHECKING
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -21,14 +24,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
+ from vllm.platforms import current_platform
+-from vllm.utils.b12x import (
+-    B12xPreparationUnit,
+-    B12xWorkload,
+-    get_b12x_bf16_vocab_projection,
+-    set_b12x_preparation_provider,
+-)
+ from vllm.utils.flashinfer import has_flashinfer
+ 
++if TYPE_CHECKING:
++    from vllm.utils.b12x import B12xPreparationUnit, B12xWorkload
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -60,6 +60,28 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+ 
+ 
+ # --8<-- [start:logits_processor]
++def _is_packed_head(head: torch.nn.Module) -> bool:
++    from vllm.model_executor.layers.quantization.online.packed_bf16 import (
++        PackedBf16LmHeadMethod,
++    )
++
++    return isinstance(getattr(head, "quant_method", None), PackedBf16LmHeadMethod)
++
++
++def _is_plain_bf16_head(head: torch.nn.Module) -> bool:
++    """A loaded, unquantized, contiguous BF16 vocabulary head on the GPU."""
++    return (
++        isinstance(head, VocabParallelEmbedding)
++        and isinstance(
++            head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
++        )
++        and head.weight.ndim == 2
++        and head.weight.dtype == torch.bfloat16
++        and head.weight.is_cuda
++        and head.weight.is_contiguous()
++    )
++
++
+ @PluggableLayer.register("logits_processor")
+ class LogitsProcessor(PluggableLayer):
+     """Process logits and apply logits processors from sampling metadata.
+@@ -103,34 +125,66 @@ class LogitsProcessor(PluggableLayer):
+         model_config = get_current_vllm_config().model_config
+         self.head_dtype = model_config.head_dtype if model_config is not None else None
+         kernel_config = get_current_vllm_config().kernel_config
+-        self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
++        # DS4.1's TileLang family projects its vocabulary heads with TileLang.
++        self.use_tilelang_vocab_projection = kernel_config.linear_backend == "tilelang"
++        # BF16 heads registered here, whose TileLang kernels this processor declares.
++        self._tilelang_vocab_heads: list[VocabParallelEmbedding] = []
+         self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
+         self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
++        if kernel_config.linear_backend == "b12x":
++            from vllm.utils.b12x import (
++                get_b12x_bf16_vocab_projection,
++                get_b12x_packed_bf16_vocab_projection,
++            )
++
++            self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
++            self._b12x_packed_vocab_projection = (
++                get_b12x_packed_bf16_vocab_projection()
++            )
++        else:
++            self._b12x_vocab_projection = None
++            self._b12x_packed_vocab_projection = None
+         self.use_b12x_vocab_projection = bool(
+             kernel_config.linear_backend == "b12x"
+             and self._b12x_vocab_projection is not None
+             and self._b12x_vocab_projection.is_supported()
+         )
++        self.use_b12x_packed_vocab_projection = bool(
++            kernel_config.linear_backend == "b12x"
++            and self._b12x_packed_vocab_projection is not None
++            and self._b12x_packed_vocab_projection.is_supported()
++        )
+         if lm_head is not None:
+-            self.prepare_b12x_vocab_projection(lm_head)
++            self.prepare_vocab_projection(lm_head)
+ 
+-    def prepare_b12x_vocab_projection(
++    def prepare_vocab_projection(
+         self,
+         lm_head: torch.nn.Module,
+     ) -> None:
+-        """Register the loaded LM head; preparation happens in worker lifecycle."""
+-        if (
+-            not self.use_b12x_vocab_projection
+-            or not isinstance(lm_head, VocabParallelEmbedding)
+-            or not isinstance(
+-                lm_head.quant_method,
+-                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+-            )
+-            or lm_head.weight.ndim != 2
+-            or lm_head.weight.dtype != torch.bfloat16
+-            or not lm_head.weight.is_cuda
+-            or not lm_head.weight.is_contiguous()
+-        ):
++        """Register the loaded LM head; preparation happens in worker lifecycle.
++
++        With the TileLang backend, the first processor to register a BF16 head
++        fixes its logits dtype here and declares its kernels when the worker
++        prepares kernels (``declare_kernels``); a packed head's method declares
++        the packed head's kernels.
++        """
++        if self.use_tilelang_vocab_projection:
++            if (
++                not _is_packed_head(lm_head)
++                and not hasattr(lm_head, "tilelang_vocab_dtype")
++                and _is_plain_bf16_head(lm_head)
++            ):
++                lm_head.tilelang_vocab_dtype = self.head_dtype or lm_head.weight.dtype
++                self._tilelang_vocab_heads.append(lm_head)
++            return
++        if _is_packed_head(lm_head):
++            if (
++                not self.use_b12x_packed_vocab_projection
++                or not hasattr(lm_head, "packed_bf16_exponent_base")
++                or not lm_head.weight.is_cuda
++            ):
++                return
++        elif not self.use_b12x_vocab_projection or not _is_plain_bf16_head(lm_head):
+             return
+         owner = getattr(lm_head, "_b12x_vocab_projection_owner", None)
+         if owner is not None:
+@@ -142,14 +196,38 @@ class LogitsProcessor(PluggableLayer):
+             self._b12x_vocab_plans = owner._b12x_vocab_plans
+             self._b12x_vocab_heads = owner._b12x_vocab_heads
+             return
++        from vllm.utils.b12x import set_b12x_preparation_provider
++
+         self._b12x_vocab_heads[id(lm_head)] = lm_head
+         object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
+         set_b12x_preparation_provider(self, self)
+ 
++    prepare_b12x_vocab_projection = prepare_vocab_projection
++
++    def declare_kernels(self) -> None:
++        """Declare the TileLang projections of the BF16 heads registered here."""
++        if not self._tilelang_vocab_heads:
++            return
++        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
++
++        for head in self._tilelang_vocab_heads:
++            prepare_bf16_head(head, head.tilelang_vocab_dtype)
++
+     def _b12x_vocab_name(self, head: VocabParallelEmbedding, tokens: int) -> str:
+         return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"
+ 
+     def _declare_b12x_vocab_plan(self, head: VocabParallelEmbedding, rows: int):
++        if _is_packed_head(head):
++            packed = self._b12x_packed_vocab_projection
++            assert packed is not None
++            return packed.plan(
++                packed.Caps(
++                    device=head.weight.device,
++                    max_tokens=rows,
++                    in_features=head.packed_bf16_in_features,
++                    out_features=int(head.weight.shape[0]),
++                )
++            )
+         projection = self._b12x_vocab_projection
+         assert head is not None and projection is not None
+         out_features, in_features = map(int, head.weight.shape)
+@@ -163,7 +241,10 @@ class LogitsProcessor(PluggableLayer):
+         )
+ 
+     def _b12x_vocab_call(self, head: VocabParallelEmbedding, rows: int):
+-        in_features = int(head.weight.shape[1])
++        packed = _is_packed_head(head)
++        in_features = (
++            head.packed_bf16_in_features if packed else int(head.weight.shape[1])
++        )
+ 
+         def call(state):
+             from b12x.preparation import PreparedCall
+@@ -184,6 +265,25 @@ class LogitsProcessor(PluggableLayer):
+                 ).reshape_as(source)
+                 source.copy_((indices.remainder(53).sub_(26)).mul_(1 / 32))
+ 
++            if packed:
++                weight = head.quant_method.packed_weight(head)
++                return PreparedCall(
++                    run=lambda: state.run(
++                        source,
++                        weight.values,
++                        weight.exception_rows,
++                        weight.exception_entries,
++                        weight.row_offsets,
++                        weight.exponent_base,
++                    ),
++                    produce=produce,
++                    owners=(
++                        weight.values,
++                        weight.exception_rows,
++                        weight.exception_entries,
++                        weight.row_offsets,
++                    ),
++                )
+             return PreparedCall(
+                 run=lambda: state.run(source, head.weight),
+                 produce=produce,
+@@ -216,6 +316,7 @@ class LogitsProcessor(PluggableLayer):
+     ) -> Sequence[B12xPreparationUnit]:
+         if layer is not self:
+             return ()
++        from vllm.utils.b12x import B12xPreparationUnit
+         units = []
+         for head_id, head in self._b12x_vocab_heads.items():
+             if head.weight.is_meta:
+@@ -291,7 +392,48 @@ class LogitsProcessor(PluggableLayer):
+         embedding_bias: torch.Tensor | None,
+     ) -> torch.Tensor:
+         """Project hidden states through the lm_head, honoring head_dtype."""
++        if (
++            self.use_tilelang_vocab_projection
++            and embedding_bias is None
++            and hasattr(lm_head, "tilelang_vocab")
++            and getattr(lm_head, "tilelang_vocab_dtype", hidden_states.dtype)
++            == (self.head_dtype or hidden_states.dtype)
++        ):
++            # TileLang heads accumulate in FP32 and write the head dtype directly:
++            # FP32 logits from the exact packed or BF16 weights, not widened BF16.
++            from vllm.models.deepseek_v4_1.tilelang.vocab import project_head
++
++            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
++            logits = project_head(lm_head, flat)
++            return logits.reshape(*hidden_states.shape[:-1], -1)
+         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
++            if (
++                self.use_tilelang_vocab_projection
++                and embedding_bias is None
++                and hasattr(lm_head, "tilelang_vocab")
++            ):
++                from vllm.models.deepseek_v4_1.tilelang.vocab import project_head
++
++                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
++                logits = project_head(lm_head, flat)
++                return logits.reshape(*hidden_states.shape[:-1], -1)
++            if (
++                _is_packed_head(lm_head)
++                and self.use_b12x_packed_vocab_projection
++                and embedding_bias is None
++            ):
++                # The packed head's bytes are its only copy of the weights.
++                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
++                plan = self._b12x_vocab_plan_for(lm_head, int(flat.shape[0]))
++                packed = self._b12x_packed_vocab_projection
++                assert packed is not None
++                binding = packed.bind(
++                    plan,
++                    source=flat,
++                    weight=lm_head.quant_method.packed_weight(lm_head),
++                )
++                logits = packed.run(binding)
++                return logits.reshape(*hidden_states.shape[:-1], -1)
+             if (
+                 self.use_b12x_vocab_projection
+                 and embedding_bias is None
+diff --git a/vllm/model_executor/layers/quantization/__init__.py b/vllm/model_executor/layers/quantization/__init__.py
+index 89bb6b8cfa1e4f7c93b3a3ae99702833606c72db..55101e55a408107ee6e038a28315bee4fe6f959c 100644
+--- a/vllm/model_executor/layers/quantization/__init__.py
++++ b/vllm/model_executor/layers/quantization/__init__.py
+@@ -115,95 +115,116 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
+     if quantization not in QUANTIZATION_METHODS:
+         raise ValueError(f"Invalid quantization method: {quantization}")
+ 
+-    # lazy import to avoid triggering `torch.compile` too early
+-    from vllm.config.quantization import _ONLINE_SHORTHANDS
+-    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+-
+-    if current_platform.is_cuda() or current_platform.is_rocm():
+-        # The v4.1 class is the v4 one extended to accept model_type
+-        # "deepseek_v41" and its 32x32 MXFP8 linear layout. V4.1 has
+-        # platform-specific implementations for both CUDA and ROCm.
+-        from vllm.models.deepseek_v41.quant_config import (
+-            DeepseekV4FP8Config as UpstreamDeepseekV41FP8Config,
++    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
++        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
++
++    # Lazy per-method imports avoid importing heavy native/Triton backends for
++    # unrelated quantization methods during ModelConfig verification.
++    if quantization in ("awq", "awq_marlin", "auto_awq"):
++        from .auto_awq import AutoAWQConfig
++
++        return AutoAWQConfig
++    if quantization in ("auto_gptq", "gptq", "gptq_marlin"):
++        from .auto_gptq import AutoGPTQConfig
++
++        return AutoGPTQConfig
++    if quantization == "fp8":
++        from .fp8 import Fp8Config
++
++        return Fp8Config
++    if quantization == "fbgemm_fp8":
++        from .fbgemm_fp8 import FBGEMMFp8Config
++
++        return FBGEMMFp8Config
++    if quantization == "fp_quant":
++        from .fp_quant import FPQuantConfig
++
++        return FPQuantConfig
++    if quantization == "modelopt":
++        from .modelopt import ModelOptFp8Config
++
++        return ModelOptFp8Config
++    if quantization == "modelopt_fp4":
++        from .modelopt import ModelOptNvFp4Config
++
++        return ModelOptNvFp4Config
++    if quantization in ("modelopt_mxfp8", "mxfp8"):
++        from .modelopt import ModelOptMxFp8Config
++
++        return ModelOptMxFp8Config
++    if quantization == "modelopt_mixed":
++        from .modelopt import ModelOptMixedPrecisionConfig
++
++        return ModelOptMixedPrecisionConfig
++    if quantization == "compressed-tensors":
++        from .compressed_tensors.compressed_tensors import (
++            CompressedTensorsConfig,
+         )
+ 
+-        deepseek_config: type[QuantizationConfig] = UpstreamDeepseekV41FP8Config
+-    else:
++        return CompressedTensorsConfig
++    if quantization == "experts_int8":
++        from .experts_int8 import ExpertsInt8Config
++
++        return ExpertsInt8Config
++    if quantization == "quark":
++        from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
++
++        return QuarkConfig
++    if quantization == "moe_wna16":
++        from .moe_wna16 import MoeWNA16Config
++
++        return MoeWNA16Config
++    if quantization == "exl3":
++        from .exl3 import Exl3Config
++
++        return Exl3Config
++    if quantization == "torchao":
++        from .torchao import TorchAOConfig
++
++        return TorchAOConfig
++    if quantization == "inc":
++        from .inc import INCConfig
++
++        return INCConfig
++    if quantization == "mxfp4":
++        from .mxfp4 import Mxfp4Config
++
++        return Mxfp4Config
++    if quantization == "gpt_oss_mxfp4":
++        from .mxfp4 import GptOssMxfp4Config
++
++        return GptOssMxfp4Config
++    if quantization == "deepseek_v4_fp8":
++        if current_platform.is_cuda() or current_platform.is_rocm():
++            from vllm.models.deepseek_v41.quant_config import (
++                DeepseekV4FP8Config as UpstreamDeepseekV41FP8Config,
++            )
++
++            return UpstreamDeepseekV41FP8Config
+         from vllm.models.deepseek_v4 import DeepseekV4FP8Config
+ 
+-        deepseek_config = DeepseekV4FP8Config
+-
+-    from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
+-
+-    from .auto_awq import AutoAWQConfig
+-    from .auto_gptq import AutoGPTQConfig
+-    from .compressed_tensors.compressed_tensors import (
+-        CompressedTensorsConfig,
+-    )
+-    from .exl3 import Exl3Config
+-    from .experts_int8 import ExpertsInt8Config
+-    from .fbgemm_fp8 import FBGEMMFp8Config
+-    from .fp8 import Fp8Config
+-    from .fp_quant import FPQuantConfig
+-    from .humming import HummingConfig
+-    from .inc import INCConfig
+-    from .modelopt import (
+-        ModelOptFp8Config,
+-        ModelOptMixedPrecisionConfig,
+-        ModelOptMxFp8Config,
+-        ModelOptNvFp4Config,
+-    )
+-    from .moe_wna16 import MoeWNA16Config
+-    from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
+-    from .mxfp4_csf import Mxfp4CsfConfig
++        return DeepseekV4FP8Config
++    if quantization == "deepseek_v41_fp8":
++        from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
++
++        return DeepseekV41FP8Config
++    if quantization == "mxfp4_csf":
++        from .mxfp4_csf import Mxfp4CsfConfig
++
++        return Mxfp4CsfConfig
++    if quantization == "humming":
++        from .humming import HummingConfig
++
++        return HummingConfig
++
++    from vllm.config.quantization import _ONLINE_SHORTHANDS
++
+     from .online.base import OnlineQuantizationConfig
+-    from .torchao import TorchAOConfig
+-
+-    method_to_config: dict[str, type[QuantizationConfig]] = {
+-        "awq": AutoAWQConfig,
+-        "awq_marlin": AutoAWQConfig,
+-        "auto_awq": AutoAWQConfig,
+-        "fp8": Fp8Config,
+-        "fbgemm_fp8": FBGEMMFp8Config,
+-        "fp_quant": FPQuantConfig,
+-        "modelopt": ModelOptFp8Config,
+-        "modelopt_fp4": ModelOptNvFp4Config,
+-        "modelopt_mxfp8": ModelOptMxFp8Config,
+-        "modelopt_mixed": ModelOptMixedPrecisionConfig,
+-        "auto_gptq": AutoGPTQConfig,
+-        "gptq": AutoGPTQConfig,
+-        "gptq_marlin": AutoGPTQConfig,
+-        "compressed-tensors": CompressedTensorsConfig,
+-        "experts_int8": ExpertsInt8Config,
+-        "quark": QuarkConfig,
+-        "moe_wna16": MoeWNA16Config,
+-        "exl3": Exl3Config,
+-        "torchao": TorchAOConfig,
+-        "inc": INCConfig,
+-        "mxfp4": Mxfp4Config,
+-        "gpt_oss_mxfp4": GptOssMxfp4Config,
+-        "deepseek_v4_fp8": deepseek_config,
+-        "deepseek_v41_fp8": DeepseekV41FP8Config,
+-        "mxfp4_csf": Mxfp4CsfConfig,
+-        "humming": HummingConfig,
+-        "online": OnlineQuantizationConfig,
+-        # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
+-        # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
+-        # below only applies to the `--quantization mxfp8` CLI path.
+-        "mxfp8": ModelOptMxFp8Config,
+-    }
+-
+-    # Register online shorthands (e.g. "fp8_per_tensor") as quant methods.
+-    # setdefault so a shorthand that is also a checkpoint method (e.g. "mxfp8")
+-    # keeps its checkpoint config; the shorthand still works via the
+-    # `--quantization` CLI path in `resolve_quantization_config`.
+-    for shorthand in _ONLINE_SHORTHANDS:
+-        method_to_config.setdefault(shorthand, OnlineQuantizationConfig)
+-
+-    # Update the `method_to_config` with customized quantization methods.
+-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+-
+-    return method_to_config[quantization]
++
++    if quantization == "online" or quantization in _ONLINE_SHORTHANDS:
++        return OnlineQuantizationConfig
++
++    raise ValueError(f"Invalid quantization method: {quantization}")
+ 
+ 
+ __all__ = [
+diff --git a/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py b/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
+index f9ffbe7dbacf907b2c7a65d92059bb408a043177..6428f8fc98030ad94252d3adb5cf0cee625ab6ff 100644
+--- a/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/kimi_mxfp4_csf.py
+@@ -7,7 +7,7 @@ import torch
+ from vllm.config import get_current_vllm_config
+ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
+-from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
++from vllm.model_executor.layers.quantization.mxfp4_csf_moe import Mxfp4CsfMoEMethod
+ 
+ 
+ class KimiMxfp4CsfConfig(Mxfp4Config):
+diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
+index cc3fb73f80a9408aa5a9bb8d08bf88966f4880dc..4bf77982caf5ee094f548188e913790574019585 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4.py
++++ b/vllm/model_executor/layers/quantization/mxfp4.py
+@@ -3,6 +3,8 @@
+ 
+ import torch
+ 
++import vllm.envs as envs
++
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+ from vllm.model_executor.layers.fused_moe import (
+@@ -585,30 +587,71 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+         weight_loader = extra_weight_attrs.pop("weight_loader")
+         scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
+ 
++        slot_target = envs.VLLM_DS41_EXPERT_SLOTS
++        prefix = getattr(layer, "prefix", None) or getattr(layer, "layer_name", "") or ""
++        is_draft_layer = "dspark" in prefix or "mtp" in prefix
++        if not is_draft_layer and "layers." in prefix:
++            from vllm.model_executor.models.utils import extract_layer_index
++
++            try:
++                is_draft_layer = extract_layer_index(prefix) >= 40
++            except ValueError:
++                pass
++        use_slot_meta = (
++            slot_target != 0
++            and not is_draft_layer
++            and (slot_target < 0 or slot_target < num_experts)
++        )
++        from vllm.model_executor.model_loader.direct_loader import (
++            is_deferring_arena_weight_alloc,
++        )
++
++        defer_arena_meta = (not use_slot_meta) and is_deferring_arena_weight_alloc()
++        if use_slot_meta:
++            self.uses_meta_device = True
++            alloc_fn = lambda shape, dt: torch.empty(
++                shape, dtype=dt, device=torch.device("meta")
++            )
++        elif defer_arena_meta:
++            alloc_fn = lambda shape, dt: torch.empty((1,), dtype=dt).expand(shape)
++        else:
++            alloc_fn = lambda shape, dt: torch.zeros(shape, dtype=dt)
++
++        def _mark_deferred(param: torch.nn.Parameter) -> torch.nn.Parameter:
++            if defer_arena_meta:
++                param._direct_deferred_alloc = True
++            return param
++
+         # Fused gate_up_proj (column parallel)
+-        w13_weight = torch.nn.Parameter(
+-            torch.zeros(
+-                num_experts,
+-                self.moe.w13_num_shards * intermediate_size_per_partition,
+-                hidden_size // 2,
+-                dtype=weight_dtype,
+-            ),
+-            requires_grad=False,
++        w13_weight = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                        hidden_size // 2,
++                    ),
++                    weight_dtype,
++                ),
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w13_weight", w13_weight)
+         set_weight_attrs(w13_weight, extra_weight_attrs)
+         set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
+ 
+-        w13_weight_scale = torch.nn.Parameter(
+-            torch.zeros(
+-                (
+-                    num_experts,
+-                    self.moe.w13_num_shards * intermediate_size_per_partition,
+-                    hidden_size // mxfp4_block,
++        w13_weight_scale = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                        hidden_size // mxfp4_block,
++                    ),
++                    scale_dtype,
+                 ),
+-                dtype=scale_dtype,
+-            ),
+-            requires_grad=False,
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w13_weight_scale", w13_weight_scale)
+         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+@@ -616,29 +659,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+         w13_weight_scale.quant_method = "block"
+ 
+         # down_proj (row parallel)
+-        w2_weight = torch.nn.Parameter(
+-            torch.zeros(
+-                num_experts,
+-                hidden_size,
+-                intermediate_size_per_partition // 2,
+-                dtype=weight_dtype,
+-            ),
+-            requires_grad=False,
++        w2_weight = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        hidden_size,
++                        intermediate_size_per_partition // 2,
++                    ),
++                    weight_dtype,
++                ),
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w2_weight", w2_weight)
+         set_weight_attrs(w2_weight, extra_weight_attrs)
+         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
+ 
+-        w2_weight_scale = torch.nn.Parameter(
+-            torch.zeros(
+-                (
+-                    num_experts,
+-                    hidden_size,
+-                    intermediate_size_per_partition // mxfp4_block,
++        w2_weight_scale = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        hidden_size,
++                        intermediate_size_per_partition // mxfp4_block,
++                    ),
++                    scale_dtype,
+                 ),
+-                dtype=scale_dtype,
+-            ),
+-            requires_grad=False,
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+@@ -647,10 +696,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+ 
+         if self.moe.has_bias:
+             w13_bias = torch.nn.Parameter(
+-                torch.zeros(
+-                    num_experts,
+-                    self.moe.w13_num_shards * intermediate_size_per_partition,
+-                    dtype=torch.bfloat16,
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                    ),
++                    torch.bfloat16,
+                 ),
+                 requires_grad=False,
+             )
+@@ -659,17 +710,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             set_weight_attrs(w13_bias, {"weight_loader": weight_loader})
+ 
+             w2_bias = torch.nn.Parameter(
+-                torch.zeros(
+-                    num_experts,
+-                    hidden_size,
+-                    dtype=torch.bfloat16,
+-                ),
++                alloc_fn((num_experts, hidden_size), torch.bfloat16),
+                 requires_grad=False,
+             )
+             layer.register_parameter("w2_bias", w2_bias)
+             set_weight_attrs(w2_bias, extra_weight_attrs)
+             set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
+ 
++        if use_slot_meta:
++            from vllm.model_executor.model_loader.reload.layerwise import (
++                initialize_online_processing,
++            )
++
++            initialize_online_processing(layer)
++
+     def _setup_kernel(
+         self,
+         layer: RoutedExperts,
+@@ -785,6 +839,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+ 
+     def process_weights_after_loading(self, layer):
++        if getattr(layer, "_already_called_process_weights_after_loading", False):
++            return
++        layer._already_called_process_weights_after_loading = True
+         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+             return
+ 
+diff --git a/vllm/model_executor/layers/quantization/mxfp4_csf.py b/vllm/model_executor/layers/quantization/mxfp4_csf.py
+index de0306934d216f8c7e14924e3310d6098c83a0ed..380d5c74c25b2f3b16e1ab686812b0ed02e4bf43 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4_csf.py
++++ b/vllm/model_executor/layers/quantization/mxfp4_csf.py
+@@ -2,13 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """MXFP4 lossless scale compression with model-specific retained precision."""
+ 
+-from vllm.models.deepseek_v4_1.mxfp4_csf import DeepseekV41Mxfp4CsfConfig
+-
+ from .kimi_mxfp4_csf import KimiMxfp4CsfConfig
+ 
+ 
+ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
+-    """Select Kimi, DeepSeek-V4.1 or DeepSeek-V4 dense precision by family."""
++    """Select Kimi or DeepSeek-V4 dense precision by family."""
+ 
+     @classmethod
+     def get_name(cls):
+@@ -31,7 +29,12 @@ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
+             raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
+         family = checkpoint_contract(config["checkpoint_root"])["family"]
+         if family == "deepseek_v41":
+-            return DeepseekV41Mxfp4CsfConfig.from_config(config)
++            # The CSF experts run B12X's fused MoE; DeepSeek-V4.1 runs TileLang's
++            # kernels only.
++            raise ValueError(
++                "MXFP4-CSF DeepSeek-V4.1 checkpoints are not served: DeepSeek-V4.1 "
++                "runs TileLang kernels only; serve the native checkpoint"
++            )
+         if family == "deepseek_v4_flash":
+             # Deferred: the DeepSeek-V4 package imports its platform model.
+             from vllm.models.deepseek_v4.mxfp4_csf import DeepseekV4Mxfp4CsfConfig
+diff --git a/vllm/model_executor/layers/quantization/mxfp4_csf_moe.py b/vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3ebdd3689f7240360e2559cb993f8754daf9619
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/mxfp4_csf_moe.py
+@@ -0,0 +1,191 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Routed experts with losslessly compressed MXFP4 scales (MXFP4-CSF), on B12X's
++prepared fused MoE. The Kimi-K3 and DeepSeek-V4-Flash MXFP4-CSF configurations
++select it for their target models' routed experts."""
++
++import regex as re
++import torch
++
++from vllm.distributed import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++)
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe import modular_kernel as mk
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++from vllm.model_executor.layers.fused_moe.config import (
++    FusedMoEQuantConfig,
++    FusedMoEQuantDesc,
++)
++from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
++    FusedMoEMethodBase,
++)
++from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
++    MoEPrepareAndFinalizeNoDPEPModular,
++)
++from vllm.utils.torch_utils import set_default_torch_num_threads
++
++logger = init_logger(__name__)
++
++
++class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
++    """Expand scales for routed experts into serialized, model-owned scratch."""
++
++    def __init__(self, moe, owner, *, activation_mode="a16"):
++        super().__init__(moe)
++        self.owner = owner
++        if activation_mode not in ("a16", "a8"):
++            raise ValueError("MXFP4-CSF requires A16 or MXFP8 activations")
++        self.activation_mode = activation_mode
++        parallel = moe.moe_parallel_config
++        if (
++            parallel.use_ep
++            or parallel.ep_size != 1
++            or parallel.dp_size != 1
++            or parallel.use_all2all_kernels
++            or parallel.enable_eplb
++        ):
++            raise NotImplementedError("MXFP4-CSF experts support TP without EP/DP")
++        if (
++            moe.activation not in (MoEActivation.SILU, MoEActivation.SITU)
++            or moe.in_dtype != torch.bfloat16
++            or moe.has_bias
++            or (
++                moe.activation == MoEActivation.SITU
++                and (
++                    moe.activation_situ_beta != 4.0
++                    or moe.activation_situ_linear_beta != 25.0
++                )
++            )
++        ):
++            raise ValueError(
++                "MXFP4-CSF requires bias-free BF16 SwiGLU or SiTU(4,25) experts"
++            )
++
++    def create_weights(
++        self,
++        layer,
++        num_experts,
++        hidden_size,
++        intermediate_size_per_partition,
++        params_dtype,
++        **extra_weight_attrs,
++    ):
++        match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer.layer_name)
++        if match is None or params_dtype != torch.bfloat16:
++            raise ValueError("MXFP4-CSF requires a numbered BF16 expert layer")
++        self.layer_index = int(match.group(1))
++        self.num_experts, self.hidden_size = num_experts, hidden_size
++        self.local_intermediate = intermediate_size_per_partition
++        for name in ("w13_weight", "w2_weight"):
++            layer.register_buffer(
++                name, torch.empty(0, dtype=torch.uint8), persistent=False
++            )
++
++    def get_fused_moe_quant_config(self, layer):
++        activation = "mxfp8" if self.activation_mode == "a8" else None
++        return FusedMoEQuantConfig(
++            _a1=FusedMoEQuantDesc(dtype=activation),
++            _a2=FusedMoEQuantDesc(dtype=activation),
++            _w1=FusedMoEQuantDesc(dtype="mxfp4"),
++            _w2=FusedMoEQuantDesc(dtype="mxfp4"),
++        )
++
++    def process_weights_after_loading(self, layer):
++        from b12x.moe import fused_moe
++
++        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
++        from vllm.model_executor.model_loader.mxfp4_csf_loader import (
++            read_mxfp4_csf_layer,
++        )
++
++        tp, rank = (
++            get_tensor_model_parallel_world_size(),
++            get_tensor_model_parallel_rank(),
++        )
++        device = layer.w13_weight.device
++        e, h, n = self.num_experts, self.hidden_size, self.local_intermediate
++        shapes = ((e, h // 32, 2 * n), (e, n // 32, h))
++        if self.owner.scale_scratch is None:
++            # MXFP4-CSF disallows ubatching: every layer consumes these scale grids
++            # before its successor may overwrite them on the same stream.
++            self.owner.scale_scratch = tuple(
++                torch.empty(s, dtype=torch.uint8, device=device) for s in shapes
++            )
++        scratch = self.owner.scale_scratch
++        if any(
++            t.shape != shape or t.device != device for t, shape in zip(scratch, shapes)
++        ):
++            raise ValueError("MXFP4-CSF shared scale scratch geometry/device mismatch")
++        # Per-expert CPU slices are too small to amortize intra-op barriers.
++        # Restore the serving thread policy before kernel preparation.
++        with set_default_torch_num_threads(1):
++            weights = read_mxfp4_csf_layer(
++                self.owner.checkpoint_root,
++                self.layer_index,
++                num_experts=e,
++                hidden_size=h,
++                intermediate_size=n * tp,
++                tp_rank=rank,
++                tp_size=tp,
++                device=device,
++                w13_scale_scratch=scratch[0],
++                w2_scale_scratch=scratch[1],
++            )
++        plan = fused_moe.plan_weights(
++            source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
++            activation=fused_moe.ActivationSpec(
++                mode=self.activation_mode,
++                nonlinearity="situ"
++                if self.moe.activation == MoEActivation.SITU
++                else "silu",
++                io_dtype=torch.bfloat16,
++                swiglu_limit=self.moe.swiglu_limit,
++            ),
++            geometry=fused_moe.MoEGeometry(
++                num_experts=e, hidden_size=h, intermediate_size=n
++            ),
++        )
++        prepared = fused_moe.prepare_weights(plan=plan, weights=weights)
++        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
++        backend = B12xExperts(self.moe, self.moe_quant_config)
++        backend.install_prepared_experts(layer, prepared)
++        self.moe_kernel = mk.FusedMoEKernel(
++            MoEPrepareAndFinalizeNoDPEPModular(), backend
++        )
++        logger.info(
++            "MXFP4-CSF lossless MXFP4 layer %d rank %d/%d: %s activations, "
++            "compressed scales, shared scratch %d bytes",
++            self.layer_index,
++            rank,
++            tp,
++            "MXFP8" if self.activation_mode == "a8" else "BF16",
++            sum(t.numel() for t in scratch),
++        )
++
++    def apply(
++        self,
++        layer,
++        x,
++        topk_weights,
++        topk_ids,
++        shared_experts,
++        shared_experts_input,
++        workspace=None,
++    ):
++        assert self.moe_kernel is not None
++        return self.moe_kernel.apply(
++            hidden_states=x,
++            w1=layer.w13_weight,
++            w2=layer.w2_weight,
++            topk_weights=topk_weights,
++            topk_ids=topk_ids,
++            activation=layer.activation,
++            global_num_experts=layer.global_num_experts,
++            expert_map=layer.expert_map,
++            apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            shared_experts=shared_experts,
++            shared_experts_input=shared_experts_input,
++            workspace=workspace,
++        )
+diff --git a/vllm/model_executor/layers/quantization/online/nvfp4.py b/vllm/model_executor/layers/quantization/online/nvfp4.py
+index 2d5c32076546a1b654584432e74576f22a8b5883..4f47561c47bd3c6b951af657b4b29182ce8f7b9e 100644
+--- a/vllm/model_executor/layers/quantization/online/nvfp4.py
++++ b/vllm/model_executor/layers/quantization/online/nvfp4.py
+@@ -1,10 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import importlib.util
++
+ import torch
+ from torch.nn import Module
+ 
+ from vllm._custom_ops import create_fp4_output_tensors, scaled_fp4_quant
++from vllm.config import get_current_vllm_config
+ from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+     B12xNvFp4LinearKernel,
+     run_b12x_nvfp4_serialized_linear,
+@@ -40,15 +43,37 @@ from vllm.platforms import current_platform
+ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+ 
+ 
++def _tilelang_nvfp4_head_supported() -> bool:
++    return (
++        current_platform.is_cuda()
++        and current_platform.is_device_capability_family(120)
++        and importlib.util.find_spec("tilelang") is not None
++    )
++
++
+ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
+     """Online NVFP4 draft head with selectable activation precision."""
+ 
+     def __init__(self, *, use_a16: bool = False):
+-        super().__init__()
+-        supported, reason = B12xNvFp4LinearKernel.is_supported()
+-        if not supported:
+-            raise ValueError(f"Online NVFP4 draft head requires b12x: {reason}")
+-        self.kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
++        vllm_config = get_current_vllm_config()
++        if vllm_config.model_config is not None:
++            super().__init__()
++        else:
++            self.out_dtype = torch.get_default_dtype()
++            self.input_dtype = torch.bfloat16
++        kernel_config = vllm_config.kernel_config
++        self.tilelang = kernel_config.linear_backend == "tilelang"
++        if self.tilelang:
++            if not _tilelang_nvfp4_head_supported():
++                raise ValueError(
++                    "Online NVFP4 draft head with TileLang requires SM120/SM121 and tilelang"
++                )
++            self.kernel = None
++        else:
++            supported, reason = B12xNvFp4LinearKernel.is_supported()
++            if not supported:
++                raise ValueError(f"Online NVFP4 draft head requires b12x: {reason}")
++            self.kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
+         self.use_a16 = use_a16
+         if use_a16 and self.input_dtype != torch.bfloat16:
+             raise ValueError("A16 LM heads require BF16 activations")
+@@ -57,8 +82,11 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+         weight = layer.weight.contiguous()
+-        if weight.shape[1] % 16:
++        in_features = int(weight.shape[1])
++        if in_features % 16:
+             raise ValueError("Online NVFP4 head requires K divisible by 16")
++        if self.tilelang and in_features % 128:
++            raise ValueError("TileLang online NVFP4 head requires K divisible by 128")
+         amax = weight.abs().amax().float().clamp_min(1e-8)
+         global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
+         packed, scales = scaled_fp4_quant(
+@@ -69,20 +97,55 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
+         replace_parameter(layer, "weight_global_scale", global_scale.reciprocal())
+         replace_parameter(layer, "input_global_scale_inv", torch.ones_like(amax))
+         replace_parameter(layer, "alpha", layer.weight_global_scale.clone())
+-        # The quantized head scales its activations per call and runs the
+-        # serialized GEMM, so its exact-M plans are serialized declarations
+-        # even though the activations arrive in BF16.
+-        layer.b12x_nvfp4_serialized_activations = not self.use_a16
+-        layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
+-        self.kernel.process_weights_after_loading(layer)
++        layer.nvfp4_in_features = in_features
++        if self.tilelang:
++            model_config = get_current_vllm_config().model_config
++            layer.tilelang_vocab_dtype = (
++                (model_config.head_dtype or torch.bfloat16)
++                if model_config
++                else torch.bfloat16
++            )
++        else:
++            # The quantized head scales its activations per call and runs the
++            # serialized GEMM, so its exact-M plans are serialized declarations
++            # even though the activations arrive in BF16.
++            layer.b12x_nvfp4_serialized_activations = not self.use_a16
++            layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
++            assert self.kernel is not None
++            self.kernel.process_weights_after_loading(layer)
+         layer._already_called_process_weights_after_loading = True
+ 
++    def declare_layer_kernels(self, layer: torch.nn.Module) -> None:
++        """With the TileLang backend, declare the online NVFP4 head's projection."""
++        if not self.tilelang or not hasattr(layer, "nvfp4_in_features"):
++            return
++        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_nvfp4_head
++
++        prepare_nvfp4_head(
++            layer, getattr(layer, "tilelang_vocab_dtype", torch.bfloat16)
++        )
++
+     def apply(
+         self,
+         layer: torch.nn.Module,
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if self.tilelang:
++            from vllm.models.deepseek_v4_1.tilelang.vocab import (
++                prepare_nvfp4_head,
++                project_head,
++            )
++
++            if not hasattr(layer, "tilelang_vocab"):
++                prepare_nvfp4_head(
++                    layer, getattr(layer, "tilelang_vocab_dtype", x.dtype)
++                )
++            output = project_head(layer, x.reshape(-1, x.shape[-1]))
++            if bias is not None:
++                output = output + bias
++            return output.view(*x.shape[:-1], layer.weight.shape[0])
++        assert self.kernel is not None
+         if self.use_a16 or (
+             x.numel() // x.shape[-1] <= layer.b12x_linear.a16_max_tokens
+         ):
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff312b9a012a99277708980bba35c2c621465643
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -0,0 +1,207 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Vocabulary heads stored in B12X's exact 12-bit packed BF16 form.
++
++The checkpoint's BF16 head loads unchanged; after loading it is packed, in
++its own storage, into one sign-and-mantissa byte plus a 4-bit exponent code
++per value, with the rare out-of-window values kept exactly in a per-row
++exception list. Packing
++verifies that every bit round-trips and refuses otherwise, so the served head
++is the checkpoint tensor in 75% of the bytes, not an approximation.
++
++The packed head runs only through the logits processor's vocabulary
++projection, which reads the packed bytes directly: B12X's prepared projection,
++or TileLang's with the TileLang linear backend.
++"""
++
++import importlib.util
++import os
++
++import torch
++from torch.nn import Parameter
++
++from vllm.config import get_current_vllm_config
++from vllm.logger import init_logger
++from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
++from vllm.model_executor.utils import replace_parameter, set_weight_attrs
++from vllm.platforms import current_platform
++from vllm.utils.b12x import get_b12x_packed_bf16_vocab_projection
++
++logger = init_logger(__name__)
++
++
++def _tilelang_packed_bf16_supported() -> bool:
++    return (
++        current_platform.is_cuda()
++        and current_platform.is_device_capability_family(120)
++        and importlib.util.find_spec("tilelang") is not None
++    )
++
++
++def packed_bf16_supported(input_size: int, params_dtype: torch.dtype) -> bool:
++    if params_dtype != torch.bfloat16 or input_size <= 0 or input_size % 128 != 0:
++        return False
++    kernel_config = get_current_vllm_config().kernel_config
++    if kernel_config.linear_backend == "tilelang":
++        return _tilelang_packed_bf16_supported()
++    projection = get_b12x_packed_bf16_vocab_projection()
++    return projection is not None and projection.is_supported()
++
++
++class PackedBf16LmHeadMethod(QuantizeMethodBase):
++    """A BF16 LM head served from its exact 12-bit packed form."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        kernel_config = get_current_vllm_config().kernel_config
++        self.tilelang = kernel_config.linear_backend == "tilelang"
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        from vllm.v1.worker import display_carveout
++
++        n = sum(output_partition_sizes)
++        k = input_size_per_partition
++        shape = (n, k)
++        # In the GB10 display carve-out when it is required: the checkpoint
++        # streams straight in and the head is then packed where it lies with
++        # GPU_CACHEABLE_YES so repeat refinement passes keep L2 reuse. The
++        # single-pass 8-bit screening table W_q is allocated separately as
++        # GPU_CACHEABLE_NO once compaction reclaims the packed slack.
++        data = display_carveout.allocate(
++            shape,
++            params_dtype,
++            torch.get_default_device(),
++            cacheable=True,
++        )
++        weight = Parameter(
++            data if data is not None else torch.empty(*shape, dtype=params_dtype),
++            requires_grad=False,
++        )
++        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
++        layer.register_parameter("weight", weight)
++        set_weight_attrs(weight, extra_weight_attrs)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if getattr(layer, "_already_called_process_weights_after_loading", False):
++            return
++        weight = layer.weight.data
++        in_features = int(weight.shape[1])
++        # In place: the packed rows take the first three quarters of the BF16
++        # head's own storage, so loading frees nothing the BF16 head would not.
++        # On GB10 freed memory stays charged to the process, so an extra
++        # allocation and free here would cost host memory for good.
++        if self.tilelang:
++            from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
++
++            packed = pack_bf16_weight(weight, in_place=True)
++        else:
++            projection = get_b12x_packed_bf16_vocab_projection()
++            if projection is not None:
++                packed = projection.pack(weight, in_place=True)
++            else:
++                from vllm.models.deepseek_v4_1.tilelang.vocab import pack_bf16_weight
++
++                packed = pack_bf16_weight(weight, in_place=True)
++        from vllm.v1.worker import display_carveout
++
++        del weight
++        values = packed.values
++        if getattr(layer, "_carveout_screen_wq", None) is None:
++            values = display_carveout.compact(values)
++        replace_parameter(layer, "weight", values)
++        replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
++        replace_parameter(layer, "weight_exception_entries", packed.exception_entries)
++        replace_parameter(layer, "weight_row_offsets", packed.row_offsets)
++        layer.packed_bf16_in_features = in_features
++        layer.packed_bf16_exponent_base = packed.exponent_base
++        layer.packed_bf16_exceptions = packed.exceptions
++        layer._already_called_process_weights_after_loading = True
++        if self.tilelang:
++            from vllm.models.deepseek_v4_1.tilelang.vocab import _ensure_screen_weights
++
++            if (
++                getattr(layer, "_carveout_screen_wq", None) is None
++                and os.getenv("VLLM_DS41_CARVEOUT_SCREEN_WQ", "1") != "0"
++            ):
++                wq = display_carveout.allocate(
++                    (int(values.shape[0]), in_features),
++                    torch.uint8,
++                    values.device,
++                    optional=True,
++                    cacheable=False,
++                )
++                if wq is not None:
++                    layer._carveout_screen_wq = wq
++            _ensure_screen_weights(layer)
++            # The model's head dtype: FP32 logits as DeepSeek's reference head, or
++            # the model dtype. The projection is declared with it when the worker
++            # prepares kernels (declare_layer_kernels).
++            model_config = get_current_vllm_config().model_config
++            layer.tilelang_vocab_dtype = (
++                model_config.head_dtype if model_config else torch.bfloat16
++            )
++        logger.info_once(
++            "Packed the BF16 LM head exactly into 12 bits per weight: "
++            "exponents %d..%d, %d out-of-window values kept exactly per shard.",
++            packed.exponent_base,
++            packed.exponent_base + 14,
++            packed.exceptions,
++        )
++
++    def declare_layer_kernels(self, layer: torch.nn.Module) -> None:
++        """With the TileLang backend, declare the packed head's projection: once the
++        head is packed, since its kernels depend on the exponent base packing found."""
++        if not self.tilelang or not hasattr(layer, "packed_bf16_exponent_base"):
++            return
++        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
++
++        prepare_packed_head(layer, layer.tilelang_vocab_dtype)
++
++    @staticmethod
++    def packed_weight(layer: torch.nn.Module):
++        """The layer's current packed tensors (after any relocation)."""
++        tilelang_method = getattr(getattr(layer, "quant_method", None), "tilelang", False)
++        if not tilelang_method:
++            projection = get_b12x_packed_bf16_vocab_projection()
++            if projection is not None:
++                return projection.PackedBf16Weight(
++                    layer.weight,
++                    layer.packed_bf16_exponent_base,
++                    layer.weight_exception_rows,
++                    layer.weight_exception_entries,
++                    layer.weight_row_offsets,
++                    layer.packed_bf16_exceptions,
++                )
++        from vllm.models.deepseek_v4_1.tilelang.vocab import PackedBf16Weight
++
++        return PackedBf16Weight(
++            layer.weight,
++            layer.packed_bf16_exponent_base,
++            layer.weight_exception_rows,
++            layer.weight_exception_entries,
++            layer.weight_row_offsets,
++            layer.packed_bf16_exceptions,
++        )
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        raise RuntimeError(
++            "A packed BF16 LM head runs only through the logits processor's "
++            "vocabulary projection (linear backend b12x or tilelang, no bias)."
++        )
++
++    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        raise RuntimeError("A packed BF16 LM head is not an input embedding.")
+diff --git a/vllm/model_executor/layers/quantization/utils/humming_utils.py b/vllm/model_executor/layers/quantization/utils/humming_utils.py
+index 2a3c1bd4f219573ea2d8f59ee5cf016aeda736e3..d074fbf4f8eb8f55c5bb8c2c0048834a7e7130f0 100644
+--- a/vllm/model_executor/layers/quantization/utils/humming_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/humming_utils.py
+@@ -61,30 +61,38 @@ class HummingMoEQuantConfig(FusedMoEQuantConfig):
+     w2_humming_config: "LayerConfig"
+ 
+ 
+-if has_humming():
+-    from vllm.utils.humming import dtypes as humming_dtypes
+-
+-    _HUMMING_TO_QUANT_DTYPE: dict[humming_dtypes.DataType, Any] = {
+-        humming_dtypes.float4e2m1: FP4_DTYPE,
+-        humming_dtypes.float8e4m3: FP8_DTYPE,
+-        humming_dtypes.float8e5m2: torch.float8_e5m2,
+-        humming_dtypes.int8: torch.int8,
+-        humming_dtypes.uint4: INT4_DTYPE,
+-        humming_dtypes.uint8: INT8_DTYPE,
+-        humming_dtypes.uint2: torch.uint8,
+-        humming_dtypes.uint3: torch.uint8,
+-        humming_dtypes.uint5: torch.uint8,
+-        humming_dtypes.uint6: torch.uint8,
+-        humming_dtypes.uint7: torch.uint8,
+-    }
+-
+-    _HUMMING_TO_SCALE_DTYPE: dict[humming_dtypes.DataType, torch.dtype] = {
+-        humming_dtypes.float8e8m0: MXFP_SCALE_DTYPE,
+-        humming_dtypes.float8e4m3: FP8_DTYPE,
+-        humming_dtypes.float16: torch.float16,
+-        humming_dtypes.bfloat16: torch.bfloat16,
+-        humming_dtypes.float32: torch.float32,
+-    }
++_HUMMING_TO_QUANT_DTYPE: dict[Any, Any] = {}
++_HUMMING_TO_SCALE_DTYPE: dict[Any, torch.dtype] = {}
++humming_dtypes: Any = None
++
++
++def _ensure_humming_dtypes() -> Any:
++    global humming_dtypes, _HUMMING_TO_QUANT_DTYPE, _HUMMING_TO_SCALE_DTYPE
++    if humming_dtypes is None and has_humming():
++        from vllm.utils.humming import dtypes as _dtypes
++
++        humming_dtypes = _dtypes
++        _HUMMING_TO_QUANT_DTYPE = {
++            _dtypes.float4e2m1: FP4_DTYPE,
++            _dtypes.float8e4m3: FP8_DTYPE,
++            _dtypes.float8e5m2: torch.float8_e5m2,
++            _dtypes.int8: torch.int8,
++            _dtypes.uint4: INT4_DTYPE,
++            _dtypes.uint8: INT8_DTYPE,
++            _dtypes.uint2: torch.uint8,
++            _dtypes.uint3: torch.uint8,
++            _dtypes.uint5: torch.uint8,
++            _dtypes.uint6: torch.uint8,
++            _dtypes.uint7: torch.uint8,
++        }
++        _HUMMING_TO_SCALE_DTYPE = {
++            _dtypes.float8e8m0: MXFP_SCALE_DTYPE,
++            _dtypes.float8e4m3: FP8_DTYPE,
++            _dtypes.float16: torch.float16,
++            _dtypes.bfloat16: torch.bfloat16,
++            _dtypes.float32: torch.float32,
++        }
++    return humming_dtypes
+ 
+ 
+ def _group_shape(group_size: int, group_size_n: int = 0) -> GroupShape:
+@@ -113,6 +121,7 @@ def _humming_weight_schema_to_quant_key(
+     from vllm.utils.humming import WeightScaleType
+ 
+     """Convert a HummingWeightSchema to a QuantKey."""
++    _ensure_humming_dtypes()
+     dtype = _HUMMING_TO_QUANT_DTYPE[schema.b_dtype]
+ 
+     if schema.bs_dtype is not None:
+@@ -191,6 +200,7 @@ def _compressed_tensors_weight_schema_to_quant_key(
+     elif "nvfp4" in fmt or "mxfp4" in fmt:
+         dtype = FP4_DTYPE
+     else:
++        _ensure_humming_dtypes()
+         dtype = _HUMMING_TO_QUANT_DTYPE[
+             humming_dtypes.DataType.from_str(f"uint{schema.num_bits}")
+         ]
+@@ -302,6 +312,7 @@ def _humming_input_schema_to_quant_key(
+     if schema.a_dtype is None or schema.a_dtype.num_bits >= 16:
+         return None
+ 
++    _ensure_humming_dtypes()
+     dtype = _HUMMING_TO_QUANT_DTYPE[schema.a_dtype]
+ 
+     gs = schema.input_scale_group_size
+@@ -335,6 +346,7 @@ def _resolve_input_quant_key(
+     from vllm.utils.humming import HummingInputSchema
+ 
+     """Resolve the actual activation QuantKey after platform fallback."""
++    _ensure_humming_dtypes()
+     a_dtype = HummingInputSchema().get_fallback_input_dtype(origin_a_dtype)
+     if a_dtype is None or a_dtype.num_bits >= 16:
+         return None
+@@ -351,6 +363,7 @@ def _resolve_input_quant_key(
+ def _compressed_tensors_input_schema_to_quant_key(
+     schema: "CompressedTensorsInputSchema",
+ ) -> QuantKey | None:
++    _ensure_humming_dtypes()
+     type_bits_to_dtype = {
+         ("float", 8): humming_dtypes.float8e4m3,
+         ("float", 4): humming_dtypes.float4e2m1,
+@@ -378,6 +391,7 @@ def input_schema_to_quant_key(
+ 
+     """Convert any BaseInputSchema to a QuantKey. Returns None if
+     the schema represents unquantized (bf16/fp16) inputs."""
++    _ensure_humming_dtypes()
+     if isinstance(schema, HummingInputSchema):
+         return _humming_input_schema_to_quant_key(schema)
+ 
+@@ -650,6 +664,7 @@ def get_humming_moe_quant_config(
+         and q_dtype.startswith("float8")
+         and input_scale_group_size == 128
+     ):
++        _ensure_humming_dtypes()
+         q_dtype = _HUMMING_TO_QUANT_DTYPE.get(input_schema.a_dtype, FP8_DTYPE)
+         activation_group_shape = GroupShape(row=1, col=input_scale_group_size)
+ 
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index bb56178ec2f32821dad2807809a27f04f45bc21b..921d1785ea89a1a3bfeaf4b1af341e2e63b6a03d 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -4,7 +4,7 @@
+ import math
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+-from typing import Literal
++from typing import Literal, cast
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -18,6 +18,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+     tensor_model_parallel_all_reduce,
++    tensor_model_parallel_reduce_scatter,
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import PluggableLayer
+@@ -84,13 +85,18 @@ def _supports_default_lm_head_quantization(
+         or params_dtype != torch.bfloat16
+         or input_size % 128
+         or output_size % 8
+-        or config.kernel_config.linear_backend not in ("auto", "b12x")
++        # DS4.1's TileLang family keeps B12X's NVFP4 and MXFP8 head kernels.
++        or config.kernel_config.linear_backend not in ("auto", "b12x", "tilelang")
+         or not current_platform.is_cuda()
+         or not current_platform.is_device_capability_family(120)
+     ):
+         return False
+ 
+     if recipe == "nvfp4":
++        if config.kernel_config.linear_backend == "tilelang":
++            import importlib.util
++
++            return importlib.util.find_spec("tilelang") is not None
+         from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+             B12xNvFp4LinearKernel,
+         )
+@@ -125,12 +131,18 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         **extra_weight_attrs,
+     ):
+         """Create weights for embedding layer."""
++        shape = (sum(output_partition_sizes), input_size_per_partition)
++        data = None
++        if isinstance(layer, VocabParallelEmbedding):
++            from vllm.v1.worker import display_carveout
++
++            # Vocabulary-sized tables go straight into the GB10 display
++            # carve-out when it is required, so loading streams into it.
++            data = display_carveout.allocate(
++                shape, params_dtype, torch.get_default_device()
++            )
+         weight = Parameter(
+-            torch.empty(
+-                sum(output_partition_sizes),
+-                input_size_per_partition,
+-                dtype=params_dtype,
+-            ),
++            data if data is not None else torch.empty(*shape, dtype=params_dtype),
+             requires_grad=False,
+         )
+         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+@@ -158,6 +170,27 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+         return F.embedding(input_, layer.weight)
+ 
++    def parallel_embedding(
++        self,
++        layer: torch.nn.Module,
++        input_ids: torch.Tensor,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """This rank's partial embeddings of the 1-D ``input_ids`` (the layer's
++        fused tensor-parallel lookup): its shard's row for each id it owns, zeros
++        for every other id. A model's kernel family may supply its own kernel."""
++        shard = layer.shard_indices
++        return ops.vocab_parallel_embedding(
++            input_ids,
++            layer.weight,
++            shard.org_vocab_start_index,
++            shard.org_vocab_end_index,
++            shard.num_org_vocab_padding,
++            shard.added_vocab_start_index,
++            shard.added_vocab_end_index,
++            out=out,
++        )
++
+     def tie_weights(
+         self, layer: torch.nn.Module, embed_tokens: "VocabParallelEmbedding"
+     ):
+@@ -333,7 +366,7 @@ class VocabParallelEmbedding(PluggableLayer):
+         disable_tp: bool = False,
+         quant_method: QuantizeMethodBase | None = None,
+         parallel_group: GroupCoordinator | None = None,
+-        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
++        lm_head_quantization: Literal["mxfp8", "nvfp4", "packed_bf16"] | None = None,
+     ):
+         super().__init__()
+ 
+@@ -384,7 +417,45 @@ class VocabParallelEmbedding(PluggableLayer):
+         head_quantization = lm_head_quantization
+         if head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
+             head_quantization = "mxfp8"
+-        self.runtime_lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None
++        self.runtime_lm_head_quantization: (
++            Literal["mxfp8", "nvfp4", "packed_bf16"] | None
++        ) = None
++        if not is_embedding_layer and head_quantization == "packed_bf16":
++            # Lossless: the BF16 head is packed exactly, never re-quantized.
++            from vllm.config import get_current_vllm_config
++            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++            from vllm.model_executor.layers.quantization.online.packed_bf16 import (
++                PackedBf16LmHeadMethod,
++                packed_bf16_supported,
++            )
++
++            config = get_current_vllm_config()
++            tied = not prefix.endswith("markov_w2") and getattr(
++                getattr(config.model_config, "hf_text_config", None),
++                "tie_word_embeddings",
++                False,
++            )
++            if tied or not isinstance(
++                quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
++            ):
++                raise ValueError(
++                    "A packed BF16 LM head needs an untied, unquantized checkpoint head"
++                )
++            # DS4.1's TileLang family keeps B12X's vocabulary projections.
++            if config.kernel_config.linear_backend not in (
++                "b12x",
++                "tilelang",
++            ) or not packed_bf16_supported(
++                embedding_dim, params_dtype or torch.get_default_dtype()
++            ):
++                raise ValueError(
++                    "A packed BF16 LM head needs B12X's packed vocabulary "
++                    "projection: linear backend b12x or tilelang, BF16 weights "
++                    "and K divisible by 128"
++                )
++            quant_method = PackedBf16LmHeadMethod()
++            self.runtime_lm_head_quantization = "packed_bf16"
++            head_quantization = None
+         if not is_embedding_layer and head_quantization is not None:
+             from vllm.config import get_current_vllm_config
+             from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+@@ -645,19 +716,21 @@ class VocabParallelEmbedding(PluggableLayer):
+         copy_weight(param[: loaded_weight.shape[0]].data, loaded_weight)
+         param[loaded_weight.shape[0] :].data.fill_(0)
+ 
++    def _fused_embedding(
++        self, input_ids: torch.Tensor, out: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        """The fused lookup of this rank's shard (``use_fused_embedding``), by the
++        unquantized embedding method's kernel."""
++        method = cast(UnquantizedEmbeddingMethod, self.quant_method)
++        return method.parallel_embedding(self, input_ids, out=out)
++
+     def forward(self, input_):
+         if self.tp_size == 1:
+-            return self.quant_method.embedding(self, input_.long())
++            return self.quant_method.embedding(self, input_.clamp_min(0).long())
+ 
+         if self.use_fused_embedding:
+-            output_parallel = ops.vocab_parallel_embedding(
+-                input_ if input_.ndim == 1 else input_.reshape(-1),
+-                self.weight,
+-                self.shard_indices.org_vocab_start_index,
+-                self.shard_indices.org_vocab_end_index,
+-                self.shard_indices.num_org_vocab_padding,
+-                self.shard_indices.added_vocab_start_index,
+-                self.shard_indices.added_vocab_end_index,
++            output_parallel = self._fused_embedding(
++                input_ if input_.ndim == 1 else input_.reshape(-1)
+             )
+             if input_.ndim != 1:
+                 output_parallel = output_parallel.view(
+@@ -692,6 +765,54 @@ class VocabParallelEmbedding(PluggableLayer):
+             return self.parallel_group.all_reduce(output_parallel)
+         return tensor_model_parallel_all_reduce(output_parallel)
+ 
++    def forward_reduce_scatter(
++        self, input_: torch.Tensor, padded_rows: int
++    ) -> torch.Tensor:
++        """Embed ``input_`` and reduce-scatter the rows over the TP group.
++
++        For sequence parallelism: the partial embeddings are written into a
++        ``padded_rows`` buffer whose trailing rows are zero, and rank r
++        receives rows ``[r * padded_rows // tp_size, (r + 1) * ...)`` of the
++        full embeddings. Each token has one owning shard, so the reduction is
++        exact, as in :meth:`forward`.
++        """
++        rows = input_.shape[0]
++        if (
++            self.tp_size == 1
++            or self.parallel_group is not None
++            or input_.ndim != 1
++            or padded_rows < rows
++            or padded_rows % self.tp_size
++        ):
++            raise ValueError(
++                "Embedding reduce-scatter needs 1-D ids, the default TP group "
++                f"and padded rows divisible by it (rows={rows}, "
++                f"padded_rows={padded_rows}, tp_size={self.tp_size})"
++            )
++        if self.use_fused_embedding:
++            output_parallel = torch.empty(
++                (padded_rows, self.embedding_dim),
++                dtype=self.params_dtype,
++                device=self.weight.device,
++            )
++            self._fused_embedding(input_, out=output_parallel[:rows])
++        else:
++            masked_input, input_mask = get_masked_input_and_mask(
++                input_,
++                self.shard_indices.org_vocab_start_index,
++                self.shard_indices.org_vocab_end_index,
++                self.shard_indices.num_org_vocab_padding,
++                self.shard_indices.added_vocab_start_index,
++                self.shard_indices.added_vocab_end_index,
++            )
++            local = self.quant_method.embedding(self, masked_input.long())
++            if local.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++                raise NotImplementedError("FP8 embedding reduce-scatter")
++            output_parallel = local.new_empty((padded_rows, *local.shape[1:]))
++            output_parallel[:rows].copy_(local.masked_fill_(input_mask[:, None], 0))
++        output_parallel[rows:].zero_()
++        return tensor_model_parallel_reduce_scatter(output_parallel, dim=0)
++
+     def extra_repr(self) -> str:
+         s = f"num_embeddings={self.num_embeddings}"
+         s += f", num_embeddings_per_partition={self.num_embeddings_per_partition}"
+@@ -735,7 +856,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+         prefix: str = "",
+         *,
+         disable_tp: bool = False,
+-        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
++        lm_head_quantization: Literal["mxfp8", "nvfp4", "packed_bf16"] | None = None,
+     ):
+         super().__init__(
+             num_embeddings,
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 49da3c58933c64f269a82481487722f7dd647b78..f4418a69cab91a739f790f8fff9d4b2c21f637d5 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import TYPE_CHECKING, Any
+ 
+ from vllm.logger import init_logger
+@@ -479,9 +480,12 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+             ):
+                 quant_config["quant_method"] = "deepseek_v41_fp8"
+         # DeepSeek's reference head computes FP32 logits; a BF16 head rounds
+-        # them to steps of up to 1/8. An explicit head_dtype override wins.
++        # them to steps of up to 1/8. An explicit head_dtype override wins;
++        # VLLM_DS41_HEAD_DTYPE sets the default for the target and its drafter.
+         if getattr(model_config.hf_config, "head_dtype", None) is None:
+-            model_config.hf_config.head_dtype = "float32"
++            from vllm import envs
++
++            model_config.hf_config.head_dtype = envs.VLLM_DS41_HEAD_DTYPE
+ 
+     @staticmethod
+     def update_model_config_for_parallelism(
+@@ -508,9 +512,22 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+             )
+ 
+         padded_groups = round_up(original_groups, tp_size)
+-        if padded_groups == original_groups:
+-            return
+         padded_heads = padded_groups * (original_heads // original_groups)
++        original_moe_intermediate = getattr(
++            text_config,
++            "original_moe_intermediate_size",
++            getattr(text_config, "moe_intermediate_size", None),
++        )
++        padded_moe_intermediate = (
++            round_up(original_moe_intermediate, tp_size * 64)
++            if original_moe_intermediate is not None
++            else None
++        )
++        if (
++            padded_groups == original_groups
++            and padded_moe_intermediate == original_moe_intermediate
++        ):
++            return
+ 
+         seen: set[int] = set()
+         for config in (
+@@ -522,26 +539,60 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+                 continue
+             seen.add(id(config))
+             config_with_originals: Any = config
+-            if hasattr(config, "num_attention_heads"):
+-                config_with_originals.original_num_attention_heads = original_heads
+-                config.num_attention_heads = padded_heads
+-            if hasattr(config, "o_groups"):
+-                config_with_originals.original_o_groups = original_groups
+-                config.o_groups = padded_groups
++            if padded_groups != original_groups:
++                if hasattr(config, "num_attention_heads"):
++                    config_with_originals.original_num_attention_heads = original_heads
++                    config.num_attention_heads = padded_heads
++                if hasattr(config, "o_groups"):
++                    config_with_originals.original_o_groups = original_groups
++                    config.o_groups = padded_groups
++            if (
++                padded_moe_intermediate is not None
++                and padded_moe_intermediate != original_moe_intermediate
++                and hasattr(config, "moe_intermediate_size")
++            ):
++                config_with_originals.original_moe_intermediate_size = (
++                    original_moe_intermediate
++                )
++                config.moe_intermediate_size = padded_moe_intermediate
+ 
+         model_config.model_arch_config = model_config.get_model_arch_config()
+-        logger.warning(
+-            "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
+-            "output groups %d -> %d.",
+-            tp_size,
+-            original_heads,
+-            padded_heads,
+-            original_groups,
+-            padded_groups,
+-        )
++        if padded_groups != original_groups:
++            logger.warning(
++                "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
++                "output groups %d -> %d.",
++                tp_size,
++                original_heads,
++                padded_heads,
++                original_groups,
++                padded_groups,
++            )
++        if (
++            padded_moe_intermediate is not None
++            and padded_moe_intermediate != original_moe_intermediate
++        ):
++            logger.warning(
++                "Padded DeepSeek V4.1 MoE intermediate size for TP%d: "
++                "%d -> %d (%d per rank).",
++                tp_size,
++                original_moe_intermediate,
++                padded_moe_intermediate,
++                padded_moe_intermediate // tp_size,
++            )
+ 
+     @staticmethod
+     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
++        retired_options = (
++            "VLLM_DS41_ENGRAM_OVERLAP",
++            "VLLM_DS41_MARKOV_NVFP4",
++            "VLLM_DS41_DRAFT_NVFP4_HEAD",
++        )
++        supplied = [name for name in retired_options if name in os.environ]
++        if supplied:
++            raise ValueError(
++                "DeepSeek V4.1 no longer accepts these retired settings: "
++                + ", ".join(supplied)
++            )
+         from vllm.platforms import current_platform
+         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+@@ -550,10 +601,33 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+             and current_platform.is_device_capability_family(120)
+         ):
+             return
+-        backend = AttentionBackendEnum.B12X
+-        if vllm_config.attention_config.backend not in (None, backend):
+-            raise ValueError("DeepSeek V4.1 requires B12X.")
++        # TileLang's kernels run the whole model, drafter included; explicit
++        # per-component backends must name them.
++        backend = AttentionBackendEnum.TILELANG
++        requested = {"attention backend": vllm_config.attention_config.backend}
++        kernel = vllm_config.kernel_config
++        components = {"linear backend": kernel.linear_backend}
++        components["MoE backend"] = kernel.moe_backend
++        spec = vllm_config.speculative_config
++        if spec is not None:
++            requested["speculative attention backend"] = spec.attention_backend
++            components["speculative MoE backend"] = spec.moe_backend
++        for name, value in requested.items():
++            if value not in (None, backend):
++                raise ValueError(
++                    f"DeepSeek V4.1 requires the {backend.name} {name}, "
++                    f"got {value.name}."
++                )
++        for name, value in components.items():
++            if value not in (None, "auto", "tilelang"):
++                raise ValueError(
++                    f"DeepSeek V4.1 requires the tilelang {name}, got {value}."
++                )
+         vllm_config.attention_config.backend = backend
++        kernel.linear_backend = kernel.moe_backend = "tilelang"
++        # Prefill chunks end at absolute multiples of long_prefill_token_threshold
++        # (temperature-0 determinism), whatever else the step holds.
++        vllm_config.scheduler_config.align_prefill_chunks = True
+ 
+ 
+ class Glm5NextForCausalLMConfig(VerifyAndUpdateConfig):
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index cc17fd77e15b6f427c02fa56a6b6e45c9da4f545..756554ca2f536c985181b18f65ee2cbfc16bc8bc 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -70,6 +70,7 @@ class DSparkMarkovHead(nn.Module):
+         quant_config: QuantizationConfig | None = None,
+         retain_weight_for_gather: bool = False,
+         lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
++        vocab_parallel: bool = False,
+     ) -> None:
+         super().__init__()
+         self.shard_across_tp = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
+@@ -78,20 +79,34 @@ class DSparkMarkovHead(nn.Module):
+             raise ValueError("Replicated Markov W1 requires a TP-sharded Markov head")
+         if self.shard_across_tp and retain_weight_for_gather:
+             raise ValueError("Gathered Markov top-k requires replicated weights")
+-        self.markov_w1 = (
+-            VocabParallelEmbedding(
++        if self.shard_across_tp and not self.replicate_w1:
++            self.markov_w1 = VocabParallelEmbedding(
+                 vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
+             )
+-            if self.shard_across_tp and not self.replicate_w1
+-            else nn.Embedding(vocab_size, markov_rank)
+-        )
++        else:
++            from vllm.v1.worker import display_carveout
++
++            data = display_carveout.allocate(
++                (vocab_size, markov_rank),
++                torch.get_default_dtype(),
++                torch.get_default_device(),
++            )
++            self.markov_w1 = nn.Embedding(
++                vocab_size,
++                markov_rank,
++                _weight=data,
++                _freeze=data is not None,
++            )
++            self.markov_w1._display_carveout_required = True
++        # vocab_parallel shards the projection by vocabulary rows like the
++        # LM head, for callers that reduce the draft argmax across shards.
+         self.markov_w2 = ParallelLMHead(
+             draft_vocab_size,
+             markov_rank,
+             bias=False,
+             quant_config=quant_config,
+             prefix=maybe_prefix(prefix, "markov_w2"),
+-            disable_tp=not self.shard_across_tp,
++            disable_tp=not (self.shard_across_tp or vocab_parallel),
+             lm_head_quantization=lm_head_quantization,
+         )
+         self.markov_w2._retain_weight_for_gather = retain_weight_for_gather
+@@ -154,6 +169,19 @@ class DSparkMarkovHead(nn.Module):
+                 )
+                 return logits
+ 
++        corrected = self.apply_bias_topk(markov_embed, values, index, scale)
++        return logits.scatter_(1, index, corrected)
++
++    def apply_bias_topk(
++        self,
++        markov_embed: torch.Tensor,
++        values: torch.Tensor,
++        index: torch.Tensor,
++        scale: float = 1.0,
++    ) -> torch.Tensor:
++        """Return ``values + markov_bias`` ([num_reqs, k]) on the selected candidates
++        without scattering into a dense vocabulary buffer."""
++        if self.markov_w2._retain_weight_for_gather and self.markov_w2.is_w4a16_nvfp4:
+             flat_index = index.reshape(-1)
+             packed_weight = self.markov_w2._nvfp4_weight_for_gather.index_select(
+                 0, flat_index
+@@ -183,12 +211,14 @@ class DSparkMarkovHead(nn.Module):
+             beta=1.0,
+             alpha=scale,
+         )
+-        return logits.scatter_(1, index, corrected.squeeze(-1))
++        return corrected.squeeze(-1)
+ 
+ 
+ class DSparkConfidenceHead(nn.Module):
+     """DSpark acceptance-confidence head."""
+ 
++    tp_invariant: bool = False
++
+     def __init__(
+         self,
+         input_dim: int,
+@@ -213,6 +243,16 @@ class DSparkConfidenceHead(nn.Module):
+         ).float()
+         return self.proj(x).squeeze(-1)
+ 
++    def probability(
++        self,
++        hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """The acceptance probability, ``sigmoid`` of the head's logit (into
++        ``out`` when given)."""
++        return torch.sigmoid(self(hidden, markov_embed), out=out)
++
+ 
+ class Qwen3DSparkModel(DFlashQwen3Model):
+     """DFlash Qwen3 backbone + DSpark Markov / confidence heads."""
+@@ -325,12 +365,29 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+             self.logits_processor.scale,
+         )
+ 
++    def apply_markov_bias_topk(
++        self,
++        markov_embed: torch.Tensor,
++        values: torch.Tensor,
++        index: torch.Tensor,
++    ) -> torch.Tensor:
++        return self.model.markov_head.apply_bias_topk(
++            markov_embed,
++            values,
++            index,
++            self.logits_processor.scale,
++        )
++
+     def compute_confidence(
+-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        """Per-position acceptance probability for each drafted token."""
++        """Per-position acceptance probability for each drafted token, into
++        ``out`` when given."""
+         assert self.model.confidence_head is not None
+-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
++        return self.model.confidence_head.probability(head_hidden, markov_embed, out)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         model_weights = {}
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 255637ef8c664df4e68745fd9b9385ad42c1693f..e6693e8835e037b9a854555ed85267af246b0684 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -653,10 +653,13 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+                 speculative_config is not None
+                 and speculative_config.num_speculative_tokens is not None
+             ):
+-                max_num_queries_for_spec = (
++                # A copying request verifies up to num_verification_tokens
++                # drafts (copy drafts), every other one the drafter's block.
++                max_num_queries_for_spec = max(
+                     1
+                     + (2 if speculative_config.parallel_drafting else 1)
+-                    * speculative_config.num_speculative_tokens
++                    * speculative_config.num_speculative_tokens,
++                    1 + speculative_config.num_verification_tokens,
+                 )
+                 self.reorder_batch_threshold = max(
+                     self.reorder_batch_threshold,
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 8c2c2824aafdb9b28816fbe032c6a1a90ee170b7..75cc8701ba0275c1b402231824a1ddc967c0735c 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -932,6 +932,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         num_actual_tokens = common_attn_metadata.num_actual_tokens
+         max_query_len = common_attn_metadata.max_query_len
+         max_seq_len = common_attn_metadata.max_seq_len
++        if envs.VLLM_BATCH_INVARIANT:
++            max_seq_len = self.model_config.max_model_len
+         query_start_loc = common_attn_metadata.query_start_loc
+         seq_lens = common_attn_metadata.seq_lens
+         block_table_tensor = common_attn_metadata.block_table_tensor
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 571566db1f254a4a2804c1404a4272cde1385f02..cb445528c4c7fa28bbfeedf3533a973fded2d374 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -115,6 +115,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+         "DeepseekV4FlashInferMLASparseBackend"
+     )
+     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
++    # DeepSeek V4.1 TileLang sparse MLA (model-driven; selected via the V4.1
++    # layer).
++    TILELANG = "vllm.models.deepseek_v4_1.tilelang.attention.DeepseekV41TileLangBackend"
+     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
+     FLASH_ATTN_MLA_SPARSE = (
+         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index 695ba624f77fc96df342002797f1b3f140bddc14..3bdf218b7b8b239d7fd83658d901c74337a6b91d 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -887,6 +887,10 @@ def _topk_topp_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     split_enabled = current_platform.is_cuda_alike()
+     mode: Any = WarmupChoices((True, False), (True, True), (False, True))
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(1, _max_sampler_batch_size(vllm_config) + 1)
+     topk_enabled = mode[0]
+     topp_enabled = mode[1]
+@@ -1047,6 +1051,10 @@ def _topp_split_stats_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     vocab_size = vllm_config.model_config.get_vocab_size()
+     num_sm = num_compute_units()
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(
+         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
+     )
+@@ -1336,6 +1344,10 @@ def _topp_split_step_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     vocab_size = vllm_config.model_config.get_vocab_size()
+     num_sm = num_compute_units()
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(
+         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
+     )
+@@ -1518,6 +1530,10 @@ def _topp_split_mask_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     vocab_size = vllm_config.model_config.get_vocab_size()
+     num_sm = num_compute_units()
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(
+         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
+     )
+diff --git a/vllm/v1/sample/sink.py b/vllm/v1/sample/sink.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..99bf5f8d1e84862a9d9cc5c7fea1c689a1796123
+--- /dev/null
++++ b/vllm/v1/sample/sink.py
+@@ -0,0 +1,227 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Attention-sink detection and rejection: configuration and host-side events.
++
++A generated token can become an attention sink: from a middle layer on, one
++channel of its residual (DeepSeek V4.1 Flash: its BOS sink channel) runs away by
++orders of magnitude and the row's next-token distribution turns into
++document-start noise. The forward pass is the model's own, so the remedy is a
++decoding policy. The detector reads that column of the pre-norm residual at
++every sampled row (vllm.v1.worker.gpu.sample.sink). It is on by default for the
++models in SINK_CHANNELS and off for every other; ``VLLM_SINK_REJECTION=0`` turns
++it off.
++
++With rejection on, the last token a step samples is not committed when it is
++sampled: it is the request's provisional token, and the scheduler schedules it
++as draft zero of the request's next step, ahead of the drafter's tokens. It then
++goes through the speculative-decoding machinery like any draft: its KV slot is
++rolled back if it is rejected, the prefix cache and the grammar only see it once
++it is committed, and the frontend only receives it then. The verifier accepts
++draft zero unless its own row (the row whose input it is) is sunk; a sunk draft
++zero is rejected and replaced by the next alternate of the draw that produced
++it. A sunk drafter token (row j >= 1) cuts the verification at that draft.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from enum import IntEnum
++from typing import TYPE_CHECKING
++
++import vllm.envs as envs
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++
++# Fields of a request's per-step sink event, as the worker encodes them.
++NUM_SINK_EVENT_FIELDS = 6
++
++
++class SinkOutcome(IntEnum):
++    """What happened at a request's row 0 (the row whose input is the step's
++    first token: draft zero of a decoding request, the last prompt token of a
++    request finishing its prefill)."""
++
++    NONE = 0
++    # Row 0 was sunk and nothing was replaced: the detector runs without
++    # rejection, or the row's input is a prompt token.
++    FLAGGED = 1
++    # Draft zero was sunk and replaced by its next alternate.
++    REJECTED = 2
++    # Draft zero was sunk past its alternates and committed as it is.
++    FALLTHROUGH = 3
++
++
++class SinkRow(IntEnum):
++    """Where a flagged row sits; the counters record flags per kind."""
++
++    # Row 0 of a decoding request: its input is draft zero, the token the
++    # request's previous step sampled.
++    DRAFT_ZERO = 0
++    # A row whose input is a drafter token (row j >= 1).
++    DRAFTER = 1
++    # Row 0 of a request finishing its prefill: its input is a prompt token.
++    PROMPT = 2
++
++    @property
++    def label(self) -> str:
++        return self.name.lower()
++
++
++@dataclass(frozen=True)
++class SinkChannel:
++    """A model's sink channel: the residual column that runs away when a
++    sampled token turns into an attention sink, and the ``|value|`` above
++    which a sampled row counts as sunk."""
++
++    column: int
++    threshold: float
++
++
++# The models the detector and rejection are on for by default, by
++# architecture. Every other model has no entry and runs without them. This
++# table is the only place the numbers live: the code here exists for these
++# checkpoints, and a model without the behaviour drops its entry.
++SINK_CHANNELS: dict[str, SinkChannel] = {
++    # DeepSeek V4.1 Flash (measured on the 1017 checkpoint): column 2455 is its
++    # BOS sink channel. Sunk rows carry 108,032 to 125,440 there on DeepSeek's
++    # reference and 116,736 to 118,784 served; ordinary text peaked at 62,720
++    # (number tokens) over a 358,785-token survey. 85,000 is the geometric
++    # midpoint (experiments/2026-10-19-sink-rejection-v2 in spark-ds41f).
++    "DeepseekV41ForCausalLM": SinkChannel(column=2455, threshold=85_000.0),
++}
++
++
++@dataclass(frozen=True)
++class SinkConfig:
++    """The detector's column and threshold, and the rejection policy's switch."""
++
++    # Column of the pre-norm residual watched at every sampled row.
++    column: int
++    # |residual[column]| above which the row is sunk.
++    threshold: float
++    # Hold the last sampled token as draft zero and reject it when sunk (the
++    # fix); off counts only and leaves decoding as it is.
++    rejection: bool
++    # Alternates kept per provisional token: the rejections a position may take.
++    max_retries: int
++
++    @classmethod
++    def for_model(cls, vllm_config: VllmConfig) -> SinkConfig | None:
++        """The settings for the served model, or None when the detector is off.
++
++        On (detector and rejection) for the architectures in SINK_CHANNELS, off
++        for every other model; ``VLLM_SINK_REJECTION`` overrides the default.
++        ``VLLM_SINK_DETECTOR_COLUMN`` and ``_THRESHOLD`` replace the model's
++        numbers; with rejection off, an explicit column runs the detector alone.
++
++        Raises:
++            ValueError: rejection on without a column (a model with no entry),
++                or no threshold for the column.
++        """
++        architecture = vllm_config.model_config.architecture
++        channel = SINK_CHANNELS.get(architecture)
++        rejection = envs.VLLM_SINK_REJECTION
++        if rejection is None:
++            rejection = channel is not None
++        column = envs.VLLM_SINK_DETECTOR_COLUMN
++        if column is None:
++            if not rejection:
++                return None
++            if channel is None:
++                raise ValueError(
++                    f"VLLM_SINK_REJECTION: {architecture} has no sink channel "
++                    "(vllm.v1.sample.sink.SINK_CHANNELS); set "
++                    "VLLM_SINK_DETECTOR_COLUMN and VLLM_SINK_DETECTOR_THRESHOLD."
++                )
++            column = channel.column
++        if column < 0:
++            raise ValueError("VLLM_SINK_DETECTOR_COLUMN must not be negative.")
++        threshold = envs.VLLM_SINK_DETECTOR_THRESHOLD
++        if threshold is None:
++            if channel is None:
++                raise ValueError(
++                    f"VLLM_SINK_DETECTOR_COLUMN: {architecture} has no sink "
++                    "channel, so set VLLM_SINK_DETECTOR_THRESHOLD too."
++                )
++            threshold = channel.threshold
++        if threshold <= 0:
++            raise ValueError("VLLM_SINK_DETECTOR_THRESHOLD must be positive.")
++        max_retries = envs.VLLM_SINK_REJECTION_MAX_RETRIES
++        if rejection and max_retries < 1:
++            raise ValueError("VLLM_SINK_REJECTION_MAX_RETRIES must be at least 1.")
++        return cls(
++            column=column,
++            threshold=threshold,
++            rejection=rejection,
++            max_retries=max_retries,
++        )
++
++    @property
++    def num_alternates(self) -> int:
++        """Alternates kept per provisional token (0: none needed)."""
++        return self.max_retries if self.rejection else 0
++
++
++@dataclass(frozen=True)
++class SinkEvent:
++    """One request's sink event of one step (host form of the worker's
++    ``[num_reqs, NUM_SINK_EVENT_FIELDS]`` record)."""
++
++    outcome: SinkOutcome
++    # The kind of row 0: DRAFT_ZERO for a decoding request, PROMPT otherwise.
++    row0: SinkRow
++    # Flagged drafter rows among the rows whose inputs were committed or cut.
++    num_drafter_flags: int
++    # Rejection on: the drafter row at which the verification was cut, or -1.
++    cut_row: int
++    # Draft zero rejected: the logprob and rank of its replacement in the
++    # distribution that produced the replaced token (None without logprobs).
++    recovered_logprob: float | None = None
++    recovered_rank: int | None = None
++    # The largest |residual[column]| among the flagged rows, and its row in
++    # the request's step (0: the step's first input; -1: none).
++    value: int = 0
++    value_row: int = -1
++
++    @property
++    def flagged_row0(self) -> bool:
++        return self.outcome != SinkOutcome.NONE
++
++    @property
++    def num_flagged_rows(self) -> int:
++        return int(self.flagged_row0) + self.num_drafter_flags
++
++
++def events_to_dict(
++    events: list[list[int]],
++    req_ids: list[str],
++    recovered_logprobs: list[float] | None = None,
++    recovered_ranks: list[int] | None = None,
++) -> dict[str, SinkEvent] | None:
++    """The host form: request id -> event, for the requests with one."""
++    result: dict[str, SinkEvent] = {}
++    for i, (req_id, fields) in enumerate(zip(req_ids, events)):
++        outcome, row0, num_drafter_flags, cut_row, value, value_row = fields
++        if outcome == SinkOutcome.NONE and num_drafter_flags == 0:
++            continue
++        rejected = outcome == SinkOutcome.REJECTED
++        result[req_id] = SinkEvent(
++            outcome=SinkOutcome(outcome),
++            row0=SinkRow(row0),
++            num_drafter_flags=int(num_drafter_flags),
++            cut_row=int(cut_row),
++            value=int(value),
++            value_row=int(value_row),
++            recovered_logprob=(
++                float(recovered_logprobs[i])
++                if rejected and recovered_logprobs is not None
++                else None
++            ),
++            recovered_rank=(
++                int(recovered_ranks[i])
++                if rejected and recovered_ranks is not None
++                else None
++            ),
++        )
++    return result or None

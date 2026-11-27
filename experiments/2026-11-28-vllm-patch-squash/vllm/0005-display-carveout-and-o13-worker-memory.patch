@@ -1,0 +1,2924 @@
+From f86eeca5b24f9dab1c1bef4a75cc045229fcebfe Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:45:00 +0000
+Subject: [PATCH] worker: add display carveout, order-13 contiguous CUDA pool,
+ and warmup controls
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Pre-allocate the contiguous order-13 CUDA pool on unified-memory GB10 hosts, add display carveout accounting, and integrate TileLang warmup and startup memory guards.
+Quality impact: none (tree-identical squash of qualified candidate-77 vLLM tree 58f9b11080cf8ebeccd80c0ce1d9bb7a6ff4ae58).
+Tests: candidate-77 release-tests (12,082 passed, 0 failed) and 2-boot tp3-triangle screen.
+Upstream status: local squashed subsystem patch (tree-identical to candidate-77 0001..0871).
+---
+ vllm/model_executor/warmup/b12x_prepare.py |   55 +-
+ vllm/model_executor/warmup/jit_warmup.py   |   54 +-
+ vllm/v1/worker/display_carveout.py         |  966 +++++++++++++++++
+ vllm/v1/worker/gpu_worker.py               | 1141 +++++++++++++++++++-
+ vllm/v1/worker/utils.py                    |  117 +-
+ vllm/v1/worker/workspace.py                |   73 ++
+ 6 files changed, 2318 insertions(+), 88 deletions(-)
+ create mode 100644 vllm/v1/worker/display_carveout.py
+
+diff --git a/vllm/model_executor/warmup/b12x_prepare.py b/vllm/model_executor/warmup/b12x_prepare.py
+index bc15f4d488eb1cd558f78d364acc205e321a89a7..723c3433cd665ef8f209da9277a0da09933730ce 100644
+--- a/vllm/model_executor/warmup/b12x_prepare.py
++++ b/vllm/model_executor/warmup/b12x_prepare.py
+@@ -110,7 +110,10 @@ def _planned_decode_counts(
+                 {
+                     tokens
+                     for _, tokens in dense_varlen_decode_shapes(
+-                        max_reqs, query_len, limit
++                        max_reqs,
++                        query_len,
++                        limit,
++                        worker.vllm_config.uniform_decode_query_len,
+                     )
+                 }
+             )
+@@ -252,7 +255,9 @@ def _units_from_modules(
+         if workload.stage == "weights":
+             head = getattr(module, "lm_head", None)
+             processor = getattr(module, "logits_processor", None)
+-            bind_head = getattr(processor, "prepare_b12x_vocab_projection", None)
++            bind_head = getattr(
++                processor, "prepare_vocab_projection", None
++            ) or getattr(processor, "prepare_b12x_vocab_projection", None)
+             if head is not None and callable(bind_head):
+                 bind_head(head)
+         provider = getattr(module, "b12x_preparation_provider", None)
+@@ -388,6 +393,10 @@ def collect_b12x_units(
+                 replace(unit, workspace_lanes=tuple(sorted({0, lane})))
+                 for unit in hook(provider, workload)
+             )
++    if units:
++        # Only a model that declares units, of either stage, tunes its state
++        # against a temporary cache (initialize_b12x_tuning_cache).
++        worker._b12x_units_declared = True
+     # The state stage also carries the weights-stage units: their prepared
+     # plans are skipped by the session, and any plan a layer declared for a
+     # count that only the state stage exposes is prepared before capture.
+@@ -539,18 +548,23 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
+     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+     from vllm.v1.worker.workspace import current_workspace_manager
+ 
+-    batches = []
+-    units: list[B12xPreparationUnit] = []
+-    if b12x_native_supported(worker):
+-        workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
+-        units = collect_b12x_units(worker, workload)
+-        batches = b12x_batches(
+-            units,
+-            autotune=(
+-                bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
+-                and os.environ.get("B12X_AUTOTUNE", "1") != "0"
+-            ),
++    if not b12x_native_supported(worker):
++        return B12xPreparationCoordinator(
++            None,
++            [],
++            global_rank=int(worker.rank),
++            world_group=None,
++            process_local_only=True,
+         )
++    workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
++    units = collect_b12x_units(worker, workload)
++    batches = b12x_batches(
++        units,
++        autotune=(
++            bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
++            and os.environ.get("B12X_AUTOTUNE", "1") != "0"
++        ),
++    )
+     session = get_b12x_session(worker) if batches else None
+     if getattr(worker, "_b12x_tuning_cache", False):
+         worker._b12x_tuning_batch = B12xPreparedBatch(
+@@ -606,6 +620,10 @@ def initialize_b12x_tuning_cache(worker: Worker, kv_cache_config) -> bool:
+     """Use final cache groups and layout with a small disposable block pool."""
+     if not b12x_native_supported(worker) or not worker.use_v2_model_runner:
+         return False
++    # A model that declared no unit, in its weights stage or against the
++    # profiling pools, has nothing to tune.
++    if not getattr(worker, "_b12x_units_declared", False):
++        return False
+     # HiSparse has a separate shared host-pool lifecycle.
+     if worker.vllm_config.attention_config.hisparse_config is not None:
+         return False
+@@ -659,16 +677,15 @@ def release_b12x_tuning_cache(worker: Worker) -> None:
+ 
+ def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:
+     """Prime profiling-pool plans with defaults in complete-world control rounds."""
++    if not b12x_native_supported(worker):
++        return B12xPreparedBatch(None, ())
+     from vllm.distributed.parallel_state import get_world_group
+     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+     from vllm.v1.worker.workspace import current_workspace_manager
+ 
+-    requests: tuple[PreparationRequest, ...] = ()
+-    units: list[B12xPreparationUnit] = []
+-    if b12x_native_supported(worker):
+-        workload = b12x_workload(worker, stage=stage)
+-        units = collect_b12x_units(worker, workload)
+-        requests = tuple(request for unit in units for request in unit.requests)
++    workload = b12x_workload(worker, stage=stage)
++    units = collect_b12x_units(worker, workload)
++    requests = tuple(request for unit in units for request in unit.requests)
+     session = get_b12x_session(worker) if requests else None
+     fresh = tuple(request.plan for request in requests if request.plan.prepared is None)
+     batch = B12xPreparedBatch(session, fresh)
+diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
+index 84f713aa6489577a905667728023da405737f250..0f54c22e89e94137afba7702d6c77f8edd25b678 100644
+--- a/vllm/model_executor/warmup/jit_warmup.py
++++ b/vllm/model_executor/warmup/jit_warmup.py
+@@ -1005,6 +1005,24 @@ def _same_registration(
+     ) and all(_same_value(left_kwargs[k], right_kwargs[k]) for k in left_kwargs)
+ 
+ 
++_FAST_KEY_ATOMS = (int, float, str, bytes, bool, type(None), type)
++
++
++def _fast_registration_key(value: Any) -> Any:
++    if isinstance(value, _FAST_KEY_ATOMS):
++        return (type(value), value)
++    if callable(value):
++        return (id, id(value))
++    if isinstance(value, tuple):
++        return (tuple, tuple(_fast_registration_key(x) for x in value))
++    if isinstance(value, dict) and all(isinstance(k, str) for k in value):
++        return (
++            dict,
++            tuple((k, _fast_registration_key(value[k])) for k in sorted(value)),
++        )
++    raise TypeError
++
++
+ class JitWarmupRegistry:
+     """Collect and compile JIT kernels selected during runner setup."""
+ 
+@@ -1019,6 +1037,11 @@ class JitWarmupRegistry:
+             VllmJitKernel[Any],
+             list[tuple[tuple[Any, ...], dict[str, Any]]],
+         ] = {}
++        self._fast_registration_keys: dict[VllmJitKernel[Any], set[Any]] = {}
++        self._slow_registrations: dict[
++            VllmJitKernel[Any],
++            list[tuple[tuple[Any, ...], dict[str, Any]]],
++        ] = {}
+ 
+     @classmethod
+     def capture(cls, init_fn: Callable[..., None]) -> Callable[..., None]:
+@@ -1042,6 +1065,11 @@ class JitWarmupRegistry:
+         finally:
+             self._active.reset(token)
+ 
++    @classmethod
++    def active(cls) -> JitWarmupRegistry | None:
++        """The registry collecting registrations in this context, if any."""
++        return cls._active.get()
++
+     @classmethod
+     def register(
+         cls,
+@@ -1067,16 +1095,32 @@ class JitWarmupRegistry:
+         # get_warmup_keys once per distinct registration is sufficient. Dedup on
+         # identity-or-equality -- identity short-circuits shared singletons like
+         # vllm_config before any deep __eq__.
+-        if any(
+-            _same_registration(registered, (args, kwargs))
+-            for registered in registrations
+-        ):
+-            return
++        try:
++            fast_key = _fast_registration_key((args, kwargs))
++        except TypeError:
++            slow = self._slow_registrations.setdefault(kernel, [])
++            if any(
++                _same_registration(registered, (args, kwargs))
++                for registered in slow
++            ):
++                return
++            slow.append((args, kwargs))
++        else:
++            fast_keys = self._fast_registration_keys.setdefault(kernel, set())
++            if fast_key in fast_keys:
++                return
++            fast_keys.add(fast_key)
+         registrations.append((args, kwargs))
+ 
+     def __len__(self) -> int:
+         return sum(len(registrations) for registrations in self._registrations.values())
+ 
++    def registrations(
++        self,
++    ) -> list[tuple[VllmJitKernel[Any], list[tuple[tuple[Any, ...], dict[str, Any]]]]]:
++        """Each registered kernel and its distinct registrations."""
++        return [(kernel, list(regs)) for kernel, regs in self._registrations.items()]
++
+     def warmup(self) -> None:
+         """Expand registrations and compile each wrapper/key pair once."""
+         from tqdm import tqdm
+diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3feb7de7805a5b1c781f4add108b92bd44bfeb76
+--- /dev/null
++++ b/vllm/v1/worker/display_carveout.py
+@@ -0,0 +1,966 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Embedding, output-head, and decode-only weights in the GB10 display carve-out.
++
++DGX Spark firmware reserves about 2 GiB at the top of physical memory for
++display scanout surfaces (the DISPLAY_FRM carve-out). Linux and ordinary CUDA
++allocations never use it, so on a headless node it sits idle; a text console
++takes only its framebuffer (8 MiB at 1920x1080). Calling NVIDIA's Resource
++Manager directly on /dev/nvidiactl (NV_ESC_RM_ALLOC with
++NV01_MEMORY_SYSTEM, NVOS32_ATTR2_ISO_YES, and 2 MiB huge pages),
++exporting the RM handle via NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD,
++and importing it through CUDA Virtual Memory Management
++(cuMemImportFromShareableHandle + cuMemAddressReserve + cuMemMap +
++cuMemSetAccess) maps scanout memory into CUDA without touching
++/dev/dri/card0, avoiding DRM master contention and 16 MiB dumb-buffer
++rounding while staying readable by kernels and direct_io.
++
++Measured on GB10 (spark-ds41f:candidate-60), both RM scanout modes stream
++at full speed (~251-257 GB/s sequential read) and deliver ~231-234 GB/s on
++random 576-byte reads (versus ~10 GB/s on DRM dumb buffers and ~225 GB/s in
++cudaMalloc). NVOS32_ATTR2_GPU_CACHEABLE_YES matches cudaMalloc
++(1.00x) on large-M GEMMs that re-read weights (appropriate for embed_tokens,
++packed lm_head.weight, markov_w1, and multi-token tables), while
++NVOS32_ATTR2_GPU_CACHEABLE_NO bypasses L2 cache line allocation for
++single-pass decode-only weights such as the 8-bit vocab screening matrix W_q
++and DSpark routed-expert slabs (saving ~39 us on lm_head_greedy(M=6) vs.
++caching W_q).
++
++With SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 mandatory vocabulary tables are
++created in the carve-out when the model is built (allocate), so the
++checkpoint streams straight into it and they never occupy ordinary memory: on
++GB10, memory freed after loading stays charged to the process, so copying them
++in after loading and freeing the originals would cost host memory for good.
++Once loading is done, before any kernel plan or graph captures the weights,
++the worker confirms that every mandatory vocabulary-sized weight of the served
++model is in the carve-out and that no carve-out buffer was left behind by a
++layer the model dropped. It refuses to start otherwise, or when the carve-out
++cannot hold them.
++
++Nothing writes the weights after loading, and nothing else can reach them:
++the RM client, device, memory handles, and export file descriptor all close
++immediately after CUDA VMM imports the handle, leaving no open RM control fd
++and keeping the imported allocation private to the worker process (reclaimed by
++the kernel on close() or process exit). The scanout heap never hands out a
++range already in use, and _MAX_TOTAL_BYTES keeps at least 64 MiB free for a
++node's 8 MiB /dev/fb0 text console. A driver fault or GPU reset could still
++leave a stale mapping, so SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS above
++0 turns on periodic side-stream checksum verification; production leaves it
++unset for zero runtime overhead.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import ctypes
++import errno
++import fcntl
++import math
++import os
++import signal
++import threading
++import time
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
++
++logger = init_logger(__name__)
++
++_REQUIRED = os.environ.get("SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
++_CHECK_SECONDS = float(
++    os.environ.get("SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS", "0")
++)
++# 16 MiB of 32-bit words per partial checksum (a 32 MiB int64 transient).
++_CHECK_CHUNK_WORDS = 1 << 22
++_RM_NODE = "/dev/nvidiactl"
++
++# 2 MiB huge pages inside the scanout reserve match CUDA VMM mapping granularity.
++_GRANULE = 2 << 20
++# Vocabulary-sized tables (including DSpark's 60-64 MiB markov_w1) and
++# decode-only DSpark routed-expert slabs; small embeddings stay where they are.
++_MIN_WEIGHT_BYTES = 60 << 20
++# Leave 64 MiB of the 2,032 MiB scanout reserve free for the console framebuffer.
++_MAX_TOTAL_BYTES = 1968 << 20
++
++# NVIDIA Resource Manager escape codes (nv_escape.h), class IDs (cl0000.h /
++# cl0080.h / cl003e.h), and control commands (ctrl0000gpu.h / ctrl0000unix.h).
++_NV_ESC_RM_FREE = 0x29
++_NV_ESC_RM_CONTROL = 0x2A
++_NV_ESC_RM_ALLOC = 0x2B
++
++_NV01_ROOT = 0x0
++_NV01_DEVICE_0 = 0x80
++_NV01_MEMORY_SYSTEM = 0x3E
++
++_NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS = 0x201
++_NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2 = 0x205
++_NV0000_CTRL_CMD_GPU_ATTACH_IDS = 0x215
++_NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID = 0x275
++_NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD = 0x3D05
++
++_NV0000_CTRL_GPU_ATTACH_ALL_PROBED_IDS = 0x0000FFFF
++_NV0000_CTRL_GPU_INVALID_ID = 0xFFFFFFFF
++_NV0000_CTRL_CMD_GPU_GET_UUID_FLAGS_BINARY_SHA1 = 0x2
++_NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM = 1
++_NV0000_GPU_MAX_GID_LENGTH = 256
++_NV_MAX_DEVICES = 32
++
++# Non-zero RM owner tag ('spk1') and memory attributes (nvos.h) for contiguous
++# 2 MiB ISO scanout pages with selectable GPU L2 cacheability.
++_RM_OWNER = 0x73706B31
++_NVOS32_TYPE_IMAGE = 0
++_NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE = 0x00000100
++_NVOS32_ATTR = (
++    (3 << 23)  # NVOS32_ATTR_PAGE_SIZE_HUGE
++    | (1 << 25)  # NVOS32_ATTR_LOCATION_PCI
++    | (2 << 27)  # NVOS32_ATTR_PHYSICALITY_CONTIGUOUS
++    | (1 << 29)  # NVOS32_ATTR_COHERENCY_CACHED
++)
++_NVOS32_ATTR2_BASE = (
++    (1 << 18)  # NVOS32_ATTR2_ISO_YES
++    | (1 << 20)  # NVOS32_ATTR2_PAGE_SIZE_HUGE_2MB
++)
++_NVOS32_ATTR2_GPU_CACHEABLE_YES = 1 << 2
++_NVOS32_ATTR2_GPU_CACHEABLE_NO = 2 << 2
++
++_CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1
++_CU_MEM_LOCATION_TYPE_DEVICE = 1
++_CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
++
++_HANDLE_DEVICE = 0x10001
++_HANDLE_MEMORY = 0x20001
++
++
++def _iowr(nr: int, size: int) -> int:
++    return (3 << 30) | (size << 16) | (ord("F") << 8) | nr
++
++
++class _NvOs21Params(ctypes.Structure):
++    _fields_ = [
++        ("hRoot", ctypes.c_uint32),
++        ("hObjectParent", ctypes.c_uint32),
++        ("hObjectNew", ctypes.c_uint32),
++        ("hClass", ctypes.c_uint32),
++        ("pAllocParms", ctypes.c_uint64),
++        ("paramsSize", ctypes.c_uint32),
++        ("status", ctypes.c_uint32),
++    ]
++
++
++class _NvOs00Params(ctypes.Structure):
++    _fields_ = [
++        ("hRoot", ctypes.c_uint32),
++        ("hObjectParent", ctypes.c_uint32),
++        ("hObjectOld", ctypes.c_uint32),
++        ("status", ctypes.c_uint32),
++    ]
++
++
++class _NvOs54Params(ctypes.Structure):
++    _fields_ = [
++        ("hClient", ctypes.c_uint32),
++        ("hObject", ctypes.c_uint32),
++        ("cmd", ctypes.c_uint32),
++        ("flags", ctypes.c_uint32),
++        ("params", ctypes.c_uint64),
++        ("paramsSize", ctypes.c_uint32),
++        ("status", ctypes.c_uint32),
++    ]
++
++
++class _Nv0000AllocParams(ctypes.Structure):
++    _fields_ = [
++        ("hClient", ctypes.c_uint32),
++        ("processID", ctypes.c_uint32),
++        ("processName", ctypes.c_char * 100),
++        ("pOsPidInfo", ctypes.c_uint64),
++    ]
++
++
++class _Nv0080AllocParams(ctypes.Structure):
++    _fields_ = [
++        ("deviceId", ctypes.c_uint32),
++        ("hClientShare", ctypes.c_uint32),
++        ("hTargetClient", ctypes.c_uint32),
++        ("hTargetDevice", ctypes.c_uint32),
++        ("flags", ctypes.c_uint32),
++        ("vaSpaceSize", ctypes.c_uint64),
++        ("vaStartInternal", ctypes.c_uint64),
++        ("vaLimitInternal", ctypes.c_uint64),
++        ("vaMode", ctypes.c_uint32),
++    ]
++
++
++class _NvMemoryAllocationParams(ctypes.Structure):
++    _fields_ = [
++        ("owner", ctypes.c_uint32),
++        ("type", ctypes.c_uint32),
++        ("flags", ctypes.c_uint32),
++        ("width", ctypes.c_uint32),
++        ("height", ctypes.c_uint32),
++        ("pitch", ctypes.c_int32),
++        ("attr", ctypes.c_uint32),
++        ("attr2", ctypes.c_uint32),
++        ("format", ctypes.c_uint32),
++        ("comprCovg", ctypes.c_uint32),
++        ("zcullCovg", ctypes.c_uint32),
++        ("rangeLo", ctypes.c_uint64),
++        ("rangeHi", ctypes.c_uint64),
++        ("size", ctypes.c_uint64),
++        ("alignment", ctypes.c_uint64),
++        ("offset", ctypes.c_uint64),
++        ("limit", ctypes.c_uint64),
++        ("address", ctypes.c_uint64),
++        ("ctagOffset", ctypes.c_uint32),
++        ("hVASpace", ctypes.c_uint32),
++        ("internalflags", ctypes.c_uint32),
++        ("tag", ctypes.c_uint32),
++        ("numaNode", ctypes.c_int32),
++    ]
++
++
++class _Nv0000AttachIdsParams(ctypes.Structure):
++    _fields_ = [
++        ("gpuIds", ctypes.c_uint32 * _NV_MAX_DEVICES),
++        ("failedId", ctypes.c_uint32),
++    ]
++
++
++class _Nv0000AttachedIdsParams(ctypes.Structure):
++    _fields_ = [("gpuIds", ctypes.c_uint32 * _NV_MAX_DEVICES)]
++
++
++class _Nv0000GpuIdInfoV2Params(ctypes.Structure):
++    _fields_ = [
++        ("gpuId", ctypes.c_uint32),
++        ("gpuFlags", ctypes.c_uint32),
++        ("deviceInstance", ctypes.c_uint32),
++        ("subDeviceInstance", ctypes.c_uint32),
++        ("sliStatus", ctypes.c_uint32),
++        ("boardId", ctypes.c_uint32),
++        ("gpuInstance", ctypes.c_uint32),
++        ("numaId", ctypes.c_int32),
++    ]
++
++
++class _Nv0000UuidFromGpuIdParams(ctypes.Structure):
++    _fields_ = [
++        ("gpuId", ctypes.c_uint32),
++        ("flags", ctypes.c_uint32),
++        ("gpuUuid", ctypes.c_uint8 * _NV0000_GPU_MAX_GID_LENGTH),
++        ("uuidStrLen", ctypes.c_uint32),
++    ]
++
++
++class _Nv0000CtrlOsUnixExportObjectToFdParams(ctypes.Structure):
++    _fields_ = [
++        ("type", ctypes.c_uint32),
++        ("hDevice", ctypes.c_uint32),
++        ("hParent", ctypes.c_uint32),
++        ("hObject", ctypes.c_uint32),
++        ("fd", ctypes.c_int32),
++        ("flags", ctypes.c_uint32),
++    ]
++
++
++class _CUmemLocation(ctypes.Structure):
++    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
++
++
++class _CUmemAccessDesc(ctypes.Structure):
++    _fields_ = [("location", _CUmemLocation), ("flags", ctypes.c_int)]
++
++
++_libcuda = None
++
++
++def _cuda():
++    global _libcuda
++    if _libcuda is None:
++        _libcuda = ctypes.CDLL("libcuda.so.1")
++    return _libcuda
++
++
++def _check(cuda, status: int, what: str) -> None:
++    if status:
++        text = ctypes.c_char_p()
++        cuda.cuGetErrorString(status, ctypes.byref(text))
++        detail = text.value.decode() if text.value else status
++        raise OSError(errno.ENOMEM, f"{what} failed: {detail}")
++
++
++def _rm_alloc(
++    ctl_fd: int, root: int, parent: int, new_obj: int, cls: int, params
++) -> int:
++    req = _NvOs21Params(
++        hRoot=root,
++        hObjectParent=parent,
++        hObjectNew=new_obj,
++        hClass=cls,
++        pAllocParms=ctypes.addressof(params),
++        paramsSize=ctypes.sizeof(params),
++    )
++    fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_ALLOC, ctypes.sizeof(req)), req)
++    if req.status != 0:
++        err = errno.ENOMEM if req.status == 0x51 else errno.EIO
++        raise OSError(
++            err, f"NV_ESC_RM_ALLOC(class={cls:#x}) failed: status={req.status:#x}"
++        )
++    return req.hObjectNew
++
++
++def _rm_control(ctl_fd: int, client: int, obj: int, cmd: int, params) -> None:
++    req = _NvOs54Params(
++        hClient=client,
++        hObject=obj,
++        cmd=cmd,
++        flags=0,
++        params=ctypes.addressof(params),
++        paramsSize=ctypes.sizeof(params),
++    )
++    fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_CONTROL, ctypes.sizeof(req)), req)
++    if req.status != 0:
++        raise OSError(
++            errno.EIO,
++            f"NV_ESC_RM_CONTROL(cmd={cmd:#x}) failed: status={req.status:#x}",
++        )
++
++
++def _rm_free(ctl_fd: int, root: int, parent: int, obj: int) -> None:
++    req = _NvOs00Params(hRoot=root, hObjectParent=parent, hObjectOld=obj)
++    with contextlib.suppress(OSError):
++        fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_FREE, ctypes.sizeof(req)), req)
++
++
++def _device_uuid(cuda, device_index: int) -> bytes:
++    cu_dev = ctypes.c_int()
++    _check(cuda, cuda.cuDeviceGet(ctypes.byref(cu_dev), device_index), "cuDeviceGet")
++    cu_uuid = (ctypes.c_uint8 * 16)()
++    get_uuid = getattr(cuda, "cuDeviceGetUuid_v2", cuda.cuDeviceGetUuid)
++    _check(cuda, get_uuid(cu_uuid, cu_dev), "cuDeviceGetUuid")
++    return bytes(cu_uuid)
++
++
++def _resolve_device_instance(
++    ctl_fd: int, hclient: int, cuda, device_index: int
++) -> int:
++    target_uuid = _device_uuid(cuda, device_index)
++    attached = _Nv0000AttachedIdsParams()
++    _rm_control(ctl_fd, hclient, hclient, _NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS, attached)
++    for gpu_id in attached.gpuIds:
++        if gpu_id == 0 or gpu_id == _NV0000_CTRL_GPU_INVALID_ID:
++            continue
++        uuid_req = _Nv0000UuidFromGpuIdParams(
++            gpuId=gpu_id, flags=_NV0000_CTRL_CMD_GPU_GET_UUID_FLAGS_BINARY_SHA1
++        )
++        try:
++            _rm_control(
++                ctl_fd,
++                hclient,
++                hclient,
++                _NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID,
++                uuid_req,
++            )
++        except OSError:
++            continue
++        if bytes(uuid_req.gpuUuid[:16]) == target_uuid:
++            info = _Nv0000GpuIdInfoV2Params(gpuId=gpu_id)
++            _rm_control(
++                ctl_fd, hclient, hclient, _NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, info
++            )
++            return int(info.deviceInstance)
++    raise OSError(
++        errno.ENODEV,
++        f"No RM GPU matches CUDA device {device_index} UUID {target_uuid.hex()}",
++    )
++
++
++class _Carveout:
++    """One RM scanout allocation mapped via CUDA VMM; alive for the process.
++
++    /dev/nvidiactl and all RM handles (client, device, memory, and export
++    fd) close right after cuMemImportFromShareableHandle retains its own
++    kernel reference to the exported object.
++    """
++
++    def __init__(
++        self, nbytes: int, *, device_index: int = 0, cacheable: bool = True
++    ):
++        self.nbytes = nbytes
++        self.device_index = device_index
++        self.cacheable = cacheable
++        self._closed = True
++        self.handle = ctypes.c_uint64()
++        self.pointer = ctypes.c_ulonglong()
++        self._mapped = False
++
++        cuda = _cuda()
++        torch.cuda.init()
++
++        ctl_fd = os.open(_RM_NODE, os.O_RDWR | os.O_CLOEXEC)
++        hclient = 0
++        hdev = 0
++        hmem = 0
++        export_fd = -1
++        try:
++            root_params = _Nv0000AllocParams()
++            # Kernel upgrades NV01_ROOT allocation hObjectNew cleanly when 0.
++            req = _NvOs21Params(
++                hRoot=0,
++                hObjectParent=0,
++                hObjectNew=0,
++                hClass=_NV01_ROOT,
++                pAllocParms=ctypes.addressof(root_params),
++                paramsSize=ctypes.sizeof(root_params),
++            )
++            fcntl.ioctl(ctl_fd, _iowr(_NV_ESC_RM_ALLOC, ctypes.sizeof(req)), req)
++            if req.status != 0:
++                raise OSError(
++                    errno.EIO,
++                    f"NV_ESC_RM_ALLOC(NV01_ROOT) failed: status={req.status:#x}",
++                )
++            hclient = req.hObjectNew
++
++            attach = _Nv0000AttachIdsParams()
++            attach.gpuIds[0] = _NV0000_CTRL_GPU_ATTACH_ALL_PROBED_IDS
++            attach.gpuIds[1] = _NV0000_CTRL_GPU_INVALID_ID
++            _rm_control(
++                ctl_fd, hclient, hclient, _NV0000_CTRL_CMD_GPU_ATTACH_IDS, attach
++            )
++
++            device_instance = _resolve_device_instance(
++                ctl_fd, hclient, cuda, device_index
++            )
++            dev_params = _Nv0080AllocParams(
++                deviceId=device_instance, hClientShare=hclient
++            )
++            hdev = _rm_alloc(
++                ctl_fd, hclient, hclient, _HANDLE_DEVICE, _NV01_DEVICE_0, dev_params
++            )
++
++            cache_attr = (
++                _NVOS32_ATTR2_GPU_CACHEABLE_YES
++                if cacheable
++                else _NVOS32_ATTR2_GPU_CACHEABLE_NO
++            )
++            mem_params = _NvMemoryAllocationParams(
++                owner=_RM_OWNER,
++                type=_NVOS32_TYPE_IMAGE,
++                flags=_NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE,
++                attr=_NVOS32_ATTR,
++                attr2=_NVOS32_ATTR2_BASE | cache_attr,
++                size=nbytes,
++                alignment=_GRANULE,
++            )
++            hmem = _rm_alloc(
++                ctl_fd, hclient, hdev, _HANDLE_MEMORY, _NV01_MEMORY_SYSTEM, mem_params
++            )
++
++            export_fd = os.open(_RM_NODE, os.O_RDWR | os.O_CLOEXEC)
++            export_params = _Nv0000CtrlOsUnixExportObjectToFdParams(
++                type=_NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM,
++                hDevice=hdev,
++                hParent=hdev,
++                hObject=hmem,
++                fd=export_fd,
++                flags=0,
++            )
++            _rm_control(
++                ctl_fd,
++                hclient,
++                hclient,
++                _NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD,
++                export_params,
++            )
++            _check(
++                cuda,
++                cuda.cuMemImportFromShareableHandle(
++                    ctypes.byref(self.handle),
++                    ctypes.c_void_p(export_fd),
++                    _CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
++                ),
++                "cuMemImportFromShareableHandle",
++            )
++        finally:
++            if export_fd >= 0:
++                with contextlib.suppress(OSError):
++                    os.close(export_fd)
++            if hmem:
++                _rm_free(ctl_fd, hclient, hdev, hmem)
++            if hdev:
++                _rm_free(ctl_fd, hclient, hclient, hdev)
++            if hclient:
++                _rm_free(ctl_fd, hclient, 0, hclient)
++            os.close(ctl_fd)
++
++        self._closed = False
++        try:
++            _check(
++                cuda,
++                cuda.cuMemAddressReserve(
++                    ctypes.byref(self.pointer),
++                    ctypes.c_size_t(nbytes),
++                    ctypes.c_size_t(_GRANULE),
++                    ctypes.c_ulonglong(0),
++                    ctypes.c_ulonglong(0),
++                ),
++                "cuMemAddressReserve",
++            )
++            _check(
++                cuda,
++                cuda.cuMemMap(
++                    self.pointer,
++                    ctypes.c_size_t(nbytes),
++                    ctypes.c_size_t(0),
++                    self.handle,
++                    ctypes.c_ulonglong(0),
++                ),
++                "cuMemMap",
++            )
++            self._mapped = True
++            access = _CUmemAccessDesc(
++                location=_CUmemLocation(
++                    type=_CU_MEM_LOCATION_TYPE_DEVICE, id=device_index
++                ),
++                flags=_CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
++            )
++            _check(
++                cuda,
++                cuda.cuMemSetAccess(
++                    self.pointer,
++                    ctypes.c_size_t(nbytes),
++                    ctypes.byref(access),
++                    ctypes.c_size_t(1),
++                ),
++                "cuMemSetAccess",
++            )
++        except Exception:
++            self.close()
++            raise
++
++    def close(self) -> None:
++        if getattr(self, "_closed", True):
++            return
++        self._closed = True
++        cuda = _cuda()
++        if getattr(self, "_mapped", False) and getattr(self, "pointer", None) and self.pointer.value:
++            cuda.cuMemUnmap(self.pointer, ctypes.c_size_t(self.nbytes))
++            self._mapped = False
++        if getattr(self, "pointer", None) and self.pointer.value:
++            cuda.cuMemAddressFree(self.pointer, ctypes.c_size_t(self.nbytes))
++            self.pointer = ctypes.c_ulonglong()
++        if getattr(self, "handle", None) and self.handle.value:
++            cuda.cuMemRelease(self.handle)
++            self.handle = ctypes.c_uint64()
++
++    @property
++    def __cuda_array_interface__(self):
++        return {
++            "shape": (self.nbytes,),
++            "typestr": "|i1",
++            "data": (self.pointer.value, False),
++            "version": 3,
++            "strides": None,
++        }
++
++
++# One buffer per weight, alive for the whole process.
++_carveouts: list[_Carveout] = []
++
++
++def required() -> bool:
++    return _REQUIRED
++
++
++def allocate(
++    shape: tuple[int, ...],
++    dtype: torch.dtype,
++    device: torch.device | str,
++    *,
++    optional: bool = False,
++    cacheable: bool = True,
++) -> torch.Tensor | None:
++    """A vocabulary-sized weight created in its own carve-out buffer, or None.
++
++    Returns None unless the carve-out is required (or optional=True and the
++    RM scanout reserve can hold it), the device is CUDA and the weight reaches
++    the vocabulary-sized threshold; the caller then allocates ordinary memory as
++    usual. Loading writes the checkpoint straight into the returned tensor.
++    """
++    device = torch.device(device)
++    nbytes = math.prod(shape) * dtype.itemsize
++    if device.type != "cuda" or nbytes < _MIN_WEIGHT_BYTES:
++        return None
++    if not _REQUIRED and not optional:
++        return None
++    rounded = -(-nbytes // _GRANULE) * _GRANULE
++    if total_bytes() + rounded > _MAX_TOTAL_BYTES:
++        if optional:
++            return None
++        raise RuntimeError(
++            f"SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out limit "
++            f"({_MAX_TOTAL_BYTES >> 20} MiB) cannot hold a {nbytes >> 20} MiB weight"
++        )
++    device_index = (
++        device.index if device.index is not None else torch.cuda.current_device()
++    )
++    try:
++        carveout = _Carveout(rounded, device_index=device_index, cacheable=cacheable)
++    except OSError as error:
++        if optional:
++            return None
++        raise RuntimeError(
++            f"SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
++            f"hold a {nbytes >> 20} MiB weight ({_RM_NODE}: {error})"
++        ) from error
++    _carveouts.append(carveout)
++    backing = torch.as_tensor(carveout, device=device)
++    assert backing.data_ptr() == carveout.pointer.value
++    return backing[:nbytes].view(dtype).view(shape)
++
++
++def total_bytes() -> int:
++    """Total bytes currently reserved across all active carve-out buffers."""
++    return sum(carveout.nbytes for carveout in _carveouts)
++
++
++def compact(tensor: torch.Tensor) -> torch.Tensor:
++    """Shrink a carve-out buffer to fit tensor after in-place packing.
++
++    12-bit vocabulary packing shrinks an unpacked BF16 table to 75% of its
++    bytes in place. Reallocating a tight scanout buffer and closing the unpacked
++    one reclaims carve-out space (at 2 MiB granularity) without touching
++    ordinary memory.
++
++    The old buffer is closed, so tensor must be the only live view of it:
++    a caller that keeps other data in the same buffer (the TileLang packed
++    head's screening table) must not compact it.
++    """
++    nbytes = _nbytes(tensor)
++    if (
++        not _REQUIRED
++        or not tensor.is_cuda
++        or not tensor.is_contiguous()
++        or nbytes <= 0
++    ):
++        return tensor
++    rounded = -(-nbytes // _GRANULE) * _GRANULE
++    for index, carveout in enumerate(_carveouts):
++        if not _holds(carveout, tensor):
++            continue
++        if rounded >= carveout.nbytes:
++            return tensor
++        try:
++            staging = _Carveout(
++                rounded,
++                device_index=carveout.device_index,
++                cacheable=carveout.cacheable,
++            )
++        except OSError:
++            return tensor
++        staging_view = (
++            torch.as_tensor(staging, device=tensor.device)[:nbytes]
++            .view(tensor.dtype)
++            .view(tensor.shape)
++        )
++        staging_view.copy_(tensor)
++        torch.cuda.synchronize(tensor.device)
++        device_index = carveout.device_index
++        cacheable = carveout.cacheable
++        del tensor
++        carveout.close()
++        # Reallocate at the bottom of the scanout heap now that carveout is
++        # closed so compacted vocabulary tables leave no hole between them.
++        try:
++            shrunk = _Carveout(
++                rounded, device_index=device_index, cacheable=cacheable
++            )
++        except OSError:
++            _carveouts[index] = staging
++            return staging_view
++        backing = torch.as_tensor(shrunk, device=staging_view.device)
++        assert backing.data_ptr() == shrunk.pointer.value
++        out = backing[:nbytes].view(staging_view.dtype).view(staging_view.shape)
++        out.copy_(staging_view)
++        torch.cuda.synchronize(staging_view.device)
++        del staging_view
++        staging.close()
++        _carveouts[index] = shrunk
++        return out
++    return tensor
++
++
++def move(tensor: torch.Tensor, *, cacheable: bool = False) -> torch.Tensor:
++    """Move a prepared decode-only weight tensor into the carve-out if space permits.
++
++    Used after process_weights_after_loading prepares a tile-major
++    decode-only weight (such as DSpark's routed-expert w13_weight and
++    w2_weight) when the remaining carve-out capacity within
++    _MAX_TOTAL_BYTES can hold it. Defaults to uncached L2 streaming
++    (GPU_CACHEABLE_NO) for single-pass decode weights.
++    """
++    nbytes = _nbytes(tensor)
++    if (
++        not _REQUIRED
++        or not tensor.is_cuda
++        or not tensor.is_contiguous()
++        or nbytes < _MIN_WEIGHT_BYTES
++    ):
++        return tensor
++    if any(_holds(carveout, tensor) for carveout in _carveouts):
++        return tensor
++    rounded = -(-nbytes // _GRANULE) * _GRANULE
++    if total_bytes() + rounded > _MAX_TOTAL_BYTES:
++        return tensor
++    device_index = (
++        tensor.device.index
++        if tensor.device.index is not None
++        else torch.cuda.current_device()
++    )
++    try:
++        carveout = _Carveout(rounded, device_index=device_index, cacheable=cacheable)
++    except OSError:
++        return tensor
++    _carveouts.append(carveout)
++    backing = torch.as_tensor(carveout, device=tensor.device)
++    assert backing.data_ptr() == carveout.pointer.value
++    out = backing[:nbytes].view(tensor.dtype).view(tensor.shape)
++    out.copy_(tensor)
++    torch.cuda.synchronize(tensor.device)
++    return out
++
++
++def _holds(carveout: _Carveout, tensor: torch.Tensor) -> bool:
++    start = carveout.pointer.value
++    return start <= tensor.data_ptr() < start + carveout.nbytes
++
++
++def _checksum(tensor: torch.Tensor) -> torch.Tensor:
++    """The sum of the tensor's 32-bit words in 64 bits: any flipped bit changes it.
++
++    Summed in chunks: a 64-bit sum casts its input first, which over a whole
++    421 MiB table would allocate 842 MiB, and the check stream's allocator
++    pool would keep it.
++    """
++    raw = tensor.detach().reshape(-1).view(torch.uint8)
++    words = raw.view(torch.int32) if raw.numel() % 4 == 0 else raw
++    parts = words.split(_CHECK_CHUNK_WORDS)
++    return torch.stack([part.sum(dtype=torch.int64) for part in parts]).sum()
++
++
++def _kill_worker(reason: str) -> None:
++    """Stop the engine from a background thread: its executor sees the worker die."""
++    logger.error("Stopping the worker: %s", reason)
++    os.kill(os.getpid(), signal.SIGKILL)
++
++
++class _IntegrityCheck:
++    """Periodic checksums of the weights held in the carve-out (debug mode)."""
++
++    def __init__(
++        self,
++        weights: list[tuple[str, torch.Tensor]],
++        expected: list[int],
++        device: torch.device,
++        interval: float,
++        on_failure=_kill_worker,
++    ):
++        self.weights = weights
++        self.expected = expected
++        self.device = device
++        self.interval = interval
++        self.on_failure = on_failure
++        self.failure: str | None = None
++        self.passed = 0
++        self._started = False
++        self._stream = torch.cuda.Stream(device) if device.type == "cuda" else None
++
++    def sums(self) -> list[int]:
++        stream = (
++            torch.cuda.stream(self._stream)
++            if self._stream is not None
++            else contextlib.nullcontext()
++        )
++        with stream:
++            return torch.stack(
++                [_checksum(weight) for _, weight in self.weights]
++            ).tolist()
++
++    def check(self) -> None:
++        changed = [
++            f"{name} (checksum {want:#x}, now {got:#x})"
++            for (name, _), want, got in zip(self.weights, self.expected, self.sums())
++            if want != got
++        ]
++        if changed:
++            self.failure = "display carve-out weights changed: " + "; ".join(changed)
++            logger.error("%s", self.failure)
++            return
++        self.passed += 1
++        if self.passed == 1 or self.passed % 12 == 0:
++            logger.info(
++                "Display carve-out integrity check %d passed (every %g s)",
++                self.passed,
++                self.interval,
++            )
++
++    def start(self) -> None:
++        if self._started or self.interval <= 0:
++            return
++        self._started = True
++        threading.Thread(
++            target=self._run, name="display-carveout-check", daemon=True
++        ).start()
++
++    def _run(self) -> None:
++        if self._stream is not None:
++            torch.cuda.set_device(self.device)
++        while self.failure is None:
++            time.sleep(self.interval)
++            try:
++                self.check()
++            except Exception as error:
++                # A check that cannot run must not pass silently either.
++                self.failure = f"display carve-out integrity check failed: {error!r}"
++                logger.exception("Display carve-out integrity check failed")
++        self.on_failure(self.failure)
++
++
++_integrity: _IntegrityCheck | None = None
++
++
++def start_checks() -> None:
++    """Start the debug-mode periodic check, if on; called once after graph capture.
++
++    Starting after the last capture keeps the check's side-stream work away
++    from graph captures.
++    """
++    if _integrity is not None:
++        _integrity.start()
++
++
++def _nbytes(tensor: torch.Tensor) -> int:
++    return tensor.numel() * tensor.element_size()
++
++
++def _is_mandatory_vocab_module(module: torch.nn.Module) -> bool:
++    return isinstance(module, VocabParallelEmbedding) or (
++        isinstance(module, torch.nn.Embedding)
++        and getattr(module, "_display_carveout_required", False)
++    )
++
++
++def streamed_weights(
++    model: torch.nn.Module, *extra_models: torch.nn.Module | None
++) -> list[tuple[str, torch.nn.Parameter]]:
++    """Streamed carve-out weights across model and any extra_models, deduplicated.
++
++    Includes every mandatory vocabulary-sized table (VocabParallelEmbedding
++    and DSpark's markov_w1) plus any decode-only parameters moved into
++    _carveouts after preparation. A drafter that aliases the target's
++    modules shares their parameters, so each tensor appears once.
++    """
++    roots = [model, *(m for m in extra_models if m is not None)]
++    found: dict[int, tuple[str, torch.nn.Parameter]] = {}
++    for root in roots:
++        for name, module in root.named_modules():
++            if _is_mandatory_vocab_module(module):
++                weight = getattr(module, "weight", None)
++                if (
++                    isinstance(weight, torch.nn.Parameter)
++                    and weight.is_cuda
++                    and weight.is_contiguous()
++                    and _nbytes(weight) >= _MIN_WEIGHT_BYTES
++                ):
++                    label = f"{name}.weight" if name else "weight"
++                    found.setdefault(weight.data_ptr(), (label, weight))
++            screen_wq = getattr(module, "_carveout_screen_wq", None)
++            if (
++                isinstance(screen_wq, torch.Tensor)
++                and screen_wq.is_cuda
++                and screen_wq.is_contiguous()
++                and any(_holds(carveout, screen_wq) for carveout in _carveouts)
++            ):
++                label = (
++                    f"{name}._carveout_screen_wq"
++                    if name
++                    else "_carveout_screen_wq"
++                )
++                found.setdefault(screen_wq.data_ptr(), (label, screen_wq))
++        for name, param in root.named_parameters():
++            if (
++                param.is_cuda
++                and param.is_contiguous()
++                and any(_holds(carveout, param.data) for carveout in _carveouts)
++            ):
++                found.setdefault(param.data_ptr(), (name, param))
++    return list(found.values())
++
++
++def confirm_streamed_weights(
++    model: torch.nn.Module,
++    device: torch.device,
++    *extra_models: torch.nn.Module | None,
++) -> None:
++    """Confirm the streamed weights loaded into the display carve-out.
++
++    Every vocabulary-sized weight of the served model (and any drafter) must
++    sit in a buffer from allocate, and every carve-out buffer must hold a
++    live parameter of the served models.
++    """
++    assert ctypes.sizeof(_NvOs21Params) == 32
++    assert ctypes.sizeof(_NvOs00Params) == 16
++    assert ctypes.sizeof(_NvOs54Params) == 32
++    assert ctypes.sizeof(_Nv0000AllocParams) == 120
++    assert ctypes.sizeof(_Nv0080AllocParams) == 56
++    assert ctypes.sizeof(_NvMemoryAllocationParams) == 128
++    assert ctypes.sizeof(_Nv0000CtrlOsUnixExportObjectToFdParams) == 24
++    assert ctypes.sizeof(_CUmemLocation) == 8
++    assert ctypes.sizeof(_CUmemAccessDesc) == 12
++    weights = streamed_weights(model, *extra_models)
++    if not weights:
++        raise RuntimeError(
++            "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
++            "vocabulary-sized embedding or output-head weights"
++        )
++    outside = [
++        name
++        for name, weight in weights
++        if not any(_holds(carveout, weight.data) for carveout in _carveouts)
++    ]
++    if outside:
++        raise RuntimeError(
++            "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but these vocabulary-sized weights "
++            f"were not created in the display carve-out: {', '.join(outside)}"
++        )
++    orphaned = [
++        carveout
++        for carveout in _carveouts
++        if not any(_holds(carveout, weight.data) for _, weight in weights)
++    ]
++    if orphaned:
++        # A vocabulary-sized layer built and then dropped would hold carve-out
++        # space for nothing; placeholders the model replaces after loading
++        # belong on the meta device.
++        raise RuntimeError(
++            f"{len(orphaned)} display carve-out buffers "
++            f"({sum(c.nbytes for c in orphaned) >> 20} MiB) hold no weight of the "
++            "served model; build placeholder layers on the meta device"
++        )
++    checking = _CHECK_SECONDS > 0
++    if checking:
++        global _integrity
++        held = [(name, weight.data) for name, weight in weights]
++        torch.cuda.synchronize(device)
++        expected = [int(_checksum(weight)) for _, weight in held]
++        _integrity = _IntegrityCheck(held, expected, device, _CHECK_SECONDS)
++    logger.info(
++        "Display carve-out holds %.1f MiB of streamed weights in %d buffers, "
++        "loaded in place (%s); debug integrity check %s",
++        sum(_nbytes(weight) for _, weight in weights) / (1 << 20),
++        len(_carveouts),
++        ", ".join(name for name, _ in weights),
++        f"every {_CHECK_SECONDS:g} s" if checking else "off",
++    )
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 7d48ec16338e7e1dd287e4717f7661981f028741..9fcbb989781cadad52943e028456067c4cebaed4 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1,3 +1,4 @@
++from pathlib import Path
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A GPU worker class."""
+@@ -5,6 +6,7 @@
+ import contextlib
+ import gc
+ import os
++import sys
+ import time
+ from collections.abc import Callable
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+@@ -49,6 +51,7 @@ from vllm.distributed.parallel_state import (
+     get_pcp_group,
+     get_pp_group,
+     get_tp_group,
++    get_world_group,
+     resume_device_comms,
+     suspend_device_comms,
+ )
+@@ -70,6 +73,10 @@ from vllm.profiler.wrapper import (
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.tracing import instrument
++from vllm.utils.cpu_affinity import (
++    apply_worker_thread_affinity,
++    configure_worker_cpu_affinity,
++)
+ from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
+ from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
+ from vllm.utils.mem_constants import GiB_bytes
+@@ -78,6 +85,8 @@ from vllm.utils.mem_utils import (
+     MemorySnapshot,
+     format_gib,
+     memory_profiling,
++    reclaim_uma_memory,
++    trim_host_heap,
+ )
+ from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
+ from vllm.v1.attention.backends.utils import record_kv_cache_layout
+@@ -88,6 +97,7 @@ from vllm.v1.outputs import (
+     DraftTokenIds,
+     ModelRunnerOutput,
+ )
++from vllm.v1.sample.sink import SinkConfig
+ from vllm.v1.utils import compute_iteration_details, report_usage_stats
+ from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
+ from vllm.v1.worker.startup_plan import (
+@@ -181,14 +191,34 @@ class AsyncIntermediateTensors(IntermediateTensors):
+         return object.__getattribute__(self, name)
+ 
+ 
++@contextmanager
++def _collective_cause(failure: Callable[[], str | None]):
++    """Re-raise an error as the one-shot collectives' failure report, if any.
++
++    A collective that waited past its timeout stopped the GPU, so CUDA raises
++    a launch failure at the next sync, which does not say which peer stalled.
++    """
++    try:
++        yield
++    except Exception as error:
++        report = failure()
++        if report is not None:
++            raise RuntimeError(report) from error
++        raise
++
++
+ class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
+     """An asynchronous output whose completion is followed by the RoCEnante check."""
+ 
+     def __init__(
+-        self, inner: AsyncModelRunnerOutput, check: Callable[[], None]
++        self,
++        inner: AsyncModelRunnerOutput,
++        check: Callable[[], None],
++        failure: Callable[[], str | None],
+     ) -> None:
+         self._inner = inner
+         self._check = check
++        self._failure = failure
+ 
+     def get_output(self) -> ModelRunnerOutput:
+         """Wait for the wrapped output, then run the fail-stop check.
+@@ -199,7 +229,8 @@ class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
+         Raises:
+             RuntimeError: When a RoCEnante wait timed out or its proxy died.
+         """
+-        output = self._inner.get_output()
++        with _collective_cause(self._failure):
++            output = self._inner.get_output()
+         self._check()
+         return output
+ 
+@@ -255,9 +286,14 @@ class Worker(WorkerBase):
+         # the worker-local registry while publishing native resources.
+         self._b12x_session = None
+         self._b12x_stage: str | None = None
++        # This rank's startup heartbeat in the distributed store (see
++        # startup_rendezvous): runs from distributed init until warm-up is done.
++        self._startup_heartbeat = None
+         self._b12x_profile_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_cache = False
++        # Whether a preparation stage collected any unit (collect_b12x_units).
++        self._b12x_units_declared = False
+         # Startup-plan key computed before profiling can rewrite the config.
+         self.startup_plan_fingerprint: str | None = None
+         # Resolved lazily on first sleep/wake; persists worker-process state.
+@@ -395,8 +431,599 @@ class Worker(WorkerBase):
+         finally:
+             torch._C._accelerator_setAllocatorSettings(conf)
+ 
++    @staticmethod
++    def _parse_unmovable_sub_order13_bytes(pagetypeinfo_text: str) -> int:
++        """Sum free bytes in Zone Normal MIGRATE_UNMOVABLE orders < 13 (64 KiB pages)."""
++        total = 0
++        for line in pagetypeinfo_text.splitlines():
++            if "Normal" in line and "Unmovable" in line and "type" in line:
++                parts = line.split()
++                try:
++                    idx = parts.index("Unmovable")
++                    counts = [int(x) for x in parts[idx + 1 :]]
++                except (ValueError, IndexError):
++                    continue
++                if len(counts) >= 14:
++                    total += sum(c * (65536 << order) for order, c in enumerate(counts[:-1]))
++        return total
++
++    @staticmethod
++    def _read_proc_uma_memory_state() -> tuple[int, int, int]:
++        """Return ``(order13_bytes, avail_bytes, unmov_sub_bytes)`` on 64 KiB Linux."""
++        o13_bytes = 0
++        avail_bytes = 0
++        unmov_sub_bytes = 0
++        try:
++            from vllm.model_executor.model_loader.direct_loader import (
++                parse_buddyinfo_order13,
++            )
++
++            _, o13_bytes = parse_buddyinfo_order13(
++                Path("/proc/buddyinfo").read_text(encoding="utf-8"),
++                page_bytes=65536,
++            )
++        except OSError:
++            o13_bytes = 0
++        try:
++            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
++                if line.startswith("MemAvailable:"):
++                    avail_bytes = int(line.split()[1]) * 1024
++                    break
++        except (OSError, ValueError, IndexError):
++            avail_bytes = 0
++        try:
++            unmov_sub_bytes = Worker._parse_unmovable_sub_order13_bytes(
++                Path("/proc/pagetypeinfo").read_text(encoding="utf-8")
++            )
++        except OSError:
++            unmov_sub_bytes = 0
++        return o13_bytes, avail_bytes, unmov_sub_bytes
++
++    def _allocate_soaked_contiguous_pool(
++        self, pool_bytes: int
++    ) -> tuple[int, int, int, bool]:
++        """Soak MIGRATE_UNMOVABLE sub-order-13 blocks and allocate one anchored
++        contiguous CUDA pool of ``pool_bytes``.
++
++        Returns ``(soak_bytes, unmov_sub_bytes, avail_bytes, front_clean)``.
++        """
++        block_bytes = 512 * 1024 * 1024
++        _, avail_bytes, unmov_sub_bytes = self._read_proc_uma_memory_state()
++
++        # One-shot soak of MIGRATE_UNMOVABLE sub-order-13 blocks so nvidia.ko
++        # draws the entire weight pool from pure 512 MiB order-13 blocks starting
++        # at offset 0. Keep >= 8 GiB MemAvailable above startup memguard.
++        soak_headroom_bytes = 8 * 1024**3
++        soak_align = 2 * 1024 * 1024
++        max_soak = (
++            max(0, avail_bytes - pool_bytes - soak_headroom_bytes)
++            if avail_bytes > 0
++            else 0
++        )
++        soak_bytes = (
++            (min(unmov_sub_bytes, max_soak) // soak_align) * soak_align
++            if unmov_sub_bytes >= block_bytes and max_soak >= block_bytes
++            else 0
++        )
++
++        # Return stale cached-free segments left over from runner/speculator
++        # init before allocating the pool so the 2 MiB anchor lands inside the
++        # newly allocated segment rather than being swallowed by earlier holes.
++        torch.accelerator.empty_cache()
++        soak: torch.Tensor | None = None
++        try:
++            if soak_bytes > 0:
++                try:
++                    soak = torch.empty(
++                        (soak_bytes,), dtype=torch.uint8, device=self.device
++                    )
++                    soak[::65536].zero_()
++                except torch.OutOfMemoryError:
++                    soak = None
++                    soak_bytes = 0
++                    torch.accelerator.empty_cache()
++
++            pool = torch.empty((pool_bytes,), dtype=torch.uint8, device=self.device)
++            pool_ptr = int(pool.data_ptr()) if hasattr(pool, "data_ptr") else 0
++            pool_end = pool_ptr + pool_bytes if pool_ptr > 0 else 0
++            del pool
++            # A >= 2 MiB allocation lands in PyTorch's large_pool. Drain any
++            # remaining cached-free holes in partially-occupied earlier segments
++            # so the 2 MiB anchor is guaranteed to sit inside [pool_ptr, pool_end)
++            # and pin the segment across empty_cache() and GC threshold sweeps.
++            holders: list[torch.Tensor] = []
++            anchor: torch.Tensor | None = None
++            try:
++                for _ in range(1024):
++                    cand = torch.empty(
++                        (2 * 1024 * 1024,), dtype=torch.uint8, device=self.device
++                    )
++                    cand_ptr = int(cand.data_ptr()) if hasattr(cand, "data_ptr") else 0
++                    if pool_ptr == 0 or (pool_ptr <= cand_ptr < pool_end):
++                        anchor = cand
++                        break
++                    holders.append(cand)
++            finally:
++                holders.clear()
++            if anchor is None:
++                raise RuntimeError(
++                    "Failed to place contiguous CUDA pool anchor inside "
++                    f"[{pool_ptr:#x}, {pool_end:#x})"
++                )
++            self._contiguous_pool_anchor = anchor
++            self._contiguous_pool_bytes = pool_bytes
++            self._contiguous_pool_range = (pool_ptr, pool_end)
++            if soak is not None:
++                del soak
++                soak = None
++                torch.accelerator.empty_cache()
++            front_clean = (unmov_sub_bytes - soak_bytes) < (1024**3)
++            self._contiguous_pool_front_clean = front_clean
++            return soak_bytes, unmov_sub_bytes, avail_bytes, front_clean
++        except (torch.OutOfMemoryError, RuntimeError):
++            if soak is not None:
++                del soak
++            self._contiguous_pool_anchor = None
++            self._contiguous_pool_bytes = 0
++            self._contiguous_pool_range = (0, 0)
++            self._contiguous_pool_front_clean = False
++            torch.accelerator.empty_cache()
++            raise
++
++    def _release_contiguous_cuda_pool(self) -> None:
++        """Atomically release the pre-allocated contiguous CUDA pool (evacuating
++        and restoring any live tensors inside its address range) so fallback paths
++        such as direct_loader's buddy sponge never double-allocate on top of it."""
++        if (
++            getattr(self, "_contiguous_pool_bytes", 0) <= 0
++            and getattr(self, "_contiguous_pool_anchor", None) is None
++        ):
++            return
++        pool_ptr, pool_end = getattr(self, "_contiguous_pool_range", (0, 0))
++        _, evac_groups, evac_snapshots = self._evacuate_tensors_in_pool_range(
++            pool_ptr, pool_end
++        )
++        try:
++            self._contiguous_pool_anchor = None
++            self._contiguous_pool_bytes = 0
++            self._contiguous_pool_range = (0, 0)
++            self._contiguous_pool_front_clean = False
++            self._contiguous_pool_finalized = True
++            from vllm.model_executor.model_loader.direct_loader import (
++                set_preallocated_cuda_pool_bytes,
++            )
++
++            set_preallocated_cuda_pool_bytes(0)
++            gc.collect()
++            torch.accelerator.empty_cache()
++        finally:
++            self._restore_evacuated_tensors(evac_groups, evac_snapshots)
++
++    def _evacuate_tensors_in_pool_range(
++        self, pool_ptr: int, pool_end: int
++    ) -> tuple[
++        int,
++        dict[
++            int,
++            tuple[
++                int,
++                list[tuple[torch.Tensor, int, tuple[int, ...], tuple[int, ...]]],
++            ],
++        ],
++        dict[int, torch.Tensor],
++    ]:
++        """Snapshot and detach any live CUDA tensors whose storage lies inside
++        ``[pool_ptr, pool_end)`` (excluding the pool anchor) so ``empty_cache()``
++        can cleanly release the oversized scratch segment."""
++        if pool_ptr <= 0 or pool_end <= pool_ptr:
++            return 0, {}, {}
++        anchor = self._contiguous_pool_anchor
++        empty_storage = torch.empty(
++            (0,), dtype=torch.uint8, device=self.device
++        ).untyped_storage()
++        groups: dict[
++            int,
++            tuple[
++                int,
++                list[tuple[torch.Tensor, int, tuple[int, ...], tuple[int, ...]]],
++            ],
++        ] = {}
++        snapshots: dict[int, torch.Tensor] = {}
++        gc.collect()
++        with torch.no_grad():
++            for obj in gc.get_objects():
++                try:
++                    if not isinstance(obj, torch.Tensor):
++                        continue
++                    if obj is anchor or obj.is_meta or not obj.is_cuda:
++                        continue
++                    if obj.numel() == 0:
++                        continue
++                    storage = obj.untyped_storage()
++                    nbytes = storage.nbytes()
++                    if nbytes == 0:
++                        continue
++                    ptr = int(storage.data_ptr())
++                    if not (pool_ptr <= ptr < pool_end):
++                        continue
++                    if ptr not in groups:
++                        groups[ptr] = (nbytes, [])
++                    groups[ptr][1].append(
++                        (
++                            obj,
++                            int(obj.storage_offset()),
++                            tuple(obj.shape),
++                            tuple(obj.stride()),
++                        )
++                    )
++                except Exception:
++                    continue
++            for ptr, (nbytes, views) in groups.items():
++                orig_storage = views[0][0].untyped_storage()
++                src = torch.empty((0,), dtype=torch.uint8, device=self.device).set_(
++                    orig_storage
++                )
++                cpu_copy = torch.empty((nbytes,), dtype=torch.uint8, device="cpu")
++                cpu_copy.copy_(src)
++                snapshots[ptr] = cpu_copy
++                del src, orig_storage
++                for tensor, _, _, _ in views:
++                    tensor.set_(empty_storage, 0, (0,), (1,))
++        evac_bytes = sum(nbytes for nbytes, _ in groups.values())
++        return evac_bytes, groups, snapshots
++
++    def _restore_evacuated_tensors(
++        self,
++        groups: dict[
++            int,
++            tuple[
++                int,
++                list[tuple[torch.Tensor, int, tuple[int, ...], tuple[int, ...]]],
++            ],
++        ],
++        snapshots: dict[int, torch.Tensor],
++    ) -> None:
++        with torch.no_grad():
++            for ptr, (nbytes, views) in groups.items():
++                cpu_copy = snapshots.pop(ptr, None)
++                if cpu_copy is None:
++                    continue
++                restored = torch.empty(
++                    (nbytes,), dtype=torch.uint8, device=self.device
++                )
++                restored.copy_(cpu_copy)
++                restored_storage = restored.untyped_storage()
++                for tensor, orig_offset, shape, stride in views:
++                    tensor.set_(restored_storage, orig_offset, shape, stride)
++                del restored, restored_storage, cpu_copy
++            snapshots.clear()
++
++    def _compute_desired_pool_bytes(
++        self, total_model_bytes: int, max_moe_bytes: int
++    ) -> int:
++        block_bytes = 512 * 1024 * 1024
++        spec_cfg = getattr(self, "speculative_config", None)
++        repack_and_ws = max(int(max_moe_bytes), int(1.5 * 1024**3))
++        par_cfg = getattr(self, "parallel_config", None)
++        pp_size = int(getattr(par_cfg, "pipeline_parallel_size", 1) or 1)
++        has_local_drafter = spec_cfg is not None
++        if has_local_drafter and pp_size > 1:
++            try:
++                from vllm.distributed.parallel_state import get_pp_group
++
++                if torch.distributed.is_initialized():
++                    has_local_drafter = bool(get_pp_group().is_last_rank)
++            except Exception:
++                pass
++        if has_local_drafter:
++            default_tp = int(getattr(par_cfg, "tensor_parallel_size", 1) or 1)
++            draft_tp = int(
++                getattr(spec_cfg, "draft_tensor_parallel_size", None) or default_tp
++            )
++            draft_tp = max(1, draft_tp)
++            draft_and_other = max(
++                int(1.0 * 1024**3), int((8.0 * 1024**3) // draft_tp)
++            )
++        else:
++            draft_and_other = int(1.0 * 1024**3)
++        raw_desired = int(total_model_bytes) + repack_and_ws + draft_and_other
++        desired_bytes = ((raw_desired + block_bytes - 1) // block_bytes) * block_bytes
++        return max(block_bytes, min(desired_bytes, self._contiguous_pool_max_bytes))
++
++    def _resize_contiguous_cuda_pool_for_model(
++        self, model_bytes: int, max_moe_bytes: int = 0
++    ) -> tuple[int, bool]:
++        """Shrink the initial scratch contiguous pool to the model's actual rank
++        weight + draft + workspace footprint so shapes with large KV pools or
++        offloaded experts (TP1, TP2, TP4..TP8, or smaller models) never pin
++        unused host RAM inside Segment #1."""
++        if (
++            self._contiguous_pool_finalized
++            or self._contiguous_pool_override
++            or self._contiguous_pool_bytes <= 0
++            or model_bytes <= 0
++        ):
++            return self._contiguous_pool_bytes, self._contiguous_pool_front_clean
++
++        self._contiguous_pool_finalized = True
++        block_bytes = 512 * 1024 * 1024
++        old_bytes = self._contiguous_pool_bytes
++
++        def _cached_free_bytes() -> int:
++            anchor = getattr(self, "_contiguous_pool_anchor", None)
++            try:
++                reserved = int(torch.cuda.memory_reserved(self.device))
++                allocated = int(torch.cuda.memory_allocated(self.device))
++                if reserved > 0 or (isinstance(anchor, torch.Tensor) and anchor.is_cuda):
++                    return max(0, reserved - allocated)
++            except Exception:
++                pass
++            return old_bytes
++
++        # Fast path: keep the already-soaked segment only when it is within
++        # <= 1 GiB of initial pool AND actually has >= model_bytes cached free.
++        est_desired = self._compute_desired_pool_bytes(model_bytes, max_moe_bytes)
++        if (
++            est_desired >= old_bytes - 2 * block_bytes
++            and _cached_free_bytes() >= model_bytes
++        ):
++            logger.info(
++                "Keeping %.1f GiB contiguous CUDA pool (exact fit for %.1f GiB "
++                "weights, desired %.1f GiB, front_clean=%s)",
++                old_bytes / (1024**3),
++                model_bytes / (1024**3),
++                est_desired / (1024**3),
++                self._contiguous_pool_front_clean,
++            )
++            return old_bytes, self._contiguous_pool_front_clean
++
++        t0 = time.perf_counter()
++        pool_ptr, pool_end = getattr(self, "_contiguous_pool_range", (0, 0))
++        evac_bytes, evac_groups, evac_snapshots = self._evacuate_tensors_in_pool_range(
++            pool_ptr, pool_end
++        )
++        try:
++            # Include any evacuated model/vocab/buffer tensors in the final size!
++            desired_bytes = self._compute_desired_pool_bytes(
++                model_bytes + evac_bytes, max_moe_bytes
++            )
++            if (
++                desired_bytes >= old_bytes - 2 * block_bytes
++                and _cached_free_bytes() >= model_bytes
++            ):
++                logger.info(
++                    "Keeping %.1f GiB contiguous CUDA pool (exact fit for %.1f + %.1f GiB "
++                    "weights, desired %.1f GiB, front_clean=%s)",
++                    old_bytes / (1024**3),
++                    model_bytes / (1024**3),
++                    evac_bytes / (1024**3),
++                    desired_bytes / (1024**3),
++                    self._contiguous_pool_front_clean,
++                )
++                return old_bytes, self._contiguous_pool_front_clean
++
++            try:
++                pre_release_reserved = int(torch.cuda.memory_reserved(self.device))
++            except Exception:
++                pre_release_reserved = old_bytes
++            self._contiguous_pool_anchor = None
++            gc.collect()
++            torch.accelerator.empty_cache()
++            try:
++                post_release_reserved = int(torch.cuda.memory_reserved(self.device))
++            except Exception:
++                post_release_reserved = 0
++            freed_bytes = pre_release_reserved - post_release_reserved
++            if post_release_reserved >= desired_bytes and freed_bytes < (old_bytes // 2):
++                self._contiguous_pool_anchor = torch.empty(
++                    (2 * 1024 * 1024,), dtype=torch.uint8, device=self.device
++                )
++                logger.info(
++                    "Skipped shrinking %.1f GiB contiguous CUDA pool to %.1f GiB "
++                    "(freed %.1f GiB, %.1f GiB remained reserved after empty_cache)",
++                    old_bytes / (1024**3),
++                    desired_bytes / (1024**3),
++                    freed_bytes / (1024**3),
++                    post_release_reserved / (1024**3),
++                )
++                return old_bytes, self._contiguous_pool_front_clean
++
++            from vllm.model_executor.model_loader.direct_loader import (
++                set_preallocated_cuda_pool_bytes,
++            )
++
++            try:
++                soak_bytes, unmov_sub_bytes, avail_bytes, front_clean = (
++                    self._allocate_soaked_contiguous_pool(desired_bytes)
++                )
++            except (torch.OutOfMemoryError, RuntimeError) as exc:
++                set_preallocated_cuda_pool_bytes(0)
++                logger.warning(
++                    "Resizing contiguous CUDA pool to %.1f GiB failed (%s); "
++                    "falling back to standard allocator",
++                    desired_bytes / (1024**3),
++                    exc,
++                )
++                return 0, False
++
++            set_preallocated_cuda_pool_bytes(
++                desired_bytes,
++                front_clean=front_clean,
++                resize_cb=None,
++                release_cb=self._release_contiguous_cuda_pool,
++            )
++            logger.info(
++                "Resized contiguous CUDA pool %.1f -> %.1f GiB for %.1f GiB weights "
++                "(+%.2f GiB evacuated) in %.2f s (freed %.1f GiB, soaked %.2f/%.2f GiB "
++                "Unmovable sub-O13, MemAvailable was %.1f GiB, front_clean=%s)",
++                old_bytes / (1024**3),
++                desired_bytes / (1024**3),
++                model_bytes / (1024**3),
++                evac_bytes / (1024**3),
++                time.perf_counter() - t0,
++                (old_bytes - desired_bytes) / (1024**3),
++                soak_bytes / (1024**3),
++                unmov_sub_bytes / (1024**3),
++                avail_bytes / (1024**3),
++                front_clean,
++            )
++            return desired_bytes, front_clean
++        finally:
++            if evac_groups:
++                self._restore_evacuated_tensors(evac_groups, evac_snapshots)
++
++    def _preallocate_contiguous_cuda_pool(self) -> int:
++        """Pre-allocate one large contiguous caching-allocator segment on 64 KiB
++        integrated UMA CUDA hosts when native cudaMalloc caching is active.
++
++        On 64 KiB ARM64 UMA hosts (GB10) with iommu.passthrough=0, hundreds of
++        small cuMemCreate/cudaMalloc segments interleave immortal SMMU L3 page
++        tables into 512 MiB order-13 pageblocks and cause permanent boot-to-boot
++        slowdown. Pre-allocating one contiguous scratch segment keeps model
++        construction inside a single cudaMalloc; bind_weight_arena then shrinks
++        it to the rank's exact weight + draft + workspace footprint so every
++        TP shape (TP1..TP8) and model size avoids pinning unused host RAM.
++        """
++        self._contiguous_pool_anchor: torch.Tensor | None = None
++        self._contiguous_pool_bytes = 0
++        self._contiguous_pool_range = (0, 0)
++        self._contiguous_pool_max_bytes = 0
++        self._contiguous_pool_front_clean = False
++        self._contiguous_pool_finalized = False
++        self._contiguous_pool_override = False
++        from vllm.model_executor.model_loader.direct_loader import (
++            set_preallocated_cuda_pool_bytes,
++        )
++
++        set_preallocated_cuda_pool_bytes(0)
++
++        raw_override = os.environ.get("VLLM_CUDA_PREALLOC_POOL_MIB", "").strip()
++        if raw_override.lower() in ("0", "false", "off", "no"):
++            return 0
++        if not current_platform.is_cuda():
++            return 0
++        conf = torch._C._accelerator_getAllocatorSettings()
++        if re.search(
++            r"(?:^|,)\s*(?:expandable_segments\s*:\s*True|backend\s*:\s*cudaMallocAsync)\s*(?:,|$)",
++            conf,
++        ):
++            return 0
++
++        override_mib: int | None = None
++        if raw_override:
++            try:
++                override_mib = int(raw_override)
++            except ValueError:
++                logger.warning(
++                    "Ignoring invalid VLLM_CUDA_PREALLOC_POOL_MIB=%r", raw_override
++                )
++                return 0
++            if override_mib <= 0:
++                return 0
++
++        if override_mib is None:
++            try:
++                page_bytes = os.sysconf("SC_PAGE_SIZE")
++            except (AttributeError, OSError, ValueError):
++                page_bytes = 0
++            if page_bytes < 65536:
++                return 0
++            try:
++                props = torch.cuda.get_device_properties(self.device)
++                is_integrated = bool(getattr(props, "is_integrated", False))
++            except Exception:
++                is_integrated = False
++            if not is_integrated:
++                return 0
++
++        block_bytes = 512 * 1024 * 1024
++        o13_bytes, avail_bytes, _ = self._read_proc_uma_memory_state()
++
++        if override_mib is not None:
++            pool_bytes = (override_mib * 1024 * 1024 // block_bytes) * block_bytes
++            if pool_bytes <= 0:
++                pool_bytes = override_mib * 1024 * 1024
++            self._contiguous_pool_override = True
++            self._contiguous_pool_finalized = True
++        else:
++            # Auto-activate only when enough 512 MiB blocks exist to benefit;
++            # on an already-fragmented host, let direct_loader's buddy sponge run.
++            if o13_bytes < 32 * 1024**3:
++                return 0
++            # Exclude explicit kv_cache_memory_bytes from the upper-bound weight
++            # pool so weights + draft + workspace fit in Segment #1 and KV cache
++            # takes one clean contiguous Segment #2 with zero slack spill.
++            kv_bytes = int(getattr(self.cache_config, "kv_cache_memory_bytes", 0) or 0)
++            req_bytes = int(self.requested_memory)
++            if kv_bytes > 0 and req_bytes > kv_bytes + 16 * 1024**3:
++                req_bytes -= kv_bytes
++            headroom_bytes = 12 * 1024**3
++            cap_bytes = (
++                max(0, avail_bytes - headroom_bytes)
++                if avail_bytes > 0
++                else req_bytes
++            )
++            target_bytes = min(req_bytes, cap_bytes)
++            pool_bytes = (target_bytes // block_bytes) * block_bytes
++            if pool_bytes < 16 * 1024**3:
++                return 0
++
++        self._contiguous_pool_max_bytes = pool_bytes
++        t0 = time.perf_counter()
++        try:
++            soak_bytes, unmov_sub_bytes, avail_bytes, front_clean = (
++                self._allocate_soaked_contiguous_pool(pool_bytes)
++            )
++        except (torch.OutOfMemoryError, RuntimeError) as exc:
++            logger.warning(
++                "Pre-allocation of %.1f GiB contiguous CUDA pool failed (%s); "
++                "falling back to standard allocator",
++                pool_bytes / (1024**3),
++                exc,
++            )
++            return 0
++
++        set_preallocated_cuda_pool_bytes(
++            pool_bytes,
++            front_clean=front_clean,
++            resize_cb=(
++                None
++                if self._contiguous_pool_override
++                else self._resize_contiguous_cuda_pool_for_model
++            ),
++            release_cb=self._release_contiguous_cuda_pool,
++        )
++        logger.info(
++            "Pre-allocated %.1f GiB single contiguous CUDA pool in %.2f s "
++            "(soaked %.2f/%.2f GiB Unmovable sub-O13, order-13 free was %.1f GiB, "
++            "MemAvailable was %.1f GiB, front_clean=%s)",
++            pool_bytes / (1024**3),
++            time.perf_counter() - t0,
++            soak_bytes / (1024**3),
++            unmov_sub_bytes / (1024**3),
++            o13_bytes / (1024**3),
++            avail_bytes / (1024**3),
++            front_clean,
++        )
++        return pool_bytes
++
+     @instrument(span_name="Init device")
+     def init_device(self):
++        if envs.VLLM_DS41_IKET:
++            # Debug only: IKET phase ranges in every TileLang kernel this process
++            # compiles, so it must be on before the first one.
++            from vllm.models.deepseek_v4_1.tilelang import iket
++
++            iket.enable(
++                envs.VLLM_DS41_IKET,
++                envs.VLLM_DS41_IKET_CTAS,
++                envs.VLLM_DS41_IKET_ITERS,
++                envs.VLLM_DS41_IKET_SKIP,
++                granularity=envs.VLLM_DS41_IKET_GRANULARITY,
++                warps=envs.VLLM_DS41_IKET_WARPS,
++                payloads=envs.VLLM_DS41_IKET_PAYLOADS,
++                cache_dir=envs.VLLM_DS41_IKET_CACHE_DIR,
++            )
+         if self.device_config.device_type == "cuda":
+             # This env var set by Ray causes exceptions with graph building.
+             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+@@ -464,6 +1091,8 @@ class Worker(WorkerBase):
+ 
+             current_platform.check_if_supports_dtype(self.model_config.dtype)
+ 
++            self._cpu_affinity_plan = configure_worker_cpu_affinity(self.local_rank)
++
+             # Initialize the distributed environment BEFORE taking
+             # memory snapshot
+             # This ensures NCCL buffers are allocated before we measure
+@@ -475,6 +1104,7 @@ class Worker(WorkerBase):
+                 self.local_rank,
+                 current_platform.dist_backend,
+             )
++            self._start_startup_heartbeat()
+ 
+             if self.use_v2_model_runner:
+                 logger.info_once("Using V2 Model Runner")
+@@ -491,6 +1121,7 @@ class Worker(WorkerBase):
+             # Now take memory snapshot after NCCL is initialized
+             gc.collect()
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+ 
+             # take current memory snapshot
+             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+@@ -524,13 +1155,37 @@ class Worker(WorkerBase):
+             self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
+                 self.vllm_config, self.device
+             )
++            self._pp_p2p = None
++            if (
++                self.parallel_config.pipeline_parallel_size > 1
++                and os.environ.get("VLLM_PP_SPARKNET_P2P", "0") == "1"
++            ):
++                from sparknet.integration.vllm import SparknetOneShotP2P
++
++                pp_p2p = SparknetOneShotP2P(
++                    group=get_pp_group().cpu_group,
++                    device=self.device,
++                )
++                if not pp_p2p.disabled:
++                    self._pp_p2p = pp_p2p
++                    self.model_runner._pp_p2p = pp_p2p
+         else:
+             from vllm.v1.worker.gpu_model_runner import (
+                 GPUModelRunner as GPUModelRunnerV1,
+             )
+ 
++            if SinkConfig.for_model(self.vllm_config) is not None:
++                # The scheduler would hold each step's last token for a
++                # verification this runner does not do.
++                raise ValueError(
++                    "The sink detector (vllm.v1.sample.sink) runs in the V2 model "
++                    "runner: set VLLM_USE_V2_MODEL_RUNNER=1, or "
++                    "VLLM_SINK_REJECTION=0 to serve without it."
++                )
+             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+ 
++        apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
++
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+@@ -540,13 +1195,37 @@ class Worker(WorkerBase):
+         return self.worker_sentinel.handle_command(ft_request)
+ 
+     def load_model(self, *, load_dummy_weights: bool = False) -> None:
++        # Pre-allocate a single contiguous CUDA weight scratch pool right before
++        # model construction (after GPUModelRunner.__init__ so runner buffers do
++        # not pin the scratch segment and prevent exact-fit shrinking).
++        self._preallocate_contiguous_cuda_pool()
+         with (
+             self._maybe_get_memory_pool_context(tag="weights"),
+             set_current_vllm_config(self.vllm_config),
+             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+-            self._scoped_allocator_max_split(max_split_size_mb=20),
++            # Skip it when a single contiguous CUDA pool is pre-allocated, or
++            # PyTorch will refuse to split the pool for >= 20 MiB weights.
++            (
++                nullcontext()
++                if getattr(self, "_contiguous_pool_anchor", None) is not None
++                else self._scoped_allocator_max_split(max_split_size_mb=20)
++            ),
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
++        if (
++            getattr(self, "_contiguous_pool_bytes", 0) > 0
++            and not getattr(self, "_contiguous_pool_finalized", True)
++        ):
++            self._contiguous_pool_finalized = True
++            from vllm.model_executor.model_loader.direct_loader import (
++                set_preallocated_cuda_pool_bytes,
++            )
++
++            set_preallocated_cuda_pool_bytes(
++                self._contiguous_pool_bytes,
++                front_clean=getattr(self, "_contiguous_pool_front_clean", True),
++                resize_cb=None,
++            )
+ 
+         if has_ec_transfer():
+             get_ec_transfer().start_worker_services()
+@@ -558,6 +1237,7 @@ class Worker(WorkerBase):
+                 self.device,
+                 self.model_runner.get_model(),
+             )
++        apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
+ 
+     def update_config(self, overrides: dict[str, Any]) -> None:
+         self.model_runner.update_config(overrides)
+@@ -574,9 +1254,11 @@ class Worker(WorkerBase):
+             raise RuntimeError("b12x preparation is already active")
+         with set_current_vllm_config(self.vllm_config):
+             coordinator = begin_b12x_preparation(self, stage=stage)
+-        self._b12x_startup_coordinator = coordinator
+-        self._b12x_stage = stage
+-        return coordinator.status()
++        outcome = coordinator.status()
++        if not outcome["done"]:
++            self._b12x_startup_coordinator = coordinator
++            self._b12x_stage = stage
++        return outcome
+ 
+     def _prepare_b12x_profile_state(self) -> None:
+         """Prepare pool-dependent plans against the profiling pool, untimed."""
+@@ -595,6 +1277,7 @@ class Worker(WorkerBase):
+             gc.collect()
+             torch.accelerator.synchronize()
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+ 
+     def advance_b12x_preparation(
+         self, *, cancel_tuning: bool = False
+@@ -614,6 +1297,7 @@ class Worker(WorkerBase):
+             gc.collect()
+             torch.accelerator.synchronize()
+             torch.accelerator.empty_cache()
++            trim_host_heap()
+         return outcome
+ 
+     def abort_b12x_preparation(self) -> dict[str, object]:
+@@ -629,14 +1313,45 @@ class Worker(WorkerBase):
+ 
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+-        """Profile model memory through the ordinary vLLM admission path."""
++        """Profile model memory through the ordinary vLLM admission path; a
++        one-shot collective that stops the GPU while profiling is named as the
++        error's cause, as in a serving step."""
++        with _collective_cause(self._roce_failure):
++            return self._determine_available_memory()
++
++    def _determine_available_memory(self) -> int:
+         maybe_apply_startup_plan(self)
++        # Every declared kernel compiles here, on this rank alone, for as long as
++        # its caches need; the ranks then meet on the host.
++        self._prepare_kernels()
++        self._startup_rendezvous("memory profiling")
+ 
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+-            try:
+-                self.model_runner.profile_run(self._prepare_b12x_profile_state)
+-            finally:
+-                self._release_b12x_profile_state()
++            has_compiled_submodule = any(
++                hasattr(m, "do_not_compile") and not m.do_not_compile
++                for model in (
++                    self.model_runner.get_model(),
++                    getattr(self.model_runner, "get_draft_model", lambda: None)(),
++                )
++                if model is not None
++                for m in model.modules()
++            )
++            skip_profile = (
++                (
++                    self.vllm_config.compilation_config.mode == CompilationMode.NONE
++                    or not has_compiled_submodule
++                )
++                and self._b12x_session is None
++                and hasattr(self.model_runner, "_reserve_profile_scratch")
++            )
++            if skip_profile:
++                self.model_runner._reserve_profile_scratch()
++                reclaim_uma_memory(synchronize=False)
++            else:
++                try:
++                    self.model_runner.profile_run(self._prepare_b12x_profile_state)
++                finally:
++                    self._release_b12x_profile_state()
+             msg = (
+                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
+                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
+@@ -697,6 +1412,7 @@ class Worker(WorkerBase):
+         gc.collect()
+         torch.accelerator.synchronize()
+         torch.accelerator.empty_cache()
++        trim_host_heap()
+ 
+         # Backend and CUDA-graph profiling can initialize communication pools,
+         # compiled modules, and other persistent device allocations after the
+@@ -879,6 +1595,7 @@ class Worker(WorkerBase):
+         gc.collect()
+         torch.accelerator.synchronize()
+         torch.accelerator.empty_cache()
++        trim_host_heap()
+ 
+         # Update local config with adjusted num blocks after profiling,
+         # so that it's available to the warmup stage.
+@@ -934,7 +1651,10 @@ class Worker(WorkerBase):
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
+-        with set_current_vllm_config(self.vllm_config):
++        with (
++            set_current_vllm_config(self.vllm_config),
++            _collective_cause(self._roce_failure),
++        ):
+             return self._compile_or_warm_up_model_after_preparation()
+ 
+     def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:
+@@ -978,10 +1698,16 @@ class Worker(WorkerBase):
+         # Warmup and tune the kernels used during model execution before
+         # cuda graph capture.
+         kernel_warmup(self)
++        # The JIT warm-up compiles locally, for as long as each rank's cache needs.
++        self._startup_rendezvous("warm-up")
+ 
+         if self.use_v2_model_runner:
+             # A workspace resize after capture frees what the graphs point at.
+             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
++            gc.collect()
++            torch.accelerator.synchronize()
++            torch.accelerator.empty_cache()
++            trim_host_heap()
+ 
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:
+@@ -1077,8 +1803,15 @@ class Worker(WorkerBase):
+             ):
+                 # Exercise captured execution paths before serving requests.
+                 warmup_kernels(
+-                    self.model_runner, self.execute_model, self.sample_tokens
++                    self.model_runner,
++                    self.execute_model,
++                    self.sample_tokens,
++                    post_capture=True,
+                 )
++                gc.collect()
++                torch.accelerator.synchronize()
++                torch.accelerator.empty_cache()
++                trim_host_heap()
+         elif get_pp_group().is_last_rank:
+             # V1: Warm up sampler and preallocate memory buffer for logits and other
+             # sampling related tensors of max possible shape to avoid memory
+@@ -1115,6 +1848,10 @@ class Worker(WorkerBase):
+ 
+             trigger_inductor_lazy_init(self.device)
+ 
++        if self._startup_heartbeat is not None:
++            self._startup_heartbeat.stop()
++            self._startup_heartbeat = None
++
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+         from vllm.utils.jit_monitor import activate as activate_jit_monitor
+@@ -1123,12 +1860,22 @@ class Worker(WorkerBase):
+             mode=self.observability_config.jit_monitor_mode,
+             verbose=self.observability_config.jit_monitor_verbose,
+         )
++        if "sparknet.oneshot" in sys.modules:
++            # sparknet prepared its kernels before capture; one compiling now
++            # would stall a step, so it raises instead.
++            sys.modules["sparknet.oneshot"].freeze_kernel_resolution(
++                "vLLM warm-up is complete"
++            )
++
++        apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
+ 
+-        # Freeze the worker heap so the GC won't scan static objects
+-        # (model weights, KV caches, CUDA graphs) during inference.
++        # Freeze the worker heap and trim host arenas before logging the
++        # steady-state startup memory breakdown.
+         freeze_gc_heap()
+         maybe_attach_gc_debug_callback()
+ 
++        log_startup_memory_breakdown(self, cuda_graph_memory_bytes)
++
+         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
+         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
+         enable_gpu_sync_check()
+@@ -1333,19 +2080,174 @@ class Worker(WorkerBase):
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+-        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
++        with _collective_cause(self._roce_failure):
++            output = self.model_runner.sample_tokens(grammar_output)
++        return self._roce_guarded(output)
++
++    def _pp_p2p_runtimes(self) -> list[Any]:
++        runtimes: list[Any] = []
++        pp_p2p = getattr(self, "_pp_p2p", None)
++        if pp_p2p is not None and not getattr(pp_p2p, "disabled", False):
++            runtimes.append(pp_p2p)
++        runner = getattr(self, "model_runner", None)
++        pp_handler = getattr(runner, "pp_handler", None)
++        pp_bcast = getattr(pp_handler, "_pp_bcast_p2p", None)
++        if pp_bcast is not None and not getattr(pp_bcast, "disabled", False):
++            runtimes.append(pp_bcast)
++        return runtimes
++
++    def _roce_failure(self) -> str | None:
++        """One-shot TP collective and PP P2P failure report, or None."""
++        parts: list[str] = []
++        communicator = get_tp_group().device_communicator
++        failure = getattr(communicator, "roce_failure", None)
++        if failure is not None:
++            report = failure()
++            if report:
++                parts.append(report)
++        for rt in self._pp_p2p_runtimes():
++            report = rt.failure()
++            if report:
++                parts.append(report)
++        return "; ".join(parts) if parts else None
++
++    def _start_startup_heartbeat(self) -> None:
++        """Publish this rank's startup heartbeat (see ``startup_rendezvous``)."""
++        if get_world_group().world_size == 1:
++            return
++        from vllm.v1.worker.startup_rendezvous import StartupHeartbeat
++
++        store = torch.distributed.distributed_c10d._get_default_store()
++        self._startup_heartbeat = StartupHeartbeat(
++            store, get_world_group().rank, self._startup_progress
++        ).start()
++
++    def _startup_progress(self) -> str:
++        """What this rank's heartbeat reports besides its phase."""
++        from vllm.models.deepseek_v4_1.tilelang.prepare import PROGRESS
++
++        done, total = PROGRESS.snapshot()
++        return f"prepared {done}/{total} kernels" if total else ""
++
++    def _set_startup_phase(self, phase: str) -> None:
++        if self._startup_heartbeat is not None:
++            self._startup_heartbeat.phase = phase
++
++    def _prepare_kernels(self) -> None:
++        """Compile every declared JIT kernel before any distributed work.
++
++        DeepSeek V4.1 declares each TileLang call its loaded modules can make;
++        the runner's JIT registry holds the Triton kernels its samplers and
++        model state registered, and the runner adds its step's kernels here, once
++        the KV cache layout is set. They compile here on this rank alone,
++        TileLang's in one thread pool, and TileLang's kernel cache is then frozen,
++        so profiling, warm-up, capture and serving compile nothing: a kernel that
++        was not declared fails by name on every rank alike.
++        """
++        registry = getattr(self.model_runner, "jit_warmup_registry", None)
++        if registry is None:
++            return
++        self._set_startup_phase("preparing kernels")
++        started = time.monotonic()
++        # Declarations read the scheduler sizing and model configuration.
++        with set_current_vllm_config(self.vllm_config):
++            from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+-    def _b12x_roce_health_check(self) -> Callable[[], None] | None:
+-        """The RoCEnante health check of the TP communicator, if one is active.
++            speculator = getattr(self.model_runner, "speculator", None)
++            with registry.activate():
++                prepare.declare_modules(
++                    self.model_runner.model, getattr(speculator, "model", None)
++                )
++            tilelang_calls = prepare.prepare_declared(registry)
++            with torch.inference_mode():
++                prepare.warm_declared(registry)
++            # A step's Triton kernels (input preparation, sampling, verification,
++            # drafting), specialized on the runner's buffers, the loaded heads and
++            # the block tables of the KV cache groups (the layout is set by now).
++            declare_step_kernels = getattr(
++                self.model_runner, "declare_step_kernels", None
++            )
++            if declare_step_kernels is not None:
++                with registry.activate():
++                    declare_step_kernels()
++            registry.warmup()
++            if tilelang_calls:
++                prepare.release_host_memory()
++        if tilelang_calls:
++            prepare.freeze("every declared kernel was prepared before memory profiling")
++            with set_current_vllm_config(self.vllm_config):
++                prepare.bind_declared(registry)
++            # Nothing compiles from here on: the JIT monitor reports (or, in error
++            # mode, refuses) any other compile, Triton's included, from profiling on.
++            from vllm.utils.jit_monitor import activate as activate_jit_monitor
++
++            activate_jit_monitor(
++                mode=self.observability_config.jit_monitor_mode,
++                verbose=self.observability_config.jit_monitor_verbose,
++            )
++        logger.info(
++            "Prepared %d TileLang calls and the registry's other kernels in %.1f s.",
++            tilelang_calls,
++            time.monotonic() - started,
++        )
++
++    def _startup_rendezvous(self, phase: str) -> None:
++        """Wait on the host until every rank reaches ``phase``.
++
++        Ranks finish loading and preparing kernels at their own pace. The wait
++        lasts while every missing rank is alive, however long it takes, and fails
++        naming a rank whose heartbeat stopped (see ``startup_rendezvous``).
++        """
++        group = get_world_group()
++        if group.world_size == 1:
++            return
++        from vllm.v1.worker.startup_rendezvous import rendezvous
++
++        self._set_startup_phase(f"waiting before {phase}")
++        waited = rendezvous(
++            torch.distributed.distributed_c10d._get_default_store(),
++            group.rank,
++            group.world_size,
++            phase,
++            envs.VLLM_STARTUP_HEARTBEAT_TIMEOUT_S,
++            logger.info,
++        )
++        self._set_startup_phase(phase)
++        if waited >= 1.0:
++            logger.info("Waited %.1f s for every rank before %s.", waited, phase)
++
++    def _roce_health_check(self) -> Callable[[], None] | None:
++        """The RoCEnante health check of the TP communicator and PP P2P runtimes.
+ 
+         Returns:
+-            The check callable, or None when RoCEnante is not in use.
++            The check callable, or None when neither is in use.
+         """
++        checks: list[Callable[[], None]] = []
+         communicator = get_tp_group().device_communicator
+-        comm = getattr(communicator, "b12x_ar_comm", None)
+-        return getattr(comm, "check_health", None)
++        comm = getattr(communicator, "roce_ar_comm", None) or getattr(
++            communicator, "b12x_ar_comm", None
++        )
++        tp_check = getattr(comm, "check_health", None)
++        if tp_check is not None:
++            checks.append(tp_check)
++        for rt in self._pp_p2p_runtimes():
++            pp_check = getattr(rt, "check_health", None)
++            if pp_check is not None:
++                checks.append(pp_check)
++        if not checks:
++            return None
++        if len(checks) == 1:
++            return checks[0]
++
++        def _check_all() -> None:
++            for fn in checks:
++                fn()
+ 
+-    def _b12x_roce_guarded(self, output):
++        return _check_all
++
++    _b12x_roce_health_check = _roce_health_check
++
++    def _roce_guarded(self, output):
+         """Fail-stop RoCEnante check once the step's output is on the host.
+ 
+         A RoCEnante wait that timed out records itself and freezes the runtime.
+@@ -1371,10 +2273,12 @@ class Worker(WorkerBase):
+         if check is None:
+             return output
+         if isinstance(output, AsyncModelRunnerOutput):
+-            return _B12xRoceCheckedAsyncOutput(output, check)
++            return _B12xRoceCheckedAsyncOutput(output, check, self._roce_failure)
+         check()
+         return output
+ 
++    _b12x_roce_guarded = _roce_guarded
++
+     @torch.inference_mode()
+     @with_gpu_sync_check
+     def execute_model(
+@@ -1423,7 +2327,12 @@ class Worker(WorkerBase):
+                 )
+             }
+ 
+-        if forward_pass and not get_pp_group().is_first_rank:
++        _sparknet_pp_p2p = getattr(self, "_pp_p2p", None)
++        if (
++            forward_pass
++            and not get_pp_group().is_first_rank
++            and _sparknet_pp_p2p is None
++        ):
+             tensor_dict, comm_handles, comm_postprocess = (
+                 get_pp_group().irecv_tensor_dict(
+                     all_gather_group=get_tp_group(),
+@@ -1437,7 +2346,10 @@ class Worker(WorkerBase):
+                 comm_postprocess=comm_postprocess,
+             )
+ 
+-        with self.annotate_profile(scheduler_output):
++        with (
++            self.annotate_profile(scheduler_output),
++            _collective_cause(self._roce_failure),
++        ):
+             output = self.model_runner.execute_model(
+                 scheduler_output, intermediate_tensors
+             )
+@@ -1450,7 +2362,7 @@ class Worker(WorkerBase):
+             if isinstance(
+                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+             ):
+-                return self._b12x_roce_guarded(output)
++                return self._roce_guarded(output)
+ 
+         assert isinstance(output, IntermediateTensors)
+         parallel_config = self.vllm_config.parallel_config
+@@ -1459,15 +2371,27 @@ class Worker(WorkerBase):
+             and not get_pp_group().is_last_rank
+         )
+ 
+-        # Non-blocking send of the intermediate tensors. The metadata handle
+-        # is reaped lazily by the GroupCoordinator; the device handles are
+-        # waited at the top of the next step.
+-        handles = get_pp_group().isend_tensor_dict(
+-            output.tensors,
+-            all_gather_group=get_tp_group(),
+-            all_gather_tensors=all_gather_tensors,
+-        )
+-        self._pp_send_work = handles[1:]
++        if _sparknet_pp_p2p is not None:
++            pp_group = get_pp_group()
++            dst = (pp_group.rank_in_group + 1) % pp_group.world_size
++            keys = [
++                k
++                for k in sorted(output.tensors.keys())
++                if output.tensors[k].numel() > 0
++            ]
++            if keys:
++                _sparknet_pp_p2p.send_tensor_dict_fixed(output.tensors, keys, dst=dst)
++            self._pp_send_work = []
++        else:
++            # Non-blocking send of the intermediate tensors. The metadata handle
++            # is reaped lazily by the GroupCoordinator; the device handles are
++            # waited at the top of the next step.
++            handles = get_pp_group().isend_tensor_dict(
++                output.tensors,
++                all_gather_group=get_tp_group(),
++                all_gather_tensors=all_gather_tensors,
++            )
++            self._pp_send_work = handles[1:]
+ 
+         if self.use_v2_model_runner and self.model_runner.is_pooling_model:
+             return self.model_runner.pool()  # type: ignore
+@@ -1476,15 +2400,39 @@ class Worker(WorkerBase):
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+         return self.model_runner.take_draft_token_ids()
+ 
+-    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+-        # Check if profiling is enabled
++    def profile(
++        self, is_start: bool | str = True, profile_prefix: str | None = None
++    ):
++        if isinstance(is_start, str):
++            is_start = is_start.strip().lower() in ("1", "true", "yes", "on")
++
++        # Check if profiling is enabled (allow lazy dev-mode CUPTI setup via RPC)
+         if self.profiler_config is None or self.profiler_config.profiler is None:
+-            raise RuntimeError(
+-                "Profiling is not enabled. Please set --profiler-config to enable "
+-                "profiling. Example: "
+-                "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
+-                "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
++            if not envs.VLLM_SERVER_DEV_MODE:
++                raise RuntimeError(
++                    "Profiling is not enabled. Please set --profiler-config to enable "
++                    "profiling. Example: "
++                    "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
++                    "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
++                )
++            if not is_start:
++                logger.warning("Profiler was not started, nothing to stop.")
++                return
++            from vllm.config.profiler import ProfilerConfig
++
++            profiler_dir = "/cache/torch-profiler"
++            os.makedirs(profiler_dir, exist_ok=True)
++            self.profiler_config = ProfilerConfig(
++                profiler="torch",
++                torch_profiler_dir=profiler_dir,
++                torch_profiler_with_stack=False,
++                torch_profiler_record_shapes=False,
++                ignore_frontend=True,
++                torch_profiler_use_gzip=True,
++                torch_profiler_dump_cuda_time_total=False,
+             )
++            self.vllm_config.profiler_config = self.profiler_config
++            self._lazy_dev_profiler = True
+ 
+         if is_start:
+             profiler_type = self.profiler_config.profiler
+@@ -1538,13 +2486,27 @@ class Worker(WorkerBase):
+             try:
+                 self.profiler.stop()
+             finally:
+-                if self.profiler_config.profiler == "proton" and not (
+-                    self.profiler.has_cuda_graph_session
+-                ):
+-                    # Proton output names are fixed when the wrapper is constructed.
+-                    # Recreate it so the next profile_prefix is honored.
++                if (
++                    self.profiler_config.profiler == "proton"
++                    and not self.profiler.has_cuda_graph_session
++                ) or getattr(self, "_lazy_dev_profiler", False):
++                    # Proton output names are fixed at construction; lazy dev-mode
++                    # torch profiling also drops the wrapper after stop so normal
++                    # serving returns to zero overhead and new prefixes take effect.
+                     self.profiler = None
+ 
++    def engine_grid(self, spec: str) -> dict:
++        """The engine cost grid (``GPUModelRunner.engine_grid``) for the dev-mode
++        collective RPC, whose arguments arrive as strings: ``spec`` is JSON."""
++        import json
++
++        grid = getattr(self.model_runner, "engine_grid", None)
++        if grid is None:
++            raise NotImplementedError("engine_grid needs the V2 GPU model runner")
++        result = grid(json.loads(spec))
++        result["rank"] = self.rank
++        return result
++
+     def execute_dummy_batch(self) -> None:
+         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+@@ -1734,6 +2696,9 @@ class Worker(WorkerBase):
+         if session := getattr(self, "_b12x_session", None):
+             session.close()
+             self._b12x_session = None
++        if pp_p2p := getattr(self, "_pp_p2p", None):
++            pp_p2p.close()
++            self._pp_p2p = None
+ 
+         # Release kept-alive cumem pools while the pluggable allocator wrappers
+         # and callbacks are still alive, so MemPool teardown is not deferred to
+@@ -1791,3 +2756,85 @@ def init_worker_distributed_environment(
+     # Init ec connector here before KV caches init
+     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
+     ensure_ec_transfer_initialized(vllm_config)
++
++
++def log_startup_memory_breakdown(
++    worker: Any,
++    cuda_graph_memory_bytes: int = 0,
++) -> dict[str, int]:
++    """Record and log a per-component GPU/UMA memory breakdown after warmup."""
++    device = getattr(worker, "device", None)
++    if device is None:
++        return {}
++
++    snapshot = MemorySnapshot(device=device)
++    model_runner = getattr(worker, "model_runner", None)
++    cache_config = getattr(worker, "cache_config", None)
++
++    weights_bytes = int(getattr(model_runner, "model_memory_usage", 0) or 0)
++    kv_cache_bytes = int(
++        getattr(worker, "available_kv_cache_memory_bytes", 0)
++        or getattr(cache_config, "kv_cache_memory_bytes", 0)
++        or 0
++    )
++
++    from vllm.v1.worker import workspace as workspace_mod
++
++    mgr = workspace_mod._manager
++    workspace_bytes = 0
++    if mgr is not None:
++        workspace_bytes = sum(
++            workspace_mod.WorkspaceManager._workspace_size_bytes(ws)
++            for ws in getattr(mgr, "_current_workspaces", ())
++        ) + int(getattr(mgr, "_moe_output_bytes", 0) or 0)
++
++    torch_allocated_bytes = int(getattr(snapshot, "torch_allocated", 0) or 0)
++    torch_reserved_bytes = int(getattr(snapshot, "torch_memory", 0) or 0)
++    torch_allocator_slack_bytes = max(
++        torch_reserved_bytes - torch_allocated_bytes, 0
++    )
++    other_torch_allocated_bytes = max(
++        torch_allocated_bytes - weights_bytes - kv_cache_bytes - workspace_bytes,
++        0,
++    )
++    peak_activation_bytes = int(
++        getattr(worker, "peak_activation_memory", 0) or 0
++    )
++    cudagraph_bytes = int(cuda_graph_memory_bytes or 0)
++    non_torch_cuda_bytes = int(getattr(snapshot, "non_torch_memory", 0) or 0)
++    free_memory_bytes = int(getattr(snapshot, "free_memory", 0) or 0)
++
++    breakdown = {
++        "weights_bytes": weights_bytes,
++        "kv_cache_bytes": kv_cache_bytes,
++        "workspace_bytes": workspace_bytes,
++        "other_torch_allocated_bytes": other_torch_allocated_bytes,
++        "torch_allocated_bytes": torch_allocated_bytes,
++        "torch_reserved_bytes": torch_reserved_bytes,
++        "torch_allocator_slack_bytes": torch_allocator_slack_bytes,
++        "peak_activation_bytes": peak_activation_bytes,
++        "cudagraph_bytes": cudagraph_bytes,
++        "non_torch_cuda_bytes": non_torch_cuda_bytes,
++        "free_memory_bytes": free_memory_bytes,
++    }
++    worker.startup_memory_breakdown = breakdown
++    logger.info(
++        "[memory_breakdown] rank=%s weights=%s GiB kv_cache=%s GiB "
++        "workspace=%s GiB other_torch_allocated=%s GiB "
++        "torch_allocated=%s GiB torch_reserved=%s GiB "
++        "torch_allocator_slack=%s GiB peak_activation=%s GiB "
++        "cudagraph=%s GiB non_torch_cuda=%s GiB free_memory=%s GiB",
++        getattr(worker, "rank", 0),
++        format_gib(weights_bytes),
++        format_gib(kv_cache_bytes),
++        format_gib(workspace_bytes),
++        format_gib(other_torch_allocated_bytes),
++        format_gib(torch_allocated_bytes),
++        format_gib(torch_reserved_bytes),
++        format_gib(torch_allocator_slack_bytes),
++        format_gib(peak_activation_bytes),
++        format_gib(cudagraph_bytes),
++        format_gib(non_torch_cuda_bytes),
++        format_gib(free_memory_bytes),
++    )
++    return breakdown
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 855e693a532fe94c93b88bd943d4d96356c1c64a..85cbd0c9bab0a18b9bcf7e9c0e38b633c3aed2c7 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -10,6 +10,7 @@ from typing import Any
+ import numpy as np
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.config import CacheConfig, VllmConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+@@ -56,6 +57,8 @@ def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
+     raise RuntimeError(f"NaNs detected in logits: {corrupted_requests}")
+ 
+ 
++# The reference the TileLang zeroing (``gpu.tilelang_inputs.zero_kv_blocks_kernel``)
++# is tested against; the runner no longer launches it.
+ @triton.jit
+ def _zero_kv_blocks_kernel(
+     seg_addrs_ptr,
+@@ -102,14 +105,72 @@ def _zero_kv_blocks_kernel(
+     )
+ 
+ 
++def zero_kv_blocks_block_size(max_page_size_el: int) -> int:
++    """``_zero_kv_blocks_kernel``'s BLOCK_SIZE for the largest page, in int32s."""
++    return min(1 << (max_page_size_el - 1).bit_length(), 1024)
++
++
++# ``VLLM_KV_CACHE_POISON``'s fill: every byte 0xFF, a NaN in FP32, BF16, FP16, FP8
++# E4M3 and E5M2 and UE8M0, whatever the record's layout or the byte's offset in it.
++# E2M1 (FP4) has neither NaN nor Inf: its nibble reads -6, its largest magnitude,
++# and the UE8M0 scale beside it is NaN.
++KV_POISON_WORD = -1
++
++
++def declare_zero_kv_blocks_kernel() -> None:
++    """Declare KV block zeroing (one kernel for every page size and block count), or
++    under ``VLLM_KV_CACHE_POISON`` the fill that replaces it."""
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    if envs.VLLM_KV_CACHE_POISON:
++        tilelang_inputs.declare(tilelang_inputs.fill_kv_blocks_calls)
++    else:
++        tilelang_inputs.declare(tilelang_inputs.zero_kv_blocks_calls)
++
++
++def _zero_kv_blocks(
++    seg_addrs: torch.Tensor,
++    seg_block_strides: torch.Tensor,
++    seg_page_sizes: torch.Tensor,
++    block_ids: torch.Tensor,
++    max_page_size_el: int,
++) -> None:
++    """Zero each segment's page of each block (TileLang: ``seg_addrs`` as int64)."""
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    tilelang_inputs.zero_kv_blocks(
++        seg_addrs, seg_block_strides, seg_page_sizes, block_ids, max_page_size_el
++    )
++
++
++def _fill_kv_blocks(
++    seg_addrs: torch.Tensor,
++    seg_block_strides: torch.Tensor,
++    seg_page_sizes: torch.Tensor,
++    block_ids: torch.Tensor,
++    max_page_size_el: int,
++    word: int,
++) -> None:
++    """``_zero_kv_blocks`` storing ``word`` (an int32) in place of zero."""
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    tilelang_inputs.fill_kv_blocks(
++        seg_addrs, seg_block_strides, seg_page_sizes, block_ids, max_page_size_el, word
++    )
++
++
+ class KVBlockZeroer:
+-    """Manages efficient zeroing of KV cache blocks via a Triton kernel.
++    """Manages efficient zeroing of KV cache blocks via a TileLang kernel.
+ 
+     Construct once after KV caches are allocated to precompute segment
+     addresses, then call :meth:`zero_block_ids` each step to zero
+-    newly-allocated blocks.
++    newly-allocated blocks. Under ``VLLM_KV_CACHE_POISON`` the same pages are
++    filled with ``KV_POISON_WORD`` instead.
+     """
+ 
++    # The word new blocks are filled with in place of zeros (the poison check).
++    _fill_word: int | None = None
++
+     def __init__(
+         self,
+         device: torch.device,
+@@ -119,7 +180,7 @@ class KVBlockZeroer:
+         num_blocks: int,
+         runner_only_attn_layers: set[str] | None = None,
+     ) -> None:
+-        """Precompute the absolute-address table for the Triton zeroing kernel.
++        """Precompute the absolute-address table for the zeroing kernel.
+ 
+         Each entry is the absolute byte address of a segment start on the
+         GPU, so segments in different CUDA allocations work correctly.
+@@ -138,6 +199,7 @@ class KVBlockZeroer:
+         Only AttentionSpec layers are processed; Mamba layers are skipped.
+         """
+         self.device = device
++        self._fill_word = KV_POISON_WORD if envs.VLLM_KV_CACHE_POISON else None
+         self._meta: (
+             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+         ) = None
+@@ -216,7 +278,7 @@ class KVBlockZeroer:
+             return
+ 
+         max_page_size_el = max(seg_page_sizes)
+-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
++        blk_size = zero_kv_blocks_block_size(max_page_size_el)
+         self._meta = (
+             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+             torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
+@@ -227,31 +289,52 @@ class KVBlockZeroer:
+         )
+ 
+     def zero_block_ids(self, block_ids: list[int]) -> None:
+-        """Zero the KV cache memory for the given block IDs."""
++        """Zero the KV cache memory for the given block IDs (poison it under
++        ``VLLM_KV_CACHE_POISON``)."""
++        if self._fill_word is not None:
++            self._fill_block_ids(block_ids, self._fill_word)
++            return
+         if not block_ids or self._meta is None:
+             return
+-        (
+-            seg_addrs,
++        seg_addrs, seg_block_strides, seg_page_sizes, max_chunks, blk_size, _ = (
++            self._meta
++        )
++        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
++        # max_chunks pages of blk_size (at most 1024) int32s cover the largest
++        # page, as the kernel's 1024-element chunks do.
++        _zero_kv_blocks(
++            seg_addrs.view(torch.int64),
+             seg_block_strides,
+             seg_page_sizes,
+-            max_chunks,
+-            blk_size,
+-            n_segs,
+-        ) = self._meta
+-        n_blocks = len(block_ids)
++            idx,
++            max_chunks * blk_size,
++        )
++
++    def _fill_block_ids(self, block_ids: list[int], word: int) -> None:
++        if not block_ids or self._meta is None:
++            return
++        seg_addrs, seg_block_strides, seg_page_sizes, max_chunks, blk_size, _ = (
++            self._meta
++        )
+         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+-        grid = (n_blocks, n_segs, max_chunks)
+-        _zero_kv_blocks_kernel[grid](
+-            seg_addrs,
++        _fill_kv_blocks(
++            seg_addrs.view(torch.int64),
+             seg_block_strides,
+             seg_page_sizes,
+             idx,
+-            BLOCK_SIZE=blk_size,
++            max_chunks * blk_size,
++            word,
+         )
+ 
+     def warmup(self, num_kv_blocks: int) -> None:
+         """JIT-compile the zeroing kernel before the first real request."""
+-        if num_kv_blocks > 0:
++        if num_kv_blocks <= 0:
++            return
++        if self._fill_word is not None:
++            # The poison fill compiles on the null block, which no request is
++            # given: it stays zero, as without the check.
++            self._fill_block_ids([0], 0)
++        else:
+             self.zero_block_ids([0])
+ 
+ 
+diff --git a/vllm/v1/worker/workspace.py b/vllm/v1/worker/workspace.py
+index b4422534049164966bed866c78db987daf0da44d..30eeeb9d0e79af7008952171078d216939f46217 100644
+--- a/vllm/v1/worker/workspace.py
++++ b/vllm/v1/worker/workspace.py
+@@ -131,6 +131,9 @@ class WorkspaceManager:
+         self._current_workspaces: list[torch.Tensor | None] = [None] * (
+             self._num_ubatches * self._num_lanes
+         )
++        self._moe_output_buffers: list[torch.Tensor | None] = [None] * (
++            self._num_ubatches * self._num_lanes
++        )
+         self._locked: bool = False
+ 
+     @staticmethod
+@@ -222,6 +225,53 @@ class WorkspaceManager:
+             for i in range(len(shapes_and_dtypes))
+         ]
+ 
++    def get_moe_output_buffer(
++        self, shape: tuple[int, ...], dtype: torch.dtype
++    ) -> torch.Tensor:
++        """Return a reusable MoE output tensor view for the active ``(ubatch, lane)``.
++
++        Unlike :meth:`get_simultaneous`, this buffer is separate from the scratch
++        workspace arena so consumers that run between two MoE layers (such as
++        ``mHC`` and attention) never overwrite the previous MoE layer's output.
++        """
++        ubatch_id = dbo_current_ubatch_id()
++        lane = _workspace_lane.get()
++        if lane >= self._num_lanes:
++            raise RuntimeError(
++                f"Workspace lane {lane} is not configured; manager has "
++                f"{self._num_lanes} lane(s)."
++            )
++        workspace_id = ubatch_id * self._num_lanes + lane
++        actual_bytes = _compute_bytes(shape, dtype)
++        buf = self._moe_output_buffers[workspace_id]
++        current_size = self._workspace_size_bytes(buf)
++        if current_size < actual_bytes:
++            if self._locked or (
++                self._device.type == "cuda" and torch.cuda.is_current_stream_capturing()
++            ):
++                return torch.empty(shape, dtype=dtype, device=self._device)
++            alloc_bytes = actual_bytes
++            from vllm.config import get_current_vllm_config_or_none
++
++            vllm_config = get_current_vllm_config_or_none()
++            sched_cfg = getattr(vllm_config, "scheduler_config", None)
++            max_tokens = getattr(sched_cfg, "max_num_batched_tokens", None)
++            if isinstance(max_tokens, int) and max_tokens > 0 and len(shape) >= 1:
++                alloc_rows = max(shape[0], max_tokens)
++                alloc_bytes = max(
++                    alloc_bytes,
++                    alloc_rows * prod(shape[1:]) * dtype.itemsize,
++                )
++            if self._device.type == "cuda" and buf is not None:
++                torch.accelerator.synchronize(self._device)
++            self._moe_output_buffers[workspace_id] = None
++            del buf
++            torch.accelerator.empty_cache()
++            buf = torch.empty((alloc_bytes,), dtype=torch.uint8, device=self._device)
++            self._moe_output_buffers[workspace_id] = buf
++        assert buf is not None
++        return buf[:actual_bytes].view(dtype).reshape(shape)
++
+     def reserve_all(
+         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+     ) -> None:
+@@ -269,6 +319,29 @@ class WorkspaceManager:
+         self._reserve_slots(
+             lane_bytes * self._num_ubatches, operation="reserve_by_lane"
+         )
++        moe_lane_bytes = [
++            max(
++                map(
++                    self._workspace_size_bytes,
++                    self._moe_output_buffers[lane :: self._num_lanes],
++                ),
++                default=0,
++            )
++            for lane in range(self._num_lanes)
++        ]
++        for workspace_id, required in enumerate(moe_lane_bytes * self._num_ubatches):
++            if (
++                not self._locked
++                and self._workspace_size_bytes(self._moe_output_buffers[workspace_id])
++                < required
++            ):
++                current_buf = self._moe_output_buffers[workspace_id]
++                self._moe_output_buffers[workspace_id] = None
++                del current_buf
++                torch.accelerator.empty_cache()
++                self._moe_output_buffers[workspace_id] = torch.empty(
++                    (required,), dtype=torch.uint8, device=self._device
++                )
+ 
+     def _reserve_slots(self, sizes: list[int], *, operation: str) -> None:
+         undersized = [

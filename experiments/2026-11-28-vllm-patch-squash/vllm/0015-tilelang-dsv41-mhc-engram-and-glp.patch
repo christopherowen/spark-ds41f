@@ -1,0 +1,4061 @@
+From 486c675c54798b6743f28f968e6e75d56fcadf52 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:55:00 +0000
+Subject: [PATCH] tilelang: DS4.1 mHC residual mixing, Engram hashing/rows, and
+ GLP steering kernels
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Add TileLang DS4.1 kernels for manifold-constrained hyper-connections (mHC), Engram N-gram hashing and row lookup, and GLP activation steering.
+Quality impact: none (tree-identical squash of qualified candidate-77 vLLM tree 58f9b11080cf8ebeccd80c0ce1d9bb7a6ff4ae58).
+Tests: candidate-77 release-tests (12,082 passed, 0 failed) and 2-boot tp3-triangle screen.
+Upstream status: local squashed subsystem patch (tree-identical to candidate-77 0001..0871).
+---
+ vllm/models/deepseek_v4_1/tilelang/engram.py  |  661 ++++++
+ .../deepseek_v4_1/tilelang/engram_hash.py     |  330 +++
+ .../deepseek_v4_1/tilelang/engram_rows.py     |  600 +++++
+ vllm/models/deepseek_v4_1/tilelang/glp.py     |  328 +++
+ .../models/deepseek_v4_1/tilelang/glp_rows.py |   76 +
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     | 2004 +++++++++++++++++
+ 6 files changed, 3999 insertions(+)
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/engram.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/glp.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/glp_rows.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/mhc.py
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram.py b/vllm/models/deepseek_v4_1/tilelang/engram.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b2e8b56104dd08244018ffe11f86a81f95bf581
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/engram.py
+@@ -0,0 +1,661 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang Engram gate for DeepSeek-V4.1.
++
++DeepSeek's signed-sqrt gate (TileKernels ``engram_gate_fwd``, inference form) over
++the multi-stream residual. For each token and stream, with the stream's residual
++``x``, key ``k``, the token's shared value ``v`` and the stream's fused norm weight
++``w`` (the product of the query and key RMSNorm weights)::
++
++    dot  = sum(x * w * k) * rsqrt(mean(x^2) + eps) * rsqrt(mean(k^2) + eps) / sqrt(D)
++    gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot))
++    out  = x + gate * v
++
++in FP32, rounded to BF16. Image tokens (the step's ids equal to the image sentinel:
++no mask kernel before the gate) keep ``x``. The magnitude's floor compares
++and selects, as the reference's ``clamp_min``, so a NaN dot makes the stream NaN
++rather than gating it with the floor. One block per (token, stream)
++spreads a row's loads over the whole block, and every load (the value too) is
++issued before the reduction, so a decode row costs one DRAM round trip.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import pdl
++from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
++
++# Gate magnitudes below this clamp to it before the square root.
++CLAMP = 1e-6
++
++
++@T.macro
++def _reconstruct_stream(
++    layer_out,
++    residual,
++    post,
++    comb,
++    xs,
++    t,
++    h,
++    tx,
++    chunks,
++    threads,
++    vec,
++    hc_mult,
++    world=1,
++):
++    """Reconstruct stream ``h`` of token ``t`` from ``layer_out`` (``[T, D]`` or
++    rank-major ``[world, T, D]``) and ``residual`` in registers using ``post_streams``'
++    exact FP32 FMA sequence, rounded to BF16."""
++    xv = T.alloc_local((vec,), T.bfloat16)
++    xp = T.alloc_local((world * vec,), T.bfloat16)
++    av = T.alloc_local((vec,), T.float32)
++    rv = T.alloc_local((hc_mult * vec,), T.bfloat16)
++    pm = T.alloc_local((1,), T.float32)
++    cm = T.alloc_local((hc_mult,), T.float32)
++    p_acc = T.alloc_var(T.float32)
++    pm[0] = post[t, h]
++    for m in T.unroll(hc_mult):
++        cm[m] = comb[t, m, h]
++    for c in T.serial(chunks):
++        col = (c * threads + tx) * vec
++        if world == 1:
++            for i in T.vectorized(vec):
++                xv[i] = layer_out[t, col + i]
++        else:
++            for r in T.unroll(world):
++                for i in T.vectorized(vec):
++                    xp[r * vec + i] = layer_out[r, t, col + i]
++            for r in T.unroll(world):
++                for i in T.unroll(vec):
++                    if r == 0:
++                        av[i] = T.cast(xp[i], T.float32)
++                    else:
++                        av[i] = av[i] + T.cast(xp[r * vec + i], T.float32)
++            for i in T.unroll(vec):
++                xv[i] = T.cast(av[i], T.bfloat16)
++        for m in T.unroll(hc_mult):
++            for i in T.vectorized(vec):
++                rv[m * vec + i] = residual[t, m, col + i]
++        for i in T.unroll(vec):
++            p_acc = cm[0] * T.cast(rv[i], T.float32)
++            p_acc = T.fma(pm[0], T.cast(xv[i], T.float32), p_acc)
++            for m in T.unroll(1, hc_mult):
++                p_acc = T.fma(cm[m], T.cast(rv[m * vec + i], T.float32), p_acc)
++            xs[c * vec + i] = T.cast(T.cast(p_acc, T.bfloat16), T.float32)
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_gate_kernel(
++    hc_mult: int,
++    hidden: int,
++    eps: float,
++    ids_dtype: str,
++    threads: int = 256,
++    vec: int = 4,
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    scalar = hidden**-0.5
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def engram_gate(
++        x: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        kv: T.Tensor((tokens, hc_mult + 1, hidden), T.bfloat16),
++        weight: T.Tensor((hc_mult, hidden), T.float32),
++        ids: T.Tensor((tokens,), ids_dtype),
++        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    ):
++        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * vec,), T.float32)
++            vs = T.alloc_local((chunks * vec,), T.float32)
++            ks = T.alloc_local((vec,), T.float32)
++            ws = T.alloc_local((vec,), T.float32)
++            acc = T.alloc_local((3,), T.float32)
++            partial = T.alloc_shared((3, warps), T.float32)
++            gate = T.alloc_shared((1,), T.float32)
++            for c in T.serial(chunks):
++                for i in T.vectorized(vec):
++                    xs[c * vec + i] = x[t, h, (c * threads + tx) * vec + i]
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i], T.bfloat16
++                        )
++            else:
++                for j in T.serial(3):
++                    acc[j] = T.float32(0)
++                for c in T.serial(chunks):
++                    # The value loads with the key: no second round trip after
++                    # the gate.
++                    for i in T.vectorized(vec):
++                        vs[c * vec + i] = kv[t, hc_mult, (c * threads + tx) * vec + i]
++                    for i in T.vectorized(vec):
++                        ks[i] = kv[t, h, (c * threads + tx) * vec + i]
++                    for i in T.vectorized(vec):
++                        ws[i] = weight[h, (c * threads + tx) * vec + i]
++                    for i in T.serial(vec):
++                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
++                        acc[1] += ks[i] * ks[i]
++                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
++                for j in T.serial(3):
++                    acc[j] = T.warp_reduce_sum(acc[j])
++                if tx % 32 == 0:
++                    for j in T.serial(3):
++                        partial[j, tx // 32] = acc[j]
++                T.sync_threads()
++                if tx == 0:
++                    for j in T.serial(3):
++                        acc[j] = T.float32(0)
++                        for warp in T.serial(warps):
++                            acc[j] += partial[j, warp]
++                    dot = (
++                        acc[2]
++                        * T.rsqrt(acc[0] / hidden + eps)
++                        * T.rsqrt(acc[1] / hidden + eps)
++                        * scalar
++                    )
++                    magnitude = T.abs(dot)
++                    floored = T.if_then_else(
++                        magnitude < CLAMP, T.float32(CLAMP), magnitude
++                    )
++                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
++                T.sync_threads()
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
++                        )
++
++    return engram_gate
++
++
++def _dtype(ids: torch.Tensor) -> str:
++    return str(ids.dtype).removeprefix("torch.")
++
++
++def engram_gate(
++    x: torch.Tensor,
++    kv: torch.Tensor,
++    weight: torch.Tensor,
++    ids: torch.Tensor,
++    out: torch.Tensor,
++    eps: float,
++    hc_mult: int,
++) -> None:
++    """Gate ``x`` ([T, hc_mult * D]) with ``kv`` ([T, (hc_mult + 1) * D]: the keys,
++    then the shared value) and the fused norm ``weight`` ([hc_mult * D], FP32) into
++    ``out``. ``ids`` ([T], int32 or int64) are the step's token ids: the image
++    sentinel's rows pass through unchanged."""
++    tokens = x.shape[0]
++    if tokens == 0:
++        return
++    hidden = weight.numel() // hc_mult
++    kernel = engram_gate_kernel(hc_mult, hidden, eps, _dtype(ids))
++    kernel(
++        x.view(tokens, hc_mult, hidden),
++        kv.view(tokens, hc_mult + 1, hidden),
++        weight.view(hc_mult, hidden),
++        ids,
++        out.view(tokens, hc_mult, hidden),
++    )
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_gate_blocked_kernel(
++    hc_mult: int,
++    hidden: int,
++    eps: float,
++    ids_dtype: str,
++    blocks: int,
++    block_cols: int,
++    threads: int = 256,
++    vec: int = 4,
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    # A vector of a logical column group never straddles two blocks.
++    assert block_cols % vec == 0 and blocks * block_cols >= (hc_mult + 1) * hidden
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    scalar = hidden**-0.5
++    tokens = T.dynamic("tokens")
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def engram_gate_blocked(
++        x: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        kv: T.Tensor((blocks, rows, block_cols), T.bfloat16),
++        weight: T.Tensor((hc_mult, hidden), T.float32),
++        ids: T.Tensor((tokens,), ids_dtype),
++        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    ):
++        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * vec,), T.float32)
++            vs = T.alloc_local((chunks * vec,), T.float32)
++            ks = T.alloc_local((vec,), T.float32)
++            ws = T.alloc_local((vec,), T.float32)
++            acc = T.alloc_local((3,), T.float32)
++            partial = T.alloc_shared((3, warps), T.float32)
++            gate = T.alloc_shared((1,), T.float32)
++            for c in T.serial(chunks):
++                for i in T.vectorized(vec):
++                    xs[c * vec + i] = x[t, h, (c * threads + tx) * vec + i]
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i], T.bfloat16
++                        )
++            else:
++                for j in T.serial(3):
++                    acc[j] = T.float32(0)
++                for c in T.serial(chunks):
++                    # The value loads with the key: no second round trip after
++                    # the gate.
++                    value = hc_mult * hidden + (c * threads + tx) * vec
++                    key = h * hidden + (c * threads + tx) * vec
++                    for i in T.vectorized(vec):
++                        vs[c * vec + i] = kv[
++                            value // block_cols, t, value % block_cols + i
++                        ]
++                    for i in T.vectorized(vec):
++                        ks[i] = kv[key // block_cols, t, key % block_cols + i]
++                    for i in T.vectorized(vec):
++                        ws[i] = weight[h, (c * threads + tx) * vec + i]
++                    for i in T.serial(vec):
++                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
++                        acc[1] += ks[i] * ks[i]
++                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
++                for j in T.serial(3):
++                    acc[j] = T.warp_reduce_sum(acc[j])
++                if tx % 32 == 0:
++                    for j in T.serial(3):
++                        partial[j, tx // 32] = acc[j]
++                T.sync_threads()
++                if tx == 0:
++                    for j in T.serial(3):
++                        acc[j] = T.float32(0)
++                        for warp in T.serial(warps):
++                            acc[j] += partial[j, warp]
++                    dot = (
++                        acc[2]
++                        * T.rsqrt(acc[0] / hidden + eps)
++                        * T.rsqrt(acc[1] / hidden + eps)
++                        * scalar
++                    )
++                    magnitude = T.abs(dot)
++                    floored = T.if_then_else(
++                        magnitude < CLAMP, T.float32(CLAMP), magnitude
++                    )
++                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
++                T.sync_threads()
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
++                        )
++
++    return engram_gate_blocked
++
++
++def engram_gate_blocked(
++    x: torch.Tensor,
++    kv: torch.Tensor,
++    weight: torch.Tensor,
++    ids: torch.Tensor,
++    out: torch.Tensor,
++    eps: float,
++    hc_mult: int,
++) -> None:
++    """``engram_gate`` with ``kv`` as column blocks ``[N, rows, C]``: the logical
++    ``[T, (hc_mult + 1) * D]`` row t is the blocks' row t side by side, cut to its
++    width (prefill SP's exchanged blocks, read in place). Rows past T are not read.
++    The same loads in the same order as the packed gate: the same bits."""
++    tokens = x.shape[0]
++    if tokens == 0:
++        return
++    hidden = weight.numel() // hc_mult
++    blocks, _, block_cols = kv.shape
++    kernel = engram_gate_blocked_kernel(
++        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols
++    )
++    kernel(
++        x.view(tokens, hc_mult, hidden),
++        kv,
++        weight.view(hc_mult, hidden),
++        ids,
++        out.view(tokens, hc_mult, hidden),
++    )
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_post_gate_kernel(
++    hc_mult: int,
++    hidden: int,
++    eps: float,
++    ids_dtype: str,
++    threads: int = 256,
++    vec: int = 4,
++    world: int = 1,
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0 and world >= 1
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    scalar = hidden**-0.5
++    tokens = T.dynamic("tokens")
++    layer_stride0 = T.dynamic("layer_stride0")
++    layer_out_ann = (
++        T.Tensor((tokens, hidden), T.bfloat16)
++        if world == 1
++        else T.StridedTensor((world, tokens, hidden), (layer_stride0, hidden, 1), T.bfloat16)
++    )
++
++    @T.prim_func
++    def engram_post_gate(
++        layer_out: layer_out_ann,
++        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        post: T.Tensor((tokens, hc_mult), T.float32),
++        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
++        kv: T.Tensor((tokens, hc_mult + 1, hidden), T.bfloat16),
++        weight: T.Tensor((hc_mult, hidden), T.float32),
++        ids: T.Tensor((tokens,), ids_dtype),
++        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    ):
++        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * vec,), T.float32)
++            vs = T.alloc_local((chunks * vec,), T.float32)
++            ks = T.alloc_local((vec,), T.float32)
++            ws = T.alloc_local((vec,), T.float32)
++            acc = T.alloc_local((3,), T.float32)
++            partial = T.alloc_shared((3, warps), T.float32)
++            gate = T.alloc_shared((1,), T.float32)
++            _reconstruct_stream(
++                layer_out,
++                residual,
++                post,
++                comb,
++                xs,
++                t,
++                h,
++                tx,
++                chunks,
++                threads,
++                vec,
++                hc_mult,
++                world,
++            )
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i], T.bfloat16
++                        )
++            else:
++                for j in T.serial(3):
++                    acc[j] = T.float32(0)
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        vs[c * vec + i] = kv[t, hc_mult, (c * threads + tx) * vec + i]
++                    for i in T.vectorized(vec):
++                        ks[i] = kv[t, h, (c * threads + tx) * vec + i]
++                    for i in T.vectorized(vec):
++                        ws[i] = weight[h, (c * threads + tx) * vec + i]
++                    for i in T.serial(vec):
++                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
++                        acc[1] += ks[i] * ks[i]
++                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
++                for j in T.serial(3):
++                    acc[j] = T.warp_reduce_sum(acc[j])
++                if tx % 32 == 0:
++                    for j in T.serial(3):
++                        partial[j, tx // 32] = acc[j]
++                T.sync_threads()
++                if tx == 0:
++                    for j in T.serial(3):
++                        acc[j] = T.float32(0)
++                        for warp in T.serial(warps):
++                            acc[j] += partial[j, warp]
++                    dot = (
++                        acc[2]
++                        * T.rsqrt(acc[0] / hidden + eps)
++                        * T.rsqrt(acc[1] / hidden + eps)
++                        * scalar
++                    )
++                    magnitude = T.abs(dot)
++                    floored = T.if_then_else(
++                        magnitude < CLAMP, T.float32(CLAMP), magnitude
++                    )
++                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
++                T.sync_threads()
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
++                        )
++
++    return engram_post_gate
++
++
++def engram_post_gate(
++    layer_out: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    kv: torch.Tensor,
++    weight: torch.Tensor,
++    ids: torch.Tensor,
++    out: torch.Tensor,
++    eps: float,
++    hc_mult: int,
++) -> None:
++    """Reconstruct ``residual`` via ``mhc.post(layer_out, residual, post, comb)`` and
++    gate it with ``kv`` and ``weight`` into ``out`` in a single launch, without
++    writing or reading the intermediate multi-stream residual."""
++    tokens = residual.shape[0]
++    if tokens == 0:
++        return
++    hidden = weight.numel() // hc_mult
++    world = int(layer_out.shape[0]) if layer_out.ndim == 3 else 1
++    extra = {"world": world} if world != 1 else {}
++    kernel = engram_post_gate_kernel(hc_mult, hidden, eps, _dtype(ids), **extra)
++    kernel(
++        layer_out.view(tokens, hidden)
++        if world == 1
++        else (
++            layer_out
++            if layer_out.shape == (world, tokens, hidden)
++            else layer_out.view(world, tokens, hidden)
++        ),
++        residual.view(tokens, hc_mult, hidden),
++        post.view(tokens, hc_mult),
++        comb.view(tokens, hc_mult, hc_mult),
++        kv.view(tokens, hc_mult + 1, hidden),
++        weight.view(hc_mult, hidden),
++        ids,
++        out.view(tokens, hc_mult, hidden),
++    )
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_post_gate_blocked_kernel(
++    hc_mult: int,
++    hidden: int,
++    eps: float,
++    ids_dtype: str,
++    blocks: int,
++    block_cols: int,
++    threads: int = 256,
++    vec: int = 4,
++    world: int = 1,
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0 and world >= 1
++    assert block_cols % vec == 0 and blocks * block_cols >= (hc_mult + 1) * hidden
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    scalar = hidden**-0.5
++    tokens = T.dynamic("tokens")
++    rows = T.dynamic("rows")
++    layer_stride0 = T.dynamic("layer_stride0")
++    layer_out_ann = (
++        T.Tensor((tokens, hidden), T.bfloat16)
++        if world == 1
++        else T.StridedTensor((world, tokens, hidden), (layer_stride0, hidden, 1), T.bfloat16)
++    )
++
++    @T.prim_func
++    def engram_post_gate_blocked(
++        layer_out: layer_out_ann,
++        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        post: T.Tensor((tokens, hc_mult), T.float32),
++        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
++        kv: T.Tensor((blocks, rows, block_cols), T.bfloat16),
++        weight: T.Tensor((hc_mult, hidden), T.float32),
++        ids: T.Tensor((tokens,), ids_dtype),
++        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    ):
++        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * vec,), T.float32)
++            vs = T.alloc_local((chunks * vec,), T.float32)
++            ks = T.alloc_local((vec,), T.float32)
++            ws = T.alloc_local((vec,), T.float32)
++            acc = T.alloc_local((3,), T.float32)
++            partial = T.alloc_shared((3, warps), T.float32)
++            gate = T.alloc_shared((1,), T.float32)
++            _reconstruct_stream(
++                layer_out,
++                residual,
++                post,
++                comb,
++                xs,
++                t,
++                h,
++                tx,
++                chunks,
++                threads,
++                vec,
++                hc_mult,
++                world,
++            )
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i], T.bfloat16
++                        )
++            else:
++                for j in T.serial(3):
++                    acc[j] = T.float32(0)
++                for c in T.serial(chunks):
++                    value = hc_mult * hidden + (c * threads + tx) * vec
++                    key = h * hidden + (c * threads + tx) * vec
++                    for i in T.vectorized(vec):
++                        vs[c * vec + i] = kv[
++                            value // block_cols, t, value % block_cols + i
++                        ]
++                    for i in T.vectorized(vec):
++                        ks[i] = kv[key // block_cols, t, key % block_cols + i]
++                    for i in T.vectorized(vec):
++                        ws[i] = weight[h, (c * threads + tx) * vec + i]
++                    for i in T.serial(vec):
++                        acc[0] += xs[c * vec + i] * xs[c * vec + i]
++                        acc[1] += ks[i] * ks[i]
++                        acc[2] += xs[c * vec + i] * ws[i] * ks[i]
++                for j in T.serial(3):
++                    acc[j] = T.warp_reduce_sum(acc[j])
++                if tx % 32 == 0:
++                    for j in T.serial(3):
++                        partial[j, tx // 32] = acc[j]
++                T.sync_threads()
++                if tx == 0:
++                    for j in T.serial(3):
++                        acc[j] = T.float32(0)
++                        for warp in T.serial(warps):
++                            acc[j] += partial[j, warp]
++                    dot = (
++                        acc[2]
++                        * T.rsqrt(acc[0] / hidden + eps)
++                        * T.rsqrt(acc[1] / hidden + eps)
++                        * scalar
++                    )
++                    magnitude = T.abs(dot)
++                    floored = T.if_then_else(
++                        magnitude < CLAMP, T.float32(CLAMP), magnitude
++                    )
++                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
++                T.sync_threads()
++                for c in T.serial(chunks):
++                    for i in T.vectorized(vec):
++                        out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                            xs[c * vec + i] + gate[0] * vs[c * vec + i], T.bfloat16
++                        )
++
++    return engram_post_gate_blocked
++
++
++def engram_post_gate_blocked(
++    layer_out: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    kv: torch.Tensor,
++    weight: torch.Tensor,
++    ids: torch.Tensor,
++    out: torch.Tensor,
++    eps: float,
++    hc_mult: int,
++) -> None:
++    """``engram_post_gate`` with ``kv`` as column blocks ``[N, rows, C]``."""
++    tokens = residual.shape[0]
++    if tokens == 0:
++        return
++    hidden = weight.numel() // hc_mult
++    blocks, _, block_cols = kv.shape
++    world = int(layer_out.shape[0]) if layer_out.ndim == 3 else 1
++    extra = {"world": world} if world != 1 else {}
++    kernel = engram_post_gate_blocked_kernel(
++        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols, **extra
++    )
++    kernel(
++        layer_out.view(tokens, hidden)
++        if world == 1
++        else (
++            layer_out
++            if layer_out.shape == (world, tokens, hidden)
++            else layer_out.view(world, tokens, hidden)
++        ),
++        residual.view(tokens, hc_mult, hidden),
++        post.view(tokens, hc_mult),
++        comb.view(tokens, hc_mult, hc_mult),
++        kv,
++        weight.view(hc_mult, hidden),
++        ids,
++        out.view(tokens, hc_mult, hidden),
++    )
++
++
++__all__ = [
++    "CLAMP",
++    "engram_gate",
++    "engram_gate_blocked",
++    "engram_gate_blocked_kernel",
++    "engram_gate_kernel",
++    "engram_post_gate",
++    "engram_post_gate_blocked",
++    "engram_post_gate_blocked_kernel",
++    "engram_post_gate_kernel",
++]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..891b887f33f6f2a327b489afeea6abb54fbae999
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+@@ -0,0 +1,330 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang Engram n-gram hashing for DeepSeek-V4.1, every layer in one launch.
++
++For token ``t`` of request ``r`` (the last request whose query starts at or before
++``t``) and head ``h`` of Engram layer ``l``, the sources are the compressed ids of
++tokens ``t``, ``t - 1``, ``t - 2`` and ``t - 3``: query tokens while they are in the
++request's query, then its three committed history tokens, then nothing. A token
++compresses through the tokenizer map unless it is the image sentinel or out of
++vocabulary (the image tokens are the sentinel's ids: no mask kernel before the
++hash).
++From the first missing source on, every lag takes the pad id (the compressed id of
++token 2). Heads 0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams::
++
++    mixed = XOR over lags < order of source[lag] * multiplier[l, lag]
++    hash  = mixed mod prime[l, h] + offset[l, h]
++
++Tokens past the step's live count hash to -1. The arithmetic is B12X's Engram hash
++(compress, request ids and hash in three Triton launches per layer, after vLLM's
++metadata copy); here each block hashes one token for every layer and head, and the
++first block also publishes the request and live token counts.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++from dataclasses import dataclass
++
++import numpy as np
++import tilelang
++import tilelang.language as T
++import torch
++
++HEADS = 24
++LAGS = 4
++HISTORY = LAGS - 1
++IMAGE_SENTINEL = 129264  # the history exclusion of vLLM's Engram metadata
++PAD_TOKEN = 2
++
++
++def _device(value) -> torch.device:
++    d = torch.device(value)
++    if d.type == "cuda" and d.index is None:
++        return torch.device("cuda", torch.cuda.current_device())
++    return d
++
++
++@dataclass(frozen=True, kw_only=True)
++class Caps:
++    device: torch.device | str
++    max_tokens: int
++    max_seqs: int
++    max_requests: int
++    vocab_size: int = 129280
++    layer_id: int = 1
++    tp_size: int = 8
++    tp_rank: int = 0
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "device", _device(self.device))
++        if self.device.type != "cuda" or any(
++            type(getattr(self, n)) is not int or getattr(self, n) <= 0
++            for n in ("max_tokens", "max_seqs", "max_requests", "vocab_size", "tp_size")
++        ):
++            raise ValueError("Engram requires positive CUDA capacities")
++        if (
++            not 0 <= self.tp_rank < self.tp_size
++            or self.max_tokens >= 2**31
++            or self.max_seqs >= 2**31
++        ):
++            raise ValueError("invalid Engram rank or int32 capacity")
++
++
++@dataclass(frozen=True)
++class Geometry:
++    """Host-only immutable geometry; all device geometry uses signed int64."""
++
++    layer_ids: tuple[int, ...]
++    primes: tuple[tuple[int, ...], ...]
++    offsets: tuple[tuple[int, ...], ...]
++    multipliers: tuple[tuple[int, ...], ...]
++    num_embeddings: tuple[int, ...]
++    compressed_vocab_size: int
++
++
++def _is_prime_64(n: int) -> bool:
++    """Deterministic Miller-Rabin primality test for 0 <= n < 2**64."""
++    if n < 2:
++        return False
++    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
++        if n % p == 0:
++            return n == p
++    d = n - 1
++    r = 0
++    while d % 2 == 0:
++        d //= 2
++        r += 1
++    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
++        if a >= n:
++            continue
++        x = pow(a, d, n)
++        if x in (1, n - 1):
++            continue
++        for _ in range(r - 1):
++            x = (x * x) % n
++            if x == n - 1:
++                break
++        else:
++            return False
++    return True
++
++
++def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
++    """Use raw backend decoding, retaining malformed UTF-8 token spellings."""
++    from tokenizers import Regex, normalizers
++
++    sentinel = "\ue000"
++    normalizer = normalizers.Sequence(
++        [
++            normalizers.NFKC(),
++            normalizers.NFD(),
++            normalizers.StripAccents(),
++            normalizers.Lowercase(),
++            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
++            normalizers.Replace(Regex(r"^ $"), sentinel),
++            normalizers.Strip(),
++            normalizers.Replace(sentinel, " "),
++        ]
++    )
++    backend = tokenizer.backend_tokenizer
++    keys: dict[str, int] = {}
++    lookup = []
++    for token_id in range(len(tokenizer)):
++        text = backend.decode([token_id], skip_special_tokens=False)
++        key = (
++            backend.id_to_token(token_id)
++            if "\ufffd" in text
++            else normalizer.normalize_str(text) or text
++        )
++        if key not in keys:
++            keys[key] = len(keys)
++        lookup.append(keys[key])
++    return lookup, len(keys)
++
++
++def build_geometry(
++    *,
++    layer_ids=(1, 14),
++    base_table_size=16_000_000,
++    compressed_vocab_size=99_092,
++) -> Geometry:
++    """Generate 2/3/4-gram, eight-head geometry with globally unreused primes."""
++    layer_ids = tuple(layer_ids)
++    if (
++        not layer_ids
++        or len(set(layer_ids)) != len(layer_ids)
++        or any(i < 0 for i in layer_ids)
++    ):
++        raise ValueError("layer_ids must be unique nonnegative actual layer IDs")
++    if base_table_size < 2 or not 0 < compressed_vocab_size < (1 << 62):
++        raise ValueError("invalid table or compressed vocabulary size")
++    seen: set[int] = set()
++    primes, offsets, multipliers, totals = [], [], [], []
++    bound = max(1, (((1 << 63) - 1) // compressed_vocab_size) // 2)
++    for layer in layer_ids:
++        sizes = []
++        for _ in range(3):
++            current = base_table_size - 1
++            for _ in range(8):
++                current += 1
++                while current in seen or not _is_prime_64(current):
++                    current += 1
++                seen.add(current)
++                sizes.append(current)
++        cumulative, total = [], 0
++        for size in sizes:
++            cumulative.append(total)
++            total += size
++        if total * 256 > (1 << 63) - 1:
++            raise ValueError("table extent exceeds signed int64 indexing")
++        rng = np.random.Generator(np.random.PCG64(10007 * layer))
++        values = rng.integers(0, bound, size=4, dtype=np.int64) * 2 + 1
++        primes.append(tuple(sizes))
++        offsets.append(tuple(cumulative))
++        multipliers.append(tuple(int(v) for v in values))
++        totals.append(total)
++    return Geometry(
++        layer_ids,
++        tuple(primes),
++        tuple(offsets),
++        tuple(multipliers),
++        tuple(totals),
++        compressed_vocab_size,
++    )
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_hash_kernel(
++    layers: int, vocab: int, ids_dtype: str = "int64", history_dtype: str = "int64"
++):
++    """``out`` may be any ``[rows, layers, 24]`` view with a contiguous head
++    dimension: a layer-major buffer's permutation writes each layer's plane."""
++    threads = (layers * HEADS + 31) // 32 * 32
++    tokens = T.dynamic("tokens")
++    seqs1 = T.dynamic("seqs1")  # requests + 1
++    history_rows = T.dynamic("history_rows")
++    history_stride = T.dynamic("history_stride")
++    out_rows = T.dynamic("out_rows")
++    out_token_stride, out_layer_stride = T.dynamic("out_token_stride, out_layer_stride")
++
++    @T.prim_func
++    def engram_hash(
++        ids: T.Tensor((tokens,), ids_dtype),
++        starts: T.Tensor((seqs1,), T.int32),
++        history: T.StridedTensor(
++            (history_rows, HISTORY), (history_stride, 1), history_dtype
++        ),
++        token_map: T.Tensor((vocab,), T.int64),
++        multipliers: T.Tensor((layers, LAGS), T.int64),
++        primes: T.Tensor((layers, HEADS), T.int64),
++        offsets: T.Tensor((layers, HEADS), T.int64),
++        out: T.StridedTensor(
++            (out_rows, layers, HEADS), (out_token_stride, out_layer_stride, 1), T.int64
++        ),
++        num_seqs: T.Tensor((1,), T.int32),
++        num_tokens: T.Tensor((1,), T.int32),
++    ):
++        with T.Kernel(tokens, threads=threads) as t:
++            tx = T.get_thread_binding()
++            layer = tx // HEADS
++            head = tx % HEADS
++            seqs = seqs1 - 1
++            live = starts[seqs]
++            if t == 0 and tx == 0:
++                num_seqs[0] = seqs
++                num_tokens[0] = live
++            if layer < layers:
++                if t >= live:
++                    out[t, layer, head] = T.int64(-1)
++                else:
++                    request = T.alloc_var(T.int32)
++                    request = 0
++                    for r in T.serial(seqs - 1):
++                        if starts[r + 1] <= t:
++                            request = r + 1
++                    start = starts[request]
++                    pad = token_map[PAD_TOKEN]
++                    order = head // 8 + 2
++                    blocked = T.alloc_var(T.bool)
++                    blocked = False
++                    mixed = T.alloc_var(T.int64)
++                    mixed = T.int64(0)
++                    for lag in T.unroll(LAGS):
++                        source = T.alloc_var(T.int64)
++                        source = T.int64(-1)
++                        relative = t - start - lag
++                        if relative >= 0:
++                            raw = T.cast(ids[t - lag], T.int64)
++                            if raw >= 0 and raw < vocab and raw != IMAGE_SENTINEL:
++                                source = token_map[raw]
++                        elif relative >= -HISTORY:
++                            raw = T.cast(history[request, HISTORY + relative], T.int64)
++                            if raw >= 0 and raw < vocab and raw != IMAGE_SENTINEL:
++                                source = token_map[raw]
++                        blocked = blocked or source == -1
++                        if lag < order:
++                            value = T.if_then_else(blocked, pad, source)
++                            mixed = mixed ^ (value * multipliers[layer, lag])
++                    prime = primes[layer, head]
++                    out[t, layer, head] = mixed % prime + offsets[layer, head]
++
++    return engram_hash
++
++
++def engram_hash(
++    ids: torch.Tensor,
++    starts: torch.Tensor,
++    history: torch.Tensor,
++    token_map: torch.Tensor,
++    multipliers: torch.Tensor,
++    primes: torch.Tensor,
++    offsets: torch.Tensor,
++    out: torch.Tensor,
++    num_seqs: torch.Tensor,
++    num_tokens: torch.Tensor,
++) -> None:
++    """Hash ``ids`` ([T], int32 or int64; T may include padding past the live count
++    ``starts[-1]``) into ``out`` ([>= T, layers, 24] int64, any view with contiguous
++    heads) and write the request and live token counts. ``history`` (int32 or
++    int64; the runner keeps int32) holds each request's last three committed token
++    ids, oldest first."""
++    if ids.numel() == 0:
++        return
++    kernel = engram_hash_kernel(
++        multipliers.shape[0],
++        token_map.numel(),
++        str(ids.dtype).removeprefix("torch."),
++        str(history.dtype).removeprefix("torch."),
++    )
++    kernel(
++        ids,
++        starts,
++        history,
++        token_map,
++        multipliers,
++        primes,
++        offsets,
++        out,
++        num_seqs,
++        num_tokens,
++    )
++
++
++def geometry_tensors(geometry, device) -> tuple[torch.Tensor, ...]:
++    """Multipliers [L, 4], primes [L, 24] and offsets [L, 24] of an Engram hash
++    geometry, as int64 device tensors in layer order."""
++    return tuple(
++        torch.tensor(values, dtype=torch.int64, device=device)
++        for values in (geometry.multipliers, geometry.primes, geometry.offsets)
++    )
++
++
++__all__ = [
++    "Caps",
++    "Geometry",
++    "build_compressed_token_map",
++    "build_geometry",
++    "engram_hash",
++    "engram_hash_kernel",
++    "geometry_tensors",
++]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2441ba0fddad08283657897e01c7c37c213eb800
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -0,0 +1,600 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang wait for and gather of a step's Engram rows from mapped host memory.
++
++The Engram disk reader (``engram_rows/_reader.c``) puts each of this rank's lookups'
++E4M3 row and E8M0 scales in mapped host buffers, in lookup order (token-major, 24
++heads), and publishes the step in the control block. Two kernels on the forward's
++stream:
++- the wait: one thread waits until the rows of the step this stream staged are
++  published, bounded by the control block's timeout. A timed-out wait, or a reader
++  that reports a failure, records the step and the time waited and stops the GPU,
++  so no kernel after it reads stale rows. One wait per table and step: polling host
++  memory from every gather block cost about 0.5 us a block.
++- the gather: one block per (column, token) of this rank's hash columns dequantizes
++  the row as b12x's Engram lookup does (the value times its E8M0 scale, 2^-127 for
++  byte 0 and NaN for 255, rounded to BF16) into the token's slice of the column, the
++  rank's columns side by side. A token past the step, or a row outside this rank's
++  shard, loads nothing and writes zeros (the reader leaves those slots untouched).
++- the release: one thread writes the step it gathered into the control block, so the
++  reader may now fill the buffers with the next step's early rows (those the host
++  hashed while this step ran).
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++import os
++
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
++HEADS = 24
++ROW = 256
++SCALES = ROW // 32
++CONTROL_WORDS = 64
++
++# Debug only: the wait records each wait's length for the reader's timeline
++# (SPARK_DS41F_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
++_TIMING = (
++    "#define ENGRAM_TIMING\n"
++    if os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
++    else ""
++)
++
++# Control-block word offsets, as in engram_rows/_reader.c.
++_HEADER = (
++    _TIMING
++    + r"""
++// Engram rows: the reader publishes a step by writing its sequence number into the
++// control block in mapped host memory; this stream wrote the step it staged there.
++#define ENGRAM_CTRL_IDS_SEQ 0
++#define ENGRAM_CTRL_CONSUMED_SEQ 1
++#define ENGRAM_CTRL_ROWS_SEQ 16
++#define ENGRAM_CTRL_TIMEOUT_US 32
++#define ENGRAM_CTRL_WAITED_US 33
++#define ENGRAM_CTRL_FAILED_SEQ 34
++#define ENGRAM_CTRL_GPU_WAIT_SEQ 40
++#define ENGRAM_CTRL_GPU_WAIT_NS 41
++#define ENGRAM_CTRL_PHASE 48
++#define ENGRAM_CTRL_RETIRED_CTAS 56
++#define ENGRAM_PHASE_FAILED 3
++
++// Wait until the rows of the step this stream staged are published (cyclic
++// sequence order). The clock, the timeout and the reader's phase are read only
++// after 64 unanswered polls, so a wait for rows already in place costs one load. A
++// timeout, or a reader that failed, records the time waited and the step, fenced,
++// then stops the GPU.
++__device__ __forceinline__ unsigned engram_wait_rows_cta(void *control, int is_lead_cta) {
++    unsigned *ctrl = (unsigned *)control;
++    unsigned target;
++    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(target) : "l"(ctrl + ENGRAM_CTRL_IDS_SEQ) : "memory");
++    unsigned long long start = 0ull, limit = 0ull;
++#ifdef ENGRAM_TIMING
++    unsigned long long entered = 0ull;
++    if (is_lead_cta) {
++        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(entered));
++    }
++#else
++    (void)is_lead_cta;
++#endif
++    for (unsigned polls = 1u;; polls++) {
++        unsigned seen;
++        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(seen) : "l"(ctrl + ENGRAM_CTRL_ROWS_SEQ) : "memory");
++        if ((int)(seen - target) >= 0) {
++#ifdef ENGRAM_TIMING
++            if (is_lead_cta) {
++                unsigned long long left;
++                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(left));
++                unsigned long long ns = left - entered;
++                unsigned waited = ns > 0xffffffffull ? 0xffffffffu : (unsigned)ns;
++                asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
++                             :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_NS), "r"(waited)
++                             : "memory");
++                asm volatile("st.release.sys.global.u32 [%0], %1;"
++                             :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_SEQ), "r"(target)
++                             : "memory");
++            }
++#endif
++            return target;
++        }
++        if ((polls & 63u) == 0u) {
++            unsigned long long now;
++            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
++            unsigned phase;
++            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(phase) : "l"(ctrl + ENGRAM_CTRL_PHASE) : "memory");
++            if (start == 0ull) {
++                unsigned timeout;
++                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(timeout) : "l"(ctrl + ENGRAM_CTRL_TIMEOUT_US) : "memory");
++                start = now;
++                limit = 1000ull * (unsigned long long)timeout;
++            }
++            if (phase == ENGRAM_PHASE_FAILED || now - start >= limit) {
++                unsigned waited = (unsigned)((now - start) / 1000ull);
++                asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(ctrl + ENGRAM_CTRL_WAITED_US), "r"(waited) : "memory");
++                asm volatile("fence.sc.sys;" ::: "memory");
++                asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(ctrl + ENGRAM_CTRL_FAILED_SEQ), "r"(target) : "memory");
++                asm volatile("fence.sc.sys;" ::: "memory");
++                asm volatile("trap;");
++            }
++        }
++    }
++}
++
++__device__ __forceinline__ void engram_wait_rows(void *control) {
++    engram_wait_rows_cta(control, 1);
++}
++
++// The stream's gather of the step it staged is done (the kernels before this one have
++// retired their loads of the mapped rows): tell the reader, with release semantics.
++__device__ __forceinline__ void engram_release_rows(void *control) {
++    unsigned *ctrl = (unsigned *)control;
++    unsigned staged;
++    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
++                 : "=r"(staged) : "l"(ctrl + ENGRAM_CTRL_IDS_SEQ) : "memory");
++    asm volatile("st.release.sys.global.u32 [%0], %1;"
++                 :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
++}
++
++// Device-L2 synchronization state across CTAs of engram_rows_step_kernel (128B cache-line
++// isolated words so only CTA 0 touches mapped-host control on wait and only the last
++// finishing CTA touches mapped-host control on release).
++__device__ __align__(128) unsigned engram_gpu_sync[128] = {0u};
++#define ENGRAM_SYNC_COMPLETED 0
++#define ENGRAM_SYNC_READY     32
++#define ENGRAM_SYNC_RETIRED   64
++#define ENGRAM_SYNC_STAGED    96
++
++__device__ __forceinline__ void engram_wait_rows_step(void *control, int is_lead_cta, int total_ctas) {
++    if (total_ctas <= 1) {
++        unsigned target = engram_wait_rows_cta(control, 1);
++        asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]), "r"(target) : "memory");
++        return;
++    }
++    unsigned my_step;
++    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(my_step) : "l"(&engram_gpu_sync[ENGRAM_SYNC_COMPLETED]) : "memory");
++    my_step += 1u;
++    if (is_lead_cta) {
++        unsigned target = engram_wait_rows_cta(control, 1);
++        asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]), "r"(target) : "memory");
++        asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_READY]), "r"(my_step) : "memory");
++    } else {
++        for (;;) {
++            unsigned ready;
++            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(ready) : "l"(&engram_gpu_sync[ENGRAM_SYNC_READY]) : "memory");
++            if (ready == my_step) break;
++            asm volatile("nanosleep.u32 16;");
++        }
++    }
++}
++
++__device__ __forceinline__ void engram_release_rows_cta(void *control, int total_ctas) {
++    unsigned *ctrl = (unsigned *)control;
++    if (total_ctas <= 1) {
++        unsigned staged;
++        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(staged) : "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]) : "memory");
++        asm volatile("st.release.sys.global.u32 [%0], %1;"
++                     :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
++        return;
++    }
++    unsigned limit = (unsigned)(total_ctas - 1);
++    unsigned prev;
++    asm volatile("atom.inc.release.gpu.global.u32 %0, [%1], %2;"
++                 : "=r"(prev)
++                 : "l"(&engram_gpu_sync[ENGRAM_SYNC_RETIRED]), "r"(limit)
++                 : "memory");
++    if (prev == limit) {
++        unsigned my_step, staged;
++        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(my_step) : "l"(&engram_gpu_sync[ENGRAM_SYNC_READY]) : "memory");
++        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(staged) : "l"(&engram_gpu_sync[ENGRAM_SYNC_STAGED]) : "memory");
++        asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(&engram_gpu_sync[ENGRAM_SYNC_COMPLETED]), "r"(my_step) : "memory");
++        asm volatile("st.release.sys.global.u32 [%0], %1;"
++                     :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
++    }
++}
++
++// One-shot streaming loads (L2::evict_first) for step row IDs and mapped-host
++// E4M3 rows / E8M0 scales: each slot is consumed once by a single thread, so
++// streaming keeps mapped-host reads from evicting resident weights in the 24 MB L2.
++__device__ __forceinline__ long long engram_ld_cs_s64(const void *ptr) {
++    long long val;
++    asm("ld.global.cs.s64 %0, [%1];" : "=l"(val) : "l"(ptr));
++    return val;
++}
++
++__device__ __forceinline__ unsigned int engram_ld_cs_u8(const void *ptr) {
++    unsigned int val;
++    asm("ld.global.cs.u8 %0, [%1];" : "=r"(val) : "l"(ptr));
++    return val;
++}
++
++__device__ __forceinline__ unsigned int engram_ld_cs_u32(const void *ptr) {
++    unsigned int val;
++    asm("ld.global.cs.u32 %0, [%1];" : "=r"(val) : "l"(ptr));
++    return val;
++}
++"""  # noqa: E501 (CUDA source)
++)
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_rows_wait_kernel():
++    @T.prim_func
++    def engram_rows_wait(control: T.Tensor((CONTROL_WORDS,), T.int32)):
++        with T.Kernel(1, threads=32):
++            T.import_source(_HEADER)
++            if T.get_thread_binding() == 0:
++                T.call_extern(
++                    "engram_wait_rows", T.address_of(control[0]), dtype="handle"
++                )
++
++    return engram_rows_wait
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_rows_release_kernel():
++    @T.prim_func
++    def engram_rows_release(control: T.Tensor((CONTROL_WORDS,), T.int32)):
++        with T.Kernel(1, threads=32):
++            T.import_source(_HEADER)
++            if T.get_thread_binding() == 0:
++                T.call_extern(
++                    "engram_release_rows", T.address_of(control[0]), dtype="handle"
++                )
++
++    return engram_rows_release
++
++
++def column_span(columns: int) -> tuple[int, int, int]:
++    """The hash columns of the 24-bit mask ``columns`` as (first, step, count): a
++    rank reads every ``step``-th column from its ``first`` (``column_shard``)."""
++    heads = [head for head in range(HEADS) if columns >> head & 1]
++    step = heads[1] - heads[0] if len(heads) > 1 else 1
++    if not heads or heads != list(range(heads[0], HEADS, step))[: len(heads)]:
++        raise ValueError(
++            f"Engram row columns must be every n-th column from the first: {columns:#x}"
++        )
++    return heads[0], step, len(heads)
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
++def engram_rows_gather_kernel(
++    max_lookups: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++    out_cols: int = 0,
++    threads: int = 64,
++    vec: int = 4,
++):
++    assert threads * vec == ROW and 32 % vec == 0
++    first, step, count = column_span(columns)
++    stride_cols = out_cols or count
++    assert stride_cols >= count
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def engram_rows_gather(
++        ids: T.Tensor((tokens, HEADS), T.int64),
++        num_tokens: T.Tensor((1,), T.int32),
++        rows: T.Tensor((max_lookups, ROW), T.float8_e4m3fn),
++        scales: T.Tensor((max_lookups, SCALES), T.uint8),
++        out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
++    ):
++        with T.Kernel(count, tokens, threads=threads) as (column, t):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            head = first + column * step
++            row = T.call_extern(
++                "int64", "engram_ld_cs_s64", T.address_of(ids[t, head])
++            )
++            lookup = t * HEADS + head
++            owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
++            if owned:
++                exponent = T.call_extern(
++                    "uint32",
++                    "engram_ld_cs_u8",
++                    T.address_of(scales[lookup, tx * vec // 32]),
++                )
++                scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
++                scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
++                scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
++                if vec == 4:
++                    packed = T.call_extern(
++                        "uint32",
++                        "engram_ld_cs_u32",
++                        T.address_of(rows[lookup, tx * vec]),
++                    )
++                    for i in T.vectorized(vec):
++                        byte = T.cast(
++                            T.shift_right(packed, T.uint32(8 * i)) & T.uint32(0xFF),
++                            T.uint8,
++                        )
++                        out[t, column * ROW + tx * vec + i] = T.cast(
++                            T.cast(T.reinterpret(byte, T.float8_e4m3fn), T.float32)
++                            * scale,
++                            T.bfloat16,
++                        )
++                else:
++                    for i in T.vectorized(vec):
++                        out[t, column * ROW + tx * vec + i] = T.cast(
++                            T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
++                            T.bfloat16,
++                        )
++            else:
++                for i in T.vectorized(vec):
++                    out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
++
++    return engram_rows_gather
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
++def engram_rows_step_kernel(
++    max_lookups: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++    out_cols: int = 0,
++    vec: int = 4,
++):
++    """Fused multi-CTA wait + gather + release kernel for a step's Engram rows."""
++    assert 32 % vec == 0
++    first, step, count = column_span(columns)
++    stride_cols = out_cols or count
++    assert stride_cols >= count
++    row_threads = ROW // vec
++    rows_per_cta = next(r for r in range(min(count, 8), 0, -1) if count % r == 0)
++    threads = rows_per_cta * row_threads
++    col_blocks = count // rows_per_cta
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def engram_rows_step(
++        ids: T.Tensor((tokens, HEADS), T.int64),
++        num_tokens: T.Tensor((1,), T.int32),
++        rows: T.Tensor((max_lookups, ROW), T.float8_e4m3fn),
++        scales: T.Tensor((max_lookups, SCALES), T.uint8),
++        control: T.Tensor((CONTROL_WORDS,), T.int32),
++        out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
++    ):
++        with T.Kernel(col_blocks, tokens, threads=threads) as (col_block, t):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            total_ctas = col_blocks * tokens
++            row_slot = tx // row_threads
++            lane = tx % row_threads
++            column = col_block * rows_per_cta + row_slot
++            head = first + column * step
++            row = T.call_extern(
++                "int64", "engram_ld_cs_s64", T.address_of(ids[t, head])
++            )
++            n_tok = num_tokens[0]
++            if tx == 0:
++                T.call_extern(
++                    "engram_wait_rows_step",
++                    T.address_of(control[0]),
++                    T.if_then_else((col_block == 0) & (t == 0), T.int32(1), T.int32(0)),
++                    total_ctas,
++                    dtype="handle",
++                )
++            T.sync_threads()
++            lookup = t * HEADS + head
++            owned = (t < n_tok) & (row >= shard_start) & (row < shard_end)
++            if owned:
++                exponent = T.call_extern(
++                    "uint32",
++                    "engram_ld_cs_u8",
++                    T.address_of(scales[lookup, lane * vec // 32]),
++                )
++                scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
++                scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
++                scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
++                if vec == 4:
++                    packed = T.call_extern(
++                        "uint32",
++                        "engram_ld_cs_u32",
++                        T.address_of(rows[lookup, lane * vec]),
++                    )
++                    for i in T.vectorized(vec):
++                        byte = T.cast(
++                            T.shift_right(packed, T.uint32(8 * i)) & T.uint32(0xFF),
++                            T.uint8,
++                        )
++                        out[t, column * ROW + lane * vec + i] = T.cast(
++                            T.cast(T.reinterpret(byte, T.float8_e4m3fn), T.float32)
++                            * scale,
++                            T.bfloat16,
++                        )
++                else:
++                    for i in T.vectorized(vec):
++                        out[t, column * ROW + lane * vec + i] = T.cast(
++                            T.cast(rows[lookup, lane * vec + i], T.float32) * scale,
++                            T.bfloat16,
++                        )
++            else:
++                for i in T.vectorized(vec):
++                    out[t, column * ROW + lane * vec + i] = T.bfloat16(0)
++            T.sync_threads()
++            if tx == 0:
++                T.call_extern(
++                    "engram_release_rows_cta",
++                    T.address_of(control[0]),
++                    col_blocks * tokens,
++                    dtype="handle",
++                )
++
++    return engram_rows_step
++
++
++def row_kernel_calls(
++    max_lookups: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int,
++    out_cols: int = 0,
++) -> list[prepare.TileLangCall]:
++    """The kernel calls ``engram_rows_gather`` makes for a reader of ``max_lookups``
++    rows a step (``rows.shape[0]``) and the rank's rows ``[shard_start, shard_end)``
++    of the hash columns in the mask ``columns``."""
++    _, _, count = column_span(columns)
++    extra = (out_cols,) if out_cols and out_cols != count else ()
++    return [
++        prepare.call(
++            engram_rows_step_kernel,
++            max_lookups,
++            shard_start,
++            shard_end,
++            columns,
++            *extra,
++        ),
++    ]
++
++
++def engram_rows_gather(
++    ids: torch.Tensor,
++    num_tokens: torch.Tensor,
++    rows: torch.Tensor,
++    scales: torch.Tensor,
++    control: torch.Tensor,
++    out: torch.Tensor,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++) -> None:
++    """Wait for the staged step's rows, dequantize the first ``num_tokens`` tokens'
++    rows into ``out`` ([tokens, columns * 256] BF16: the rank's hash columns side by
++    side), then release the buffers to the reader. ``ids`` ([>= tokens, 24] int64)
++    are the step's row IDs; ``rows``, ``scales`` and ``control`` are the reader's
++    mapped buffers; the rank owns the rows in [shard_start, shard_end) of the hash
++    columns in the mask ``columns``, every n-th from the first."""
++    tokens = out.shape[0]
++    if tokens:
++        _, _, count = column_span(columns)
++        stride_cols = out.shape[1] // ROW
++        extra = (stride_cols,) if stride_cols != count else ()
++        kernel = engram_rows_step_kernel(
++            rows.shape[0], shard_start, shard_end, columns, *extra
++        )
++        kernel(ids[:tokens], num_tokens, rows, scales, control, out)
++    else:
++        engram_rows_wait_kernel()(control)
++        engram_rows_release_kernel()(control)
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_resident_lookup_kernel(
++    shard_rows: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++    out_cols: int = 0,
++    threads: int = 64,
++    vec: int = 4,
++):
++    assert threads * vec == ROW and 32 % vec == 0
++    first, step, count = column_span(columns)
++    stride_cols = out_cols or count
++    assert stride_cols >= count
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def engram_resident_lookup(
++        ids: T.Tensor((tokens, HEADS), T.int64),
++        num_tokens: T.Tensor((1,), T.int32),
++        weight: T.Tensor((shard_rows, ROW), T.float8_e4m3fn),
++        scales: T.Tensor((shard_rows, SCALES), T.uint8),
++        out: T.Tensor((tokens, stride_cols * ROW), T.bfloat16),
++    ):
++        with T.Kernel(count, tokens, threads=threads) as (column, t):
++            tx = T.get_thread_binding()
++            head = first + column * step
++            row = ids[t, head]
++            n_tok = num_tokens[0]
++            owned = (
++                (n_tok >= 0)
++                & (n_tok <= tokens)
++                & (t < n_tok)
++                & (row >= shard_start)
++                & (row < shard_end)
++            )
++            if owned:
++                local_row = row - T.int64(shard_start)
++                exponent = T.cast(scales[local_row, tx * vec // 32], T.uint32)
++                scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
++                scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
++                scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
++                for i in T.vectorized(vec):
++                    out[t, column * ROW + tx * vec + i] = T.cast(
++                        T.cast(weight[local_row, tx * vec + i], T.float32) * scale,
++                        T.bfloat16,
++                    )
++            else:
++                for i in T.vectorized(vec):
++                    out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
++
++    return engram_resident_lookup
++
++
++def resident_lookup_calls(
++    shard_rows: int,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++    out_cols: int = 0,
++) -> list[prepare.TileLangCall]:
++    """The kernel call ``engram_resident_lookup`` makes for a resident shard of
++    ``shard_rows`` rows covering ``[shard_start, shard_end)`` and the hash columns
++    in the mask ``columns``."""
++    _, _, count = column_span(columns)
++    extra = (out_cols,) if out_cols and out_cols != count else ()
++    return [
++        prepare.call(
++            engram_resident_lookup_kernel,
++            shard_rows,
++            shard_start,
++            shard_end,
++            columns,
++            *extra,
++        ),
++    ]
++
++
++def engram_resident_lookup(
++    ids: torch.Tensor,
++    num_tokens: torch.Tensor,
++    weight: torch.Tensor,
++    scales: torch.Tensor,
++    out: torch.Tensor,
++    shard_start: int,
++    shard_end: int,
++    columns: int = (1 << HEADS) - 1,
++) -> None:
++    """Dequantize the first ``num_tokens`` tokens' resident Engram rows from ``weight``
++    and ``scales`` into ``out`` ([tokens, columns * 256] BF16) and zero any trailing
++    rows up to ``out.shape[0]``."""
++    tokens = out.shape[0]
++    if tokens:
++        _, _, count = column_span(columns)
++        stride_cols = out.shape[1] // ROW
++        extra = (stride_cols,) if stride_cols != count else ()
++        kernel = engram_resident_lookup_kernel(
++            weight.shape[0], shard_start, shard_end, columns, *extra
++        )
++        kernel(ids[:tokens], num_tokens, weight, scales.view(torch.uint8), out)
++
++
++engram_table_gather_kernel = engram_resident_lookup_kernel
++table_gather_calls = resident_lookup_calls
++engram_table_gather = engram_resident_lookup
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp.py b/vllm/models/deepseek_v4_1/tilelang/glp.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..15d6867b6c8c64d56a057acc083c5bc0ffa50bf9
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/glp.py
+@@ -0,0 +1,328 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLP steering of the rows a step marks, in one launch a layer.
++
++A layer leaves its write ``x`` and the mixes that fold it into the streams for the
++next layer's fused post/pre: ``h[n] = bf16(post[n] x + sum_m comb[m, n] residual[m])``.
++For each marked row (``rows[t] != 0``) one block folds the write as ``post_streams``
++does (the ranks' unreduced parts of ``x`` first added in rank order, as
++``rank_order_sum`` does), projects every stream, ``h <- h - alpha (h . d) d``, and
++writes the projected streams back as the row's ``residual``, with ``comb`` the
++identity and ``post`` zero. The next layer's fold of that row then gives the
++projected streams back exactly (``1 * r + 0 * ...`` in FP32 is ``r``; only a
++negative zero becomes positive), whichever path reads it: the fused post/pre, an
++Engram layer's post, the drafter's auxiliary states or the final collapse.
++
++A row that is not marked is not read or written: its block returns after loading
++its mark, so unsteered rows keep their bits whatever else the step carries.
++
++The kernel is on the decode chain's PDL (``pdl.chain()``): it waits for the layer
++before it reads its mark, so a step with no marked row keeps the chain's overlap.
++
++``direction`` ([hidden], FP32) is the layer's unit row and ``alpha`` ([1], FP32) a
++buffer, so a file's contents never change the traced graph. A block's 320 threads
++each own sixteen columns of every stream (two loads of eight); a stream's ``h . d``
++is reduced in a fixed order (each thread's values in sequence, then the warp's
++lanes, then the warps), the order of the projection this replaces
++(experiments/2026-10-23-next-release, glp-variants), so a row's result never
++depends on the batch.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++from functools import cache
++
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
++from vllm.models.deepseek_v4_1.tilelang.collectives import MAX_RANK_ORDER_WORLD
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def glp_steer_kernel(
++    hc_mult: int,
++    hidden: int,
++    world: int,
++    mean_streams: bool = False,
++    threads: int = 320,
++    vec: int = 8,
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    assert 1 <= world <= MAX_RANK_ORDER_WORLD
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    span = chunks * vec
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def glp_steer(
++        parts: T.Tensor((world, tokens, hidden), T.bfloat16),
++        residual: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        post: T.Tensor((tokens, hc_mult), T.float32),
++        comb: T.Tensor((tokens, hc_mult, hc_mult), T.float32),
++        rows: T.Tensor((tokens,), T.int32),
++        direction: T.Tensor((hidden,), T.float32),
++        alpha: T.Tensor((1,), T.float32),
++    ):
++        with T.Kernel(tokens, threads=threads) as t:
++            pdl.chain()
++            tx = T.get_thread_binding()
++            # The whole block leaves an unmarked row, before any barrier.
++            if rows[t] == 0:
++                T.thread_return()
++            hs = T.alloc_local((hc_mult * span,), T.float32)
++            ds = T.alloc_local((span,), T.float32)
++            xs = T.alloc_local((vec,), T.float32)
++            rv = T.alloc_local((hc_mult * vec,), T.bfloat16)
++            pv = T.alloc_local((world * vec,), T.bfloat16)
++            pm = T.alloc_local((hc_mult,), T.float32)
++            cm = T.alloc_local((hc_mult * hc_mult,), T.float32)
++            acc = T.alloc_local((hc_mult,), T.float32)
++            fold = T.alloc_var(T.float32)
++            total = T.alloc_var(T.float32)
++            partial = T.alloc_shared((hc_mult, warps), T.float32)
++            scale = T.alloc_shared((hc_mult,), T.float32)
++            for n in T.unroll(hc_mult):
++                pm[n] = post[t, n]
++                acc[n] = T.float32(0)
++            for m in T.unroll(hc_mult):
++                for n in T.unroll(hc_mult):
++                    cm[m * hc_mult + n] = comb[t, m, n]
++            for c in T.serial(chunks):
++                for r in T.unroll(world):
++                    for v in T.vectorized(vec):
++                        pv[r * vec + v] = parts[r, t, (c * threads + tx) * vec + v]
++                for m in T.unroll(hc_mult):
++                    for v in T.vectorized(vec):
++                        rv[m * vec + v] = residual[t, m, (c * threads + tx) * vec + v]
++                for v in T.vectorized(vec):
++                    ds[c * vec + v] = direction[(c * threads + tx) * vec + v]
++                # rank_order_sum: the first part as is, then the others in order.
++                for v in T.unroll(vec):
++                    xs[v] = T.Cast(T.float32, pv[v])
++                    for r in T.serial(world - 1):
++                        xs[v] = xs[v] + T.Cast(T.float32, pv[(r + 1) * vec + v])
++                    xs[v] = T.Cast(T.float32, T.Cast(T.bfloat16, xs[v]))
++                # post_streams: the first stream's rounded product, then FMAs in order.
++                for n in T.unroll(hc_mult):
++                    for v in T.unroll(vec):
++                        fold = cm[n] * T.Cast(T.float32, rv[v])
++                        fold = T.fma(pm[n], xs[v], fold)
++                        for m in T.unroll(1, hc_mult):
++                            fold = T.fma(
++                                cm[m * hc_mult + n],
++                                T.Cast(T.float32, rv[m * vec + v]),
++                                fold,
++                            )
++                        hs[n * span + c * vec + v] = T.Cast(
++                            T.float32, T.Cast(T.bfloat16, fold)
++                        )
++            if mean_streams:
++                for i in T.serial(span):
++                    fold = hs[i]
++                    for n in T.unroll(1, hc_mult):
++                        fold = fold + hs[n * span + i]
++                    acc[0] += (fold / T.float32(hc_mult)) * ds[i]
++                acc[0] = T.warp_reduce_sum(acc[0])
++                if tx % 32 == 0:
++                    partial[0, tx // 32] = acc[0]
++                T.sync_threads()
++                if tx < hc_mult:
++                    total = T.float32(0)
++                    for w in T.serial(warps):
++                        total += partial[0, w]
++                    scale[tx] = alpha[0] * total
++            else:
++                for n in T.unroll(hc_mult):
++                    for i in T.serial(span):
++                        acc[n] += hs[n * span + i] * ds[i]
++                    acc[n] = T.warp_reduce_sum(acc[n])
++                    if tx % 32 == 0:
++                        partial[n, tx // 32] = acc[n]
++                T.sync_threads()
++                if tx < hc_mult:
++                    total = T.float32(0)
++                    for w in T.serial(warps):
++                        total += partial[tx, w]
++                    scale[tx] = alpha[0] * total
++            T.sync_threads()
++            for c in T.serial(chunks):
++                for n in T.unroll(hc_mult):
++                    for v in T.vectorized(vec):
++                        residual[t, n, (c * threads + tx) * vec + v] = T.Cast(
++                            T.bfloat16,
++                            hs[n * span + c * vec + v] - scale[n] * ds[c * vec + v],
++                        )
++            if tx < hc_mult * hc_mult:
++                comb[t, tx // hc_mult, tx % hc_mult] = T.if_then_else(
++                    tx // hc_mult == tx % hc_mult, T.float32(1), T.float32(0)
++                )
++            if tx < hc_mult:
++                post[t, tx] = T.float32(0)
++
++    return glp_steer
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def glp_steer_write_kernel(
++    hidden: int, world: int, threads: int = 320, vec: int = 8
++):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    assert 1 <= world <= MAX_RANK_ORDER_WORLD
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    span = chunks * vec
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def glp_steer_write(
++        parts: T.Tensor((world, tokens, hidden), T.bfloat16),
++        rows: T.Tensor((tokens,), T.int32),
++        direction: T.Tensor((hidden,), T.float32),
++        alpha: T.Tensor((1,), T.float32),
++    ):
++        with T.Kernel(tokens, threads=threads) as t:
++            pdl.chain()
++            tx = T.get_thread_binding()
++            # The whole block leaves an unmarked row, before any barrier.
++            if rows[t] == 0:
++                T.thread_return()
++            hs = T.alloc_local((span,), T.float32)
++            ds = T.alloc_local((span,), T.float32)
++            pv = T.alloc_local((world * vec,), T.bfloat16)
++            acc = T.alloc_var(T.float32)
++            total = T.alloc_var(T.float32)
++            partial = T.alloc_shared((warps,), T.float32)
++            scale = T.alloc_shared((1,), T.float32)
++            acc = T.float32(0)
++            for c in T.serial(chunks):
++                for r in T.unroll(world):
++                    for v in T.vectorized(vec):
++                        pv[r * vec + v] = parts[r, t, (c * threads + tx) * vec + v]
++                for v in T.vectorized(vec):
++                    ds[c * vec + v] = direction[(c * threads + tx) * vec + v]
++                # rank_order_sum: the first part as is, then the others in order.
++                for v in T.unroll(vec):
++                    total = T.Cast(T.float32, pv[v])
++                    for r in T.serial(world - 1):
++                        total = total + T.Cast(T.float32, pv[(r + 1) * vec + v])
++                    hs[c * vec + v] = T.Cast(
++                        T.float32, T.Cast(T.bfloat16, total)
++                    )
++            for i in T.serial(span):
++                acc += hs[i] * ds[i]
++            acc = T.warp_reduce_sum(acc)
++            if tx % 32 == 0:
++                partial[tx // 32] = acc
++            T.sync_threads()
++            if tx == 0:
++                total = T.float32(0)
++                for w in T.serial(warps):
++                    total += partial[w]
++                scale[0] = alpha[0] * total
++            T.sync_threads()
++            for c in T.serial(chunks):
++                for v in T.vectorized(vec):
++                    parts[0, t, (c * threads + tx) * vec + v] = T.Cast(
++                        T.bfloat16,
++                        hs[c * vec + v] - scale[0] * ds[c * vec + v],
++                    )
++                for r in T.unroll(1, world):
++                    for v in T.vectorized(vec):
++                        parts[r, t, (c * threads + tx) * vec + v] = T.bfloat16(0)
++
++    return glp_steer_write
++
++
++@cache
++def _kernel(hc_mult: int, hidden: int, world: int, mean_streams: bool = False):
++    return glp_steer_kernel(hc_mult, hidden, world, mean_streams)
++
++
++@cache
++def _write_kernel(hidden: int, world: int):
++    return glp_steer_write_kernel(hidden, world)
++
++
++def glp_steer(
++    parts: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    rows: torch.Tensor,
++    direction: torch.Tensor,
++    alpha: torch.Tensor,
++    mean_streams: bool = False,
++) -> None:
++    """Steer the rows ``rows`` (int32, [T]) marks: fold ``parts`` ([world, T, H],
++    BF16, the layer's write or the ranks' unreduced parts of it) into ``residual``
++    ([T, hc_mult, H], BF16) with ``post`` ([T, hc_mult]) and ``comb`` ([T, hc_mult,
++    hc_mult]), project ``direction`` off every stream scaled by ``alpha`` ([1])
++    (each stream's own dot product, or the mean over streams when ``mean_streams``
++    is set for ``hc_fold_pre_engram``), and leave the result as the row's
++    ``residual`` with ``comb`` the identity and ``post`` zero. Unmarked rows are
++    untouched."""
++    world, tokens, hidden = parts.shape
++    if tokens == 0:
++        return
++    _kernel(residual.shape[1], hidden, world, mean_streams)(
++        parts, residual, post, comb, rows, direction, alpha
++    )
++
++
++def glp_steer_write(
++    parts: torch.Tensor,
++    rows: torch.Tensor,
++    direction: torch.Tensor,
++    alpha: torch.Tensor,
++) -> None:
++    """Steer a sublayer write ``parts`` ([world, T, H], BF16) in the rows ``rows``
++    (int32, [T]) marks: sum the parts in rank order, project ``direction`` scaled
++    by ``alpha`` ([1]), and leave the result in ``parts[0]`` with any remaining
++    parts zeroed. Unmarked rows are untouched."""
++    world, tokens, hidden = parts.shape
++    if tokens == 0:
++        return
++    _write_kernel(hidden, world)(parts, rows, direction, alpha)
++
++
++def declare(
++    hc_mult: int,
++    hidden: int,
++    worlds: tuple[int, ...],
++    *,
++    mean_streams: bool = False,
++) -> None:
++    """Declare the steering of ``hc_mult`` streams of ``hidden`` for a write of
++    each of ``worlds`` parts (and, for ``hc_fold_pre_engram``, the companion
++    attention-write projection), and keep them."""
++    if not mean_streams:
++        prepare.declare(
++            lambda: [prepare.call(glp_steer_kernel, hc_mult, hidden, w) for w in worlds],
++            bind=lambda: [_kernel(hc_mult, hidden, w) for w in worlds],
++        )
++        return
++    prepare.declare(
++        lambda: [
++            *(
++                prepare.call(glp_steer_kernel, hc_mult, hidden, w, True)
++                for w in worlds
++            ),
++            *(prepare.call(glp_steer_write_kernel, hidden, w) for w in worlds),
++        ],
++        bind=lambda: [
++            *(_kernel(hc_mult, hidden, w, True) for w in worlds),
++            *(_write_kernel(hidden, w) for w in worlds),
++        ],
++    )
++
++
++__all__ = [
++    "declare",
++    "glp_steer",
++    "glp_steer_kernel",
++    "glp_steer_write",
++    "glp_steer_write_kernel",
++]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp_rows.py b/vllm/models/deepseek_v4_1/tilelang/glp_rows.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..60eb618dec65917e0f1366f36e737c0766738282
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/glp_rows.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLP steering's row marks for a step, from its requests' marks.
++
++``rows[t]`` is ``marks[idx_mapping[r]]`` for the request ``r`` whose query holds
++row ``t`` (``query_start_loc[r] <= t < query_start_loc[r + 1]``), and 0 for a row
++past the last query (graph padding). The query bounds are read on the GPU, as the
++step's attention reads them: adaptive verification places a verifying request's
++rows there, not on the host. A thread a row scans the step's requests; a step
++holds at most ``max_num_seqs`` of them.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++from functools import cache
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++
++_THREADS = 128
++_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def mark_rows_kernel(idx_dtype: str):
++    tokens = T.dynamic("tokens")
++    num_reqs = T.dynamic("num_reqs")
++    starts_len = T.dynamic("starts_len")
++    max_reqs = T.dynamic("max_reqs")
++
++    @T.prim_func
++    def mark_rows(
++        rows: T.Tensor((tokens,), T.int32),
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        query_start_loc: T.Tensor((starts_len,), T.int32),
++        marks: T.Tensor((max_reqs,), T.int32),
++    ):
++        with T.Kernel(T.ceildiv(tokens, _THREADS), threads=_THREADS) as b:
++            t = b * _THREADS + T.get_thread_binding()
++            mark = T.alloc_var(T.int32, init=0)
++            if t < tokens:
++                for r in T.serial(num_reqs):
++                    if (query_start_loc[r] <= t) & (t < query_start_loc[r + 1]):
++                        mark = marks[idx_mapping[r]]
++                rows[t] = mark
++
++    return mark_rows
++
++
++@cache
++def _bound(idx_dtype: str):
++    """The kernel for ``idx_dtype``, resolved once (after the kernel cache freezes,
++    an undeclared key raises by name)."""
++    return mark_rows_kernel(idx_dtype)
++
++
++def mark_rows(
++    rows: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    marks: torch.Tensor,
++) -> None:
++    """Fill ``rows`` (int32) with the marks of the requests whose queries hold
++    them; ``query_start_loc`` has one more entry than ``idx_mapping``."""
++    if rows.numel() == 0:
++        return
++    if query_start_loc.shape[0] != idx_mapping.shape[0] + 1:
++        raise ValueError(
++            f"{idx_mapping.shape[0]} requests need {idx_mapping.shape[0] + 1} "
++            f"query bounds, not {query_start_loc.shape[0]}"
++        )
++    _bound(_DTYPES[idx_mapping.dtype])(rows, idx_mapping, query_start_loc, marks)
++
++
++__all__ = ["mark_rows", "mark_rows_kernel"]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f658547cdd42b6f50f3a05f5223e257b518e7a0
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -0,0 +1,2004 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1 lagged mHC on TileKernels (``--linear-backend tilelang``).
++
++V4.1's hyper-connections keep four residual streams. Each sublayer's ``pre``
++projects the flattened streams through ``fn`` (RMS-normalized), splits the 24
++mixes into a pre-mix (sigmoid), a post-mix (2 * sigmoid) and a 4 x 4
++combination (softmax, then Sinkhorn), and feeds the sublayer the streams
++collapsed with the *incoming* pre-mix, RMS-normalized with the norm weight.
++The new pre-mix is returned for the next sublayer (the lag). ``post`` folds a
++sublayer's output back into the streams.
++
++TileKernels provides DeepSeek's mHC kernels. A standalone ``post`` (where no
++sublayer entry follows to fuse it: Engram layers, GLP steering, the last layer)
++and the stream collapse (the head's input, the drafter's auxiliary states) are
++TileLang ports of TileKernels' ``mhc_post_fwd`` and ``mhc_pre_apply_mix_fwd``
++with their arithmetic to the bit:
++
++- ``post_streams``: ``bf16(post[n] * x + sum_m comb[m, n] * streams[m])``;
++- ``collapse_streams``: ``bf16(sum_m mix[m] * streams[m])``.
++
++A sublayer's entry needs more: DeepSeek moved the projection GEMM to DeepGEMM,
++which does not run on SM120/SM121, TileKernels' fused pre step applies the mix
++it has just computed rather than the lagged one, and in prefill the four streams
++are large enough that reading them once matters. Two TileLang kernels make each
++entry:
++
++- ``project_streams``: per hidden block, the previous sublayer's ``post``
++  (writing the updated streams), the projection's split partials on TF32
++  tensor cores at FP32 precision (fn split into exact TF32 parts) with the
++  streams' sum of squares, and
++  the streams collapsed with the incoming pre-mix in BF16, with its sum of
++  squares. Each thread folds and accumulates one token's columns in
++  registers; the GEMM reads the folded streams from shared memory. The split
++  is fixed and every token tile accumulates in the same order, so a token's
++  results do not depend on the batch.
++- ``finalize``: per token, TileKernels' fused reduce, RMS, mix split and
++  Sinkhorn (``mhc_pre_big_fuse``), emitting the new pre-mix, beside the
++  collapse's RMSNorm with the sublayer's weight, which it also writes as the
++  MXFP8 input of the sublayer's block-32 projections (``linear.MXFP8Rows``,
++  ``per_token_cast``'s bytes): the entry returns it, and the projections that read
++  the sublayer input (attention's fused Q-A/KV, the shared expert's gate/up, the
++  routed experts) no longer cast it themselves.
++"""
++
++import contextlib
++import threading
++from functools import cache
++
++import tilelang
++import tilelang.language as T
++import torch
++from torch import nn
++
++from vllm.config import get_current_vllm_config
++from vllm.logger import init_logger
++from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.models.deepseek_v4_1 import sp_prefill
++from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
++from vllm.models.deepseek_v4_1.tilelang.collectives import (
++    MAX_RANK_ORDER_WORLD,
++    RankOrderParts,
++)
++from vllm.models.deepseek_v4_1.tilelang.gemm import cast_block_mxfp8, scale_words
++from vllm.models.deepseek_v4_1.tilelang.linear import (
++    MXFP8Rows,
++    cast_mxfp8,
++    empty_mxfp8,
++)
++from vllm.v1.worker.workspace import (
++    current_workspace_manager,
++    retain_cuda_graph_capture_resource,
++)
++
++logger = init_logger(__name__)
++
++MULT = 4  # residual streams
++MIXES = (2 + MULT) * MULT  # pre, post and combination mixes
++BLOCK_H = 128  # hidden columns per projection split, fixed for batch invariance
++BLOCK_M = 16  # token tile of project_streams; larger tiles measured slower
++VEC = 8  # BF16 elements per vector access
++_PASS_CONFIGS = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
++}
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def project_streams(
++    hidden_size: int,
++    mode: str,
++    block_M: int = 16,
++    block_H: int = BLOCK_H,
++    world: int = 1,
++    with_aux: bool = False,
++):
++    """The streams' projection partials and their collapse, for one hidden block.
++
++    ``mode`` is the sublayer's entry: ``"post_pre"`` first folds the previous
++    sublayer's output into the streams (``post``) and writes them, ``"pre"``
++    reads streams already updated, and ``"broadcast"`` expands an embedding to
++    four copies (the first layer, whose ``fn`` is the stream blocks summed).
++    ``X`` is ``(world, M, H)``: with ``world`` > 1 (``"post_pre"`` only) the
++    previous output arrives as the ranks' unreduced partials, which each thread
++    adds in FP32 in rank order and rounds once, as the rank-order reduce-scatter
++    does, so the output has the same bits as that sum read back. With
++    ``with_aux=True`` (``"post_pre"`` only), each thread also accumulates the
++    unweighted mean (``0.25``) of the four updated streams and writes ``Aux``
++    (``[M, H]`` BF16), matching ``post_collapse_streams`` to the bit.
++
++    Each CTA owns ``block_H`` hidden columns of every stream, a K split of the
++    projection, for ``block_M`` tokens. Each thread owns one token's
++    ``block_H / 8`` contiguous columns: it loads them for every stream into
++    registers, folds the previous output in, writes the updated streams, and
++    keeps its share of the streams' sum of squares ``S`` and of the collapse
++    with the incoming pre-mix. The projection ``P = streams @ fn^T`` runs on
++    TF32 tensor cores at FP32 precision, one stream at a time: the streams are
++    BF16 (exact in TF32) and each FP32 ``fn`` value is split exactly into three
++    TF32-representable parts, so every product is exact and the three GEMMs
++    accumulate in FP32, as DeepSeek's reference computes the mixes. The
++    collapse is rounded to BF16, with its sum of squares ``Q``.
++    """
++    assert hidden_size % block_H == 0 and mode in ("pre", "post_pre", "broadcast")
++    assert 1 <= world <= MAX_RANK_ORDER_WORLD and (world == 1 or mode == "post_pre")
++    assert not with_aux or mode == "post_pre"
++    splits = hidden_size // block_H
++    streams = 1 if mode == "broadcast" else MULT
++    K = streams * hidden_size
++    N = 32  # the 24 mixes, padded
++    LANES = 8  # threads per token: adjacent lanes of one warp
++    COLS = block_H // LANES  # contiguous columns per thread
++    threads = block_M * LANES
++    H = hidden_size
++    M = T.dynamic("M")
++
++    @T.macro
++    def load_split_tf32(Fn, k0, F_shared, F_mid, F_low):
++        # fn = high + middle + low, each exact in TF32 (11 significant bits): the
++        # high part keeps fn's top 11 bits, the middle the next 11, the low the rest.
++        # Each value goes from global memory through registers into the three tiles
++        # in one pass.
++        for i, j in T.Parallel(MIXES, block_H):
++            f = Fn[i, k0 + j]
++            high = T.reinterpret(T.reinterpret(f, T.uint32) & 0xFFFFE000, T.float32)
++            rest = f - high
++            middle = T.reinterpret(
++                T.reinterpret(rest, T.uint32) & 0xFFFFE000, T.float32
++            )
++            F_shared[i, j] = high
++            F_mid[i, j] = middle
++            F_low[i, j] = rest - middle
++
++    @T.macro
++    def _project_body(
++        X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, Aux, sp, by
++    ):
++        pdl.chain()
++        h0 = sp * block_H
++        A_shared = T.alloc_shared((block_M, block_H), T.float32)
++        F_shared = T.alloc_shared((N, block_H), T.float32)
++        F_mid = T.alloc_shared((N, block_H), T.float32)
++        F_low = T.alloc_shared((N, block_H), T.float32)
++        C_local = T.alloc_fragment((block_M, N), T.float32)
++        xv = T.alloc_local((COLS,), T.bfloat16)
++        xp = T.alloc_local((world * COLS,), T.bfloat16)
++        rv = T.alloc_local((MULT * COLS,), T.bfloat16)
++        nv = T.alloc_local((COLS,), T.bfloat16)
++        av = T.alloc_local((COLS,), T.float32)
++        sq = T.alloc_local((COLS,), T.float32)
++        col = T.alloc_local((COLS,), T.float32)
++        aux_col = T.alloc_local((COLS,), T.float32)
++        coef = T.alloc_local((2 * MULT + MULT * MULT,), T.float32)
++        red = T.alloc_local((1,), T.float32)
++        tx = T.get_thread_binding()
++        row = tx // LANES
++        c0 = (tx % LANES) * COLS
++        token = by * block_M + row
++        src = T.min(token, M - 1)
++        T.clear(C_local)
++        # The padding mixes stay zero; each stream's copy fills the rest.
++        for i, j in T.Parallel(N - MIXES, block_H):
++            F_shared[MIXES + i, j] = 0.0
++            F_mid[MIXES + i, j] = 0.0
++            F_low[MIXES + i, j] = 0.0
++        # This thread's token: its mixes, then its columns of x and the streams.
++        for k in T.unroll(MULT):
++            coef[k] = pre_in[src, k]
++        if mode == "post_pre":
++            for k in T.unroll(MULT):
++                coef[MULT + k] = post[src, k]
++            for k in T.unroll(MULT * MULT):
++                coef[2 * MULT + k] = comb[src, k // MULT, k % MULT]
++        if mode != "broadcast":
++            for m in T.unroll(MULT):
++                for v in T.vectorized(COLS):
++                    rv[m * COLS + v] = R[src, m * H + h0 + c0 + v]
++        if mode != "pre" and world == 1:
++            for v in T.vectorized(COLS):
++                xv[v] = X[0, src, h0 + c0 + v]
++        if world > 1:
++            # The first part as is (signed zeros survive), then the others.
++            for r in T.unroll(world):
++                for v in T.vectorized(COLS):
++                    xp[r * COLS + v] = X[r, src, h0 + c0 + v]
++            for r in T.unroll(world):
++                for v in T.unroll(COLS):
++                    if r == 0:
++                        av[v] = T.Cast(T.float32, xp[v])
++                    else:
++                        av[v] = av[v] + T.Cast(T.float32, xp[r * COLS + v])
++            for v in T.unroll(COLS):
++                xv[v] = T.Cast(T.bfloat16, av[v])
++        for v in T.unroll(COLS):
++            sq[v] = 0.0
++            col[v] = 0.0
++            if with_aux:
++                aux_col[v] = 0.0
++
++        if mode == "broadcast":
++            # Four copies of the embedding; fn already sums the blocks.
++            load_split_tf32(Fn, h0, F_shared, F_mid, F_low)
++            for v in T.unroll(COLS):
++                av[v] = T.Cast(T.float32, xv[v])
++                A_shared[row, c0 + v] = av[v]
++                sq[v] = av[v] * av[v]
++            for n in T.unroll(MULT):
++                if token < M:
++                    for v in T.vectorized(COLS):
++                        R_out[token, n * H + h0 + c0 + v] = xv[v]
++                for v in T.unroll(COLS):
++                    col[v] += coef[n] * av[v]
++            T.sync_threads()
++            T.gemm(A_shared, F_shared, C_local, transpose_B=True)
++            T.gemm(A_shared, F_mid, C_local, transpose_B=True)
++            T.gemm(A_shared, F_low, C_local, transpose_B=True)
++        else:
++            for n in T.unroll(MULT):
++                load_split_tf32(Fn, n * H + h0, F_shared, F_mid, F_low)
++                if mode == "post_pre":
++                    # post[n] * x + sum_m comb[m, n] * streams[m] in FP32, with
++                    # post_streams' (TileKernels') instruction sequence.
++                    for v in T.unroll(COLS):
++                        av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
++                        av[v] = T.fma(
++                            coef[MULT + n], T.Cast(T.float32, xv[v]), av[v]
++                        )
++                        for m in T.unroll(1, MULT):
++                            av[v] = T.fma(
++                                coef[2 * MULT + m * MULT + n],
++                                T.Cast(T.float32, rv[m * COLS + v]),
++                                av[v],
++                            )
++                        nv[v] = T.Cast(T.bfloat16, av[v])
++                    if token < M:
++                        for v in T.vectorized(COLS):
++                            R_out[token, n * H + h0 + c0 + v] = nv[v]
++                else:
++                    for v in T.unroll(COLS):
++                        nv[v] = rv[n * COLS + v]
++                for v in T.unroll(COLS):
++                    av[v] = T.Cast(T.float32, nv[v])
++                    A_shared[row, c0 + v] = av[v]
++                    sq[v] += av[v] * av[v]
++                    col[v] += coef[n] * av[v]
++                    if with_aux:
++                        aux_col[v] = T.fma(T.float32(0.25), av[v], aux_col[v])
++                T.sync_threads()
++                T.gemm(A_shared, F_shared, C_local, transpose_B=True)
++                T.gemm(A_shared, F_mid, C_local, transpose_B=True)
++                T.gemm(A_shared, F_low, C_local, transpose_B=True)
++                T.sync_threads()
++
++        if with_aux:
++            for v in T.unroll(COLS):
++                nv[v] = T.Cast(T.bfloat16, aux_col[v])
++            if token < M:
++                for v in T.vectorized(COLS):
++                    Aux[token, h0 + c0 + v] = nv[v]
++
++        # The collapse in BF16 and its sum of squares, then the streams'.
++        for v in T.unroll(COLS):
++            nv[v] = T.Cast(T.bfloat16, col[v])
++        if token < M:
++            for v in T.vectorized(COLS):
++                C[token, h0 + c0 + v] = nv[v]
++        red[0] = 0.0
++        for v in T.unroll(COLS):
++            red[0] += T.Cast(T.float32, nv[v]) * T.Cast(T.float32, nv[v])
++        red[0] += T.shfl_xor(red[0], 4)
++        red[0] += T.shfl_xor(red[0], 2)
++        red[0] += T.shfl_xor(red[0], 1)
++        if tx % LANES == 0 and token < M:
++            Q[sp, token] = red[0]
++        red[0] = 0.0
++        for v in T.unroll(COLS):
++            red[0] += sq[v]
++        red[0] += T.shfl_xor(red[0], 4)
++        red[0] += T.shfl_xor(red[0], 2)
++        red[0] += T.shfl_xor(red[0], 1)
++        if tx % LANES == 0 and token < M:
++            S[sp, token, 0] = red[0]
++        for i, j in T.Parallel(block_M, MIXES):
++            if by * block_M + i < M:
++                P[sp, by * block_M + i, 0, j] = C_local[i, j]
++
++    if not with_aux:
++
++        @T.prim_func
++        def mhc_project_streams(
++            X: T.Tensor((world, M, H), T.bfloat16),
++            R: T.Tensor((M, MULT * H), T.bfloat16),
++            post: T.Tensor((M, MULT), T.float32),
++            comb: T.Tensor((M, MULT, MULT), T.float32),
++            pre_in: T.Tensor((M, MULT), T.float32),
++            Fn: T.Tensor((MIXES, K), T.float32),
++            R_out: T.Tensor((M, MULT * H), T.bfloat16),
++            P: T.Tensor((splits, M, 1, MIXES), T.float32),
++            S: T.Tensor((splits, M, 1), T.float32),
++            C: T.Tensor((M, H), T.bfloat16),
++            Q: T.Tensor((splits, M), T.float32),
++        ):
++            with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
++                _project_body(
++                    X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, C, sp, by
++                )
++
++        return mhc_project_streams
++
++    @T.prim_func
++    def mhc_project_streams(
++        X: T.Tensor((world, M, H), T.bfloat16),
++        R: T.Tensor((M, MULT * H), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        pre_in: T.Tensor((M, MULT), T.float32),
++        Fn: T.Tensor((MIXES, K), T.float32),
++        R_out: T.Tensor((M, MULT * H), T.bfloat16),
++        P: T.Tensor((splits, M, 1, MIXES), T.float32),
++        S: T.Tensor((splits, M, 1), T.float32),
++        C: T.Tensor((M, H), T.bfloat16),
++        Q: T.Tensor((splits, M), T.float32),
++        Aux: T.Tensor((M, H), T.bfloat16),
++    ):
++        with T.Kernel(splits, T.ceildiv(M, block_M), threads=threads) as (sp, by):
++            _project_body(
++                X, R, post, comb, pre_in, Fn, R_out, P, S, C, Q, Aux, sp, by
++            )
++
++    return mhc_project_streams
++
++
++@T.macro
++def _sinkhorn_warp(
++    P,
++    S,
++    s_val,
++    b_val,
++    post,
++    comb,
++    pre_out,
++    pid,
++    tx,
++    splits: int,
++    rms_group_size: int,
++    rms_eps: float,
++    hc_eps: float,
++    sinkhorn_repeat: int,
++    post_mult: float,
++):
++    """Warp-0 partial reduction of P/S followed by exact Sinkhorn iterations."""
++    rms_l = T.alloc_local((1,), T.float32)
++    p_acc = T.alloc_local((1,), T.float32)
++    cm_l = T.alloc_local((1,), T.float32)
++    rmax_l = T.alloc_local((1,), T.float32)
++    rsum_l = T.alloc_local((1,), T.float32)
++    csum_l = T.alloc_local((1,), T.float32)
++    s_buf = T.alloc_local((splits,), T.float32)
++    p_buf = T.alloc_local((splits,), T.float32)
++
++    rms_l[0] = 0.0
++    p_acc[0] = 0.0
++    cm_l[0] = 0.0
++    for i_split in T.unroll(splits):
++        s_buf[i_split] = S[i_split, pid, 0]
++        if tx < 24:
++            mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++            p_buf[i_split] = P[i_split, pid, 0, mix_idx]
++    for i_split in T.unroll(splits):
++        rms_l[0] += s_buf[i_split]
++        if tx < 24:
++            p_acc[0] += p_buf[i_split]
++    rms_l[0] = T.rsqrt(rms_l[0] / rms_group_size + rms_eps)
++
++    if tx < 16:
++        cm_l[0] = p_acc[0] * rms_l[0] * s_val[0] + b_val[0]
++    elif tx < 20:
++        pre_out[pid, tx - 16] = (
++            T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0]) + hc_eps
++        )
++    elif tx < 24:
++        post[pid, tx - 20] = (
++            T.sigmoid(p_acc[0] * rms_l[0] * s_val[0] + b_val[0]) * post_mult
++        )
++
++    rmax_l[0] = cm_l[0]
++    rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 2))
++    rmax_l[0] = T.max(rmax_l[0], T.shfl_xor(rmax_l[0], 1))
++    cm_l[0] = T.exp(cm_l[0] - rmax_l[0])
++    rsum_l[0] = cm_l[0]
++    rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
++    rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
++    cm_l[0] = cm_l[0] / rsum_l[0] + hc_eps
++    csum_l[0] = cm_l[0]
++    csum_l[0] += T.shfl_xor(csum_l[0], 8)
++    csum_l[0] += T.shfl_xor(csum_l[0], 4)
++    cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
++    for _ in T.unroll(sinkhorn_repeat - 1):
++        rsum_l[0] = cm_l[0]
++        rsum_l[0] += T.shfl_xor(rsum_l[0], 2)
++        rsum_l[0] += T.shfl_xor(rsum_l[0], 1)
++        cm_l[0] = cm_l[0] / (rsum_l[0] + hc_eps)
++        csum_l[0] = cm_l[0]
++        csum_l[0] += T.shfl_xor(csum_l[0], 8)
++        csum_l[0] += T.shfl_xor(csum_l[0], 4)
++        cm_l[0] = cm_l[0] / (csum_l[0] + hc_eps)
++    if tx < 16:
++        comb[pid, tx // MULT, tx % MULT] = cm_l[0]
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def finalize(
++    hidden_size: int,
++    rms_group_size: int,
++    rms_eps: float,
++    hc_eps: float,
++    sinkhorn_repeat: int,
++    norm_eps: float,
++    post_mult: float = 2.0,
++    block_H: int = BLOCK_H,
++    threads: int = 128,
++):
++    """One token per CTA: warp 0 turns the projection partials into the new
++    pre-mix, the post-mix and the Sinkhorn combination (TileKernels'
++    ``mhc_pre_big_fuse``); the other warps RMS-normalize the collapse into ``y``
++    and write its MXFP8 cast for the sublayer's projections, ``per_token_cast``'s
++    bytes: E4M3 ``yq`` and a UE8M0 byte per 32 columns in ``ysf``.
++
++    A worker holds eight adjacent columns of ``y``, so four adjacent lanes hold a
++    32-column block; two lane shuffles give them the block's amax. ``yq`` and ``ysf``
++    may have more rows than ``y`` (the projections' whole decode tiles); those rows
++    are not written."""
++    assert hidden_size % VEC == 0
++    splits = hidden_size // block_H
++    chunks = hidden_size // VEC
++    workers = threads - 32
++    steps = (chunks + workers - 1) // workers
++    # Every warp's lanes take part in a step or none do, so the shuffles of a step's
++    # blocks are warp-uniform; a block's four lanes sit in one warp.
++    assert chunks % 32 == 0 and workers % 32 == 0
++    sf_width = 4 * scale_words(hidden_size)
++    M, Mq = T.dynamic("M, Mq")
++
++    @T.prim_func
++    def mhc_finalize(
++        P: T.Tensor((splits, M, 1, MIXES), T.float32),
++        S: T.Tensor((splits, M, 1), T.float32),
++        C: T.Tensor((M, hidden_size), T.bfloat16),
++        Q: T.Tensor((splits, M), T.float32),
++        scale: T.Tensor((3,), T.float32),
++        base: T.Tensor((MIXES,), T.float32),
++        weight: T.Tensor((hidden_size,), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        pre_out: T.Tensor((M, MULT), T.float32),
++        y: T.Tensor((M, hidden_size), T.bfloat16),
++        yq: T.Tensor((Mq, hidden_size), T.float8_e4m3fn),
++        ysf: T.Tensor((Mq, sf_width), T.uint8),
++    ):
++        with T.Kernel(M, threads=threads) as pid:
++            tx = T.get_thread_binding()
++            xv = T.alloc_local((VEC,), T.bfloat16)
++            wv = T.alloc_local((steps * VEC,), T.bfloat16)
++            xq = T.alloc_local((VEC,), T.float8_e4m3fn)
++            total = T.alloc_local((1,), T.float32)
++            s_val = T.alloc_local((1,), T.float32)
++            b_val = T.alloc_local((1,), T.float32)
++            q_buf = T.alloc_local((splits,), T.float32)
++
++            if tx < 24:
++                mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++                scale_idx = T.if_then_else(tx < 16, 2, (tx - 16) // MULT)
++                s_val[0] = scale[scale_idx]
++                b_val[0] = base[mix_idx]
++            elif tx >= 32:
++                worker = tx - 32
++                for step in T.unroll(steps):
++                    chunk = step * workers + worker
++                    if chunk < chunks:
++                        for v in T.vectorized(VEC):
++                            wv[step * VEC + v] = weight[chunk * VEC + v]
++
++            pdl.chain()
++
++            if tx < 32:
++                _sinkhorn_warp(
++                    P, S, s_val, b_val, post, comb, pre_out, pid, tx,
++                    splits, rms_group_size, rms_eps, hc_eps, sinkhorn_repeat, post_mult,
++                )
++            else:
++                # Reduce Q first so C elements stream in one step without holding yv[steps*VEC].
++                worker = tx - 32
++                for i_split in T.unroll(splits):
++                    q_buf[i_split] = Q[i_split, pid]
++                total[0] = 0.0
++                for i_split in T.unroll(splits):
++                    total[0] += q_buf[i_split]
++                total[0] = T.rsqrt(total[0] / hidden_size + norm_eps)
++                for step in T.unroll(steps):
++                    chunk = step * workers + worker
++                    if chunk < chunks:
++                        for v in T.vectorized(VEC):
++                            xv[v] = C[pid, chunk * VEC + v]
++                        for v in T.unroll(VEC):
++                            xv[v] = T.Cast(
++                                T.bfloat16,
++                                T.Cast(T.float32, xv[v])
++                                * total[0]
++                                * T.Cast(T.float32, wv[step * VEC + v]),
++                            )
++                        for v in T.vectorized(VEC):
++                            y[pid, chunk * VEC + v] = xv[v]
++                        cast_block_mxfp8(
++                            xv, xq, VEC, yq, ysf, pid, chunk * VEC
++                        )
++
++    return mhc_finalize
++
++
++def _norm_ctas(hidden_size: int) -> int:
++    """Number of CTAs per token for ``finalize_norm`` (5 covers 5120 in 1 step/thread)."""
++    chunks = hidden_size // VEC
++    return 5 if chunks % 5 == 0 and (chunks // 5) % 4 == 0 else 1
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def finalize_norm(
++    hidden_size: int,
++    norm_eps: float,
++    block_H: int = BLOCK_H,
++    k_ctas: int = 5,
++    threads: int = 128,
++):
++    """Critical-path RMSNorm + MXFP8 cast of ``C`` using ``Q`` partials only.
++
++    Keeping ``pdl.chain()`` strictly first avoids any early parameter load while
++    splitting ``C`` across ``k_ctas`` parallel CTAs per token (1 step/thread at
++    hidden_size=5120)."""
++    assert hidden_size % VEC == 0
++    splits = hidden_size // block_H
++    chunks = hidden_size // VEC
++    assert chunks % k_ctas == 0
++    chunks_per_cta = chunks // k_ctas
++    assert chunks_per_cta % 32 == 0 or (chunks_per_cta % 4 == 0 and threads % 4 == 0)
++    steps = (chunks_per_cta + threads - 1) // threads
++    sf_width = 4 * scale_words(hidden_size)
++    q_loads = (splits + threads - 1) // threads
++    M, Mq = T.dynamic("M, Mq")
++
++    @T.prim_func
++    def mhc_finalize_norm(
++        C: T.Tensor((M, hidden_size), T.bfloat16),
++        Q: T.Tensor((splits, M), T.float32),
++        weight: T.Tensor((hidden_size,), T.bfloat16),
++        y: T.Tensor((M, hidden_size), T.bfloat16),
++        yq: T.Tensor((Mq, hidden_size), T.float8_e4m3fn),
++        ysf: T.Tensor((Mq, sf_width), T.uint8),
++    ):
++        with T.Kernel(M, k_ctas, threads=threads) as (pid, k_bx):
++            pdl.chain()
++            tx = T.get_thread_binding()
++            chunk_base = k_bx * chunks_per_cta
++            xv = T.alloc_local((VEC,), T.bfloat16)
++            wv = T.alloc_local((steps * VEC,), T.bfloat16)
++            xq = T.alloc_local((VEC,), T.float8_e4m3fn)
++            total = T.alloc_local((1,), T.float32)
++            q_sh = T.alloc_shared((splits,), T.float32)
++            rms_sh = T.alloc_shared((1,), T.float32)
++
++            for step in T.unroll(steps):
++                c_rel = step * threads + tx
++                if c_rel < chunks_per_cta:
++                    chunk = chunk_base + c_rel
++                    for v in T.vectorized(VEC):
++                        wv[step * VEC + v] = weight[chunk * VEC + v]
++            for g in T.unroll(q_loads):
++                sp = g * threads + tx
++                if sp < splits:
++                    q_sh[sp] = Q[sp, pid]
++            T.sync_threads()
++            if tx == 0:
++                t_sum = T.alloc_var(T.float32, init=0.0)
++                for i_split in T.unroll(splits):
++                    t_sum += q_sh[i_split]
++                rms_sh[0] = T.rsqrt(t_sum / hidden_size + norm_eps)
++            T.sync_threads()
++            total[0] = rms_sh[0]
++            for step in T.unroll(steps):
++                c_rel = step * threads + tx
++                if c_rel < chunks_per_cta:
++                    chunk = chunk_base + c_rel
++                    for v in T.vectorized(VEC):
++                        xv[v] = C[pid, chunk * VEC + v]
++                    for v in T.unroll(VEC):
++                        xv[v] = T.Cast(
++                            T.bfloat16,
++                            T.Cast(T.float32, xv[v])
++                            * total[0]
++                            * T.Cast(T.float32, wv[step * VEC + v]),
++                        )
++                    for v in T.vectorized(VEC):
++                        y[pid, chunk * VEC + v] = xv[v]
++                    cast_block_mxfp8(
++                        xv, xq, VEC, yq, ysf, pid, chunk * VEC
++                    )
++
++    return mhc_finalize_norm
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def finalize_sinkhorn(
++    hidden_size: int,
++    rms_group_size: int,
++    rms_eps: float,
++    hc_eps: float,
++    sinkhorn_repeat: int,
++    post_mult: float = 2.0,
++    block_H: int = BLOCK_H,
++):
++    """Off-critical-path Sinkhorn + mix-split kernel for ``post, comb, pre_out``."""
++    splits = hidden_size // block_H
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def mhc_finalize_sinkhorn(
++        P: T.Tensor((splits, M, 1, MIXES), T.float32),
++        S: T.Tensor((splits, M, 1), T.float32),
++        scale: T.Tensor((3,), T.float32),
++        base: T.Tensor((MIXES,), T.float32),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        pre_out: T.Tensor((M, MULT), T.float32),
++    ):
++        with T.Kernel(M, threads=32) as pid:
++            pdl.chain()
++            tx = T.get_thread_binding()
++            s_val = T.alloc_local((1,), T.float32)
++            b_val = T.alloc_local((1,), T.float32)
++            if tx < 24:
++                mix_idx = T.if_then_else(tx < 16, tx + 2 * MULT, tx - 16)
++                scale_idx = T.if_then_else(tx < 16, 2, (tx - 16) // MULT)
++                s_val[0] = scale[scale_idx]
++                b_val[0] = base[mix_idx]
++            _sinkhorn_warp(
++                P, S, s_val, b_val, post, comb, pre_out, pid, tx,
++                splits, rms_group_size, rms_eps, hc_eps, sinkhorn_repeat, post_mult,
++            )
++
++    return mhc_finalize_sinkhorn
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def post_streams(hidden_size: int, threads: int = 128, world: int = 1):
++    """A sublayer's output ``x`` folded into the streams, TileKernels' ``mhc_post_fwd``
++    to the bit: ``out[n] = bf16(post[n] * x + sum_m comb[m, n] * residual[m])``.
++
++    Per element, as TileKernels' compiled kernel computes it: the first stream's
++    product ``comb[0, n] * residual[0]`` rounded to FP32, ``post[n] * x`` added to
++    it by a fused multiply-add, then streams 1 to 3 likewise, in order, and one
++    rounding to BF16. That is how nvcc contracts TileKernels'
++    ``post * x + comb[0] * residual[0] + ...``: of the first addition's two
++    products it fuses the left one, so the first stream's product is the one
++    rounded (PTX ``mul.f32``, then four ``fma.rn.f32``). Here the ``T.fma`` calls
++    fix that sequence: the rounded product's only use is an FMA's addend, which
++    nothing can contract. The fused ``post_pre`` entry computes the same sequence.
++
++    Each thread owns eight contiguous columns of one token: it loads them from
++    ``x`` and every stream (16-byte loads) and its token's mixes before any
++    arithmetic, so a token costs one memory round trip rather than TileKernels'
++    pipelined loop over 1,024-column blocks. The grid is flat, a token's column
++    blocks adjacent, so any token count launches. No element reads another, so a
++    token's result does not depend on the batch.
++    """
++    assert hidden_size % (threads * VEC) == 0
++    assert world >= 1
++    blocks = hidden_size // (threads * VEC)
++    M = T.dynamic("M")
++
++    if world == 1:
++
++        @T.prim_func
++        def mhc_post(
++            x: T.Tensor((M, hidden_size), T.bfloat16),
++            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            post: T.Tensor((M, MULT), T.float32),
++            comb: T.Tensor((M, MULT, MULT), T.float32),
++            out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        ):
++            with T.Kernel(M * blocks, threads=threads) as pid:
++                token = pid // blocks
++                col = (pid % blocks * threads + T.get_thread_binding()) * VEC
++                xv = T.alloc_local((VEC,), T.bfloat16)
++                rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++                ov = T.alloc_local((MULT * VEC,), T.bfloat16)
++                pm = T.alloc_local((MULT,), T.float32)
++                cm = T.alloc_local((MULT * MULT,), T.float32)
++                acc = T.alloc_var(T.float32)
++                for n in T.vectorized(MULT):
++                    pm[n] = post[token, n]
++                for m in T.unroll(MULT):
++                    for n in T.vectorized(MULT):
++                        cm[m * MULT + n] = comb[token, m, n]
++                for m in T.unroll(MULT):
++                    for v in T.vectorized(VEC):
++                        rv[m * VEC + v] = residual[token, m, col + v]
++                pdl.chain()
++                for v in T.vectorized(VEC):
++                    xv[v] = x[token, col + v]
++                for n in T.unroll(MULT):
++                    for v in T.unroll(VEC):
++                        acc = cm[n] * T.Cast(T.float32, rv[v])
++                        acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++                        for m in T.unroll(1, MULT):
++                            acc = T.fma(
++                                cm[m * MULT + n],
++                                T.Cast(T.float32, rv[m * VEC + v]),
++                                acc,
++                            )
++                        ov[n * VEC + v] = T.Cast(T.bfloat16, acc)
++                for n in T.unroll(MULT):
++                    for v in T.vectorized(VEC):
++                        out[token, n, col + v] = ov[n * VEC + v]
++
++        return mhc_post
++
++    x_stride0 = T.dynamic("x_stride0")
++
++    @T.prim_func
++    def mhc_post(
++        X: T.StridedTensor((world, M, hidden_size), (x_stride0, hidden_size, 1), T.bfloat16),
++        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++    ):
++        with T.Kernel(M * blocks, threads=threads) as pid:
++            token = pid // blocks
++            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
++            xv = T.alloc_local((VEC,), T.bfloat16)
++            xp = T.alloc_local((world * VEC,), T.bfloat16)
++            av = T.alloc_local((VEC,), T.float32)
++            rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            ov = T.alloc_local((MULT * VEC,), T.bfloat16)
++            pm = T.alloc_local((MULT,), T.float32)
++            cm = T.alloc_local((MULT * MULT,), T.float32)
++            acc = T.alloc_var(T.float32)
++            for n in T.vectorized(MULT):
++                pm[n] = post[token, n]
++            for m in T.unroll(MULT):
++                for n in T.vectorized(MULT):
++                    cm[m * MULT + n] = comb[token, m, n]
++            for m in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    rv[m * VEC + v] = residual[token, m, col + v]
++            pdl.chain()
++            for r in T.unroll(world):
++                for v in T.vectorized(VEC):
++                    xp[r * VEC + v] = X[r, token, col + v]
++            for r in T.unroll(world):
++                for v in T.unroll(VEC):
++                    if r == 0:
++                        av[v] = T.Cast(T.float32, xp[v])
++                    else:
++                        av[v] = av[v] + T.Cast(T.float32, xp[r * VEC + v])
++            for v in T.unroll(VEC):
++                xv[v] = T.Cast(T.bfloat16, av[v])
++            for n in T.unroll(MULT):
++                for v in T.unroll(VEC):
++                    acc = cm[n] * T.Cast(T.float32, rv[v])
++                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++                    for m in T.unroll(1, MULT):
++                        acc = T.fma(
++                            cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
++                        )
++                    ov[n * VEC + v] = T.Cast(T.bfloat16, acc)
++            for n in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    out[token, n, col + v] = ov[n * VEC + v]
++
++    return mhc_post
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def post_collapse_streams(hidden_size: int, threads: int = 128, world: int = 1):
++    """The standalone ``post`` followed by the stream ``collapse`` in one launch:
++    each stream is updated and rounded to BF16 with ``post_streams``' exact FMA
++    sequence, then collapsed with ``mix`` and rounded to BF16 with
++    ``collapse_streams``' exact FMA sequence, without allocating, writing or reading
++    the ``[M, MULT, hidden_size]`` intermediate stream tensor."""
++    assert hidden_size % (threads * VEC) == 0
++    assert world >= 1
++    blocks = hidden_size // (threads * VEC)
++    M = T.dynamic("M")
++
++    if world == 1:
++
++        @T.prim_func
++        def mhc_post_collapse(
++            x: T.Tensor((M, hidden_size), T.bfloat16),
++            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            post: T.Tensor((M, MULT), T.float32),
++            comb: T.Tensor((M, MULT, MULT), T.float32),
++            mix: T.Tensor((M, MULT), T.float32),
++            out: T.Tensor((M, hidden_size), T.bfloat16),
++        ):
++            with T.Kernel(M * blocks, threads=threads) as pid:
++                pdl.chain()
++                token = pid // blocks
++                col = (pid % blocks * threads + T.get_thread_binding()) * VEC
++                xv = T.alloc_local((VEC,), T.bfloat16)
++                rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++                sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++                ov = T.alloc_local((VEC,), T.bfloat16)
++                pm = T.alloc_local((MULT,), T.float32)
++                cm = T.alloc_local((MULT * MULT,), T.float32)
++                mv = T.alloc_local((MULT,), T.float32)
++                acc = T.alloc_var(T.float32)
++                for n in T.vectorized(MULT):
++                    pm[n] = post[token, n]
++                for m in T.unroll(MULT):
++                    for n in T.vectorized(MULT):
++                        cm[m * MULT + n] = comb[token, m, n]
++                for m in T.vectorized(MULT):
++                    mv[m] = mix[token, m]
++                for v in T.vectorized(VEC):
++                    xv[v] = x[token, col + v]
++                for m in T.unroll(MULT):
++                    for v in T.vectorized(VEC):
++                        rv[m * VEC + v] = residual[token, m, col + v]
++                for n in T.unroll(MULT):
++                    for v in T.unroll(VEC):
++                        acc = cm[n] * T.Cast(T.float32, rv[v])
++                        acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++                        for m in T.unroll(1, MULT):
++                            acc = T.fma(
++                                cm[m * MULT + n],
++                                T.Cast(T.float32, rv[m * VEC + v]),
++                                acc,
++                            )
++                        sv[n * VEC + v] = T.Cast(T.bfloat16, acc)
++                for v in T.unroll(VEC):
++                    acc = T.float32(0)
++                    for m in T.unroll(MULT):
++                        acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
++                    ov[v] = T.Cast(T.bfloat16, acc)
++                for v in T.vectorized(VEC):
++                    out[token, col + v] = ov[v]
++
++        return mhc_post_collapse
++
++    @T.prim_func
++    def mhc_post_collapse(
++        X: T.Tensor((world, M, hidden_size), T.bfloat16),
++        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        mix: T.Tensor((M, MULT), T.float32),
++        out: T.Tensor((M, hidden_size), T.bfloat16),
++    ):
++        with T.Kernel(M * blocks, threads=threads) as pid:
++            pdl.chain()
++            token = pid // blocks
++            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
++            xv = T.alloc_local((VEC,), T.bfloat16)
++            xp = T.alloc_local((world * VEC,), T.bfloat16)
++            av = T.alloc_local((VEC,), T.float32)
++            rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            ov = T.alloc_local((VEC,), T.bfloat16)
++            pm = T.alloc_local((MULT,), T.float32)
++            cm = T.alloc_local((MULT * MULT,), T.float32)
++            mv = T.alloc_local((MULT,), T.float32)
++            acc = T.alloc_var(T.float32)
++            for n in T.vectorized(MULT):
++                pm[n] = post[token, n]
++            for m in T.unroll(MULT):
++                for n in T.vectorized(MULT):
++                    cm[m * MULT + n] = comb[token, m, n]
++            for m in T.vectorized(MULT):
++                mv[m] = mix[token, m]
++            for m in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    rv[m * VEC + v] = residual[token, m, col + v]
++            for r in T.unroll(world):
++                for v in T.vectorized(VEC):
++                    xp[r * VEC + v] = X[r, token, col + v]
++            for r in T.unroll(world):
++                for v in T.unroll(VEC):
++                    if r == 0:
++                        av[v] = T.Cast(T.float32, xp[v])
++                    else:
++                        av[v] = av[v] + T.Cast(T.float32, xp[r * VEC + v])
++            for v in T.unroll(VEC):
++                xv[v] = T.Cast(T.bfloat16, av[v])
++            for n in T.unroll(MULT):
++                for v in T.unroll(VEC):
++                    acc = cm[n] * T.Cast(T.float32, rv[v])
++                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++                    for m in T.unroll(1, MULT):
++                        acc = T.fma(
++                            cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
++                        )
++                    sv[n * VEC + v] = T.Cast(T.bfloat16, acc)
++            for v in T.unroll(VEC):
++                acc = T.float32(0)
++                for m in T.unroll(MULT):
++                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
++                ov[v] = T.Cast(T.bfloat16, acc)
++            for v in T.vectorized(VEC):
++                out[token, col + v] = ov[v]
++
++    return mhc_post_collapse
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def post_collapse_norm_streams(
++    hidden_size: int,
++    eps: float,
++    threads: int = 128,
++    world: int = 1,
++    column: int = -1,
++):
++    """The final decoder layer's ``post``, stream ``collapse`` (with optional sink
++    detector ``column`` extraction), and output ``RMSNorm`` in one 1-CTA-per-token
++    launch, matching ``norm(post_collapse(...))`` and ``collapse(..., column=column)``
++    to the bit without materializing the ``[M, MULT, hidden_size]`` stream buffer or
++    the pre-norm ``[M, hidden_size]`` collapse tensor."""
++    assert hidden_size % (threads * VEC) == 0
++    assert threads == 128 and world >= 1 and column < hidden_size
++    steps = hidden_size // (threads * VEC)
++    warps = threads // 32
++    column_vi = (column // VEC) // threads if column >= 0 else -1
++    column_thread = (column // VEC) % threads if column >= 0 else -1
++    column_element = column % VEC if column >= 0 else 0
++    M = T.dynamic("M")
++
++    @T.macro
++    def _post_collapse_norm_row(
++        X, residual, post, comb, mix, weight, out, columns, token
++    ):
++        pdl.chain()
++        tx = T.get_thread_binding()
++        xv = T.alloc_local((VEC,), T.bfloat16)
++        xp = T.alloc_local((world * VEC,), T.bfloat16)
++        av = T.alloc_local((VEC,), T.float32)
++        rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++        sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++        cv = T.alloc_local((steps * VEC,), T.bfloat16)
++        wv = T.alloc_local((steps * VEC,), T.bfloat16)
++        ov = T.alloc_local((VEC,), T.bfloat16)
++        pm = T.alloc_local((MULT,), T.float32)
++        cm = T.alloc_local((MULT * MULT,), T.float32)
++        mv = T.alloc_local((MULT,), T.float32)
++        sum_local = T.alloc_local((2,), T.float32)
++        sum_val = T.alloc_local((1,), T.float32)
++        rstd = T.alloc_local((1,), T.float32)
++        sum_shared = T.alloc_shared((warps,), T.float32)
++        acc = T.alloc_var(T.float32)
++
++        for n in T.vectorized(MULT):
++            pm[n] = post[token, n]
++        for m in T.unroll(MULT):
++            for n in T.vectorized(MULT):
++                cm[m * MULT + n] = comb[token, m, n]
++        for m in T.vectorized(MULT):
++            mv[m] = mix[token, m]
++        for vi in T.unroll(steps):
++            col = (vi * threads + tx) * VEC
++            for v in T.vectorized(VEC):
++                wv[vi * VEC + v] = weight[col + v]
++
++        sum_local[0] = T.float32(0)
++        sum_local[1] = T.float32(0)
++        for vi in T.unroll(steps):
++            col = (vi * threads + tx) * VEC
++            for m in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    rv[m * VEC + v] = residual[token, m, col + v]
++            if world == 1:
++                for v in T.vectorized(VEC):
++                    xv[v] = X[0, token, col + v]
++            else:
++                for r in T.unroll(world):
++                    for v in T.vectorized(VEC):
++                        xp[r * VEC + v] = X[r, token, col + v]
++                for r in T.unroll(world):
++                    for v in T.unroll(VEC):
++                        if r == 0:
++                            av[v] = T.Cast(T.float32, xp[v])
++                        else:
++                            av[v] = av[v] + T.Cast(T.float32, xp[r * VEC + v])
++                for v in T.unroll(VEC):
++                    xv[v] = T.Cast(T.bfloat16, av[v])
++            for n in T.unroll(MULT):
++                for v in T.unroll(VEC):
++                    acc = cm[n] * T.Cast(T.float32, rv[v])
++                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++                    for m in T.unroll(1, MULT):
++                        acc = T.fma(
++                            cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
++                        )
++                    sv[n * VEC + v] = T.Cast(T.bfloat16, acc)
++            if column >= 0:
++                if (vi == column_vi) & (tx == column_thread):
++                    for m in T.unroll(MULT):
++                        columns[token, m] = T.Cast(
++                            T.float32, sv[m * VEC + column_element]
++                        )
++            for v in T.unroll(VEC):
++                acc = T.float32(0)
++                for m in T.unroll(MULT):
++                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
++                cv[vi * VEC + v] = T.Cast(T.bfloat16, acc)
++            for v in T.unroll(VEC):
++                sum_local[v % 2] += T.Cast(
++                    T.float32, cv[vi * VEC + v]
++                ) * T.Cast(T.float32, cv[vi * VEC + v])
++
++        sum_val[0] = sum_local[0] + sum_local[1]
++        sum_val[0] += T.shfl_xor(sum_val[0], 16)
++        sum_val[0] += T.shfl_xor(sum_val[0], 8)
++        sum_val[0] += T.shfl_xor(sum_val[0], 4)
++        sum_val[0] += T.shfl_xor(sum_val[0], 2)
++        sum_val[0] += T.shfl_xor(sum_val[0], 1)
++        if tx % 32 == 0:
++            sum_shared[tx // 32] = sum_val[0]
++        T.sync_threads()
++        rstd[0] = T.rsqrt(
++            (((sum_shared[0] + sum_shared[1]) + sum_shared[2]) + sum_shared[3])
++            / hidden_size
++            + eps
++        )
++        for vi in T.unroll(steps):
++            col = (vi * threads + tx) * VEC
++            for v in T.unroll(VEC):
++                ov[v] = T.Cast(
++                    T.bfloat16,
++                    T.Cast(T.float32, cv[vi * VEC + v])
++                    * rstd[0]
++                    * T.Cast(T.float32, wv[vi * VEC + v]),
++                )
++            for v in T.vectorized(VEC):
++                out[token, col + v] = ov[v]
++
++    if column < 0:
++
++        @T.prim_func
++        def mhc_post_collapse_norm(
++            X: T.Tensor((world, M, hidden_size), T.bfloat16),
++            residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            post: T.Tensor((M, MULT), T.float32),
++            comb: T.Tensor((M, MULT, MULT), T.float32),
++            mix: T.Tensor((M, MULT), T.float32),
++            weight: T.Tensor((hidden_size,), T.bfloat16),
++            out: T.Tensor((M, hidden_size), T.bfloat16),
++        ):
++            with T.Kernel(M, threads=threads) as pid:
++                _post_collapse_norm_row(
++                    X, residual, post, comb, mix, weight, out, post, pid
++                )
++
++        return mhc_post_collapse_norm
++
++    @T.prim_func
++    def mhc_post_collapse_norm(
++        X: T.Tensor((world, M, hidden_size), T.bfloat16),
++        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        mix: T.Tensor((M, MULT), T.float32),
++        weight: T.Tensor((hidden_size,), T.bfloat16),
++        out: T.Tensor((M, hidden_size), T.bfloat16),
++        columns: T.Tensor((M, MULT), T.float32),
++    ):
++        with T.Kernel(M, threads=threads) as pid:
++            _post_collapse_norm_row(
++                X, residual, post, comb, mix, weight, out, columns, pid
++            )
++
++    return mhc_post_collapse_norm
++
++
++# Shared memory each collapse block holds without using it, which caps residency at
++# four blocks an SM. On GB10 the long-prefill collapse reads the four streams faster
++# with fewer blocks resident (TileKernels' kernel is capped by its own shared memory);
++# decode is not limited by residency. Round 4a of the TileLang completion experiment,
++# three passes against TileKernels: -2.2% to -3.0% at 8K and 16K prefill tokens and
++# -4% to -8% at decode.
++_COLLAPSE_RESERVE = 24 * 1024
++
++
++@T.macro
++def _collapse_rows(state, mix, out, sv, token, col, tx, reserve):
++    """One thread's ``VEC`` columns of a token: the streams' weighted sum, as
++    ``collapse_streams`` describes it. Leaves the streams' values in ``sv``."""
++    ov = T.alloc_local((VEC,), T.bfloat16)
++    mv = T.alloc_local((MULT,), T.float32)
++    acc = T.alloc_var(T.float32)
++    if tx == 0:
++        reserve[0] = T.float32(0)
++    for m in T.vectorized(MULT):
++        mv[m] = mix[token, m]
++    for m in T.unroll(MULT):
++        for v in T.vectorized(VEC):
++            sv[m * VEC + v] = state[token, m, col + v]
++    for v in T.unroll(VEC):
++        acc = T.float32(0)
++        for m in T.unroll(MULT):
++            acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
++        ov[v] = T.Cast(T.bfloat16, acc)
++    for v in T.vectorized(VEC):
++        out[token, col + v] = ov[v]
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
++    """The streams' weighted sum, TileKernels' ``mhc_pre_apply_mix_fwd`` to the bit:
++    ``out = bf16(sum_m mix[m] * state[m])``.
++
++    Per element, as TileKernels' compiled kernel computes it: from a positive
++    zero, each stream's term added by one fused multiply-add, streams in order,
++    and one rounding to BF16. Starting from zero rather than the first product
++    matters only in sign: four negative-zero products sum to positive zero, as
++    TileKernels' do. The thread mapping is ``post_streams``'; each block holds
++    ``_COLLAPSE_RESERVE`` bytes of shared memory.
++
++    With ``column`` (the sink detector's), the thread that reads it also writes
++    each stream's value there, as FP32, to ``columns`` ([tokens, MULT]): the
++    forward's last collapse hands the detector its column in the same launch.
++    """
++    assert hidden_size % (threads * VEC) == 0
++    assert column < hidden_size
++    blocks = hidden_size // (threads * VEC)
++    M = T.dynamic("M")
++
++    if column < 0:
++
++        @T.prim_func
++        def mhc_collapse(
++            state: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            mix: T.Tensor((M, MULT), T.float32),
++            out: T.Tensor((M, hidden_size), T.bfloat16),
++        ):
++            with T.Kernel(M * blocks, threads=threads) as pid:
++                pdl.chain()
++                tx = T.get_thread_binding()
++                sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++                # Held, not used: the one write keeps the allocation, and with it
++                # the cap.
++                reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
++                _collapse_rows(
++                    state,
++                    mix,
++                    out,
++                    sv,
++                    pid // blocks,
++                    (pid % blocks * threads + tx) * VEC,
++                    tx,
++                    reserve,
++                )
++
++        return mhc_collapse
++
++    # The block, thread and vector element that read ``column``.
++    column_block = column // (threads * VEC)
++    column_thread = column % (threads * VEC) // VEC
++    column_element = column % VEC
++
++    @T.prim_func
++    def mhc_collapse_column(
++        state: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        mix: T.Tensor((M, MULT), T.float32),
++        out: T.Tensor((M, hidden_size), T.bfloat16),
++        columns: T.Tensor((M, MULT), T.float32),
++    ):
++        with T.Kernel(M * blocks, threads=threads) as pid:
++            pdl.chain()
++            tx = T.get_thread_binding()
++            sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
++            _collapse_rows(
++                state,
++                mix,
++                out,
++                sv,
++                pid // blocks,
++                (pid % blocks * threads + tx) * VEC,
++                tx,
++                reserve,
++            )
++            if (pid % blocks == column_block) & (tx == column_thread):
++                for m in T.unroll(MULT):
++                    columns[pid // blocks, m] = T.Cast(
++                        T.float32, sv[m * VEC + column_element]
++                    )
++
++    return mhc_collapse_column
++
++
++def _project_call(
++    hidden: int, mode: str, world: int, with_aux: bool = False
++) -> prepare.TileLangCall:
++    """The ``project_streams`` call of a sublayer entry."""
++    if not with_aux:
++        return prepare.call(project_streams, hidden, mode, block_M=BLOCK_M, world=world)
++    return prepare.call(
++        project_streams, hidden, mode, block_M=BLOCK_M, world=world, with_aux=True
++    )
++
++
++def _finalize_call(
++    hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int
++) -> prepare.TileLangCall:
++    """The ``finalize`` call of a sublayer entry projecting ``k`` stream columns."""
++    return prepare.call(finalize, hidden, k, rms_eps, hc_eps, iterations, rms_eps)
++
++
++
++def _post_call(hidden: int, world: int = 1) -> prepare.TileLangCall:
++    """The standalone ``post``'s call."""
++    if world == 1:
++        return prepare.call(post_streams, hidden)
++    return prepare.call(post_streams, hidden, world=world)
++
++
++def _post_collapse_call(hidden: int, world: int = 1) -> prepare.TileLangCall:
++    """The fused ``post_collapse``'s call."""
++    if world == 1:
++        return prepare.call(post_collapse_streams, hidden)
++    return prepare.call(post_collapse_streams, hidden, world=world)
++
++
++def _post_collapse_norm_call(
++    hidden: int, eps: float, world: int = 1, column: int = -1
++) -> prepare.TileLangCall:
++    """The fused ``post_collapse_norm``'s call."""
++    kwargs = {}
++    if world != 1:
++        kwargs["world"] = world
++    if column >= 0:
++        kwargs["column"] = column
++    return prepare.call(post_collapse_norm_streams, hidden, eps, **kwargs)
++
++
++def _collapse_call(hidden: int, column: int = -1) -> prepare.TileLangCall:
++    """The stream collapse's call, and with ``column`` its variant that also writes
++    that column of every stream."""
++    if column < 0:
++        return prepare.call(collapse_streams, hidden)
++    return prepare.call(collapse_streams, hidden, column=column)
++
++
++def _make(call: prepare.TileLangCall):
++    function, args, kwargs = call
++    return function(*args, **kwargs)
++
++
++@cache
++def _project(hidden: int, mode: str, world: int, with_aux: bool = False):
++    return _make(_project_call(hidden, mode, world, with_aux))
++
++
++def _finalize_norm_call(hidden: int, rms_eps: float) -> prepare.TileLangCall:
++    """The critical-path ``finalize_norm`` call."""
++    return prepare.call(finalize_norm, hidden, rms_eps, k_ctas=_norm_ctas(hidden))
++
++
++def _finalize_sinkhorn_call(
++    hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int
++) -> prepare.TileLangCall:
++    """The off-critical-path ``finalize_sinkhorn`` call."""
++    return prepare.call(finalize_sinkhorn, hidden, k, rms_eps, hc_eps, iterations)
++
++
++@cache
++def _finalize(hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int):
++    return _make(_finalize_call(hidden, k, rms_eps, hc_eps, iterations))
++
++
++@cache
++def _finalize_norm(hidden: int, rms_eps: float):
++    return _make(_finalize_norm_call(hidden, rms_eps))
++
++
++@cache
++def _finalize_sinkhorn(
++    hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int
++):
++    return _make(_finalize_sinkhorn_call(hidden, k, rms_eps, hc_eps, iterations))
++
++
++_ASYNC_SINKHORN_MAX_ROWS = 128
++_SINKHORN_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
++_SINKHORN_FORK_EVENTS: dict[torch.device, torch.cuda.Event] = {}
++_SINKHORN_DONE_EVENTS: dict[torch.device, torch.cuda.Event] = {}
++_SINKHORN_PENDING: dict[torch.device, bool] = {}
++_SINKHORN_SCRATCH: dict[torch.device, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
++_sinkhorn_state = threading.local()
++
++
++def _normalize_device(device: torch.device | None = None) -> torch.device:
++    if device is None:
++        return torch.device("cuda", torch.cuda.current_device())
++    if device.type == "cuda" and device.index is None:
++        return torch.device("cuda", torch.cuda.current_device())
++    return device
++
++
++def _sinkhorn_stream(device: torch.device) -> torch.cuda.Stream:
++    device = _normalize_device(device)
++    stream = _SINKHORN_STREAMS.get(device)
++    if stream is None:
++        from vllm.utils.torch_utils import aux_stream
++
++        shared = aux_stream()
++        if shared is not None and _normalize_device(shared.device) == device:
++            stream = shared
++        else:
++            try:
++                _, high_priority = torch.cuda.Stream.priority_range()
++                stream = torch.cuda.Stream(device=device, priority=high_priority)
++            except Exception:
++                stream = torch.cuda.Stream(device=device)
++        _SINKHORN_STREAMS[device] = stream
++    return stream
++
++
++def _sinkhorn_scratch(splits: int, tokens: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
++    device = _normalize_device(device)
++    by_splits = _SINKHORN_SCRATCH.setdefault(device, {})
++    pair = by_splits.get(splits)
++    need_p = splits * tokens * MIXES
++    need_s = splits * tokens
++    if pair is None or pair[0].numel() < need_p or pair[1].numel() < need_s:
++        cap = max(tokens, _ASYNC_SINKHORN_MAX_ROWS)
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                f"mHC async Sinkhorn buffers for {tokens} rows must be pre-allocated before capture"
++            )
++        pair = (
++            torch.empty((splits * cap * MIXES,), dtype=torch.float32, device=device),
++            torch.empty((splits * cap,), dtype=torch.float32, device=device),
++        )
++        by_splits[splits] = pair
++    return (
++        pair[0][:need_p].view(splits, tokens, 1, MIXES),
++        pair[1][:need_s].view(splits, tokens, 1),
++    )
++
++
++def _async_sinkhorn_active() -> bool:
++    return getattr(_sinkhorn_state, "depth", 0) > 0
++
++
++def _sinkhorn_events(
++    device: torch.device,
++) -> tuple[torch.cuda.Event, torch.cuda.Event]:
++    device = _normalize_device(device)
++    fork_ev = _SINKHORN_FORK_EVENTS.get(device)
++    done_ev = _SINKHORN_DONE_EVENTS.get(device)
++    if fork_ev is None or done_ev is None:
++        with torch.cuda.device(device):
++            fork_ev = torch.cuda.Event()
++            done_ev = torch.cuda.Event()
++        _SINKHORN_FORK_EVENTS[device] = fork_ev
++        _SINKHORN_DONE_EVENTS[device] = done_ev
++    return fork_ev, done_ev
++
++
++@contextlib.contextmanager
++def async_sinkhorn(enabled: bool = True):
++    """Run Sinkhorn on a dedicated side stream across enclosed mHC entry calls."""
++    if not enabled:
++        yield
++        return
++    _sinkhorn_state.depth = getattr(_sinkhorn_state, "depth", 0) + 1
++    try:
++        yield
++    finally:
++        _sinkhorn_state.depth -= 1
++        if _sinkhorn_state.depth == 0:
++            for dev, pending in list(_SINKHORN_PENDING.items()):
++                if pending:
++                    wait_sinkhorn(dev)
++
++
++def wait_sinkhorn(device: torch.device | None = None) -> None:
++    """Join any pending async Sinkhorn launch onto the current CUDA stream."""
++    if device is None and not torch.cuda.is_available():
++        return
++    device = _normalize_device(device)
++    if not _SINKHORN_PENDING.get(device, False):
++        return
++    done_ev = _SINKHORN_DONE_EVENTS.get(device)
++    if done_ev is not None:
++        torch.cuda.current_stream(device).wait_event(done_ev)
++    _SINKHORN_PENDING[device] = False
++
++
++
++@cache
++def _post(hidden: int, world: int = 1):
++    return _make(_post_call(hidden, world))
++
++
++@cache
++def _post_collapse(hidden: int, world: int = 1):
++    return _make(_post_collapse_call(hidden, world))
++
++
++@cache
++def _post_collapse_norm(hidden: int, eps: float, world: int = 1, column: int = -1):
++    return _make(_post_collapse_norm_call(hidden, eps, world, column))
++
++
++@cache
++def _collapse(hidden: int, column: int = -1):
++    return _make(_collapse_call(hidden, column))
++
++
++def _mhc_pre(
++    residual: torch.Tensor,
++    fn: torch.Tensor,
++    scale: torch.Tensor,
++    base: torch.Tensor,
++    norm: torch.Tensor,
++    pre: torch.Tensor,
++    residual_out: torch.Tensor | None,
++    y: torch.Tensor,
++    y_q: torch.Tensor,
++    y_sf: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    pre_out: torch.Tensor,
++    rms_eps: float,
++    hc_eps: float,
++    iterations: int,
++    previous_output: torch.Tensor | None = None,
++    previous_post: torch.Tensor | None = None,
++    previous_comb: torch.Tensor | None = None,
++    aux_out: torch.Tensor | None = None,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
++    streams = MULT * hidden
++    world = 1
++    with_aux = aux_out is not None
++    # Unused operands of a mode take a buffer of the right shape; none is read.
++    if previous_output is not None:
++        # (T, H), or the ranks' unreduced partials of it, (world, T, H).
++        if previous_output.ndim == 3:
++            world = int(previous_output.shape[0])
++        mode, x, k = "post_pre", previous_output, streams
++        source, updated = residual.view(tokens, streams), residual_out
++        mix_post, mix_comb = previous_post, previous_comb
++    elif residual.ndim == 2:
++        mode, x, k = "broadcast", residual, hidden
++        source, updated = residual_out.view(tokens, streams), residual_out
++        mix_post, mix_comb = pre, comb
++    else:
++        mode, x, k = "pre", y, streams
++        source = residual.view(tokens, streams)
++        updated, mix_post, mix_comb = source, pre, comb
++    splits = hidden // BLOCK_H
++    use_async = (
++        _async_sinkhorn_active()
++        and residual.is_cuda
++        and tokens <= _ASYNC_SINKHORN_MAX_ROWS
++    )
++    if use_async:
++        P, S = _sinkhorn_scratch(splits, tokens, residual.device)
++        scratch = current_workspace_manager().get_simultaneous(
++            ((tokens, hidden), torch.bfloat16),
++            ((splits, tokens), torch.float32),
++        )
++        retain_cuda_graph_capture_resource(scratch)
++        C, Q = scratch
++    else:
++        scratch = current_workspace_manager().get_simultaneous(
++            ((splits, tokens, 1, MIXES), torch.float32),
++            ((splits, tokens, 1), torch.float32),
++            ((tokens, hidden), torch.bfloat16),
++            ((splits, tokens), torch.float32),
++        )
++        retain_cuda_graph_capture_resource(scratch)
++        P, S, C, Q = scratch
++    aux_args = (aux_out.view(tokens, hidden),) if with_aux else ()
++    _project(hidden, mode, world, with_aux)(
++        x if x.ndim == 3 else x.unsqueeze(0),
++        source,
++        mix_post,
++        mix_comb,
++        pre,
++        fn,
++        updated.view(tokens, streams),
++        P,
++        S,
++        C,
++        Q,
++        *aux_args,
++    )
++    if use_async:
++        if not torch.cuda.is_current_stream_capturing():
++            logger.info_once(
++                "[mhc] async Sinkhorn split active (max_rows=%d)",
++                _ASYNC_SINKHORN_MAX_ROWS,
++            )
++        sh_stream = _sinkhorn_stream(residual.device)
++        cur_stream = torch.cuda.current_stream(residual.device)
++        fork_ev, done_ev = _sinkhorn_events(residual.device)
++        fork_ev.record(cur_stream)
++        sh_stream.wait_event(fork_ev)
++        for tensor in (P, S, post, comb, pre_out):
++            tensor.record_stream(sh_stream)
++        with torch.cuda.stream(sh_stream):
++            _finalize_sinkhorn(hidden, k, rms_eps, hc_eps, iterations)(
++                P, S, scale, base, post, comb, pre_out
++            )
++            done_ev.record(sh_stream)
++        _SINKHORN_PENDING[_normalize_device(residual.device)] = True
++        _finalize_norm(hidden, rms_eps)(C, Q, norm, y, y_q, y_sf)
++    else:
++        _finalize(hidden, k, rms_eps, hc_eps, iterations)(
++            P, S, C, Q, scale, base, norm, post, comb, pre_out, y, y_q, y_sf
++        )
++
++
++def _mhc_post(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
++    world = int(x.shape[0]) if x.ndim == 3 else 1
++    _post(hidden, world)(
++        (
++            x
++            if x.shape == (world, tokens, hidden)
++            else x.view(world, tokens, hidden)
++        )
++        if world > 1
++        else x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        out.view(tokens, MULT, hidden),
++    )
++
++
++def _mhc_post_collapse(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
++    world = int(x.shape[0]) if x.ndim == 3 else 1
++    _post_collapse(hidden, world)(
++        x.view(world, tokens, hidden) if world > 1 else x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++    )
++
++
++def _mhc_post_collapse_norm(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post: torch.Tensor,
++    comb: torch.Tensor,
++    mix: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++    out: torch.Tensor,
++    columns: torch.Tensor | None = None,
++    column: int = -1,
++) -> None:
++    tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
++    if tokens == 0:
++        return
++    if residual.is_cuda:
++        wait_sinkhorn(residual.device)
++    world = int(x.shape[0]) if x.ndim == 3 else 1
++    x_in = x.view(world, tokens, hidden) if world > 1 else x.view(1, tokens, hidden)
++    col_arg = column if columns is not None else -1
++    extra = (columns.view(tokens, MULT),) if columns is not None else ()
++    _post_collapse_norm(hidden, eps, world, col_arg)(
++        x_in,
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        mix.view(tokens, MULT),
++        weight.view(hidden),
++        out.view(tokens, hidden),
++        *extra,
++    )
++
++
++def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> None:
++    tokens, hidden = int(state.shape[0]), int(state.shape[-1])
++    if tokens == 0:
++        return
++    if state.is_cuda:
++        wait_sinkhorn(state.device)
++    _collapse(hidden)(
++        state.view(tokens, MULT, hidden),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++    )
++
++
++def _mhc_collapse_column(
++    state: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++    columns: torch.Tensor,
++    column: int,
++) -> None:
++    tokens, hidden = int(state.shape[0]), int(state.shape[-1])
++    if tokens == 0:
++        return
++    if state.is_cuda:
++        wait_sinkhorn(state.device)
++    _collapse(hidden, column)(
++        state.view(tokens, MULT, hidden),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++        columns.view(tokens, MULT),
++    )
++
++
++# Every layer's constant mixes, by device: (first sublayer's pre-mix, the collapse's
++# mean), and every earlier, shorter pair (a captured graph may still read one).
++_MIXES: dict[torch.device, list[tuple[torch.Tensor, torch.Tensor]]] = {}
++
++
++def _constant_mixes(
++    tokens: int, device: torch.device
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """``tokens`` rows of the first sublayer's pre-mix (stream 0 alone) and of the
++    collapse's mean, slices of buffers every layer shares. torch would otherwise fill
++    them inside every forward (five kernels a target step: the first layer's zeros and
++    fill, and the three auxiliary collapses' fills). The layers build them for the
++    batch limit before CUDA graph capture (``declare_kernels``' bind); a longer batch
++    outside capture (a kernel test) grows them."""
++    built = _MIXES.setdefault(device, [])
++    if not built or built[-1][0].shape[0] < tokens:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                f"mHC constant mixes of {tokens} rows must be built before capture"
++            )
++        first = torch.zeros((tokens, MULT), dtype=torch.float32, device=device)
++        first[:, 0] = 1
++        mean = torch.full((tokens, MULT), 0.25, dtype=torch.float32, device=device)
++        built.append((first, mean))
++    first, mean = built[-1]
++    return first[:tokens], mean[:tokens]
++
++
++class TileKernelsMHC(nn.Module):
++    """V4.1 lagged mHC for a decoder layer: pre, post_pre, post and collapse."""
++
++    supports_fused_aux = True
++    supports_async_sinkhorn = True
++
++    def __init__(self, config):
++        super().__init__()
++        if config.hc_mult != MULT:
++            raise ValueError("V4.1 mHC requires four streams")
++        self.hidden_size = config.hidden_size
++        self.rms_eps = config.rms_norm_eps
++        self.hc_eps = config.hc_eps
++        self.iterations = config.hc_sinkhorn_iters
++
++    @staticmethod
++    def _post_worlds() -> tuple[int, ...]:
++        """The world sizes that ``post``, ``post_collapse`` and ``post_collapse_norm``
++        can launch."""
++        if sp_prefill.unreduced_enabled():
++            tp_world = get_tensor_model_parallel_world_size()
++            if tp_world > 1:
++                return (1, tp_world)
++        return (1,)
++
++    def _entries(self) -> list[tuple[str, int]]:
++        """The (mode, world) of every sublayer entry this layer can launch."""
++        entries = [(mode, 1) for mode in ("pre", "post_pre", "broadcast")]
++        if sp_prefill.unreduced_enabled():
++            # Sequence-parallel steps hand post_pre the ranks' unreduced parts.
++            entries.append(("post_pre", get_tensor_model_parallel_world_size()))
++        return entries
++
++    def declare_kernels(self) -> None:
++        """Declare every sublayer entry's kernels, the standalone post and the stream
++        collapse, so that no forward (or CUDA graph capture) compiles."""
++        hidden = self.hidden_size
++        entries = self._entries()
++        post_worlds = self._post_worlds()
++        # The broadcast entry projects one stream; the others all four.
++        widths = (hidden, MULT * hidden)
++        mix = (self.rms_eps, self.hc_eps, self.iterations)
++
++        def calls() -> list[prepare.TileLangCall]:
++            return [
++                *(_project_call(hidden, mode, world) for mode, world in entries),
++                *(
++                    _project_call(hidden, mode, world, with_aux=True)
++                    for mode, world in entries
++                    if mode == "post_pre"
++                ),
++                *(_finalize_call(hidden, k, *mix) for k in widths),
++                _finalize_norm_call(hidden, self.rms_eps),
++                *(_finalize_sinkhorn_call(hidden, k, *mix) for k in widths),
++                *(_post_call(hidden, w) for w in post_worlds),
++                _collapse_call(hidden),
++                *(_post_collapse_call(hidden, w) for w in post_worlds),
++                *(
++                    _post_collapse_norm_call(hidden, self.rms_eps, w)
++                    for w in post_worlds
++                ),
++            ]
++
++        def bind() -> None:
++            # The forward's cached kernels, as its lookups name them.
++            for mode, world in entries:
++                _project(hidden, mode, world)
++                if mode == "post_pre":
++                    _project(hidden, mode, world, True)
++            for k in widths:
++                _finalize(hidden, k, *mix)
++                _finalize_sinkhorn(hidden, k, *mix)
++            _finalize_norm(hidden, self.rms_eps)
++            for w in post_worlds:
++                _post(hidden, w)
++                _post_collapse(hidden, w)
++                _post_collapse_norm(hidden, self.rms_eps, w)
++            _collapse(hidden)
++            device = torch.device("cuda", torch.cuda.current_device())
++            # The constant mixes, before any graph captures.
++            _constant_mixes(
++                get_current_vllm_config().scheduler_config.max_num_batched_tokens,
++                device,
++            )
++            _sinkhorn_stream(device)
++            _sinkhorn_events(device)
++            _sinkhorn_scratch(hidden // BLOCK_H, _ASYNC_SINKHORN_MAX_ROWS, device)
++
++        prepare.declare(calls, bind=bind)
++
++    def pre(
++        self,
++        residual,
++        fn,
++        scale,
++        base,
++        norm,
++        pre,
++        *,
++        previous_output=None,
++        previous_post=None,
++        previous_comb=None,
++        aux_out: torch.Tensor | None = None,
++    ):
++        """A sublayer entry: ``(streams, post-mix, combination, y, new pre-mix,
++        y_mxfp8)``. ``y`` is the sublayer's normalized input and ``y_mxfp8`` its MXFP8
++        cast (``linear.MXFP8Rows``), which the sublayer's block-32 projections read."""
++        tokens, device = int(residual.shape[0]), residual.device
++        if isinstance(previous_output, RankOrderParts):
++            # Added inside the projection kernel, in rank order.
++            previous_output = previous_output.packed
++        if pre is None:
++            pre = _constant_mixes(tokens, device)[0]
++        unchanged = previous_output is None and residual.ndim == 3
++        residual_out = (
++            None
++            if unchanged
++            else torch.empty(
++                (tokens, MULT, self.hidden_size), dtype=residual.dtype, device=device
++            )
++        )
++        y = torch.empty((tokens, self.hidden_size), dtype=residual.dtype, device=device)
++        y_mxfp8 = empty_mxfp8(y)
++        post = torch.empty((tokens, MULT), dtype=torch.float32, device=device)
++        comb = torch.empty((tokens, MULT, MULT), dtype=torch.float32, device=device)
++        pre_out = torch.empty((tokens, MULT), dtype=torch.float32, device=device)
++        _mhc_pre(
++            residual,
++            fn,
++            scale,
++            base,
++            norm,
++            pre,
++            residual_out,
++            y,
++            y_mxfp8.values,
++            y_mxfp8.scales,
++            post,
++            comb,
++            pre_out,
++            self.rms_eps,
++            self.hc_eps,
++            self.iterations,
++            previous_output,
++            previous_post,
++            previous_comb,
++            aux_out,
++        )
++        return residual if unchanged else residual_out, post, comb, y, pre_out, y_mxfp8
++
++    def post_pre(
++        self,
++        x,
++        residual,
++        post,
++        comb,
++        fn,
++        scale,
++        base,
++        norm,
++        pre,
++        *,
++        aux_out: torch.Tensor | None = None,
++    ):
++        return self.pre(
++            residual,
++            fn,
++            scale,
++            base,
++            norm,
++            pre,
++            previous_output=x,
++            previous_post=post,
++            previous_comb=comb,
++            aux_out=aux_out,
++        )
++
++    def post(self, x, residual, post, comb):
++        if isinstance(x, RankOrderParts):
++            x = x.packed
++        out = torch.empty_like(residual)
++        _mhc_post(x, residual, post, comb, out)
++        return out
++
++    def post_collapse(
++        self,
++        x,
++        residual,
++        post,
++        comb,
++        pre: torch.Tensor | None = None,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """The standalone ``post`` followed by ``collapse`` with ``pre`` (or the
++        streams' mean when ``pre`` is None), into ``out`` when given, in one launch
++        without materializing the ``[tokens, MULT, hidden]`` stream buffer."""
++        if isinstance(x, RankOrderParts):
++            x = x.packed
++        tokens, device = int(residual.shape[0]), residual.device
++        if pre is None:
++            pre = _constant_mixes(tokens, device)[1]
++        if out is None:
++            out = torch.empty(
++                (tokens, self.hidden_size),
++                dtype=residual.dtype,
++                device=device,
++            )
++        _mhc_post_collapse(x, residual, post, comb, pre, out)
++        return out
++
++    def post_collapse_norm(
++        self,
++        x,
++        residual,
++        post,
++        comb,
++        pre: torch.Tensor | None,
++        weight: torch.Tensor,
++        eps: float | None = None,
++        *,
++        columns: torch.Tensor | None = None,
++        column: int = -1,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """The standalone ``post`` followed by ``collapse`` (with optional sink
++        detector ``column`` extraction) and ``RMSNorm`` with ``weight`` in one launch."""
++        if isinstance(x, RankOrderParts):
++            x = x.packed
++        tokens, device = int(residual.shape[0]), residual.device
++        if pre is None:
++            pre = _constant_mixes(tokens, device)[1]
++        if out is None:
++            out = torch.empty(
++                (tokens, self.hidden_size),
++                dtype=residual.dtype,
++                device=device,
++            )
++        norm_eps = self.rms_eps if eps is None else eps
++        _mhc_post_collapse_norm(
++            x,
++            residual,
++            post,
++            comb,
++            pre,
++            weight,
++            norm_eps,
++            out,
++            columns=columns,
++            column=column,
++        )
++        return out
++
++    @staticmethod
++    def cast_rows(rows: torch.Tensor) -> MXFP8Rows:
++        """The MXFP8 cast of rows regrouped from an entry's ``y`` (a CED boundary's
++        compact rows, prefill SP's gathered rows), for the projections that read it."""
++        return cast_mxfp8(rows)
++
++    def collapse(
++        self,
++        state: torch.Tensor,
++        pre: torch.Tensor | None = None,
++        columns: torch.Tensor | None = None,
++        column: int = -1,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """The streams' weighted sum with ``pre``, or their mean, into ``out``
++        (contiguous [tokens, hidden]) when given; with ``columns`` ([tokens, MULT]
++        FP32), also each stream's ``column``, in the same launch."""
++        if pre is None:
++            pre = _constant_mixes(int(state.shape[0]), state.device)[1]
++        if out is None:
++            out = torch.empty(
++                (state.shape[0], state.shape[-1]),
++                dtype=state.dtype,
++                device=state.device,
++            )
++        if columns is None:
++            _mhc_collapse(state, pre, out)
++        else:
++            _mhc_collapse_column(state, pre, out, columns, column)
++        return out
++
++    @classmethod
++    def collapse_column_calls(
++        cls, hidden: int, column: int, rms_eps: float | None = None
++    ) -> list:
++        """The declared calls of ``collapse`` and ``post_collapse_norm`` with
++        ``columns`` for ``column``."""
++        calls = [_collapse_call(hidden, column)]
++        if rms_eps is not None:
++            calls.extend(
++                _post_collapse_norm_call(hidden, rms_eps, w, column)
++                for w in cls._post_worlds()
++            )
++        return calls
++
++
++__all__ = [
++    "TileKernelsMHC",
++    "async_sinkhorn",
++    "wait_sinkhorn",
++    "collapse_streams",
++    "finalize",
++    "post_collapse_norm_streams",
++    "post_collapse_streams",
++    "post_streams",
++    "project_streams",
++]

@@ -1,0 +1,3392 @@
+From b80f8842810b003ff27e0ec3e8ae7c47b64b7fd1 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:43:00 +0000
+Subject: [PATCH] loader: add direct-IO packed checkpoint loader and weightless
+ mode
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+Rationale: Add the O_DIRECT / io_uring direct checkpoint loader, shard staging, weight transfer hooks, and weightless test loader for low-memory unified-memory loading on DGX Spark.
+Quality impact: none (tree-identical squash of qualified candidate-77 vLLM tree 58f9b11080cf8ebeccd80c0ce1d9bb7a6ff4ae58).
+Tests: candidate-77 release-tests (12,082 passed, 0 failed) and 2-boot tp3-triangle screen.
+Upstream status: local squashed subsystem patch (tree-identical to candidate-77 0001..0871).
+---
+ vllm/model_executor/model_loader/__init__.py  |    9 +-
+ .../model_loader/base_loader.py               |   65 +-
+ .../model_loader/direct_io/__init__.py        |   33 +
+ .../model_loader/direct_io/_batch.c           |  263 ++++
+ .../model_loader/direct_io/_bounce.c          |  327 +++++
+ .../model_loader/direct_io/_checkpoint.py     |  556 ++++++++
+ .../model_loader/direct_io/_cuda_range.h      |   62 +
+ .../model_loader/direct_io/_direct.c          |  131 ++
+ .../model_loader/direct_io/_native.py         |  181 +++
+ .../model_loader/direct_io/_storage.c         |  110 ++
+ .../model_loader/direct_loader.py             | 1166 +++++++++++++++++
+ .../model_loader/dummy_loader.py              |   25 +
+ vllm/model_executor/model_loader/utils.py     |   34 +-
+ .../model_loader/weight_digest.py             |   74 ++
+ .../model_loader/weight_utils.py              |    8 +-
+ vllm/model_executor/weight_transfer.py        |   14 +
+ vllm/weightless.py                            |  105 ++
+ 17 files changed, 3128 insertions(+), 35 deletions(-)
+ create mode 100644 vllm/model_executor/model_loader/direct_io/__init__.py
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_batch.c
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_bounce.c
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_checkpoint.py
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_cuda_range.h
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_direct.c
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_native.py
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_storage.c
+ create mode 100644 vllm/model_executor/model_loader/direct_loader.py
+ create mode 100644 vllm/model_executor/model_loader/weight_digest.py
+ create mode 100644 vllm/weightless.py
+
+diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
+index 631945e204a4a94c45a7f08e4e02adb359b531c1..245d0757c716066e1f518329983528ed6598fce8 100644
+--- a/vllm/model_executor/model_loader/__init__.py
++++ b/vllm/model_executor/model_loader/__init__.py
+@@ -10,6 +10,7 @@ from vllm.config.load import LoadConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++from vllm.model_executor.model_loader.direct_loader import DirectModelLoader
+ from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+ from vllm.model_executor.model_loader.modelexpress_loader import (
+     ModelExpressModelLoader,
+@@ -33,7 +34,7 @@ logger = init_logger(__name__)
+ # if a new load format is added here
+ LoadFormats = Literal[
+     "auto",
+-    "b12x",
++    "direct",
+     "hf",
+     "dummy",
+     "fastsafetensors",
+@@ -52,6 +53,7 @@ LoadFormats = Literal[
+ ]
+ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
+     "auto": DefaultModelLoader,
++    "direct": DirectModelLoader,
+     "hf": DefaultModelLoader,
+     "dummy": DummyModelLoader,
+     "fastsafetensors": DefaultModelLoader,
+@@ -126,10 +128,6 @@ def register_model_loader(load_format: str):
+ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+     """Get a model loader based on the load format."""
+     load_format = load_config.load_format
+-    if load_format == "b12x" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+-        from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+-
+-        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = B12xModelLoader
+     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+         raise ValueError(f"Load format `{load_format}` is not supported")
+     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
+@@ -160,6 +158,7 @@ __all__ = [
+     "BaseModelLoader",
+     "ModelExpressModelLoader",
+     "DefaultModelLoader",
++    "DirectModelLoader",
+     "DummyModelLoader",
+     "IpcModelLoader",
+     "RunaiModelStreamerLoader",
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 5b4a3d9618015a474748367fd48098d33a831306..89a4eda84813a749940bd34b3feaa20e4dc7d402 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -9,6 +9,7 @@ import vllm.envs as envs
+ from vllm.config import ModelConfig, VllmConfig
+ from vllm.config.load import LoadConfig
+ from vllm.logger import init_logger
++from vllm.model_executor.model_loader import weight_digest
+ from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+ from vllm.model_executor.model_loader.utils import (
+     initialize_model,
+@@ -63,32 +64,48 @@ class BaseModelLoader(ABC):
+             device_config.device if load_config.device is None else load_config.device
+         )
+         target_device = torch.device(load_device)
+-        with set_default_torch_dtype(model_config.dtype):
+-            with target_device:
+-                model = self.create_model(
+-                    vllm_config=vllm_config,
+-                    model_config=model_config,
+-                    prefix=prefix,
++        model: nn.Module | None = None
++        load_ok = False
++        try:
++            with set_default_torch_dtype(model_config.dtype):
++                with target_device:
++                    model = self.create_model(
++                        vllm_config=vllm_config,
++                        model_config=model_config,
++                        prefix=prefix,
++                    )
++
++                logger.debug("Loading weights on %s ...", load_device)
++                self.load_weights(model, model_config)
++                if weight_digest.ENABLED:
++                    # The loader's bytes, before processing turns them into kernel layouts.
++                    weight_digest.log_weight_digest(model)
++
++                # Log peak GPU memory after loading weights. This is needed
++                # to have test coverage on peak memory for online quantization.
++                if current_platform.is_cuda_alike() or current_platform.is_xpu():
++                    peak_memory = torch.accelerator.max_memory_allocated()
++                    logger.debug_once(
++                        "Peak GPU memory after loading weights: %s GiB",
++                        format_gib(peak_memory),
++                    )
++
++                # Process weights into kernel format. Note that when using online
++                # quantization, weights are (typically) quantized as they are loaded.
++                if _has_online_quant(model):
++                    finalize_layerwise_processing(model, model_config)
++
++                process_weights_after_loading(model, model_config, target_device)
++                load_ok = True
++        finally:
++            if model is not None and hasattr(model, "_direct_buddy_sponge"):
++                from vllm.model_executor.model_loader.direct_loader import (
++                    defer_weight_arena_sponge_release,
++                    release_weight_arena_sponge,
+                 )
+ 
+-            logger.debug("Loading weights on %s ...", load_device)
+-            self.load_weights(model, model_config)
+-
+-            # Log peak GPU memory after loading weights. This is needed
+-            # to have test coverage on peak memory for online quantization.
+-            if current_platform.is_cuda_alike() or current_platform.is_xpu():
+-                peak_memory = torch.accelerator.max_memory_allocated()
+-                logger.debug_once(
+-                    "Peak GPU memory after loading weights: %s GiB",
+-                    format_gib(peak_memory),
+-                )
+-
+-            # Process weights into kernel format. Note that when using online
+-            # quantization, weights are (typically) quantized as they are loaded.
+-            if _has_online_quant(model):
+-                finalize_layerwise_processing(model, model_config)
+-
+-            process_weights_after_loading(model, model_config, target_device)
++                if not load_ok or not defer_weight_arena_sponge_release(model):
++                    release_weight_arena_sponge(model, target_device)
+ 
+         return model.eval()
+ 
+diff --git a/vllm/model_executor/model_loader/direct_io/__init__.py b/vllm/model_executor/model_loader/direct_io/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..da5727a3608a837ac97fba6c5350f0defe7c9ff9
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/__init__.py
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""O_DIRECT checkpoint reads into ordinary CUDA tensors, for ``--load-format direct``
++(``direct_loader``). Importing this package neither initializes CUDA nor builds the
++native helper."""
++
++import operator
++
++from vllm.model_executor.model_loader.direct_io._checkpoint import (
++    DirectWeightSession,
++    TensorRange,
++    scratch_chunks,
++    view_offset,
++    view_records,
++)
++
++
++def capabilities(device: int = 0) -> dict[str, int]:
++    """The CUDA device attributes that decide whether the direct loader can run on
++    ``device`` (``cudaDeviceGetAttribute``)."""
++    from vllm.model_executor.model_loader.direct_io._native import load
++
++    return load().capabilities(operator.index(device))
++
++
++__all__ = [
++    "DirectWeightSession",
++    "TensorRange",
++    "capabilities",
++    "scratch_chunks",
++    "view_offset",
++    "view_records",
++]
+diff --git a/vllm/model_executor/model_loader/direct_io/_batch.c b/vllm/model_executor/model_loader/direct_io/_batch.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..37df00c5183c0f18e518e21c78eadd7ce36339a0
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_batch.c
+@@ -0,0 +1,263 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * Read descriptors into CUDA destinations: validated, split into jobs of at
++ * most 64 MiB, checked for overlapping destinations, ordered by source and run
++ * through the bounce ring (_bounce.c). Descriptor destinations are ordinary
++ * CUDA tensors retained by Python. Included by _storage.c.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_batch.c at 236ddff04a5f
++ * (Apache-2.0). Changed: the capsule is direct_io.batch_executor.
++ */
++#include <limits.h>
++#include <time.h>
++#include "_cuda_range.h"
++
++#define BATCH_CHUNK_BYTES (64 << 20)
++typedef struct {
++    int fd;
++    int64_t offset, bytes;
++    char *destination;
++    bool expand_bf16;
++    bool host_copy;
++    int64_t rows, source_stride, destination_stride;
++} read_job_t;
++
++#include "_bounce.c"
++
++typedef struct {
++    pthread_mutex_t mutex;
++    bounce_ring_t *bounce;
++    int device;
++    uint64_t batches, descriptors;
++    double execution_seconds;
++} batch_executor_t;
++
++static void delete_batch(PyObject *capsule) {
++    batch_executor_t *executor = PyCapsule_GetPointer(capsule, "direct_io.batch_executor");
++    if (!executor) return;
++    bounce_release(executor->bounce);
++    pthread_mutex_destroy(&executor->mutex);
++    free(executor);
++}
++
++static PyObject *py_batch_executor(PyObject *self, PyObject *args) {
++    (void)self;
++    int device, workers;
++    if (!PyArg_ParseTuple(args, "ii", &device, &workers)) return NULL;
++    if (workers < 1 || workers > 16)
++        return PyErr_Format(PyExc_ValueError, "io_threads must be between 1 and 16");
++    batch_executor_t *executor = calloc(1, sizeof(*executor));
++    if (!executor) return PyErr_NoMemory();
++    executor->device = device;
++    pthread_mutex_init(&executor->mutex, NULL);
++    failure_t failure = {{0}};
++    executor->bounce = bounce_create(device, (unsigned)workers, &failure);
++    if (!executor->bounce) {
++        pthread_mutex_destroy(&executor->mutex);
++        free(executor);
++        return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    }
++    PyObject *capsule = PyCapsule_New(executor, "direct_io.batch_executor", delete_batch);
++    if (!capsule) {
++        bounce_release(executor->bounce);
++        pthread_mutex_destroy(&executor->mutex);
++        free(executor);
++    }
++    return capsule;
++}
++
++static uintptr_t job_end(const read_job_t *job) {
++    return (uintptr_t)job->destination +
++           (uint64_t)job->bytes * (1 + job->expand_bf16) +
++           (uint64_t)(job->rows - 1) * (uint64_t)job->destination_stride;
++}
++
++static int job_destination_order(const void *a, const void *b) {
++    const read_job_t *ja = a, *jb = b;
++    uintptr_t x = (uintptr_t)ja->destination;
++    uintptr_t y = (uintptr_t)jb->destination;
++    if (x != y) return (x > y) - (x < y);
++    uintptr_t ex = job_end(ja);
++    uintptr_t ey = job_end(jb);
++    return (ex > ey) - (ex < ey);
++}
++
++static bool jobs_overlap(const read_job_t *a, const read_job_t *b) {
++    uintptr_t start_a = (uintptr_t)a->destination;
++    uintptr_t start_b = (uintptr_t)b->destination;
++    uintptr_t end_a = job_end(a);
++    if (end_a <= start_b) return false;
++    uint64_t width_a = (uint64_t)a->bytes * (1 + a->expand_bf16);
++    uint64_t stride_a = (uint64_t)a->destination_stride;
++    if (a->rows == 1 || stride_a <= width_a) return true;
++    uint64_t width_b = (uint64_t)b->bytes * (1 + b->expand_bf16);
++    uint64_t stride_b = (uint64_t)b->destination_stride;
++    if (b->rows == 1 || stride_b == stride_a) {
++        uint64_t rem = (start_b - start_a) % stride_a;
++        return rem < width_a || rem + width_b > stride_a;
++    }
++    for (int64_t row = 0; row < b->rows; row++) {
++        uintptr_t pos = start_b + (uint64_t)row * stride_b;
++        if (pos >= end_a) break;
++        uint64_t rem = (pos - start_a) % stride_a;
++        if (rem < width_a || rem + width_b > stride_a) return true;
++    }
++    return false;
++}
++
++static int job_source_order(const void *a, const void *b) {
++    const read_job_t *x = a, *y = b;
++    if (x->fd != y->fd) return (x->fd > y->fd) - (x->fd < y->fd);
++    return (x->offset > y->offset) - (x->offset < y->offset);
++}
++
++static PyObject *py_batch_execute(PyObject *self, PyObject *args) {
++    (void)self;
++    PyObject *capsule;
++    Py_buffer records;
++    unsigned long long stream;
++    if (!PyArg_ParseTuple(args, "Oy*K", &capsule, &records, &stream)) return NULL;
++    batch_executor_t *executor = PyCapsule_GetPointer(capsule, "direct_io.batch_executor");
++    if (!executor) { PyBuffer_Release(&records); return NULL; }
++    failure_t failure = {{0}};
++    read_job_t *jobs = NULL;
++    size_t count = 0, capacity = 0;
++    if (records.len % (8 * sizeof(uint64_t))) {
++        snprintf(failure.message, sizeof(failure.message), "invalid read descriptor byte size");
++        goto done;
++    }
++    size_t descriptors = records.len / (8 * sizeof(uint64_t));
++    for (size_t i = 0; i < descriptors; i++) {
++        uint64_t record[8];
++        memcpy(record, (char *)records.buf + i * sizeof(record), sizeof(record));
++        uint64_t fd = record[0], offset = record[1], bytes = record[2];
++        uint64_t pointer = record[3], transform = record[4];
++        uint64_t rows = record[5], source_stride = record[6], destination_stride = record[7];
++        bool expand_bf16 = transform == 1;
++        if (fd > INT_MAX || transform > 2 || offset > INT64_MAX ||
++            bytes > (uint64_t)INT64_MAX - offset ||
++            (expand_bf16 && (bytes % 2 || bytes > INT64_MAX / 2)) ||
++            (transform == 2 && ((!offset && bytes) || rows != 1)) || !rows || rows > INT64_MAX ||
++            source_stride > INT64_MAX || destination_stride > INT64_MAX ||
++            (source_stride && rows - 1 > ((uint64_t)INT64_MAX - offset - bytes) / source_stride) ||
++            (destination_stride && rows - 1 > ((uint64_t)INT64_MAX - bytes * (1 + expand_bf16)) / destination_stride)) {
++            snprintf(failure.message, sizeof(failure.message), "invalid read descriptor");
++            goto done;
++        }
++        if (rows > 1 && destination_stride < bytes * (1 + expand_bf16)) {
++            snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
++            goto done;
++        }
++        uint64_t extent = (rows - 1) * destination_stride + bytes * (1 + expand_bf16);
++        if (!device_range(pointer, extent, executor->device)) {
++            snprintf(failure.message, sizeof(failure.message), "batch destination exceeds CUDA device allocation");
++            goto done;
++        }
++        char *destination = (char *)(uintptr_t)pointer;
++        while (rows && bytes) {
++            if (count == capacity) {
++                size_t next = capacity ? capacity * 2 : 1024;
++                read_job_t *grown = realloc(jobs, next * sizeof(*jobs));
++                if (!grown) { snprintf(failure.message, sizeof(failure.message), "read descriptor allocation failed"); goto done; }
++                jobs = grown;
++                capacity = next;
++            }
++            int64_t chunk = bytes > BATCH_CHUNK_BYTES ? BATCH_CHUNK_BYTES : (int64_t)bytes;
++            uint64_t row_bytes = bytes * (1 + expand_bf16);
++            uint64_t chunk_rows = 1;
++            if (bytes <= BATCH_CHUNK_BYTES && source_stride >= bytes &&
++                destination_stride >= row_bytes) {
++                uint64_t stride = source_stride > destination_stride ? source_stride : destination_stride;
++                chunk_rows = stride ? BATCH_CHUNK_BYTES / stride : 1;
++                if (!chunk_rows) chunk_rows = 1;
++                if (chunk_rows > rows) chunk_rows = rows;
++            }
++            jobs[count++] = (read_job_t){(int)fd, (int64_t)offset, chunk, destination,
++                expand_bf16, transform == 2, (int64_t)chunk_rows,
++                (int64_t)source_stride, (int64_t)destination_stride};
++            if (chunk < (int64_t)bytes) {
++                /* Large contiguous rows can still be divided into independent jobs. */
++                if (rows != 1) {
++                    snprintf(failure.message, sizeof(failure.message), "strided rows exceed batch chunk size");
++                    goto done;
++                }
++                offset += chunk;
++                bytes -= chunk;
++                destination += chunk * (1 + expand_bf16);
++            } else {
++                rows -= chunk_rows;
++                if (rows) {
++                    offset += chunk_rows * source_stride;
++                    destination += chunk_rows * destination_stride;
++                }
++            }
++        }
++    }
++    qsort(jobs, count, sizeof(*jobs), job_destination_order);
++    size_t active_start = 0;
++    uintptr_t max_end = count ? job_end(&jobs[0]) : 0;
++    for (size_t i = 1; i < count; i++) {
++        uintptr_t start_i = (uintptr_t)jobs[i].destination;
++        uintptr_t end_i = job_end(&jobs[i]);
++        if (start_i >= max_end) {
++            active_start = i;
++            max_end = end_i;
++            continue;
++        }
++        while (active_start < i && job_end(&jobs[active_start]) <= start_i)
++            active_start++;
++        for (size_t k = active_start; k < i; k++) {
++            if (jobs_overlap(&jobs[k], &jobs[i])) {
++                snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
++                goto done;
++            }
++        }
++        if (end_i > max_end) max_end = end_i;
++    }
++    qsort(jobs, count, sizeof(*jobs), job_source_order);
++    Py_BEGIN_ALLOW_THREADS
++    pthread_mutex_lock(&executor->mutex);
++    if (cuda_ok(cudaSetDevice(executor->device), "select batch device", &failure) &&
++        cuda_ok(cudaStreamSynchronize((cudaStream_t)(uintptr_t)stream),
++                "synchronize batch destinations", &failure)) {
++        struct timespec start, stop;
++        clock_gettime(CLOCK_MONOTONIC, &start);
++        bounce_execute(executor->bounce, jobs, count, &failure);
++        clock_gettime(CLOCK_MONOTONIC, &stop);
++        executor->execution_seconds += stop.tv_sec - start.tv_sec +
++                                       (stop.tv_nsec - start.tv_nsec) * 1e-9;
++        executor->batches++;
++        executor->descriptors += descriptors;
++    }
++    pthread_mutex_unlock(&executor->mutex);
++    Py_END_ALLOW_THREADS
++done:
++    free(jobs);
++    PyBuffer_Release(&records);
++    if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    Py_RETURN_NONE;
++}
++
++static PyObject *py_batch_stats(PyObject *self, PyObject *capsule) {
++    (void)self;
++    batch_executor_t *executor = PyCapsule_GetPointer(capsule, "direct_io.batch_executor");
++    if (!executor) return NULL;
++    pthread_mutex_lock(&executor->mutex);
++    bounce_ring_t *ring = executor->bounce;
++    PyObject *result = Py_BuildValue("{s:K,s:K,s:K,s:i,s:K,s:K,s:d,s:i,s:K,s:K,s:I}",
++        "physical_bytes", (unsigned long long)ring->physical_bytes,
++        "strided_copy_bytes", (unsigned long long)ring->strided_bytes,
++        "reads", (unsigned long long)ring->reads,
++        "scratch_bytes", BOUNCE_BYTES,
++        "batches", (unsigned long long)executor->batches,
++        "descriptors", (unsigned long long)executor->descriptors,
++        "execution_seconds", executor->execution_seconds,
++        "bounce_buffer_bytes", BOUNCE_BYTES,
++        "bounced_bytes", (unsigned long long)ring->bounced_bytes,
++        "io_uring_submits", (unsigned long long)ring->submits,
++        "max_inflight_reads", ring->max_inflight);
++    pthread_mutex_unlock(&executor->mutex);
++    return result;
++}
+diff --git a/vllm/model_executor/model_loader/direct_io/_bounce.c b/vllm/model_executor/model_loader/direct_io/_bounce.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..da9a242574a4398508339be4af216300e2a31803
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_bounce.c
+@@ -0,0 +1,327 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * The bounce ring: io_uring O_DIRECT reads into 16 registered 1 MiB host slots, and
++ * a copier thread that copies each read slot into its CUDA destination with
++ * cudaMemcpy2DAsync (strided rows as one 2-D copy, BF16 expanded to FP32 in the
++ * slot first) while reads into the other slots stay in flight. Fixed read slots stay
++ * owned until their CUDA copy finishes. Included by _batch.c.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_bounce.c at 236ddff04a5f
++ * (Apache-2.0). Changed: liburing is required (_native.py refuses to build
++ * without it), so the builds without io_uring support are gone.
++ */
++#define BOUNCE_SLOTS 16
++#define BOUNCE_SLOT_BYTES (1 << 20)
++#define BOUNCE_BYTES (BOUNCE_SLOTS * BOUNCE_SLOT_BYTES)
++#include <liburing.h>
++
++typedef struct {
++    read_job_t job;
++    size_t delta, required;
++} bounce_slot_t;
++
++typedef struct {
++    char *buffers;
++    int device;
++    cudaStream_t stream;
++    bool registered;
++    failure_t copy_failure;
++    bounce_slot_t slots[BOUNCE_SLOTS];
++    pthread_mutex_t mutex;
++    pthread_cond_t ready, available, drained;
++    pthread_t copier;
++    bool copier_started, stopping, poisoned;
++    unsigned free_slots[BOUNCE_SLOTS], free_count;
++    unsigned ready_slots[BOUNCE_SLOTS], head, tail, ready_count, copying;
++    unsigned depth, max_inflight;
++    uint64_t reads, physical_bytes, bounced_bytes, strided_bytes, submits;
++    struct io_uring ring;
++    bool ring_ready;
++} bounce_ring_t;
++
++static void bounce_release(bounce_ring_t *ring) {
++    if (!ring) return;
++    if (ring->copier_started) {
++        pthread_mutex_lock(&ring->mutex);
++        ring->stopping = true;
++        pthread_cond_signal(&ring->ready);
++        pthread_mutex_unlock(&ring->mutex);
++        pthread_join(ring->copier, NULL);
++    }
++    if (ring->ring_ready) io_uring_queue_exit(&ring->ring);
++    int previous = ring->device;
++    cudaGetDevice(&previous);
++    cudaSetDevice(ring->device);
++    if (ring->stream) { cudaStreamSynchronize(ring->stream); cudaStreamDestroy(ring->stream); }
++    if (ring->registered) cudaHostUnregister(ring->buffers);
++    free(ring->buffers);
++    cudaSetDevice(previous);
++    pthread_cond_destroy(&ring->ready);
++    pthread_cond_destroy(&ring->available);
++    pthread_cond_destroy(&ring->drained);
++    pthread_mutex_destroy(&ring->mutex);
++    free(ring);
++}
++
++static void expand_bf16_inplace(char *destination, int64_t bytes) {
++    for (int64_t i = bytes / 2; i > 0;) {
++        --i;
++        uint16_t bf16;
++        memcpy(&bf16, destination + 2 * i, sizeof(bf16));
++        uint32_t fp32 = (uint32_t)bf16 << 16;
++        memcpy(destination + 4 * i, &fp32, sizeof(fp32));
++    }
++}
++
++static void *bounce_copy_worker(void *opaque) {
++    bounce_ring_t *ring = opaque;
++    failure_t failure = {{0}};
++    cuda_ok(cudaSetDevice(ring->device), "select ring copy device", &failure);
++    pthread_mutex_lock(&ring->mutex);
++    for (;;) {
++        while (!ring->ready_count && !ring->stopping)
++            pthread_cond_wait(&ring->ready, &ring->mutex);
++        if (!ring->ready_count) break;
++        unsigned batch_indices[BOUNCE_SLOTS];
++        bounce_slot_t batch_slots[BOUNCE_SLOTS];
++        unsigned batch_count = 0;
++        while (ring->ready_count && batch_count < BOUNCE_SLOTS) {
++            unsigned index = ring->ready_slots[ring->head++ % BOUNCE_SLOTS];
++            ring->ready_count--;
++            batch_indices[batch_count] = index;
++            batch_slots[batch_count] = ring->slots[index];
++            batch_count++;
++        }
++        pthread_mutex_unlock(&ring->mutex);
++        uint64_t bounced = 0, strided = 0;
++        for (unsigned b = 0; b < batch_count; b++) {
++            unsigned index = batch_indices[b];
++            bounce_slot_t slot = batch_slots[b];
++            char *buffer = ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES;
++            char *source = buffer + slot.delta;
++            size_t width = slot.job.bytes;
++            size_t pitch = slot.job.rows > 1 ? (size_t)slot.job.source_stride : width;
++            if (slot.job.expand_bf16) {
++                for (int64_t row = 0; row < slot.job.rows; row++)
++                    memmove(buffer + row * width, source + row * pitch, width);
++                expand_bf16_inplace(buffer, slot.job.rows * width);
++                source = buffer;
++                width *= 2;
++                pitch = width;
++            }
++            if (!failure.message[0])
++                cuda_ok(cudaMemcpy2DAsync(slot.job.destination,
++                    slot.job.rows > 1 ? (size_t)slot.job.destination_stride : width,
++                    source, pitch, width, slot.job.rows, cudaMemcpyHostToDevice,
++                    ring->stream), "copy checkpoint ring to CUDA weights", &failure);
++            bounced += slot.job.rows * slot.job.bytes;
++            if (slot.job.rows > 1) strided += slot.job.rows * slot.job.bytes;
++        }
++        /* Reads into other slots remain in flight while this batch is on the GPU. */
++        cuda_ok(cudaStreamSynchronize(ring->stream), "complete checkpoint ring copy", &failure);
++        pthread_mutex_lock(&ring->mutex);
++        if (failure.message[0]) ring->copy_failure = failure;
++        ring->bounced_bytes += bounced;
++        ring->strided_bytes += strided;
++        for (unsigned b = 0; b < batch_count; b++)
++            ring->free_slots[ring->free_count++] = batch_indices[b];
++        ring->copying -= batch_count;
++        pthread_cond_signal(&ring->available);
++        if (!ring->copying) pthread_cond_signal(&ring->drained);
++    }
++    pthread_mutex_unlock(&ring->mutex);
++    return NULL;
++}
++
++static bounce_ring_t *bounce_create(int device, unsigned depth, failure_t *failure) {
++    bounce_ring_t *ring = calloc(1, sizeof(*ring));
++    if (!ring) { snprintf(failure->message, sizeof(failure->message), "bounce ring allocation failed"); return NULL; }
++    pthread_mutex_init(&ring->mutex, NULL);
++    pthread_cond_init(&ring->ready, NULL);
++    pthread_cond_init(&ring->available, NULL);
++    pthread_cond_init(&ring->drained, NULL);
++    ring->device = device;
++    ring->depth = depth;
++    int error = posix_memalign((void **)&ring->buffers, IO_ALIGNMENT, BOUNCE_BYTES);
++    if (error) goto failed;
++    if (!cuda_ok(cudaSetDevice(device), "select ring device", failure) ||
++        !cuda_ok(cudaHostRegister(ring->buffers, BOUNCE_BYTES, cudaHostRegisterDefault),
++                 "pin checkpoint ring for CUDA copies", failure)) goto failed;
++    ring->registered = true;
++    if (!cuda_ok(cudaStreamCreateWithFlags(&ring->stream, cudaStreamNonBlocking),
++                 "create checkpoint copy stream", failure)) goto failed;
++    error = io_uring_queue_init(BOUNCE_SLOTS, &ring->ring, 0);
++    if (error < 0) { error = -error; goto failed; }
++    ring->ring_ready = true;
++    struct iovec buffers[BOUNCE_SLOTS];
++    for (unsigned i = 0; i < BOUNCE_SLOTS; i++) {
++        buffers[i] = (struct iovec){ring->buffers + (size_t)i * BOUNCE_SLOT_BYTES, BOUNCE_SLOT_BYTES};
++        ring->free_slots[ring->free_count++] = i;
++    }
++    error = io_uring_register_buffers(&ring->ring, buffers, BOUNCE_SLOTS);
++    if (error < 0) { error = -error; goto failed; }
++    error = pthread_create(&ring->copier, NULL, bounce_copy_worker, ring);
++    if (error) goto failed;
++    ring->copier_started = true;
++    return ring;
++failed:
++    if (!failure->message[0]) snprintf(failure->message, sizeof(failure->message),
++             "io_uring bounce initialization failed: %s; check liburing, kernel/container policy and locked-memory limits",
++             strerror(error));
++    bounce_release(ring);
++    return NULL;
++}
++
++static bool bounce_execute(bounce_ring_t *ring, read_job_t *jobs, size_t count,
++                            failure_t *failure) {
++    if (ring->poisoned) {
++        snprintf(failure->message, sizeof(failure->message), "io_uring bounce executor is unusable after a submission/completion failure");
++        return false;
++    }
++    for (size_t i = 0; i < count;) {
++        read_job_t *job = &jobs[i];
++        if (job->host_copy) { i++; continue; }
++        int fd = job->fd;
++        int64_t max_end = 0;
++        size_t j = i;
++        while (j < count && (jobs[j].host_copy || jobs[j].fd == fd)) {
++            if (!jobs[j].host_copy) {
++                int64_t span = (jobs[j].rows - 1) * jobs[j].source_stride + jobs[j].bytes;
++                if (jobs[j].offset < 0 || span < 0 || jobs[j].offset > INT64_MAX - span) {
++                    if (!validate_direct_range(fd, jobs[j].offset, span, failure)) return false;
++                }
++                int64_t end = jobs[j].offset + span;
++                if (end > max_end) max_end = end;
++            }
++            j++;
++        }
++        if (!validate_direct_range(fd, 0, max_end, failure)) return false;
++        i = j;
++    }
++    size_t next = 0;
++    int64_t row = 0, within = 0;
++    unsigned outstanding = 0;
++    while ((!failure->message[0] && next < count) || outstanding) {
++        unsigned pending = 0;
++        while (!failure->message[0] && next < count && outstanding + pending < ring->depth) {
++            read_job_t *job = &jobs[next];
++            if (job->host_copy) {
++                cuda_ok(cudaMemcpyAsync(job->destination, (void *)(uintptr_t)job->offset,
++                    job->bytes, cudaMemcpyHostToDevice, ring->stream),
++                    "copy checkpoint metadata", failure);
++                next++;
++                continue;
++            }
++            pthread_mutex_lock(&ring->mutex);
++            if (ring->copy_failure.message[0]) {
++                *failure = ring->copy_failure;
++                pthread_mutex_unlock(&ring->mutex);
++                break;
++            }
++            if (!ring->free_count) { pthread_mutex_unlock(&ring->mutex); break; }
++            unsigned index = ring->free_slots[--ring->free_count];
++            pthread_mutex_unlock(&ring->mutex);
++            bounce_slot_t *slot = &ring->slots[index];
++            slot->job = *job;
++            int64_t offset = job->offset + row * job->source_stride + within;
++            int64_t aligned = offset & ~(int64_t)(IO_ALIGNMENT - 1);
++            slot->delta = offset - aligned;
++            slot->job.destination += row * job->destination_stride + within * (1 + job->expand_bf16);
++            slot->job.bytes = job->bytes - within;
++            if (slot->job.bytes > BOUNCE_SLOT_BYTES - (int64_t)slot->delta)
++                slot->job.bytes = BOUNCE_SLOT_BYTES - slot->delta;
++            if (job->expand_bf16) {
++                if (slot->job.bytes > BOUNCE_SLOT_BYTES / 2)
++                    slot->job.bytes = BOUNCE_SLOT_BYTES / 2;
++                slot->job.bytes &= ~(int64_t)1;
++            }
++            slot->job.rows = 1;
++            if (!within && job->source_stride >= job->bytes &&
++                (job->bytes < IO_ALIGNMENT || job->source_stride - job->bytes < IO_ALIGNMENT) &&
++                job->bytes <= BOUNCE_SLOT_BYTES - (int64_t)slot->delta &&
++                (!job->expand_bf16 || job->bytes <= BOUNCE_SLOT_BYTES / 2)) {
++                slot->job.rows += (BOUNCE_SLOT_BYTES - (int64_t)slot->delta - job->bytes) / job->source_stride;
++                if (slot->job.rows > job->rows - row) slot->job.rows = job->rows - row;
++            }
++            if (job->expand_bf16 && slot->job.rows > BOUNCE_SLOT_BYTES / (2 * slot->job.bytes))
++                slot->job.rows = BOUNCE_SLOT_BYTES / (2 * slot->job.bytes);
++            slot->required = slot->delta + (slot->job.rows - 1) * job->source_stride + slot->job.bytes;
++            unsigned length = (slot->required + IO_ALIGNMENT - 1) & ~(size_t)(IO_ALIGNMENT - 1);
++            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring->ring);
++            if (!sqe) {
++                snprintf(failure->message, sizeof(failure->message), "io_uring bounce SQ capacity exhausted");
++                ring->poisoned = true;
++                break;
++            }
++            io_uring_prep_read_fixed(sqe, job->fd,
++                ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES, length, aligned, index);
++            io_uring_sqe_set_data64(sqe, index);
++            pending++;
++            within += slot->job.bytes;
++            if (within == job->bytes) { row += slot->job.rows; within = 0; }
++            if (row == job->rows) { next++; row = 0; }
++        }
++        while (pending && !failure->message[0]) {
++            ring->submits++;
++            int submitted = io_uring_submit(&ring->ring);
++            if (submitted == -EINTR) continue;
++            if (submitted <= 0) {
++                snprintf(failure->message, sizeof(failure->message), "io_uring bounce submit: %s", strerror(submitted < 0 ? -submitted : EIO));
++                ring->poisoned = true;
++                break;
++            }
++            outstanding += submitted;
++            pending -= submitted;
++            if (outstanding > ring->max_inflight) ring->max_inflight = outstanding;
++        }
++        if (outstanding) {
++            struct io_uring_cqe *cqe = NULL;
++            int status = io_uring_wait_cqe(&ring->ring, &cqe);
++            if (status < 0) {
++                if (status != -EINTR && status != -EAGAIN) {
++                    if (!failure->message[0]) snprintf(failure->message, sizeof(failure->message), "io_uring bounce wait: %s", strerror(-status));
++                    ring->poisoned = true;
++                }
++                continue;
++            }
++            unsigned index = (unsigned)io_uring_cqe_get_data64(cqe);
++            status = cqe->res;
++            io_uring_cqe_seen(&ring->ring, cqe);
++            outstanding--;
++            ring->reads++;
++            if (status > 0) ring->physical_bytes += status;
++            bool success = status >= 0 && (size_t)status >= ring->slots[index].required;
++            if (!success && !failure->message[0])
++                snprintf(failure->message, sizeof(failure->message), "io_uring bounce read: %s", status < 0 ? strerror(-status) : "short O_DIRECT read");
++            pthread_mutex_lock(&ring->mutex);
++            if (success) {
++                ring->ready_slots[ring->tail++ % BOUNCE_SLOTS] = index;
++                ring->ready_count++;
++                ring->copying++;
++                pthread_cond_signal(&ring->ready);
++            } else ring->free_slots[ring->free_count++] = index;
++            pthread_mutex_unlock(&ring->mutex);
++        } else if (!failure->message[0] && next < count) {
++            pthread_mutex_lock(&ring->mutex);
++            while (!ring->free_count) pthread_cond_wait(&ring->available, &ring->mutex);
++            pthread_mutex_unlock(&ring->mutex);
++        }
++    }
++    pthread_mutex_lock(&ring->mutex);
++    while (ring->copying) pthread_cond_wait(&ring->drained, &ring->mutex);
++    if (ring->copy_failure.message[0]) {
++        if (!failure->message[0]) *failure = ring->copy_failure;
++        ring->poisoned = true;
++    }
++    pthread_mutex_unlock(&ring->mutex);
++    if (!cuda_ok(cudaStreamSynchronize(ring->stream), "complete checkpoint metadata copies", failure))
++        ring->poisoned = true;
++    if (ring->poisoned) {
++        /* Drain submitted reads above; never submit SQEs left by a failed submit. */
++        io_uring_queue_exit(&ring->ring);
++        ring->ring_ready = false;
++    }
++    return !failure->message[0];
++}
+diff --git a/vllm/model_executor/model_loader/direct_io/_checkpoint.py b/vllm/model_executor/model_loader/direct_io/_checkpoint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..26886f3268f61d5b9d5637471ac814368b225b2d
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_checkpoint.py
+@@ -0,0 +1,556 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the b12x project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Safetensors metadata routing with O_DIRECT reads into ordinary CUDA tensors.
++
++The weights iterator yields meta tensors that carry each checkpoint tensor's file
++range. Model weight loaders slice, narrow and view them as they would real tensors and
++hand each copy to the session through vLLM's ``weight_transfer`` hook, which records
++it as descriptors (``view_records``): a file range, a destination pointer, and the
++rows and strides of a strided copy. ``flush`` runs the recorded descriptors through the
++native helper's bounce ring (``_bounce.c``): O_DIRECT reads into registered host slots,
++each copied into its destination by the copy engine. No payload is memory-mapped or
++read through the page cache, and no kernel runs.
++
++Plain copies, strided slices (tensor-parallel shards) and BF16 to FP32 expansion (done
++by the CPU in the ring slot) are recorded. A view the descriptors cannot express fails
++closed. Another dtype conversion of a contiguous tensor reads it through an 8 MiB GPU
++scratch and converts it with Torch (``scratch_chunks``). Scalars and declared metadata
++are read with O_DIRECT into CPU tensors, and a copy from a CPU tensor whose layout
++matches its destination is queued as a host copy. The session declines every other
++copy from a real tensor, and the copy goes to Torch.
++
++Ported from local-inference-lab/b12x b12x/loader/_checkpoint.py at 236ddff04a5f
++(Apache-2.0). Changed: only the bounce ring is kept (no GDS transport, shared read
++group or progress callbacks), and the descriptor planning is in functions of its own
++so it can be checked without a GPU.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import os
++from array import array
++from dataclasses import dataclass
++from itertools import product
++from pathlib import Path
++
++from vllm.model_executor.model_loader.direct_io._native import load
++
++# A descriptor is eight unsigned 64-bit words, as _batch.c reads them: (fd, offset,
++# bytes, destination, transform, rows, source stride, destination stride). Transform
++# READ copies `rows` rows of `bytes` from the file, EXPAND_BF16 also expands each BF16
++# value to FP32 (destination rows twice as wide), and HOST_COPY copies `bytes` from the
++# host address `offset` (fd 0, one row).
++READ, EXPAND_BF16, HOST_COPY = 0, 1, 2
++SCRATCH_BYTES = 8 << 20
++
++
++def _unique_object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError(f"duplicate safetensors key: {key}")
++        result[key] = value
++    return result
++
++
++@dataclass(frozen=True)
++class TensorRange:
++    name: str
++    fd: int
++    offset: int
++    nbytes: int
++    shape: tuple[int, ...]
++    dtype: object
++
++
++def view_offset(entry: TensorRange, source, destination) -> int:
++    """The byte offset of ``source``, a view of the checkpoint tensor ``entry``, in the
++    tensor's range; refuses a copy the descriptors cannot express."""
++    if (
++        source._version != 0
++        or source.element_size() != entry.dtype.itemsize
++        or source.is_neg()
++        or source.is_conj()
++        or destination.is_neg()
++        or destination.is_conj()
++        or source.shape != destination.shape
++        or any(stride < 0 for stride in (*source.stride(), *destination.stride()))
++    ):
++        raise NotImplementedError(
++            f"direct load needs an explicit transform for {entry.name}: "
++            f"{source.shape}/{source.stride()}/{source.dtype} -> "
++            f"{destination.shape}/{destination.stride()}/{destination.dtype}"
++        )
++    offset = source.storage_offset() * source.element_size()
++    source_extent = (
++        1
++        + sum(
++            (size - 1) * stride
++            for size, stride in zip(source.shape, source.stride(), strict=False)
++        )
++    ) * source.element_size()
++    if source.numel() and offset + source_extent > entry.nbytes:
++        raise ValueError(f"source view exceeds checkpoint range: {entry.name}")
++    return offset
++
++
++def view_records(
++    entry: TensorRange, offset: int, source, destination, expand: bool
++) -> list[tuple[int, ...]]:
++    """Descriptors that copy ``source``, a view at byte ``offset`` of ``entry``, into
++    ``destination`` of the same shape (and dtype, or FP32 for a BF16 source when
++    ``expand``). The innermost axes that both lay out contiguously make one row, the
++    next axis the rows of one strided copy, and each index of the axes outside it one
++    descriptor."""
++    elements = 1
++    axis = source.ndim - 1
++    while axis >= 0:
++        size = source.shape[axis]
++        if size != 1 and (
++            source.stride(axis) != elements or destination.stride(axis) != elements
++        ):
++            break
++        elements *= size
++        axis -= 1
++    rows = source.shape[axis] if axis >= 0 else 1
++    source_stride = source.stride(axis) * source.element_size() if axis >= 0 else 0
++    destination_stride = (
++        destination.stride(axis) * destination.element_size() if axis >= 0 else 0
++    )
++    outer = source.shape[:axis] if axis >= 0 else ()
++    records = []
++    for index in product(*(range(size) for size in outer)):
++        source_delta = (
++            sum(i * s for i, s in zip(index, source.stride(), strict=False))
++            * source.element_size()
++        )
++        destination_delta = (
++            sum(i * s for i, s in zip(index, destination.stride(), strict=False))
++            * destination.element_size()
++        )
++        records.append(
++            (
++                entry.fd,
++                entry.offset + offset + source_delta,
++                elements * source.element_size(),
++                destination.data_ptr() + destination_delta,
++                EXPAND_BF16 if expand else READ,
++                rows,
++                source_stride,
++                destination_stride,
++            )
++        )
++    return records
++
++
++def scratch_chunks(entry: TensorRange, offset: int, source, capacity: int):
++    """``(start, count, file offset, bytes)`` of each read that passes the contiguous
++    view ``source`` (at byte ``offset`` of ``entry``) through a scratch of ``capacity``
++    elements of its dtype, ``count`` elements from element ``start``."""
++    for start in range(0, source.numel(), capacity):
++        count = min(capacity, source.numel() - start)
++        yield (
++            start,
++            count,
++            entry.offset + offset + start * source.element_size(),
++            count * source.element_size(),
++        )
++
++
++class DirectWeightSession:
++    """Retain source metadata and destination owners through synchronous reads.
++
++    Meta tensors carry only shape, dtype and view offsets through model routing.
++    They never substitute for numerical input: unregistered transformations fail
++    closed. Scalars and explicitly declared metadata are read for value access.
++    No checkpoint payload is mapped or read through the page cache.
++    """
++
++    def __init__(self, device=0, io_threads=8):
++        import torch
++
++        if not 1 <= io_threads <= 16:
++            raise ValueError("io_threads must be between 1 and 16")
++        torch.cuda.init()
++        self.native = load()
++        self.reader = self.native.direct_reader(device)
++        self.device = device
++        self.io_threads = io_threads
++        self.executor = None
++        self.records = array("Q")
++        self.destinations = []
++        self.files = []
++        self.sources = {}
++        self.torch_copy_bytes = 0
++        self.payload_bytes = 0
++        self.metadata_bytes = 0
++        self.metadata_copy_bytes = 0
++        self.loaded_tensors = 0
++        self.transform_bytes = 0
++        self.bf16_expansion_bytes = 0
++        self.transform_scratch = None
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        try:
++            if exc[0] is None:
++                self.flush()
++        finally:
++            self._close()
++
++    def _close(self):
++        self.records = array("Q")
++        self.destinations.clear()
++        self.executor = None
++        self.transform_scratch = None
++        self.sources.clear()
++        for fd in self.files:
++            os.close(fd)
++        self.files.clear()
++        self.reader = None
++
++    def flush(self):
++        """Complete accepted destinations before a numerical consumer runs."""
++        if not self.records:
++            return
++        try:
++            self._execute(self.records)
++        finally:
++            self.records = array("Q")
++            self.destinations.clear()
++
++    def _execute(self, records):
++        import torch
++
++        with torch.accelerator.device_index(self.device):
++            if self.executor is None:
++                self.executor = self.native.batch_executor(self.device, self.io_threads)
++            self.native.batch_execute(
++                self.executor,
++                records,
++                torch.cuda.current_stream(self.device).cuda_stream,
++            )
++
++    def materialize(self, source):
++        """Read owned transform inputs without routing arithmetic through metadata."""
++        import torch
++
++        if source.device.type != "meta":
++            return source.clone()
++        destination = torch.empty(
++            source.shape, dtype=source.dtype, device=torch.device("cuda", self.device)
++        )
++        self(destination, source)
++        self.flush()
++        return destination
++
++    def _metadata_values(self, entries):
++        import torch
++
++        values = {}
++        ordered = sorted(entries, key=lambda entry: entry.offset)
++        start = 0
++        while start < len(ordered):
++            first = ordered[start]
++            end = first.offset + first.nbytes
++            stop = start + 1
++            while stop < len(ordered):
++                following = ordered[stop]
++                if following.offset - end > 4096 or (
++                    following.offset + following.nbytes - first.offset > 8 << 20
++                ):
++                    break
++                end = following.offset + following.nbytes
++                stop += 1
++            self.metadata_bytes += end - first.offset
++            if self.metadata_bytes > 64 << 20:
++                raise ValueError(
++                    "declared metadata spans exceed the 64 MiB session budget"
++                )
++            raw = bytearray(
++                self.native.direct_bytes(
++                    self.reader, first.fd, first.offset, end - first.offset
++                )
++            )
++            for entry in ordered[start:stop]:
++                values[entry.name] = (
++                    torch.frombuffer(
++                        raw,
++                        dtype=entry.dtype,
++                        count=math.prod(entry.shape),
++                        offset=entry.offset - first.offset,
++                    ).reshape(entry.shape)
++                    if entry.nbytes
++                    else torch.empty(entry.shape, dtype=entry.dtype, device="cpu")
++                )
++            start = stop
++        return values
++
++    def manifest(self, path):
++        import torch
++
++        fd = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
++        self.files.append(fd)
++        size = os.fstat(fd).st_size
++        length = int.from_bytes(
++            self.native.direct_bytes(self.reader, fd, 0, 8), "little"
++        )
++        if length > 100 << 20 or length > size - 8:
++            raise ValueError(f"invalid safetensors header length in {path}")
++        header = json.loads(
++            self.native.direct_bytes(self.reader, fd, 8, length),
++            object_pairs_hook=_unique_object,
++        )
++        if not isinstance(header, dict):
++            raise ValueError("safetensors header must be an object")
++        dtypes = {
++            "BOOL": torch.bool,
++            "U8": torch.uint8,
++            "I8": torch.int8,
++            "I16": torch.int16,
++            "I32": torch.int32,
++            "I64": torch.int64,
++            "U16": torch.uint16,
++            "U32": torch.uint32,
++            "U64": torch.uint64,
++            "F16": torch.float16,
++            "BF16": torch.bfloat16,
++            "F32": torch.float32,
++            "F64": torch.float64,
++            "F8_E4M3": torch.float8_e4m3fn,
++            "F8_E5M2": torch.float8_e5m2,
++            "F8_E8M0": torch.float8_e8m0fnu,
++        }
++        result = []
++        for name, entry in header.items():
++            if name == "__metadata__":
++                if not isinstance(entry, dict) or not all(
++                    isinstance(k, str) and isinstance(v, str) for k, v in entry.items()
++                ):
++                    raise ValueError("invalid safetensors metadata")
++                continue
++            if not isinstance(entry, dict):
++                raise ValueError(f"invalid tensor entry: {name}")
++            shape = entry.get("shape")
++            offsets = entry.get("data_offsets")
++            dtype = dtypes.get(entry.get("dtype"))
++            if (
++                dtype is None
++                or not isinstance(shape, list)
++                or any(type(d) is not int or d < 0 for d in shape)
++                or not isinstance(offsets, list)
++                or len(offsets) != 2
++                or any(type(d) is not int or d < 0 for d in offsets)
++            ):
++                raise ValueError(f"invalid tensor metadata: {name}")
++            start, end = offsets
++            nbytes = math.prod(shape) * dtype.itemsize
++            if end - start != nbytes or end > size - length - 8:
++                raise ValueError(f"invalid tensor file range: {name}")
++            result.append(
++                TensorRange(name, fd, 8 + length + start, nbytes, tuple(shape), dtype)
++            )
++        end = 8 + length
++        for tensor in sorted(result, key=lambda t: (t.offset, t.nbytes)):
++            if tensor.offset != end:
++                raise ValueError(
++                    f"overlap or hole in safetensors payload: {tensor.name}"
++                )
++            end += tensor.nbytes
++        if end != size:
++            raise ValueError("safetensors payload does not cover file")
++        return result
++
++    def weights(
++        self,
++        files,
++        *,
++        prefixes=None,
++        prefix="",
++        index_path=None,
++        needs_values=None,
++        skip=None,
++    ):
++        import torch
++
++        weight_map = None
++        indexed_paths = {}
++        if index_path is not None:
++            index_file_path = Path(index_path)
++            if index_file_path.is_file():
++                resolved_index = index_file_path.resolve()
++                cached = getattr(self, "_index_cache", None)
++                if cached is not None and cached[0] == resolved_index:
++                    _, weight_map, indexed_paths = cached
++                else:
++                    weight_map = json.loads(index_file_path.read_text())["weight_map"]
++                    index_parent = index_file_path.parent
++                    for indexed_file in set(weight_map.values()):
++                        indexed_paths[indexed_file] = (
++                            index_parent / indexed_file
++                        ).resolve()
++                    self._index_cache = (resolved_index, weight_map, indexed_paths)
++        for path in files:
++            manifest = self.manifest(path)
++            resolved_path = Path(path).resolve()
++            selected = []
++            for entry in sorted(manifest, key=lambda t: t.name):
++                if prefixes and not entry.name.startswith(prefixes):
++                    continue
++                if weight_map is not None:
++                    indexed_file = weight_map.get(entry.name)
++                    if indexed_file is None:
++                        continue
++                    if indexed_paths[indexed_file] != resolved_path:
++                        continue
++                if skip is not None and skip(entry.name):
++                    continue
++                selected.append(entry)
++            values = self._metadata_values(
++                [
++                    entry
++                    for entry in selected
++                    if needs_values is not None and needs_values(entry)
++                ]
++            )
++            for entry in selected:
++                if entry.name in values:
++                    tensor = values[entry.name]
++                else:
++                    tensor = torch.empty(entry.shape, dtype=entry.dtype, device="meta")
++                    storage = tensor.untyped_storage()
++                    self.sources[storage._cdata] = (storage, entry)
++                yield prefix + entry.name, tensor
++
++    def __call__(self, destination, source):
++        import torch
++
++        if source.device.type != "meta":
++            if (
++                source.device.type == "cpu"
++                and source.dtype == destination.dtype
++                and (
++                    source.shape == destination.shape
++                    or source.numel() == destination.numel() == 1
++                )
++                and source.is_contiguous()
++                and not source.is_neg()
++                and not source.is_conj()
++                and not destination.is_neg()
++                and not destination.is_conj()
++                and destination.device.index == self.device
++                and destination.is_cuda
++                and destination.is_contiguous()
++            ):
++                if source.nbytes:
++                    self.records.extend(
++                        (
++                            0,
++                            source.data_ptr(),
++                            source.nbytes,
++                            destination.data_ptr(),
++                            HOST_COPY,
++                            1,
++                            0,
++                            0,
++                        )
++                    )
++                    self.destinations.extend((destination, source))
++                    self.metadata_copy_bytes += source.nbytes
++                    torch.autograd.graph.increment_version(destination)
++                return True
++            self.flush()
++            self.torch_copy_bytes += destination.nbytes
++            return False
++        item = self.sources.get(source.untyped_storage()._cdata)
++        if item is None:
++            raise NotImplementedError(
++                "checkpoint routing performed an unsupported data transformation"
++            )
++        _, entry = item
++        offset = view_offset(entry, source, destination)
++        if source.nbytes == 0:
++            return True
++        if destination.device.type != "cuda" or destination.device.index != self.device:
++            raise ValueError("destination must use the session CUDA device")
++        storage = destination.untyped_storage()
++        extent = destination.element_size() * (
++            1
++            + sum(
++                (size - 1) * stride
++                for size, stride in zip(
++                    destination.shape, destination.stride(), strict=True
++                )
++            )
++        )
++        if destination.data_ptr() - storage.data_ptr() + extent > storage.nbytes():
++            raise ValueError(f"destination exceeds tensor storage: {entry.name}")
++        expand = source.dtype == torch.bfloat16 and destination.dtype == torch.float32
++        byte_cast = {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
++        if destination.dtype == source.dtype or expand or byte_cast:
++            for record in view_records(entry, offset, source, destination, expand):
++                self.records.extend(record)
++            self.destinations.append(destination)
++            if expand:
++                self.bf16_expansion_bytes += source.nbytes
++        else:
++            if not source.is_contiguous() or not destination.is_contiguous():
++                raise NotImplementedError(f"strided dtype conversion: {entry.name}")
++            with torch.accelerator.device_index(destination.device.index):
++                self.flush()
++                if self.transform_scratch is None:
++                    self.transform_scratch = torch.empty(
++                        SCRATCH_BYTES, dtype=torch.uint8, device=destination.device
++                    )
++                scratch = self.transform_scratch.view(source.dtype)
++                flat = destination.view(-1)
++                for start, count, position, nbytes in scratch_chunks(
++                    entry, offset, source, scratch.numel()
++                ):
++                    self._execute(
++                        array(
++                            "Q",
++                            (
++                                entry.fd,
++                                position,
++                                nbytes,
++                                scratch.data_ptr(),
++                                READ,
++                                1,
++                                0,
++                                0,
++                            ),
++                        )
++                    )
++                    flat[start : start + count].copy_(scratch[:count])
++                self.transform_bytes += source.nbytes
++        torch.autograd.graph.increment_version(destination)
++        self.payload_bytes += source.nbytes
++        self.loaded_tensors += 1
++        return True
++
++    def stats(self, *, flush=True):
++        if flush:
++            self.flush()
++        io = self.native.direct_stats(self.reader)
++        if self.executor is not None:
++            for name, value in self.native.batch_stats(self.executor).items():
++                io[name] = io.get(name, 0) + value
++        return {
++            **io,
++            "payload_bytes": self.payload_bytes,
++            "metadata_bytes": self.metadata_bytes,
++            "loaded_tensors": self.loaded_tensors,
++            "transform_bytes": self.transform_bytes,
++            "bf16_expansion_bytes": self.bf16_expansion_bytes,
++            "transform_scratch_bytes": (
++                0 if self.transform_scratch is None else self.transform_scratch.nbytes
++            ),
++            "metadata_host_copy_bytes": self.metadata_copy_bytes,
++            "torch_copy_bytes": self.torch_copy_bytes,
++        }
+diff --git a/vllm/model_executor/model_loader/direct_io/_cuda_range.h b/vllm/model_executor/model_loader/direct_io/_cuda_range.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f89a5ad9a91084b5db99afb4b79c34fbcf01f26
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_cuda_range.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * Whether a pointer range lies in CUDA device allocations of one device.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_cuda_range.h at 236ddff04a5f
++ * (Apache-2.0). Changed: the include guard's name, and external dma-buf device
++ * mappings under CUDA 13.5 forward compatibility.
++ */
++#ifndef VLLM_DIRECT_IO_CUDA_RANGE_H
++#define VLLM_DIRECT_IO_CUDA_RANGE_H
++#include <cuda.h>
++
++/* External dma-buf device mappings (cuImportExternalMemory +
++ * cuExternalMemoryGetMappedBuffer, such as display_carveout's DRM dumb buffers)
++ * report CU_MEMORYTYPE_HOST with no host pointer and base == 0 in
++ * cuMemGetAddressRange under CUDA 13.5 forward compatibility (cuda-compat-13-5
++ * 620.x over a 580.x host driver), while CU_POINTER_ATTRIBUTE_DEVICE_POINTER,
++ * CU_POINTER_ATTRIBUTE_RANGE_START_ADDR and CU_POINTER_ATTRIBUTE_RANGE_SIZE
++ * still identify the mapped device buffer. */
++static bool is_device_only_mapping(uintptr_t pointer, CUmemorytype kind) {
++    if (kind == CU_MEMORYTYPE_DEVICE) return true;
++    if (kind != CU_MEMORYTYPE_HOST) return false;
++    void *host_ptr = NULL;
++    CUdeviceptr dev_ptr = 0;
++    return cuPointerGetAttribute(&host_ptr, CU_POINTER_ATTRIBUTE_HOST_POINTER, pointer) != CUDA_SUCCESS &&
++           cuPointerGetAttribute(&dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, pointer) == CUDA_SUCCESS &&
++           dev_ptr == (CUdeviceptr)pointer;
++}
++
++/* Expandable tensors can span several adjacent CUDA mappings. */
++static bool device_range(uintptr_t pointer, uint64_t bytes, int device) {
++    if (bytes > UINTPTR_MAX - pointer) return false;
++    do {
++        CUmemorytype kind;
++        int ordinal;
++        CUdeviceptr base;
++        size_t size;
++        if (cuPointerGetAttribute(&kind, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, pointer) != CUDA_SUCCESS ||
++            !is_device_only_mapping(pointer, kind) ||
++            cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, pointer) != CUDA_SUCCESS ||
++            ordinal != device ||
++            cuMemGetAddressRange(&base, &size, pointer) != CUDA_SUCCESS) return false;
++        if (base == 0 && kind == CU_MEMORYTYPE_HOST) {
++            CUdeviceptr range_start = 0;
++            size_t range_size = 0;
++            if (cuPointerGetAttribute(&range_start, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, pointer) != CUDA_SUCCESS ||
++                cuPointerGetAttribute(&range_size, CU_POINTER_ATTRIBUTE_RANGE_SIZE, pointer) != CUDA_SUCCESS ||
++                range_start == 0 ||
++                range_size != size) return false;
++            base = range_start;
++        }
++        if ((CUdeviceptr)pointer < base || (CUdeviceptr)pointer - base >= size) return false;
++        size_t available = size - (size_t)((CUdeviceptr)pointer - base);
++        if (bytes <= available) return true;
++        pointer += available;
++        bytes -= available;
++    } while (bytes);
++    return true;
++}
++#endif
+diff --git a/vllm/model_executor/model_loader/direct_io/_direct.c b/vllm/model_executor/model_loader/direct_io/_direct.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7dadc977d5192d331e5cf99e8943514ccdcb5c13
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_direct.c
+@@ -0,0 +1,131 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * Small O_DIRECT reads for safetensors headers and CPU metadata. Included by
++ * _storage.c.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_direct.c at 236ddff04a5f
++ * (Apache-2.0). Changed: the capsule is direct_io.reader.
++ */
++#include <fcntl.h>
++#define IO_ALIGNMENT 4096
++#define IO_SCRATCH_BYTES (64 << 10)
++typedef struct {
++    void *scratch;
++    int scratch_bytes;
++    pthread_mutex_t mutex;
++    uint64_t physical_bytes, reads;
++} direct_reader_t;
++
++static void delete_reader(PyObject *capsule) {
++    direct_reader_t *reader = PyCapsule_GetPointer(capsule, "direct_io.reader");
++    if (!reader) return;
++    free(reader->scratch);
++    pthread_mutex_destroy(&reader->mutex);
++    free(reader);
++}
++static PyObject *py_direct_reader(PyObject *self, PyObject *args) {
++    (void)self;
++    int device;
++    if (!PyArg_ParseTuple(args, "i", &device)) return NULL;
++    direct_reader_t *reader = calloc(1, sizeof(*reader));
++    if (!reader) return PyErr_NoMemory();
++    reader->scratch_bytes = IO_SCRATCH_BYTES;
++    int error = posix_memalign(&reader->scratch, IO_ALIGNMENT, IO_SCRATCH_BYTES);
++    if (error) { free(reader); return PyErr_Format(PyExc_RuntimeError, "metadata scratch: %s", strerror(error)); }
++    pthread_mutex_init(&reader->mutex, NULL);
++    PyObject *capsule = PyCapsule_New(reader, "direct_io.reader", delete_reader);
++    if (!capsule) { free(reader->scratch); pthread_mutex_destroy(&reader->mutex); free(reader); }
++    return capsule;
++}
++
++static bool validate_direct_range(int fd, int64_t offset, int64_t bytes,
++                                  failure_t *failure) {
++    struct stat status;
++    int flags = fcntl(fd, F_GETFL);
++    if (flags < 0 || !(flags & O_DIRECT)) {
++        snprintf(failure->message, sizeof(failure->message), "direct reader requires O_DIRECT");
++        return false;
++    }
++    if (fstat(fd, &status) != 0) {
++        system_error(failure, "fstat direct input");
++        return false;
++    }
++    if (offset < 0 || bytes < 0 || offset > INT64_MAX - bytes ||
++        !S_ISREG(status.st_mode) || offset + bytes > status.st_size) {
++        snprintf(failure->message, sizeof(failure->message), "invalid direct input file range");
++        return false;
++    }
++    return true;
++}
++
++static bool direct_read_range(direct_reader_t *reader, int fd, int64_t offset,
++                              int64_t bytes, char *destination, bool allow_direct,
++                              failure_t *failure) {
++    if (!validate_direct_range(fd, offset, bytes, failure)) return false;
++    while (bytes) {
++        int64_t aligned_offset = offset & ~(int64_t)(IO_ALIGNMENT - 1);
++        size_t delta = offset - aligned_offset;
++        (void)allow_direct;
++        size_t payload = bytes < reader->scratch_bytes - (int64_t)delta ?
++                         (size_t)bytes : reader->scratch_bytes - delta;
++        size_t length = (payload + delta + IO_ALIGNMENT - 1) & ~(size_t)(IO_ALIGNMENT - 1);
++        void *buffer = reader->scratch;
++        ssize_t count;
++        do {
++            count = pread(fd, buffer, length, aligned_offset);
++        } while (count < 0 && errno == EINTR);
++        if (count < 0) {
++            system_error(failure, "O_DIRECT pread (no buffered fallback)");
++            return false;
++        }
++        if ((size_t)count < delta + payload) {
++            snprintf(failure->message, sizeof(failure->message), "short O_DIRECT read");
++            return false;
++        }
++        reader->physical_bytes += count;
++        reader->reads++;
++        memcpy(destination, (char *)buffer + delta, payload);
++        destination += payload;
++        offset += payload;
++        bytes -= payload;
++    }
++    return true;
++}
++
++static PyObject *py_direct_bytes(PyObject *self, PyObject *args) {
++    (void)self;
++    PyObject *capsule;
++    int fd;
++    long long offset, bytes;
++    if (!PyArg_ParseTuple(args, "OiLL", &capsule, &fd, &offset, &bytes)) return NULL;
++    direct_reader_t *reader = PyCapsule_GetPointer(capsule, "direct_io.reader");
++    if (!reader) return NULL;
++    if (bytes < 0 || bytes > 100 * (1 << 20))
++        return PyErr_Format(PyExc_ValueError, "header/metadata read exceeds 100 MiB");
++    PyObject *result = PyBytes_FromStringAndSize(NULL, bytes);
++    if (!result) return NULL;
++    bool success;
++    failure_t failure = {{0}};
++    char *destination = PyBytes_AS_STRING(result);
++    Py_BEGIN_ALLOW_THREADS
++    pthread_mutex_lock(&reader->mutex);
++    success = direct_read_range(reader, fd, offset, bytes, destination, false, &failure);
++    pthread_mutex_unlock(&reader->mutex);
++    Py_END_ALLOW_THREADS
++    if (!success) {
++        Py_DECREF(result);
++        return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    }
++    return result;
++}
++
++static PyObject *py_direct_stats(PyObject *self, PyObject *capsule) {
++    (void)self;
++    direct_reader_t *reader = PyCapsule_GetPointer(capsule, "direct_io.reader");
++    if (!reader) return NULL;
++    return Py_BuildValue("{s:K,s:K,s:i}",
++        "physical_bytes", (unsigned long long)reader->physical_bytes,
++        "reads", (unsigned long long)reader->reads, "scratch_bytes", reader->scratch_bytes);
++}
+diff --git a/vllm/model_executor/model_loader/direct_io/_native.py b/vllm/model_executor/model_loader/direct_io/_native.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..771e43e777c26ab17a540f5d7f6b9d9dc67d9548
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_native.py
+@@ -0,0 +1,181 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the b12x project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Build and load the direct loader's C99 helper (``_storage.c``) with the system C
++compiler, without linking the PyTorch C++ ABI.
++
++It needs the Python and CUDA headers (``CUDA_HOME``, default /usr/local/cuda), the CUDA
++runtime and driver libraries, and liburing with pkg-config. It is built on first use
++into ``$XDG_CACHE_HOME/vllm/direct_io/<digest>``, where the digest covers the C sources
++and the build identity, so a changed source rebuilds.
++
++Ported from local-inference-lab/b12x b12x/loader/_native.py at 236ddff04a5f
++(Apache-2.0). Changed: liburing is required, the cache directory and module name are
++vLLM's, and the build identity no longer names the PyTorch version (the helper does
++not link it).
++"""
++
++import functools
++import hashlib
++import importlib.util
++import json
++import os
++import platform
++import shlex
++import shutil
++import subprocess
++import sys
++import sysconfig
++import tempfile
++import threading
++from pathlib import Path
++
++_LOCK = threading.Lock()
++_SOURCE = Path(__file__).with_name("_storage.c")
++_NAME = "_direct_io_storage"
++_DEFAULT_PREBUILT_ROOT = Path("/opt/spark-ds41f/native")
++ABI_VERSION = 1
++
++
++def _pkg_config(*args: str) -> str:
++    return subprocess.check_output(["pkg-config", *args, "liburing"], text=True).strip()
++
++
++def _source_digest() -> str:
++    sources = sorted(_SOURCE.parent.glob("*.[ch]"))
++    return hashlib.sha256(b"".join(path.read_bytes() for path in sources)).hexdigest()[:24]
++
++
++def _prebuilt_target() -> Path | None:
++    if "CC" in os.environ:
++        return None
++    default_cuda = Path("/usr/local/cuda")
++    cuda_env = os.environ.get("CUDA_HOME")
++    if cuda_env and Path(cuda_env).resolve() != default_cuda.resolve():
++        return None
++    cc_path = shutil.which("cc")
++    if cc_path is not None and Path(cc_path).resolve() not in {
++        Path(p).resolve() for p in ("/usr/bin/cc", "/bin/cc") if Path(p).exists()
++    }:
++        return None
++    root = Path(os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT))
++    target = (
++        root
++        / "direct_io"
++        / _source_digest()
++        / (_NAME + sysconfig.get_config_var("EXT_SUFFIX"))
++    )
++    return target if target.is_file() else None
++
++
++def prebuild(root: Path | str | None = None) -> Path:
++    """Compile the helper and install it under ``root / 'direct_io' / <source_digest>``."""
++    built = _build(ignore_prebuilt=True)
++    dest_dir = Path(
++        root or os.environ.get("VLLM_NATIVE_CACHE_DIR", _DEFAULT_PREBUILT_ROOT)
++    ) / "direct_io" / _source_digest()
++    dest_dir.mkdir(parents=True, exist_ok=True)
++    dest = dest_dir / built.name
++    if built.resolve() != dest.resolve():
++        shutil.copy2(built, dest)
++    return dest
++
++
++def _build(*, ignore_prebuilt: bool = False) -> Path:
++    if not ignore_prebuilt:
++        prebuilt = _prebuilt_target()
++        if prebuilt is not None:
++            return prebuilt
++    compiler = shlex.split(os.environ.get("CC", "cc"))
++    if not compiler or not shutil.which(compiler[0]):
++        raise RuntimeError("the direct loader needs a C99 compiler (CC or cc)")
++    compiler[0] = shutil.which(compiler[0])
++    if (
++        not shutil.which("pkg-config")
++        or subprocess.run(
++            ["pkg-config", "--exists", "liburing"], capture_output=True
++        ).returncode
++    ):
++        raise RuntimeError("the direct loader needs liburing and pkg-config")
++    cuda = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")).resolve()
++    includes = [Path(sysconfig.get_path("include")), cuda / "include"]
++    headers = [
++        includes[0] / "Python.h",
++        includes[1] / "cuda_runtime_api.h",
++        includes[1] / "driver_types.h",
++    ]
++    for path in headers:
++        if not path.is_file():
++            raise RuntimeError(f"the direct loader's build needs {path}")
++    flags = [
++        "-O2",
++        "-std=c99",
++        "-shared",
++        "-fPIC",
++        "-pthread",
++        "-D_FILE_OFFSET_BITS=64",
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++        *shlex.split(_pkg_config("--cflags")),
++    ]
++    ldflags = shlex.split(_pkg_config("--libs"))
++    identity = {
++        "abi": ABI_VERSION,
++        "python": sys.version,
++        "soabi": sysconfig.get_config_var("SOABI"),
++        "machine": platform.machine(),
++        "compiler": compiler,
++        "version": subprocess.check_output([*compiler, "--version"], text=True),
++        "flags": flags,
++        "ldflags": ldflags,
++        "liburing": _pkg_config("--modversion"),
++        "cuda": str(cuda),
++        "headers": {
++            str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
++            for path in headers
++        },
++    }
++    sources = sorted(_SOURCE.parent.glob("*.[ch]"))
++    digest = hashlib.sha256(
++        b"".join(path.read_bytes() for path in sources)
++        + json.dumps(identity, sort_keys=True).encode()
++    ).hexdigest()[:24]
++    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
++    cache = root / "vllm" / "direct_io" / digest
++    cache.mkdir(parents=True, exist_ok=True)
++    target = cache / (_NAME + sysconfig.get_config_var("EXT_SUFFIX"))
++    if not target.exists():
++        with tempfile.TemporaryDirectory(dir=cache) as temporary:
++            output = Path(temporary) / target.name
++            command = [
++                *compiler,
++                *flags,
++                *(f"-I{path}" for path in includes),
++                str(_SOURCE),
++                f"-L{cuda / 'lib64'}",
++                f"-Wl,-rpath,{cuda / 'lib64'}",
++                "-lcudart",
++                "-lcuda",
++                *ldflags,
++                "-o",
++                str(output),
++            ]
++            result = subprocess.run(command, capture_output=True, text=True)
++            if result.returncode:
++                raise RuntimeError(
++                    "the direct loader's helper did not build:\n" + result.stderr
++                )
++            os.replace(output, target)
++    return target
++
++
++@functools.cache
++def load():
++    with _LOCK:
++        spec = importlib.util.spec_from_file_location(_NAME, _build())
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        if module.ABI_VERSION != ABI_VERSION:
++            raise RuntimeError("the direct loader helper's ABI does not match")
++        return module
+diff --git a/vllm/model_executor/model_loader/direct_io/_storage.c b/vllm/model_executor/model_loader/direct_io/_storage.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9a989c51a1135e87535bd5c8364514ee8facfb2
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_storage.c
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * The direct loader's native helper (--load-format direct): O_DIRECT reads of
++ * safetensors headers and metadata (_direct.c), and the batch executor that reads
++ * checkpoint ranges through a registered host ring into CUDA tensors (_batch.c,
++ * _bounce.c). One translation unit; _native.py builds it with the system compiler.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_storage.c at 236ddff04a5f
++ * (Apache-2.0). Changed: the module is _direct_io_storage, and the PLE reader
++ * (_ple_reader.c) and its methods are gone.
++ */
++#define _GNU_SOURCE
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++#include <cuda_runtime_api.h>
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++typedef char require_64_bit_offsets[(sizeof(off_t) == 8 && sizeof(size_t) == 8) ? 1 : -1];
++
++typedef struct {
++    char message[512];
++} failure_t;
++
++static bool cuda_ok(cudaError_t status, const char *operation, failure_t *failure) {
++    if (status == cudaSuccess) return true;
++    snprintf(failure->message, sizeof(failure->message), "%s: %s",
++             operation, cudaGetErrorString(status));
++    return false;
++}
++
++static void system_error(failure_t *failure, const char *operation) {
++    snprintf(failure->message, sizeof(failure->message), "%s: %s",
++             operation, strerror(errno));
++}
++
++static PyObject *py_capabilities(PyObject *self, PyObject *args) {
++    (void)self;
++    int device;
++    if (!PyArg_ParseTuple(args, "i", &device)) return NULL;
++    static const struct {
++        const char *name;
++        enum cudaDeviceAttr attribute;
++    } keys[] = {
++        {"integrated", cudaDevAttrIntegrated},
++        {"can_map_host_memory", cudaDevAttrCanMapHostMemory},
++        {"managed_memory", cudaDevAttrManagedMemory},
++        {"concurrent_managed_access", cudaDevAttrConcurrentManagedAccess},
++        {"pageable_memory_access", cudaDevAttrPageableMemoryAccess},
++        {"host_page_tables", cudaDevAttrPageableMemoryAccessUsesHostPageTables},
++        {"host_register_supported", cudaDevAttrHostRegisterSupported},
++        {"registered_host_pointer", cudaDevAttrCanUseHostPointerForRegisteredMem},
++    };
++    PyObject *result = PyDict_New();
++    if (!result) return NULL;
++    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++        int value;
++        failure_t failure;
++        if (!cuda_ok(cudaDeviceGetAttribute(&value, keys[i].attribute, device),
++                     "cudaDeviceGetAttribute", &failure)) {
++            Py_DECREF(result);
++            return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++        }
++        PyObject *number = PyLong_FromLong(value);
++        if (!number || PyDict_SetItemString(result, keys[i].name, number) != 0) {
++            Py_XDECREF(number);
++            Py_DECREF(result);
++            return NULL;
++        }
++        Py_DECREF(number);
++    }
++    return result;
++}
++
++#include "_direct.c"
++#include "_batch.c"
++
++static PyMethodDef methods[] = {
++    {"batch_executor", py_batch_executor, METH_VARARGS, NULL},
++    {"batch_execute", py_batch_execute, METH_VARARGS, NULL},
++    {"batch_stats", py_batch_stats, METH_O, NULL},
++    {"direct_reader", py_direct_reader, METH_VARARGS, NULL},
++    {"direct_bytes", py_direct_bytes, METH_VARARGS, NULL},
++    {"direct_stats", py_direct_stats, METH_O, NULL},
++    {"capabilities", py_capabilities, METH_VARARGS, NULL},
++    {NULL, NULL, 0, NULL},
++};
++static PyModuleDef module = {
++    PyModuleDef_HEAD_INIT, .m_name = "_direct_io_storage", .m_size = -1,
++    .m_methods = methods,
++};
++
++PyMODINIT_FUNC PyInit__direct_io_storage(void) {
++    PyObject *result = PyModule_Create(&module);
++    if (result && PyModule_AddIntConstant(result, "ABI_VERSION", 1) < 0) {
++        Py_DECREF(result);
++        return NULL;
++    }
++    return result;
++}
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..01a4336f4ad6dc1fc7c4d73af8692a199ae28180
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -0,0 +1,1166 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the b12x project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""``--load-format direct``: safetensors weights read with O_DIRECT through a registered
++host ring and copied straight into the model's CUDA parameters.
++
++The loader is for unified-memory GPUs such as GB10, where the GPU reads pageable
++memory through the host page tables. There a load through the page cache costs twice:
++
++- every byte read stays in the page cache, which counts as available memory but takes
++  the free memory the CUDA allocator needs for the KV cache and graphs allocated after
++  loading;
++- a copy from a memory-mapped checkpoint page the process has not touched can hang
++  (driver R580, 64 KiB pages); ``weight_transfer.copy_weight`` copies such sources into
++  anonymous memory first.
++
++So nothing here maps the checkpoint or reads it through the page cache:
++
++- The weights iterator yields meta tensors that carry each tensor's checkpoint range
++  (``direct_io.DirectWeightSession``). Model weight loaders route them into parameter
++  views as usual, and ``weight_transfer`` hands each copy to the session, which
++  records it and later reads it with O_DIRECT through a 16 MiB registered ring into
++  its destination. Scalars and the model's declared metadata are read into CPU
++  tensors, and copies the session declines go to Torch.
++- Tensors the model reads from the checkpoint files while serving
++  (``checkpoint_file_weight_filter``, such as DeepSeek-V4.1's Engram tables) never pass
++  through the reader: the iterator yields vLLM's file-source descriptors for them
++  (``weight_utils.file_source_tensor``), in name order with the file's other tensors.
++
++The device must report pageable memory access through the host page tables; the
++loader refuses others, since it has no GPU-direct-storage path. The native helper
++(``direct_io/_native.py``) is built on first use. ``model_loader_extra_config`` takes
++``io_threads``, the reads in flight (1-16, default 8). The loader logs one summary line
++once the weights are loaded.
++
++Ported from local-inference-lab/b12x b12x/integration/vllm/loader.py at 236ddff04a5f
++(Apache-2.0) and vLLM's former copy of it (``b12x_loader.py``, the ``b12x`` load
++format). Changed: no GDS transport, shared read group, IPC-exportable allocations or
++progress panel.
++"""
++
++from contextlib import contextmanager
++import dataclasses
++import gc
++import heapq
++import json
++import math
++import os
++import time
++from pathlib import Path
++
++import torch
++from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
++
++from vllm.logger import init_logger
++from vllm.utils.mem_utils import reclaim_uma_memory, trim_host_heap
++from vllm.model_executor.model_loader import weight_utils
++from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++from vllm.model_executor.model_loader.direct_io import (
++    DirectWeightSession,
++    capabilities,
++)
++from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
++from vllm.model_executor.weight_transfer import weight_transfer
++from vllm.v1.worker import display_carveout
++
++logger = init_logger(__name__)
++
++_ARENA_ALIGN_BYTES = 256
++_PRESERVE_STORAGE_MAX_BYTES = 1 << 20
++_TOUCH_STRIDE_BYTES = 1 << 21
++_SPONGE_CHUNK_BYTES = 1 << 27
++_SPONGE_MIN_CHUNK_BYTES = 1 << 21
++_SPONGE_HEADROOM_BYTES = 12 << 30
++_SPONGE_POST_LOAD_HEADROOM_BYTES = 16 << 30
++_SPONGE_POST_LOAD_MIN_HIGH_BYTES = 256 << 20
++_SPONGE_MIN_MODEL_BYTES = 256 << 20
++_SPONGE_POST_LOAD_SCRATCH_BYTES = 512 << 20
++_SPONGE_RESERVE_HIGH_MAX_BYTES = 512 << 20
++_NVIDIA_MIN_SYS_ALLOC_BYTES = 65536
++_GPU_HUGEPAGE_BYTES = 1 << 21
++_HIGH_ORDER_SPONGE_TARGETS_64K = tuple(65536 << order for order in range(13, 5, -1))
++_HELD_SPONGE_STACK: list[list[torch.nn.Module]] = []
++_PREALLOCATED_CUDA_POOL_BYTES: int = 0
++_PREALLOCATED_CUDA_POOL_FRONT_CLEAN: bool = True
++_PREALLOCATED_CUDA_POOL_RESIZE_CB = None
++_PREALLOCATED_CUDA_POOL_RELEASE_CB = None
++_DEFER_ARENA_WEIGHT_ALLOC: int = 0
++
++
++def is_deferring_arena_weight_alloc() -> bool:
++    """True while ``DirectModelLoader.create_model`` defers large uninitialized
++    parameter allocations to ``meta`` so ``bind_weight_arena`` allocates them
++    once under the buddy sponge instead of allocating and freeing them twice."""
++    return _DEFER_ARENA_WEIGHT_ALLOC > 0
++
++
++@contextmanager
++def defer_arena_weight_alloc():
++    global _DEFER_ARENA_WEIGHT_ALLOC
++    _DEFER_ARENA_WEIGHT_ALLOC += 1
++    try:
++        yield
++    finally:
++        _DEFER_ARENA_WEIGHT_ALLOC -= 1
++
++
++def set_preallocated_cuda_pool_bytes(
++    num_bytes: int,
++    *,
++    front_clean: bool = True,
++    resize_cb=None,
++    release_cb=None,
++) -> None:
++    """Record whether Worker.init_device pre-allocated a single contiguous CUDA
++    caching-allocator segment so bind_weight_arena skips redundant buddy soaking,
++    (when resize_cb is provided) sizes the permanent pool to the model, and
++    (when release_cb is provided) releases the pool atomically on fallback."""
++    global _PREALLOCATED_CUDA_POOL_BYTES
++    global _PREALLOCATED_CUDA_POOL_FRONT_CLEAN
++    global _PREALLOCATED_CUDA_POOL_RESIZE_CB
++    global _PREALLOCATED_CUDA_POOL_RELEASE_CB
++    _PREALLOCATED_CUDA_POOL_BYTES = max(0, int(num_bytes))
++    _PREALLOCATED_CUDA_POOL_FRONT_CLEAN = bool(front_clean)
++    _PREALLOCATED_CUDA_POOL_RESIZE_CB = resize_cb
++    _PREALLOCATED_CUDA_POOL_RELEASE_CB = release_cb
++
++
++def _align_up(value: int, alignment: int) -> int:
++    return (value + alignment - 1) & ~(alignment - 1)
++
++
++def parse_buddyinfo_order13(
++    text: str, page_bytes: int | None = None
++) -> tuple[int, int]:
++    """Return ``(sub_order13_bytes, order13_plus_bytes)`` from ``/proc/buddyinfo``.
++
++    On 64 KiB-page kernels (such as GB10), buddy order 13 is a 512 MiB contiguous
++    block. Returns ``(0, 0)`` when ``page_bytes`` is not 64 KiB.
++    """
++    if page_bytes is None:
++        try:
++            page_bytes = os.sysconf("SC_PAGE_SIZE")
++        except (AttributeError, OSError, ValueError):
++            return 0, 0
++    if page_bytes != 65536:
++        return 0, 0
++    sub_order13 = 0
++    order13_plus = 0
++    for line in text.splitlines():
++        parts = line.split()
++        if len(parts) <= 4 or parts[0] != "Node" or parts[2] != "zone":
++            continue
++        for order, raw in enumerate(parts[4:]):
++            try:
++                count = int(raw)
++            except ValueError:
++                continue
++            block_bytes = count * (page_bytes << order)
++            if order < 13:
++                sub_order13 += block_bytes
++            else:
++                order13_plus += block_bytes
++    return sub_order13, order13_plus
++
++
++def parse_buddyinfo_blocks(
++    text: str, page_bytes: int | None = None
++) -> dict[int, int]:
++    """Return ``{block_size_bytes: total_free_bytes}`` across all zones in
++    ``/proc/buddyinfo`` for any base OS page size (both 4 KiB and 64 KiB)."""
++    if page_bytes is None:
++        try:
++            page_bytes = os.sysconf("SC_PAGE_SIZE")
++        except (AttributeError, OSError, ValueError):
++            return {}
++    if page_bytes <= 0:
++        return {}
++    blocks: dict[int, int] = {}
++    for line in text.splitlines():
++        parts = line.split()
++        if len(parts) <= 4 or parts[0] != "Node" or parts[2] != "zone":
++            continue
++        for order, raw in enumerate(parts[4:]):
++            try:
++                count = int(raw)
++            except ValueError:
++                continue
++            if count <= 0:
++                continue
++            bsz = page_bytes << order
++            blocks[bsz] = blocks.get(bsz, 0) + count * bsz
++    return blocks
++
++
++def select_buddy_sponge_target(
++    text: str,
++    *,
++    required_bytes: int,
++    page_bytes: int | None = None,
++    min_alloc_bytes: int = _NVIDIA_MIN_SYS_ALLOC_BYTES,
++) -> tuple[int, int, int]:
++    """Choose ``(target_block_bytes, sub_target_bytes, at_or_above_target_bytes)``.
++
++    ``nvidia.ko`` (`nv_alloc_system_pages`) satisfies `cuMemCreate` allocations on
++    UMA by draining smaller buddy orders from ``64 KiB`` upward before splitting
++    higher-order physical blocks. Low-order physical fragments self-conflict across
++    GB10's physically-indexed 24 MiB L2 slices and DRAM banks.
++
++    1. On 64 KiB kernels, walk descending high-order targets from ``512 MiB``
++       (Order 13) down to ``4 MiB`` (Order 6) and choose the largest target whose
++       cumulative free bytes at or above that order cover
++       ``max(required_bytes, _SPONGE_CHUNK_BYTES)``.
++    2. Otherwise, pick the highest block size in ``(2 MiB, 1 MiB, 512 KiB)`` whose
++       cumulative free bytes at or above that order cover ``min(required_bytes, 512 MiB)``,
++       counting only ``>= 64 KiB`` blocks in ``sub_target_bytes`` (the orders ``nvidia.ko``
++       consumes ahead of the target).
++    """
++    blocks = parse_buddyinfo_blocks(text, page_bytes=page_bytes)
++    if not blocks:
++        return 0, 0, 0
++
++    eff_page_bytes = page_bytes
++    if eff_page_bytes is None:
++        try:
++            eff_page_bytes = os.sysconf("SC_PAGE_SIZE")
++        except (AttributeError, OSError, ValueError):
++            eff_page_bytes = 0
++
++    if eff_page_bytes == 65536:
++        full_cover = max(required_bytes, _SPONGE_CHUNK_BYTES)
++        for target_bsz in _HIGH_ORDER_SPONGE_TARGETS_64K:
++            high_bytes = sum(tot for bsz, tot in blocks.items() if bsz >= target_bsz)
++            sub_bytes = sum(
++                tot for bsz, tot in blocks.items() if min_alloc_bytes <= bsz < target_bsz
++            )
++            if high_bytes >= full_cover and sub_bytes > 0:
++                return target_bsz, sub_bytes, high_bytes
++
++    min_high_needed = min(max(required_bytes // 4, _GPU_HUGEPAGE_BYTES), 512 << 20)
++    for target_bsz in (_GPU_HUGEPAGE_BYTES, 1 << 20, 512 << 10):
++        high_bytes = sum(tot for bsz, tot in blocks.items() if bsz >= target_bsz)
++        sub_bytes = sum(
++            tot for bsz, tot in blocks.items() if min_alloc_bytes <= bsz < target_bsz
++        )
++        if high_bytes >= min_high_needed and sub_bytes > 0:
++            return target_bsz, sub_bytes, high_bytes
++    return 0, 0, 0
++
++
++def _available_uma_or_gpu_bytes(
++    device: torch.device,
++    *,
++    meminfo_path: Path | None = Path("/proc/meminfo"),
++) -> int:
++    """Return usable free bytes before KV allocation.
++
++    On integrated UMA GPUs (GB10), ``cudaMemGetInfo`` reports ``MemFree`` and omits
++    reclaimable clean VFS page cache, underreporting usable memory by tens of GiB
++    compared to ``/proc/meminfo`` ``MemAvailable`` (the metric vLLM's ``MemorySnapshot``
++    and ``memguard`` enforce).
++    """
++    gpu_free = 0
++    try:
++        gpu_free, _ = torch.accelerator.get_memory_info(device)
++    except Exception:  # noqa: BLE001
++        gpu_free = 0
++    if meminfo_path is not None:
++        try:
++            if capabilities(device.index or 0).get("integrated", 0):
++                for line in meminfo_path.read_text(encoding="utf-8").splitlines():
++                    if line.startswith("MemAvailable:"):
++                        avail_kib = int(line.split()[1])
++                        return avail_kib * 1024
++        except Exception:  # noqa: BLE001
++            pass
++    return gpu_free
++
++
++def _try_thp_buddy_defrag(
++    deficit_bytes: int,
++    *,
++    avail_bytes: int,
++    headroom_bytes: int = _SPONGE_HEADROOM_BYTES,
++) -> None:
++    # Best-effort unprivileged buddy compaction via MADV_HUGEPAGE page faults
++    # when transparent_hugepage/defrag is set to madvise on 4 KiB kernels.
++    import ctypes
++    import mmap
++
++    if deficit_bytes < _GPU_HUGEPAGE_BYTES:
++        return
++    try:
++        page_sz = os.sysconf("SC_PAGE_SIZE")
++    except (AttributeError, OSError, ValueError):
++        return
++    if page_sz != 4096:
++        return
++    max_safe = avail_bytes - headroom_bytes - (2 << 30)
++    span = min(deficit_bytes, max_safe, 32 << 30)
++    span = (span // _GPU_HUGEPAGE_BYTES) * _GPU_HUGEPAGE_BYTES
++    if span < _GPU_HUGEPAGE_BYTES:
++        return
++    mm = None
++    try:
++        libc = ctypes.CDLL("libc.so.6")
++        mm = mmap.mmap(
++            -1,
++            span + _GPU_HUGEPAGE_BYTES,
++            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
++            prot=mmap.PROT_READ | mmap.PROT_WRITE,
++        )
++        base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
++        aligned = _align_up(base, _GPU_HUGEPAGE_BYTES)
++        if (
++            libc.madvise(
++                ctypes.c_void_p(aligned),
++                ctypes.c_size_t(span),
++                ctypes.c_int(14),  # MADV_HUGEPAGE on Linux
++            )
++            == 0
++        ):
++            mv = memoryview(mm)[aligned - base : aligned - base + span]
++            mv[::_GPU_HUGEPAGE_BYTES] = b"\x01" * (span // _GPU_HUGEPAGE_BYTES)
++            del mv
++    except Exception:  # noqa: BLE001
++        pass
++    finally:
++        if mm is not None:
++            try:
++                mm.close()
++            except Exception:  # noqa: BLE001
++                pass
++
++
++def _allocate_order13_sponge(
++    device: torch.device,
++    *,
++    required_bytes: int,
++    buddyinfo_path: Path = Path("/proc/buddyinfo"),
++    meminfo_path: Path | None = Path("/proc/meminfo"),
++    page_bytes: int | None = None,
++    headroom_bytes: int = _SPONGE_HEADROOM_BYTES,
++    chunk_bytes: int = _SPONGE_CHUNK_BYTES,
++) -> list[torch.Tensor]:
++    """Temporarily soak fragmented sub-hugepage buddy blocks (``64 KiB .. 1 MiB``,
++    or ``< 512 MiB`` when Order-13 blocks exist) so subsequent model weight and
++    post-load allocations draw from ``>= 1-2 MiB`` (or ``512 MiB``) contiguous
++    physical blocks without exhausting ``>= 64 KiB`` buddy pools into order-4
++    page-cache slowpath reclaim."""
++    try:
++        text = buddyinfo_path.read_text(encoding="utf-8")
++    except OSError:
++        return []
++    target_bsz, sub_target_bytes, high_target_bytes = select_buddy_sponge_target(
++        text, required_bytes=required_bytes, page_bytes=page_bytes
++    )
++    if target_bsz == 0:
++        return []
++    eff_chunk = min(chunk_bytes, max(_SPONGE_MIN_CHUNK_BYTES, sub_target_bytes))
++    eff_chunk = max(
++        _SPONGE_MIN_CHUNK_BYTES,
++        (eff_chunk // _SPONGE_MIN_CHUNK_BYTES) * _SPONGE_MIN_CHUNK_BYTES,
++    )
++    if sub_target_bytes < eff_chunk or high_target_bytes < _SPONGE_MIN_CHUNK_BYTES:
++        return []
++    avail_bytes = _available_uma_or_gpu_bytes(device, meminfo_path=meminfo_path)
++    if avail_bytes <= 0:
++        return []
++    if (
++        buddyinfo_path == Path("/proc/buddyinfo")
++        and target_bsz == _GPU_HUGEPAGE_BYTES
++        and high_target_bytes < required_bytes
++    ):
++        _try_thp_buddy_defrag(
++            required_bytes - high_target_bytes,
++            avail_bytes=avail_bytes,
++            headroom_bytes=headroom_bytes,
++        )
++        try:
++            text = buddyinfo_path.read_text(encoding="utf-8")
++            target_bsz, sub_target_bytes, high_target_bytes = (
++                select_buddy_sponge_target(
++                    text, required_bytes=required_bytes, page_bytes=page_bytes
++                )
++            )
++            if target_bsz == 0 or sub_target_bytes < eff_chunk:
++                return []
++        except OSError:
++            pass
++    # Cap soak so (sub + high) keeps >= required_bytes + reserve_high in >=64K buddy
++    # lists, preventing __alloc_pages_slowpath(order=4) 64 KiB fallback when
++    # high_target_bytes < required_bytes while still draining all 64K..512K blocks.
++    soak_goal = sub_target_bytes + (
++        eff_chunk if target_bsz <= _GPU_HUGEPAGE_BYTES else 0
++    )
++    eff_page_bytes = page_bytes
++    if eff_page_bytes is None:
++        try:
++            eff_page_bytes = os.sysconf("SC_PAGE_SIZE")
++        except (AttributeError, OSError, ValueError):
++            eff_page_bytes = 0
++    # 4 KiB kernels spend ~2% (~20 MiB/GiB) of additional non-reclaimable RAM on
++    # CPU/GPU PTEs and UVM metadata across sponge + weight mappings.
++    usable_after_headroom = avail_bytes - headroom_bytes
++    if eff_page_bytes == 4096 and headroom_bytes > 0 and usable_after_headroom > 0:
++        usable_after_headroom = (usable_after_headroom * 48) // 49
++    reserve_high = min(_SPONGE_RESERVE_HIGH_MAX_BYTES, high_target_bytes // 4)
++    buddy_cap = (sub_target_bytes + high_target_bytes) - required_bytes - reserve_high
++    mem_cap = usable_after_headroom - required_bytes
++    budget = min(soak_goal, buddy_cap, mem_cap)
++    num_chunks = int(budget // eff_chunk)
++    if num_chunks <= 0:
++        return []
++    live_buddy = buddyinfo_path == Path("/proc/buddyinfo")
++    t0 = time.monotonic()
++    sponge: list[torch.Tensor] = []
++    try:
++        for idx in range(num_chunks):
++            chunk = torch.empty((eff_chunk,), dtype=torch.uint8, device=device)
++            if eff_chunk >= _TOUCH_STRIDE_BYTES:
++                chunk[::_TOUCH_STRIDE_BYTES].zero_()
++            elif eff_chunk > 0:
++                chunk[:1].zero_()
++            sponge.append(chunk)
++            if live_buddy and target_bsz < (65536 << 13):
++                # Linux serves nvidia.ko GFP_KERNEL (__GFP_COMP) allocations from
++                # MIGRATE_UNMOVABLE sub-target lists first, then >= target_bsz
++                # Unmovable blocks BEFORE stealing Movable sub-target lists.
++                # Stop the instant >= target_bsz free bytes drop by one chunk so we
++                # never waste >= 2 MiB blocks inside the sponge!
++                if idx == 0 or (idx + 1) % 2 == 0:
++                    torch.accelerator.synchronize(device)
++                    try:
++                        cur_blocks = parse_buddyinfo_blocks(
++                            buddyinfo_path.read_text(encoding="utf-8"),
++                            page_bytes=page_bytes,
++                        )
++                        cur_high = sum(
++                            tot for bsz, tot in cur_blocks.items() if bsz >= target_bsz
++                        )
++                        if high_target_bytes - cur_high >= eff_chunk:
++                            # Pop the single chunk that crossed into >= target_bsz so
++                            # even that block returns to the high-order pool.
++                            sponge.pop()
++                            torch.accelerator.empty_cache()
++                            high_target_bytes = cur_high + eff_chunk
++                            break
++                    except OSError:
++                        pass
++        if sponge:
++            torch.accelerator.synchronize(device)
++            logger.info(
++                "Buddy hugepage sponge soaked %.1f MiB (%d chunks) in %.2f s so %.1f MiB "
++                "of weights draw >= %.1f MiB contiguous physical blocks (%.1f MiB available)",
++                (len(sponge) * eff_chunk) / (1 << 20),
++                len(sponge),
++                time.monotonic() - t0,
++                required_bytes / (1 << 20),
++                target_bsz / (1 << 20),
++                high_target_bytes / (1 << 20),
++            )
++    except torch.OutOfMemoryError:
++        pass
++    return sponge
++
++
++def _trim_sponge_for_post_load(
++    sponge: list[torch.Tensor],
++    device: torch.device,
++    *,
++    target_bsz: int,
++    buddyinfo_path: Path = Path("/proc/buddyinfo"),
++    meminfo_path: Path | None = Path("/proc/meminfo"),
++    page_bytes: int | None = None,
++    post_load_headroom_bytes: int = _SPONGE_POST_LOAD_HEADROOM_BYTES,
++    min_high_bytes: int = _SPONGE_POST_LOAD_MIN_HIGH_BYTES,
++) -> list[torch.Tensor]:
++    """Release or trim the sponge after arena + MoE allocation when either no
++    ``>= target_bsz`` blocks remain to protect or ``MemAvailable`` would fall
++    below ``post_load_headroom_bytes`` during ``load_weights`` / post-load."""
++    if not sponge:
++        return sponge
++    chunk_bytes = sponge[0].numel() * sponge[0].element_size()
++    initial_mib = (len(sponge) * chunk_bytes) / (1 << 20)
++    if target_bsz > 0:
++        try:
++            cur_blocks = parse_buddyinfo_blocks(
++                buddyinfo_path.read_text(encoding="utf-8"),
++                page_bytes=page_bytes,
++            )
++            cur_high = sum(
++                tot for bsz, tot in cur_blocks.items() if bsz >= target_bsz
++            )
++            if cur_high < min_high_bytes:
++                logger.info(
++                    "Releasing %.1f MiB buddy sponge before weight load "
++                    "(%.1f MiB of >= %.1f MiB blocks remain; weights already "
++                    "claimed the high-order pool)",
++                    initial_mib,
++                    cur_high / (1 << 20),
++                    target_bsz / (1 << 20),
++                )
++                sponge.clear()
++                torch.accelerator.empty_cache()
++                return sponge
++        except OSError:
++            pass
++    avail_after = _available_uma_or_gpu_bytes(device, meminfo_path=meminfo_path)
++    if 0 < avail_after < post_load_headroom_bytes and chunk_bytes > 0:
++        deficit = post_load_headroom_bytes - avail_after
++        drop_chunks = min(len(sponge), (deficit + chunk_bytes - 1) // chunk_bytes)
++        if drop_chunks >= len(sponge):
++            logger.info(
++                "Releasing %.1f MiB buddy sponge before weight load to preserve "
++                "%.1f MiB post-load MemAvailable headroom (%.1f MiB available)",
++                initial_mib,
++                post_load_headroom_bytes / (1 << 20),
++                avail_after / (1 << 20),
++            )
++            sponge.clear()
++        elif drop_chunks > 0:
++            del sponge[-drop_chunks:]
++            logger.info(
++                "Trimmed buddy sponge by %.1f MiB (retaining %.1f MiB) to preserve "
++                "%.1f MiB post-load MemAvailable headroom",
++                (drop_chunks * chunk_bytes) / (1 << 20),
++                (len(sponge) * chunk_bytes) / (1 << 20),
++                post_load_headroom_bytes / (1 << 20),
++            )
++        torch.accelerator.empty_cache()
++    return sponge
++
++
++def release_weight_arena_sponge(
++    model: torch.nn.Module,
++    device: torch.device | None = None,
++) -> None:
++    """Release a retained ``model._direct_buddy_sponge`` after post-load processing."""
++    sponge = getattr(model, "_direct_buddy_sponge", None)
++    if hasattr(model, "_direct_buddy_sponge"):
++        delattr(model, "_direct_buddy_sponge")
++    if hasattr(model, "_direct_buddy_sponge_target_bsz"):
++        delattr(model, "_direct_buddy_sponge_target_bsz")
++    had_sponge = bool(sponge)
++    if sponge:
++        sponge.clear()
++    reclaim_uma_memory(device, synchronize=had_sponge and device is not None and device.type == "cuda")
++
++
++def defer_weight_arena_sponge_release(model: torch.nn.Module) -> bool:
++    """Defer releasing ``model._direct_buddy_sponge`` when a ``hold_weight_arena_sponge``
++    scope is active (for example, to keep the target's buddy sponge pinned until a
++    speculative drafter finishes loading)."""
++    if not _HELD_SPONGE_STACK or not hasattr(model, "_direct_buddy_sponge"):
++        return False
++    held = _HELD_SPONGE_STACK[-1]
++    if model not in held:
++        held.append(model)
++    return True
++
++
++def trim_held_weight_arena_sponges(
++    device: torch.device,
++    *,
++    buddyinfo_path: Path = Path("/proc/buddyinfo"),
++    meminfo_path: Path | None = Path("/proc/meminfo"),
++    page_bytes: int | None = None,
++    post_load_headroom_bytes: int = _SPONGE_POST_LOAD_HEADROOM_BYTES,
++) -> None:
++    """Trim or release any sponges held in the active ``hold_weight_arena_sponge``
++    scope so ``MemAvailable`` stays at or above ``post_load_headroom_bytes`` before
++    a subsequent model (such as a speculative drafter) allocates weights."""
++    if not _HELD_SPONGE_STACK:
++        return
++    for model in list(_HELD_SPONGE_STACK[-1]):
++        sponge = getattr(model, "_direct_buddy_sponge", None)
++        if not sponge:
++            continue
++        target_bsz = int(getattr(model, "_direct_buddy_sponge_target_bsz", 0))
++        remaining = _trim_sponge_for_post_load(
++            sponge,
++            device,
++            target_bsz=target_bsz,
++            buddyinfo_path=buddyinfo_path,
++            meminfo_path=meminfo_path,
++            page_bytes=page_bytes,
++            post_load_headroom_bytes=post_load_headroom_bytes,
++        )
++        if not remaining:
++            if hasattr(model, "_direct_buddy_sponge"):
++                delattr(model, "_direct_buddy_sponge")
++            if hasattr(model, "_direct_buddy_sponge_target_bsz"):
++                delattr(model, "_direct_buddy_sponge_target_bsz")
++
++
++@contextmanager
++def hold_weight_arena_sponge(device: torch.device | None = None):
++    """Hold retained buddy sponges across sequential model loads (target + drafter)
++    and release them together on exit."""
++    held: list[torch.nn.Module] = []
++    _HELD_SPONGE_STACK.append(held)
++    try:
++        yield held
++    finally:
++        _HELD_SPONGE_STACK.pop()
++        had_sponge = False
++        for model in held:
++            sponge = getattr(model, "_direct_buddy_sponge", None)
++            if hasattr(model, "_direct_buddy_sponge"):
++                delattr(model, "_direct_buddy_sponge")
++            if hasattr(model, "_direct_buddy_sponge_target_bsz"):
++                delattr(model, "_direct_buddy_sponge_target_bsz")
++            if sponge:
++                had_sponge = True
++                sponge.clear()
++        if had_sponge:
++            reclaim_uma_memory(
++                device,
++                synchronize=device is not None and device.type == "cuda",
++            )
++
++
++def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
++    strides = [1] * len(shape)
++    acc = 1
++    for i in range(len(shape) - 1, -1, -1):
++        strides[i] = acc
++        acc *= shape[i]
++    return tuple(strides)
++
++
++def _refresh_module_weight_views(model: torch.nn.Module) -> None:
++    """Rebind cached tensor slice views (e.g. ``shard_weight``) after ``param.set_``."""
++    for module in model.modules():
++        refresh = getattr(module, "_refresh_views", None)
++        if callable(refresh):
++            refresh()
++
++
++def bind_weight_arena(
++    model: torch.nn.Module,
++    device: torch.device,
++    *,
++    order13_sponge: bool = True,
++    sponge_min_model_bytes: int = _SPONGE_MIN_MODEL_BYTES,
++    buddyinfo_path: Path = Path("/proc/buddyinfo"),
++    page_bytes: int | None = None,
++    retain_sponge: bool = False,
++) -> torch.Tensor | None:
++    """Pack persistent CUDA model parameters into a 256-byte-aligned contiguous
++    ``uint8`` arena (``model._direct_weight_arena``) before ``load_weights``.
++
++    Parameters on ``FusedMoEMethodBase`` modules (which ``process_weights_after_loading``
++    replaces layer by layer via ``replace_parameter``) keep individual storages so their
++    pre-tile weights can be freed during post-processing, but are re-allocated largest
++    first under the same Order-13 buddy sponge. Display carve-out tensors and file-backed
++    ``load_view`` parameters are left untouched.
++    """
++    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
++        FusedMoEMethodBase,
++    )
++
++    moe_storage_ptrs: set[int] = set()
++    deferred_moe_param_ids: set[int] = set()
++    for module in model.modules():
++        if isinstance(getattr(module, "quant_method", None), FusedMoEMethodBase):
++            for param in module.parameters(recurse=True):
++                data = param.data
++                if (
++                    getattr(param, "_direct_deferred_alloc", False)
++                    and data.device.type == "cuda"
++                    and data.numel() > 0
++                ):
++                    deferred_moe_param_ids.add(id(param))
++                elif (
++                    data.device.type == "cuda"
++                    and data.numel() > 0
++                    and data.untyped_storage().nbytes() > 0
++                ):
++                    moe_storage_ptrs.add(data.untyped_storage().data_ptr())
++
++    arena_groups: dict[
++        int,
++        tuple[
++            int,
++            list[
++                tuple[
++                    torch.nn.Parameter, int, int, tuple[int, ...], tuple[int, ...]
++                ]
++            ],
++        ],
++    ] = {}
++    moe_groups: dict[
++        int,
++        tuple[
++            int,
++            list[
++                tuple[
++                    torch.nn.Parameter, int, int, tuple[int, ...], tuple[int, ...]
++                ]
++            ],
++        ],
++    ] = {}
++    for param in model.parameters():
++        if hasattr(param, "load_view"):
++            continue
++        data = param.data
++        if (
++            getattr(param, "_direct_deferred_alloc", False)
++            and data.device.type == "cuda"
++            and data.numel() > 0
++        ):
++            shape = tuple(data.shape)
++            nbytes = data.numel() * data.element_size()
++            ptr = -id(param)
++            target = (
++                moe_groups if id(param) in deferred_moe_param_ids else arena_groups
++            )
++            target[ptr] = (
++                nbytes,
++                [
++                    (
++                        param,
++                        data.element_size(),
++                        0,
++                        shape,
++                        _contiguous_strides(shape),
++                    )
++                ],
++            )
++            continue
++        if data.device.type != "cuda" or data.numel() == 0:
++            continue
++        if any(display_carveout._holds(c, data) for c in display_carveout._carveouts):
++            continue
++        storage = data.untyped_storage()
++        nbytes = storage.nbytes()
++        if nbytes == 0:
++            continue
++        ptr = storage.data_ptr()
++        target = moe_groups if ptr in moe_storage_ptrs else arena_groups
++        if ptr not in target:
++            target[ptr] = (nbytes, [])
++        target[ptr][1].append(
++            (
++                param,
++                data.element_size(),
++                data.storage_offset(),
++                tuple(data.shape),
++                tuple(data.stride()),
++            )
++        )
++
++    # Drop the final loop iteration's local references to the last parameter's
++    # CUDA storage (e.g. lm_head.weight) before detaching & freeing scratch pools.
++    param = data = storage = None  # type: ignore[assignment]
++    if not arena_groups and not moe_groups:
++        return None
++
++    arena_bytes = sum(
++        _align_up(nbytes, _ARENA_ALIGN_BYTES) for nbytes, _ in arena_groups.values()
++    )
++    moe_bytes = sum(nbytes for nbytes, _ in moe_groups.values())
++    total_bytes = arena_bytes + moe_bytes
++
++    cpu_snapshots: dict[int, torch.Tensor] = {}
++    empty_storage = torch.empty((0,), dtype=torch.uint8, device=device).untyped_storage()
++    with torch.no_grad():
++        for groups in (arena_groups, moe_groups):
++            for ptr, (nbytes, views) in groups.items():
++                if ptr < 0:
++                    for param, _, _, _, _ in views:
++                        param.set_(empty_storage, 0, (0,), (1,))
++                    continue
++                if nbytes <= _PRESERVE_STORAGE_MAX_BYTES:
++                    orig_storage = views[0][0].data.untyped_storage()
++                    src = torch.empty((0,), dtype=torch.uint8, device=device).set_(
++                        orig_storage
++                    )
++                    cpu_copy = torch.empty((nbytes,), dtype=torch.uint8, device="cpu")
++                    cpu_copy.copy_(src)
++                    cpu_snapshots[ptr] = cpu_copy
++                    del src, orig_storage
++                for param, _, _, _, _ in views:
++                    param.set_(empty_storage, 0, (0,), (1,))
++        _refresh_module_weight_views(model)
++    max_moe_bytes = max((nbytes for nbytes, _ in moe_groups.values()), default=0)
++
++    # One-shot model-exact sizing of the pre-allocated contiguous CUDA pool.
++    global _PREALLOCATED_CUDA_POOL_RESIZE_CB
++    resize_cb = _PREALLOCATED_CUDA_POOL_RESIZE_CB
++    if (
++        resize_cb is not None
++        and _PREALLOCATED_CUDA_POOL_BYTES > 0
++        and device.type == "cuda"
++        and torch.cuda.is_available()
++    ):
++        _PREALLOCATED_CUDA_POOL_RESIZE_CB = None
++        resize_cb(total_bytes, max_moe_bytes)
++
++    cached_free_bytes = 0
++    if (
++        _PREALLOCATED_CUDA_POOL_BYTES > 0
++        and device.type == "cuda"
++        and torch.cuda.is_available()
++    ):
++        cached_free_bytes = max(
++            0,
++            int(torch.cuda.memory_reserved(device))
++            - int(torch.cuda.memory_allocated(device)),
++        )
++    use_preallocated_pool = (
++        _PREALLOCATED_CUDA_POOL_BYTES > 0
++        and total_bytes >= sponge_min_model_bytes
++        and cached_free_bytes >= total_bytes
++    )
++    global _PREALLOCATED_CUDA_POOL_RELEASE_CB
++    if not use_preallocated_pool:
++        release_cb = _PREALLOCATED_CUDA_POOL_RELEASE_CB
++        _PREALLOCATED_CUDA_POOL_RELEASE_CB = None
++        if release_cb is not None and _PREALLOCATED_CUDA_POOL_BYTES > 0:
++            logger.info(
++                "Pre-allocated CUDA pool has %.1f MiB cached free for %.1f MiB "
++                "of weights; releasing pool before buddy-sponge fallback",
++                cached_free_bytes / (1 << 20),
++                total_bytes / (1 << 20),
++            )
++            release_cb()
++        torch.accelerator.empty_cache()
++    else:
++        _PREALLOCATED_CUDA_POOL_RELEASE_CB = None
++    post_load_allowance = max_moe_bytes + min(
++        _SPONGE_POST_LOAD_SCRATCH_BYTES,
++        max(total_bytes // 4, _GPU_HUGEPAGE_BYTES),
++    )
++    live_buddy = buddyinfo_path == Path("/proc/buddyinfo")
++    avail_pre_sponge = (
++        _available_uma_or_gpu_bytes(device) if live_buddy and retain_sponge else 0
++    )
++    can_retain_post_load = retain_sponge and (
++        not live_buddy
++        or avail_pre_sponge - total_bytes
++        >= _SPONGE_POST_LOAD_HEADROOM_BYTES + post_load_allowance
++    )
++    sponge_required_bytes = (
++        total_bytes + post_load_allowance if can_retain_post_load else total_bytes
++    )
++    sponge_target_bsz = 0
++    if use_preallocated_pool:
++        logger.info(
++            "Pre-allocated CUDA pool has %.1f MiB cached free for %.1f MiB of "
++            "weights; skipping buddy sponge (front_clean=%s)",
++            cached_free_bytes / (1 << 20),
++            total_bytes / (1 << 20),
++            _PREALLOCATED_CUDA_POOL_FRONT_CLEAN,
++        )
++        sponge: list[torch.Tensor] = []
++    else:
++        if order13_sponge and total_bytes >= sponge_min_model_bytes:
++            try:
++                sponge_target_bsz, _, _ = select_buddy_sponge_target(
++                    buddyinfo_path.read_text(encoding="utf-8"),
++                    required_bytes=sponge_required_bytes,
++                    page_bytes=page_bytes,
++                )
++            except OSError:
++                sponge_target_bsz = 0
++        sponge = (
++            _allocate_order13_sponge(
++                device,
++                required_bytes=sponge_required_bytes,
++                buddyinfo_path=buddyinfo_path,
++                page_bytes=page_bytes,
++            )
++            if order13_sponge and total_bytes >= sponge_min_model_bytes
++            else []
++        )
++    arena: torch.Tensor | None = None
++    kept_sponge = False
++    try:
++        with torch.no_grad():
++            def _alloc_arena() -> torch.Tensor | None:
++                if arena_bytes <= 0:
++                    return None
++                buf = torch.empty((arena_bytes,), dtype=torch.uint8, device=device)
++                if arena_bytes >= _TOUCH_STRIDE_BYTES:
++                    buf[::_TOUCH_STRIDE_BYTES].zero_()
++                arena_storage = buf.untyped_storage()
++                offset = 0
++                for ptr, (nbytes, views) in arena_groups.items():
++                    if ptr in cpu_snapshots:
++                        buf[offset : offset + nbytes].copy_(cpu_snapshots.pop(ptr))
++                    for param, elem_size, orig_offset, shape, stride in views:
++                        param.set_(
++                            arena_storage,
++                            (offset // elem_size) + orig_offset,
++                            shape,
++                            stride,
++                        )
++                        if hasattr(param, "_direct_deferred_alloc"):
++                            delattr(param, "_direct_deferred_alloc")
++                    offset += _align_up(nbytes, _ARENA_ALIGN_BYTES)
++                model._direct_weight_arena = buf
++                return buf
++
++            def _alloc_moe() -> None:
++                for ptr, (nbytes, views) in sorted(
++                    moe_groups.items(), key=lambda item: item[1][0], reverse=True
++                ):
++                    moe_buf = torch.empty((nbytes,), dtype=torch.uint8, device=device)
++                    if nbytes >= _TOUCH_STRIDE_BYTES:
++                        moe_buf[::_TOUCH_STRIDE_BYTES].zero_()
++                    if ptr in cpu_snapshots:
++                        moe_buf.copy_(cpu_snapshots.pop(ptr))
++                    moe_storage = moe_buf.untyped_storage()
++                    for param, _, orig_offset, shape, stride in views:
++                        param.set_(moe_storage, orig_offset, shape, stride)
++                        if hasattr(param, "_direct_deferred_alloc"):
++                            delattr(param, "_direct_deferred_alloc")
++                    del moe_buf, moe_storage
++
++            if use_preallocated_pool and _PREALLOCATED_CUDA_POOL_FRONT_CLEAN:
++                # Front of the pre-allocated segment is pure 512 MiB order-13
++                # blocks: place the dense arena at the aligned front first.
++                arena = _alloc_arena()
++                _alloc_moe()
++            else:
++                # Either no pre-allocated pool or unsoaked Unmovable sub-O13
++                # remains at offset 0: place temporary pre-tile MoE storages
++                # first so the permanent dense arena lands in the 512 MiB band.
++                _alloc_moe()
++                arena = _alloc_arena()
++
++            _refresh_module_weight_views(model)
++
++        if sponge or total_bytes >= _TOUCH_STRIDE_BYTES:
++            torch.accelerator.synchronize(device)
++        if retain_sponge and sponge and live_buddy:
++            sponge = _trim_sponge_for_post_load(
++                sponge,
++                device,
++                target_bsz=sponge_target_bsz,
++                buddyinfo_path=buddyinfo_path,
++                page_bytes=page_bytes,
++            )
++        if retain_sponge and sponge:
++            model._direct_buddy_sponge = sponge
++            model._direct_buddy_sponge_target_bsz = sponge_target_bsz
++            kept_sponge = True
++    finally:
++        cpu_snapshots.clear()
++        if not kept_sponge:
++            if sponge:
++                sponge.clear()
++            reclaim_uma_memory(device, synchronize=False)
++        else:
++            gc.collect()
++            trim_host_heap()
++
++    return arena
++
++
++class DirectModelLoader(DefaultModelLoader):
++    """Route checkpoint views through an asynchronous O_DIRECT read ring."""
++
++    def __init__(self, load_config):
++        options = dict(load_config.model_loader_extra_config)
++        self.io_threads = options.pop("io_threads", 8)
++        self.weight_arena = bool(options.pop("weight_arena", True))
++        self.order13_sponge = bool(options.pop("order13_sponge", True))
++        if options.get("enable_multithread_load"):
++            raise ValueError("the direct loader routes checkpoint shards in one thread")
++        if load_config.safetensors_load_strategy not in (None, "lazy"):
++            raise ValueError(
++                "the direct loader's O_DIRECT reads use no safetensors read strategy"
++            )
++        super().__init__(
++            dataclasses.replace(
++                load_config,
++                load_format="safetensors",
++                model_loader_extra_config=options,
++            )
++        )
++        self._session = None
++
++    def create_model(self, vllm_config, model_config, prefix=""):
++        device = torch.device(
++            self.load_config.device or vllm_config.device_config.device
++        )
++        if self.weight_arena and device.type == "cuda":
++            with defer_arena_weight_alloc():
++                model = super().create_model(vllm_config, model_config, prefix)
++            bind_weight_arena(
++                model,
++                device,
++                order13_sponge=self.order13_sponge,
++                retain_sponge=True,
++            )
++            return model
++        model = super().create_model(vllm_config, model_config, prefix)
++        if self.weight_arena:
++            bind_weight_arena(
++                model,
++                device,
++                order13_sponge=self.order13_sponge,
++                retain_sponge=True,
++            )
++        return model
++
++    def load_model(self, vllm_config, model_config, prefix=""):
++        device = torch.device(
++            self.load_config.device or vllm_config.device_config.device
++        )
++        if device.type != "cuda":
++            raise ValueError("the direct loader requires a CUDA device")
++        index = (
++            torch.accelerator.current_device_index()
++            if device.index is None
++            else device.index
++        )
++        if not capabilities(index)["host_page_tables"]:
++            raise RuntimeError(
++                f"--load-format direct needs a GPU that reads pageable memory through "
++                f"the host page tables, such as GB10, and CUDA device {index} does "
++                f"not; it has no GPU-direct-storage path"
++            )
++        with (
++            DirectWeightSession(index, io_threads=self.io_threads) as session,
++            weight_transfer(session),
++        ):
++            self._session = session
++            try:
++                model = super().load_model(vllm_config, model_config, prefix)
++                stats = session.stats()
++            finally:
++                self._session = None
++        reclaim_uma_memory(device, synchronize=True)
++        seconds = (
++            self.counter_after_loading_weights - self.counter_before_loading_weights
++        )
++        payload = stats["payload_bytes"] / 1e9
++        logger.info(
++            "Direct loader: weights loaded, %.2f GB of checkpoint payload in %.2f s "
++            "(%.2f GB/s); %.2f GB read from disk, %.2f GB BF16 expanded in the ring, "
++            "%.2f GB converted in the GPU scratch, %.2f GB copied by Torch",
++            payload,
++            seconds,
++            payload / seconds if seconds > 0 else 0.0,
++            stats["physical_bytes"] / 1e9,
++            stats["bf16_expansion_bytes"] / 1e9,
++            stats["transform_bytes"] / 1e9,
++            stats["torch_copy_bytes"] / 1e9,
++        )
++        logger.debug("Direct loader I/O counters: %s", stats)
++        return model
++
++    @staticmethod
++    def _needs_values(entry):
++        return math.prod(entry.shape) == 1 or entry.name.rsplit(".", 1)[-1] in {
++            "layer_multipliers",
++            "ngram_heads_offsets",
++            "ngram_heads_vocab_sizes",
++        }
++
++    def _file_backed_weights_iterator(self, files, source, index_path):
++        session = self._session
++        if session is None:
++            raise RuntimeError("the direct loader reads weights only in load_model")
++        names_by_path = None
++        if index_path.is_file():
++            weight_map = json.loads(index_path.read_text())["weight_map"]
++            indexed_paths = {}
++            names_by_path = {}
++            for name, indexed_file in weight_map.items():
++                resolved_indexed = indexed_paths.get(indexed_file)
++                if resolved_indexed is None:
++                    resolved_indexed = (index_path.parent / indexed_file).resolve()
++                    indexed_paths[indexed_file] = resolved_indexed
++                names_by_path.setdefault(resolved_indexed, []).append(name)
++        prefixes = source.weight_name_prefixes
++        local_expert_ids = self.local_expert_ids
++        file_filter = source.file_weight_filter
++        for path in files:
++            resolved_path = Path(path).resolve()
++            if names_by_path is not None:
++                indexed_names = names_by_path.get(resolved_path, ())
++                candidate_names = [
++                    name
++                    for name in indexed_names
++                    if (not prefixes or name.startswith(prefixes))
++                    and not should_skip_weight(name, local_expert_ids)
++                ]
++                if not candidate_names:
++                    continue
++                if not any(file_filter(name) for name in candidate_names):
++                    allowed_names = set(candidate_names)
++                    yield from session.weights(
++                        [path],
++                        prefix=source.prefix,
++                        needs_values=self._needs_values,
++                        skip=lambda name, allowed=allowed_names: name not in allowed,
++                    )
++                    continue
++                allowed_indexed = set(candidate_names)
++            else:
++                allowed_indexed = None
++            sources = weight_utils.safetensors_file_sources(path)
++            if allowed_indexed is not None:
++                selected = [name for name in sorted(sources) if name in allowed_indexed]
++            else:
++                selected = [
++                    name
++                    for name in sorted(sources)
++                    if (not prefixes or name.startswith(prefixes))
++                    and not should_skip_weight(name, local_expert_ids)
++                ]
++            file_names = {name for name in selected if file_filter(name)}
++            ordinary_names = {name for name in selected if name not in file_names}
++            file_backed = (
++                (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
++                for name in selected
++                if name in file_names
++            )
++            # File-backed entries never enter the checkpoint direct reader, even
++            # for mixed files or before metadata-value reads and routing.
++            ordinary = (
++                session.weights(
++                    [path],
++                    prefix=source.prefix,
++                    needs_values=self._needs_values,
++                    skip=lambda name, ordinary_names=ordinary_names: (
++                        name not in ordinary_names
++                    ),
++                )
++                if ordinary_names
++                else ()
++            )
++            yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
++
++    def _get_weights_iterator(self, source):
++        session = self._session
++        if session is None:
++            raise RuntimeError("the direct loader reads weights only in load_model")
++        folder, files, _ = self._prepare_weights(
++            source.model_or_path,
++            source.subfolder,
++            source.revision,
++            False,
++            source.allow_patterns_overrides,
++            source.weight_name_prefixes,
++        )
++        if self.counter_before_loading_weights == 0.0:
++            self.counter_before_loading_weights = time.perf_counter()
++        index_path = Path(folder) / SAFE_WEIGHTS_INDEX_NAME
++        if source.file_weight_filter is not None:
++            yield from self._file_backed_weights_iterator(files, source, index_path)
++            return
++        yield from session.weights(
++            files,
++            prefixes=source.weight_name_prefixes,
++            prefix=source.prefix,
++            index_path=index_path,
++            needs_values=self._needs_values,
++            skip=lambda name: should_skip_weight(name, self.local_expert_ids),
++        )
+diff --git a/vllm/model_executor/model_loader/dummy_loader.py b/vllm/model_executor/model_loader/dummy_loader.py
+index 0f263fe1170918f05549a4233cc91d6a431912f1..c790be6fc410b7017302476593504e415f13079d 100644
+--- a/vllm/model_executor/model_loader/dummy_loader.py
++++ b/vllm/model_executor/model_loader/dummy_loader.py
+@@ -32,6 +32,31 @@ class DummyModelLoader(BaseModelLoader):
+     def download_model(self, model_config: ModelConfig) -> None:
+         pass  # Nothing to download
+ 
++    def create_model(
++        self, vllm_config, model_config: ModelConfig, prefix: str = ""
++    ) -> nn.Module:
++        import os
++        import torch
++
++        from vllm.model_executor.model_loader.base_loader import _has_online_quant
++
++        model = super().create_model(vllm_config, model_config, prefix)
++        if (
++            os.environ.get("VLLM_DUMMY_WEIGHT_ARENA", "1").strip()
++            not in ("0", "false", "none")
++            and not _has_online_quant(model)
++        ):
++            device = torch.device(
++                self.load_config.device or vllm_config.device_config.device
++            )
++            if device.type == "cuda":
++                from vllm.model_executor.model_loader.direct_loader import (
++                    bind_weight_arena,
++                )
++
++                bind_weight_arena(model, device, retain_sponge=True)
++        return model
++
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+         for layer in model.modules():
+             info = get_layerwise_info(layer)
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 11e6be5cf8a1e6509bcba7e0de89a71b285bacfb..c76454313a44090064f848e507d80777fce88a37 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -106,6 +106,9 @@ def process_weights_after_loading(
+     # Reclaim memory when an explicit lm_head has been
+     # loaded, but it is identical to the input embeddings.
+     maybe_retie_word_embeddings(model, model_config)
++    track_cuda_reserved = (
++        target_device.type == "cuda" and torch.cuda.is_available()
++    )
+ 
+     for name, module in model.named_modules():
+         quant_method = getattr(module, "quant_method", None)
+@@ -130,6 +133,11 @@ def process_weights_after_loading(
+                 if quant_method.requires_device_loading
+                 else nullcontext()
+             )
++            reserved_before = (
++                torch.cuda.memory_reserved(target_device)
++                if track_cuda_reserved
++                else 0
++            )
+             with loading_context:
+                 quant_method.process_weights_after_loading(module)
+             # process_weights_after_loading may swap in freshly-created
+@@ -141,12 +149,34 @@ def process_weights_after_loading(
+                 module.update_param_tp_status()
+             # Repacking transients above can leave large amounts of memory in
+             # the caching allocator, which starves the OS on UMA devices.
+-            release_device_memory_under_pressure(target_device)
++            # Keep a bounded reusable working set (< 4 GiB) across identical
++            # layers while host memory still has >= 8 GiB available so
++            # back-to-back MoE layers reuse the same scratch blocks instead of
++            # unmapping and re-faulting them on every layer; reclaim once after
++            # the loop.
++            if not track_cuda_reserved:
++                release_device_memory_under_pressure(target_device)
++            else:
++                reserved_after = torch.cuda.memory_reserved(target_device)
++                if reserved_after > reserved_before:
++                    releasable = reserved_after - torch.cuda.memory_allocated(
++                        target_device
++                    )
++                    if releasable >= (4 << 30):
++                        release_device_memory_under_pressure(target_device)
++                    elif releasable >= (512 << 20):
++                        import psutil
++
++                        if psutil.virtual_memory().available < (8 << 30):
++                            release_device_memory_under_pressure(target_device)
++
++    if track_cuda_reserved:
++        release_device_memory_under_pressure(target_device)
+ 
+     # Initialize post-load attention weights for any attention layer and MM
+     # encoder. NOTE: Happens after other modules so we can easily decompress
+     # weights.
+-    for _, module in model.named_modules():
++    for name, module in model.named_modules():
+         if is_deferred_attention_layer(module):
+             # TODO(lucas): see if there is a way to unify the signatures
+             # of process_weights_after_loading
+diff --git a/vllm/model_executor/model_loader/weight_digest.py b/vllm/model_executor/model_loader/weight_digest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d28abbbe1b574aedef02a58264cafe24f2cdabe7
+--- /dev/null
++++ b/vllm/model_executor/model_loader/weight_digest.py
+@@ -0,0 +1,74 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A SHA-256 of the loaded parameters: the check that two loaders load the same bits.
++
++With ``SPARK_DS41F_WEIGHT_DIGEST=1`` every rank logs, once its loader has filled the
++parameters and before post-load processing turns them into kernel layouts::
++
++    weight digest rank <rank> <sha256> <model class>: <n> parameters, <GB> GB in <s> s
++
++The hash covers every parameter's bytes in name order, a shared parameter once under
++its first name, so a rank whose digest is equal across loaders and boots holds the
++same weights. A speculative model loads through the same loader and logs its own line.
++The bytes pass through one 64 MiB host buffer and the CPU hashes them at a few GB/s,
++so a DS4.1 rank starts some tens of seconds later. Production leaves the variable
++unset, which adds no work at all.
++"""
++
++import hashlib
++import os
++import time
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENABLED = os.environ.get("SPARK_DS41F_WEIGHT_DIGEST", "0") == "1"
++_STAGING_BYTES = 64 << 20
++
++
++def weight_digest(
++    model: torch.nn.Module, staging_bytes: int = _STAGING_BYTES
++) -> tuple[str, int, int]:
++    """The SHA-256 of ``model``'s parameter bytes in name order, with the number of
++    parameters and of bytes hashed."""
++    digest = hashlib.sha256()
++    # Touched before the first copy, so no copy writes into unfaulted host pages.
++    staging = torch.zeros(staging_bytes, dtype=torch.uint8)
++    count = total = 0
++    for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
++        tensor = parameter.detach()
++        if tensor.is_meta:
++            raise RuntimeError(f"weight digest: {name} has no storage after loading")
++        rows = tensor.reshape(1) if tensor.dim() == 0 else tensor
++        row_bytes = rows[0].numel() * rows.element_size() if rows.shape[0] else 0
++        step = max(1, staging_bytes // max(row_bytes, 1))
++        for start in range(0, rows.shape[0], step):
++            # A view of a contiguous parameter; at most one staging buffer (or one
++            # row) of temporary device memory for a strided one.
++            chunk = rows[start : start + step].contiguous().view(-1).view(torch.uint8)
++            for offset in range(0, chunk.numel(), staging_bytes):
++                part = chunk[offset : offset + staging_bytes]
++                host = staging[: part.numel()]
++                host.copy_(part)
++                digest.update(host.numpy())
++        count += 1
++        total += tensor.numel() * tensor.element_size()
++    return digest.hexdigest(), count, total
++
++
++def log_weight_digest(model: torch.nn.Module) -> None:
++    started = time.perf_counter()
++    sha256, count, total = weight_digest(model)
++    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++    logger.info(
++        "weight digest rank %d %s %s: %d parameters, %.2f GB in %.1f s",
++        rank,
++        sha256,
++        type(model).__name__,
++        count,
++        total / 1e9,
++        time.perf_counter() - started,
++    )
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index cee0ba0453a5538030ea0a31bbe45689c146a63c..4dd9095e493e1c01d61e6ec53799ff70c6da23f5 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -1972,10 +1972,10 @@ def initialize_single_dummy_weight(
+         return
+ 
+     if not torch.is_floating_point(param):
+-        if current_platform.is_rocm():
+-            # On ROCm, integer params (e.g. GPTQ qweight/qzeros) are left
+-            # as torch.empty() by default, giving non-deterministic values
+-            # across processes. Zero them for reproducibility.
++        if current_platform.is_rocm() or current_platform.is_cuda():
++            # On CUDA/ROCm, integer and packed FP4/UE8M0 params are left
++            # as torch.empty() by default, giving non-deterministic bytes
++            # across processes and boots. Zero them for reproducibility.
+             param.zero_()
+         return
+ 
+diff --git a/vllm/model_executor/weight_transfer.py b/vllm/model_executor/weight_transfer.py
+index 25be5b1ed17853aeb6c9430cee4fafe48142630a..d1676f33f2b52ecf4e6de5aed2b8ee6e9c2ee63a 100644
+--- a/vllm/model_executor/weight_transfer.py
++++ b/vllm/model_executor/weight_transfer.py
+@@ -48,6 +48,20 @@ def weight_transfer(
+ def copy_weight(destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+     writer = _writer.get()
+     if destination.is_meta or writer is None or not writer(destination, source):
++        if (
++            destination.is_cuda
++            and source.device.type == "cpu"
++            and not source.is_pinned()
++        ):
++            # A checkpoint tensor is often a view of a memory-mapped file (safetensors).
++            # On GB10, a pageable copy above about 128 KiB reads the source through the
++            # host page tables, and with driver R580 on a 64 KiB-page kernel it never
++            # completes when the file pages are not yet mapped and the copy does not
++            # start on a page boundary (the host spins in the copy, the GPU is idle).
++            # A copy into anonymous memory reads the file on the CPU first. (Not
++            # pin_memory: Torch's host allocator keeps every pinned block, rounded up
++            # to a power of two, and on GB10 that memory is the GPU's.)
++            source = source.clone()
+         destination.copy_(source)
+     return destination
+ 
+diff --git a/vllm/weightless.py b/vllm/weightless.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eae94ecd4d0a39ee53305df256691e4f895a3277
+--- /dev/null
++++ b/vllm/weightless.py
+@@ -0,0 +1,105 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Requests to the steered model name (WEIGHTLESS_STEER_MODEL).
++
++One engine serves a model and, under a second served model name, the model
++steered by a GLP file (``vllm/models/deepseek_v4_1/glp.py``). The OpenAI server
++marks a request to the steered name in its sampling parameters' ``extra_args``;
++the scheduler keys the request's cached prefix blocks by the mark, since steered
++rows write different KV; the worker marks the request's rows for the steering
++kernels. Unmarked requests are served as with steering off.
++"""
++
++import json
++import math
++from typing import Any
++
++import vllm.envs as envs
++
++EXTRA_ARGS_KEY = "weightless_steer"
++# A block hash extra key no other kind of key can equal (cache salts and LoRA
++# names are strings).
++BLOCK_HASH_KEY = ("weightless_steer",)
++
++
++def steered_model() -> str | None:
++    """The served model name whose requests are steered, or None."""
++    return envs.WEIGHTLESS_STEER_MODEL
++
++
++def is_steered_model(model_name: str | None) -> bool:
++    name = steered_model()
++    return name is not None and model_name == name
++
++
++def mark(extra_args: dict[str, Any] | None, steered: bool) -> dict[str, Any] | None:
++    """``extra_args`` with the request's mark set, or cleared: only the server
++    marks a request, never its caller."""
++    extra = dict(extra_args or {})
++    if steered:
++        extra[EXTRA_ARGS_KEY] = True
++    else:
++        extra.pop(EXTRA_ARGS_KEY, None)
++    return extra or None
++
++
++def is_marked(sampling_params: Any) -> bool:
++    """Whether ``sampling_params`` (or None) belong to a steered request."""
++    extra = getattr(sampling_params, "extra_args", None)
++    return bool(extra and extra.get(EXTRA_ARGS_KEY))
++
++
++_ALLOWED_DEFAULTS = frozenset({"temperature", "top_p", "top_k", "min_p"})
++
++
++def generation_defaults() -> dict[str, Any]:
++    """Per-model sampling defaults for WEIGHTLESS_STEER_MODEL requests, or {}."""
++    raw = envs.WEIGHTLESS_STEER_GENERATION_DEFAULTS
++    if not raw:
++        return {}
++    try:
++        parsed = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        raise ValueError(
++            f"WEIGHTLESS_STEER_GENERATION_DEFAULTS is not valid JSON: {raw!r}"
++        ) from exc
++    if not isinstance(parsed, dict):
++        raise ValueError(
++            f"WEIGHTLESS_STEER_GENERATION_DEFAULTS must be a JSON object, got {type(parsed).__name__}"
++        )
++    unknown = sorted(set(parsed) - _ALLOWED_DEFAULTS)
++    if unknown:
++        raise ValueError(
++            f"WEIGHTLESS_STEER_GENERATION_DEFAULTS has unsupported keys {unknown}"
++        )
++    for key, val in parsed.items():
++        if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS[{key!r}] must be a finite number, got {val!r}"
++            )
++        if key == "temperature" and val < 0:
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS['temperature'] must be >= 0, got {val!r}"
++            )
++        if key == "top_p" and not (0 < val <= 1):
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS['top_p'] must be in (0, 1], got {val!r}"
++            )
++        if key == "min_p" and not (0 <= val <= 1):
++            raise ValueError(
++                f"WEIGHTLESS_STEER_GENERATION_DEFAULTS['min_p'] must be in [0, 1], got {val!r}"
++            )
++    return parsed
++
++
++def sampling_defaults(
++    model_name: str | None, base_defaults: dict[str, Any]
++) -> dict[str, Any]:
++    """Return sampling defaults for ``model_name``: steered defaults merged over
++    ``base_defaults`` for WEIGHTLESS_STEER_MODEL, otherwise ``base_defaults`` unchanged."""
++    if not is_steered_model(model_name):
++        return base_defaults
++    overrides = generation_defaults()
++    if not overrides:
++        return base_defaults
++    return {**base_defaults, **overrides}
