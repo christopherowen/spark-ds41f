@@ -8,6 +8,20 @@ owner.
 
 ## Recent candidate decisions
 
+- **Candidate `75` / `75-r2` (retired 2026-11-27, unpromoted; future candidates branch from `spark-ds41f-1126`)**
+  ([`candidate-75`](experiments/2026-10-26-spark-ds41f-candidate/candidate-75/README.md),
+  vLLM `0001..0870`, `AngelSlim/DS-V4.1-Flash-DFly2-B6`): integrated KV-free DFly2
+  speculative decoding cleanly on SM121 (`12,089 passed, 356 skipped, 0 failed`
+  on `release-tests`, `+77.4 s` warm boot, `0` KV overhead, exact `1017`
+  outputs `rank1 = 1.0`, `ppl = 1.3161`), but retired because GB10's `273 GB/s`
+  LPDDR5X bandwidth imposes a `~6–7 ms` floor on DFly2's `5x` sequential
+  `lm_head` sweeps (`drafter_ms = 12.31–16.14 ms` vs `DSpark`'s `2.39–3.57 ms`,
+  `-23.7%` at `c1` and `-10.5%` to `-12.3%` at `c8`/`c16`), while native `0910`
+  target weights only recovered `+0.05` tokens/draft (`1.425 -> 1.475`, tying
+  `1017` `DSpark`'s `1.470` with `66.8%` vs `67.6%` unpruned pos-0 survival).
+  Reusable `DSpark` fixes (`cache_mask_embed` `5x` smaller draft embedding + TP
+  all-reduce and greedy `FULL` graph retention for `active_spec < K`) carried
+  into `candidate-76` directly on top of `spark-ds41f-1126`.
 - **Candidate `64` (built & 2-boot qualified 2026-11-21 on `tp3-triangle`, unpromoted)**
   ([`candidate-64`](experiments/2026-10-26-spark-ds41f-candidate/candidate-64/README.md),
   image `spark-ds41f:candidate-64`, `sha256:50b29406...`, vLLM `0001..0843`, tree
