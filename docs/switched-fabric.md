@@ -157,6 +157,38 @@ error. With `NCCL_IB_TC=106` the same runs had no retransmissions and held
 88-92 Gb/s; both PCIe paths of the port, marked, reached 174-182 Gb/s
 (2026-10-17).
 
+**Externally reported, not qualified here:** a four-node GB10 site on a MikroTik
+CRS812-8DS-2DQ-2DDQ (one 200 Gb/s breakout port per node, MTU 9000, switch
+L2MTU 9216) found that the switch's PFC settings did nothing until RouterOS 7.23
+([receipt](../experiments/2026-11-11-site-crs812-pfc-ecn/README.md), 2026-11-11):
+
+- On RouterOS 7.20.8 the QoS menus accepted a PFC configuration, but the switch
+  sent no pause frames. 802.3x global pause and transmit-only PFC did not stop
+  the drops either. MikroTik's
+  [7.23 release notes](https://forum.mikrotik.com/t/v7-23-stable-is-released/270721/1)
+  add PFC and ECN for CRS8xx; the site moved to
+  [7.23.5 long-term](https://forum.mikrotik.com/t/7-23-5-long-term-is-released/272867),
+  upgrading both the `routeros` and `switch-marvell` packages.
+- Receive PFC needs an explicit rate on the lossless queue
+  (`egress-rate-queue3=200G` on each fabric port). 7.20.8 refused any rate above
+  100G; 7.23.5 accepts the 200G wire rate.
+- The working configuration: lossless traffic class 3 with automatic buffers;
+  DSCP 26 to class 3 and DSCP 48 (CNP) to class 6; ECN on queue 3; PFC receive
+  and transmit on class 3; `trust-l3=keep`, applied to the four fabric ports
+  only. Each host trusts DSCP, maps `26:3` and `48:6`, enables PFC on priority 3
+  and turns global pause off, on both device paths of its port, from a boot-time
+  unit ([switch and host scripts](../experiments/2026-11-11-site-crs812-pfc-ecn/README.md#configuration)).
+- spark-ds41f at four nodes (`oneshot-switched`, upstream `c460d1b4` on the
+  1107 lock, 262,144 context), the same requests before and after, five repeats
+  at C1 on one boot each: `roce_adp_retrans` summed over all eight HCAs fell from
+  1,425 to 0, and the switch counted no queue drops afterwards (the before run did
+  not record switch counters). Cold prefill rose 14.0% at 4K and 3.1% at 32K, and
+  0.5% at 128K, where the ranges overlap; decode did not change (-0.7% prose,
+  -1.1% code).
+
+The firmware, buffers, classification, PFC and ECN changed together, so the gain
+is not attributed to any one of them.
+
 ### One switch port, two device paths
 
 A host reaches its switch port through two HCA device nodes on the same physical
