@@ -1,0 +1,59 @@
+From 37b92013dc11b1c216c6756590241da0fd5cfc72 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:12:21 +0100
+Subject: [PATCH] tilelang: support v0.1.16 _get_write_cache_path and load
+ errors in warm index
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 + candidate-74 (0001..0869)
+Rationale: TileLang v0.1.16 (#3807 multi-source cache) renamed
+KernelCache._get_cache_path to _get_write_cache_path and made
+_load_kernel_from_disk raise on invalid/corrupt cache entries instead of
+returning None. Without this update, _prepare_with_warm_index catches
+AttributeError and silently disables the warm index on every boot.
+Quality impact: none (preserves warm-index fast loading on both TileLang 0.1.15
+and 0.1.16; falls back cleanly to tilelang.prepare() on missing or corrupt
+entries).
+Tests: TileLang warm-index fast load verified on boot and in release-tests.
+Upstream status: local candidate-77 compatibility patch.
+---
+ vllm/models/deepseek_v4_1/tilelang/prepare.py | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index 9a9061c9af..29d19a9ba8 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -344,7 +344,8 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
+             tl_env.get_default_execution_backend(),
+             False,
+         )
+-        cache_dir = default_kc._get_cache_path("")
++        get_cache_path = getattr(default_kc, "_get_write_cache_path", None) or default_kc._get_cache_path
++        cache_dir = get_cache_path("")
+     except Exception:
+         cache_dir = None
+ 
+@@ -432,12 +433,16 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
+                 mem = kc._memory_cache.get(ckey)
+             if mem is not None:
+                 return (impl, args, kw, key, sig, mem)
+-            k = kc._load_kernel_from_disk(
+-                ckey, bc, impl.out_idx, pc, impl.compile_flags, stub, False
+-            )
++            try:
++                k = kc._load_kernel_from_disk(
++                    ckey, bc, impl.out_idx, pc, impl.compile_flags, stub, False
++                )
++            except Exception:
++                k = None
+             if k is None:
+                 import shutil
+-                shutil.rmtree(kc._get_cache_path(ckey), ignore_errors=True)
++                get_kc_path = getattr(kc, "_get_write_cache_path", None) or kc._get_cache_path
++                shutil.rmtree(get_kc_path(ckey), ignore_errors=True)
+             else:
+                 with kc._lock:
+                     existing = kc._memory_cache.get(ckey)
+-- 
+2.43.0
+
