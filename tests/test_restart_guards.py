@@ -477,12 +477,19 @@ class BuddyDefragmentationBeforeLaunchTest(unittest.TestCase):
                     "-n",
                     "sh",
                     "-c",
-                    "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; "
+                    "sync; echo 3 > /proc/sys/vm/drop_caches; "
+                    "if [ -w /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages ]; then "
+                    "hp2m=$(awk '/^MemFree:/{v=int(($2-4194304)/2048); if (v>0) print v}' /proc/meminfo 2>/dev/null); "
+                    "if [ -n \"$hp2m\" ] && [ \"$hp2m\" -gt 0 ] 2>/dev/null; then "
+                    "echo \"$hp2m\" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true; "
+                    "echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true; "
+                    "fi; fi; "
+                    "echo 1 > /proc/sys/vm/compact_memory; "
                     "if [ -w /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages ]; then "
                     "for _pass in 1 2; do "
-                    "o13=$(awk '/Node 0, zone[[:space:]]+Normal/{print $NF}' /proc/buddyinfo 2>/dev/null); "
-                    "if [ -n \"$o13\" ] && [ \"$o13\" -gt 0 ] 2>/dev/null; then "
-                    "echo \"$o13\" > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
+                    "hp512=$(awk '/^MemFree:/{v=int(($2-4194304)/524288); if (v>0) print v}' /proc/meminfo 2>/dev/null); "
+                    "if [ -n \"$hp512\" ] && [ \"$hp512\" -gt 0 ] 2>/dev/null; then "
+                    "echo \"$hp512\" > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
                     "echo 0 > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
                     "fi; "
                     "if [ \"$_pass\" -eq 1 ]; then echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true; fi; "

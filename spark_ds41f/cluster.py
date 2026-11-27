@@ -672,6 +672,11 @@ def defragment_buddy_memory(nodes: dict, target_nodes: list[dict]) -> None:
     On GB10 UMA, clean VFS page-cache and dentry pages scattered across 2 MiB
     pageblocks consume ``MemFree`` and block ``kcompactd`` from coalescing
     ``>= 2 MiB`` contiguous physical blocks before ``cuMemCreate`` weight loading.
+    A 2 MiB hugepage sweep runs first to flip ``MIGRATE_UNMOVABLE`` 512 MiB
+    pageblocks left behind by ``cuMemCreate`` back to ``MIGRATE_MOVABLE`` before
+    compaction and the 512 MiB hugepage sweep; without that flip, SLUB sprays
+    unreclaimable slabs across the empty ``Unmovable`` pageblocks and collapses
+    ``O13`` to 0 across restarts.
     Runs only after any existing serving container has stopped and before rank launch.
     """
     if not target_nodes:
@@ -685,12 +690,19 @@ def defragment_buddy_memory(nodes: dict, target_nodes: list[dict]) -> None:
             "-n",
             "sh",
             "-c",
-            "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; "
+            "sync; echo 3 > /proc/sys/vm/drop_caches; "
+            "if [ -w /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages ]; then "
+            "hp2m=$(awk '/^MemFree:/{v=int(($2-4194304)/2048); if (v>0) print v}' /proc/meminfo 2>/dev/null); "
+            "if [ -n \"$hp2m\" ] && [ \"$hp2m\" -gt 0 ] 2>/dev/null; then "
+            "echo \"$hp2m\" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true; "
+            "echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true; "
+            "fi; fi; "
+            "echo 1 > /proc/sys/vm/compact_memory; "
             "if [ -w /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages ]; then "
             "for _pass in 1 2; do "
-            "o13=$(awk '/Node 0, zone[[:space:]]+Normal/{print $NF}' /proc/buddyinfo 2>/dev/null); "
-            "if [ -n \"$o13\" ] && [ \"$o13\" -gt 0 ] 2>/dev/null; then "
-            "echo \"$o13\" > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
+            "hp512=$(awk '/^MemFree:/{v=int(($2-4194304)/524288); if (v>0) print v}' /proc/meminfo 2>/dev/null); "
+            "if [ -n \"$hp512\" ] && [ \"$hp512\" -gt 0 ] 2>/dev/null; then "
+            "echo \"$hp512\" > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
             "echo 0 > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages 2>/dev/null || true; "
             "fi; "
             "if [ \"$_pass\" -eq 1 ]; then echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true; fi; "
