@@ -4,7 +4,7 @@
 
 - **Base deployment commit**: `5f37f854ec` (`spark-ds41f-1126`, promoted baseline `2026-11-26-spark-ds41f-1126`).
 - **Base vLLM series**: `19f2c20ed4d64ae22bd009ceacadd85e2a81e354` + `candidate-74` (`0001..0869`, 742 patches, tree `f3783b0ec61851ba481f6a3a316d0a76d0e171d8`).
-- **Candidate vLLM series**: `experiments/2026-10-26-spark-ds41f-candidate/candidate-76/vllm/series` (`0001..0871`, 744 patches, patch head `52719d296ee53dba4bec3e7ea703a080f12468dc`, tree `50dd2dac2e7c75257ed6c15136042050f5629b12`, patchset SHA-256 `ed89bf949fc0e569e16e1e86a0eeb4950a8c470dc3ee0773102cb0444c2bed4a`).
+- **Candidate vLLM series**: `experiments/2026-10-26-spark-ds41f-candidate/candidate-76/vllm/series` (`0001..0871`, 744 patches, patch head `31e6870970eec4f16648556b4146f11c18427dd6`, tree `50dd2dac2e7c75257ed6c15136042050f5629b12`, patchset SHA-256 `ed89bf949fc0e569e16e1e86a0eeb4950a8c470dc3ee0773102cb0444c2bed4a`).
 - **Runtime configuration**: identical to `releases/spark-ds41f-1126/cluster.json` across all 16 shapes (`DeepSeek-V4.1-Flash-1017`, `DSpark`, `GLP-27` at `alpha=2.0`, `sparknet v0.6.0`, `tilelang`).
 - **Changes over `spark-ds41f-1126`**:
   1. `0870-dspark-cache-constant-mask-token-embedding-for-query.patch`: precompute and cache the constant `parallel_drafting_token_id` embedding once after draft weight load (`cache_mask_embed`), then embed only the `num_reqs` anchor tokens per decode step (`embed_query_block`) and broadcast the cached vector into mask offsets `1..block_size-1`. Bit-exact against full block embedding; shrinks the draft embedding lookup and TP all-reduce by `5x` on DeepSeek-V4.1-Flash (`6x` when `sample_from_anchor=False`).
