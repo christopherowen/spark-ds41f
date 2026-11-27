@@ -1,0 +1,1121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:29:19 +0000
+Subject: [PATCH 16/19] [CUDA] Add explicit host-mapped buffer annotations
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+Upstream-commit: fd5305807b09d447eb8fb89fa10c553cb69a9498
+
+Rationale: Zero-copy CPU mapped pinned buffers passed into TileLang kernels previously failed device residency checks or triggered misleading device index lookups in the Cython and tvm_ffi adapters. Add T.annotate_host_mapped_buffers(...) to validate CU_MEMORYTYPE_HOST + CU_POINTER_ATTRIBUTE_IS_MANAGED/MAPPED via cuPointerGetAttribute and allow annotated host-mapped tensors alongside GPU tensors.
+
+Quality: Opt-in annotation; no change to unannotated kernel launches.
+
+Tests: testing/python/jit/test_tilelang_jit_host_mapped.py across cython and tvm_ffi backends across two GPU boots on SM121.
+
+Upstream-status: Backported from tile-ai/tilelang#3802 (commit fd5305807b09d447eb8fb89fa10c553cb69a9498).
+---
+ docs/compiler_internals/tensor_checks.md      |  44 +++
+ src/backend/common/codegen/codegen_c_host.cc  |  19 +-
+ src/backend/common/codegen/codegen_c_host.h   |   2 +-
+ src/cuda/runtime.cc                           |  38 +++
+ src/cuda/stubs/cuda.cc                        |  11 +
+ src/cuda/stubs/cuda.h                         |   8 +
+ src/transform/make_packed_api.cc              |  25 +-
+ src/transform/tvm_ffi_binder.cc               |  23 +-
+ src/transform/tvm_ffi_binder.h                |  13 +-
+ .../jit/test_tilelang_jit_host_mapped.py      | 254 ++++++++++++++++++
+ .../test_tilelang_language_host_mapped.py     |  72 +++++
+ tilelang/engine/host_mapped.py                |  40 +++
+ tilelang/engine/lower.py                      |   6 +
+ tilelang/jit/adapter/cython/adapter.py        |  16 +-
+ .../jit/adapter/cython/cython_wrapper.pyx     |  38 ++-
+ tilelang/jit/adapter/tvm_ffi.py               |  27 +-
+ tilelang/jit/kernel.py                        |   5 +
+ tilelang/language/annotations.py              |  40 +++
+ tilelang/language/common.py                   |   2 +
+ tilelang/language/eager/builder.py            |  11 +
+ 20 files changed, 660 insertions(+), 34 deletions(-)
+ create mode 100644 testing/python/jit/test_tilelang_jit_host_mapped.py
+ create mode 100644 testing/python/language/test_tilelang_language_host_mapped.py
+ create mode 100644 tilelang/engine/host_mapped.py
+
+diff --git a/docs/compiler_internals/tensor_checks.md b/docs/compiler_internals/tensor_checks.md
+index 47788f0d..5b360561 100644
+--- a/docs/compiler_internals/tensor_checks.md
++++ b/docs/compiler_internals/tensor_checks.md
+@@ -121,6 +121,50 @@ Since `some_cond` is only known at runtime, static analysis cannot prove `A` is
+ Supported and referenced device codes in error messages: `1=CPU, 2=CUDA, 7=Vulkan, 8=Metal, 10=ROCM, 14=OneAPI, 15=WebGPU`.
+ Kernels assert that `device_type` matches the target backend, and require `device_id` consistency across tensors.
+ 
++### Explicit mapped host parameters (CUDA)
++
++`T.annotate_host_mapped_buffers(*buffers)` declares external tensor parameters
++whose storage is mapped host memory accessible to the executing GPU:
++
++```python
++@T.prim_func
++def affine(src: T.Tensor((N,), T.float32), dst: T.Tensor((N,), T.float32)):
++    T.annotate_host_mapped_buffers(dst)
++    with T.Kernel(T.ceildiv(N, 128), threads=128) as block:
++        for lane in T.Parallel(128):
++            i = block * 128 + lane
++            if i < N:
++                dst[i] = src[i] * 2 + 1
++```
++
++Compile with `target="cuda"` and `execution_backend="cython"` or `"tvm_ffi"`.
++Pass a preallocated CPU tensor, for example
++`torch.empty(N, dtype=torch.float32, pin_memory=True)`, as `dst`. Its PyTorch
++device remains CPU. The launcher validates the CUDA registration and resolves
++the device pointer; it does not assume that host and device addresses match.
++Ordinary pageable CPU tensors and CUDA tensors are rejected for annotated
++parameters. Unannotated parameters retain their existing device requirements,
++and dtype, shape, rank, and stride checks remain enabled.
++
++The annotation applies to the whole function. Multiple calls are merged into
++the `tl.host_mapped_params` function attribute, which records parameter indices
++and survives IR serialization and kernel cache restoration. It does not change
++the buffer's `global` scope. Only external buffer parameters may be annotated;
++annotated outputs cannot be allocated via `out_idx` or `T.empty`. Other targets
++and execution backends currently reject the annotation.
++
++Mapped parameters use the current CUDA execution context; CUDA tensor arguments
++must be on that device. Host tensors do not supply a CUDA device ID. Views use
++their actual data pointer and declared strides, including nonzero storage offsets.
++
++This feature supports direct global loads and stores without a D2H copy or a
++global `skip_tensor_validation`. It does not register memory or synchronize
++execution. Keep the tensor storage and its mapping alive until GPU work finishes,
++and synchronize the relevant stream or event before the CPU reads or reuses it.
++For CUDA Graphs, preallocate before capture and retain the same storage and
++mapping throughout replay. Replays reuse captured pointers and do not rerun host
++validation. Concurrent steps need separate output storage or explicit ordering.
++
+ ---
+ 
+ ## Common Error Examples (What you’ll see)
+diff --git a/src/backend/common/codegen/codegen_c_host.cc b/src/backend/common/codegen/codegen_c_host.cc
+index a9caeab9..82b5b313 100644
+--- a/src/backend/common/codegen/codegen_c_host.cc
++++ b/src/backend/common/codegen/codegen_c_host.cc
+@@ -250,7 +250,7 @@ void CodeGenCHost::PrintGetFuncFromBackend(
+   this->stream << "}\n";
+ }
+ 
+-void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
++std::string CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
+   using namespace tvm::tirx;
+   const StringImmNode *func_name = op->args[0].as<StringImmNode>();
+   ICHECK(func_name != nullptr)
+@@ -324,6 +324,7 @@ void CodeGenCHost::PrintCallPacked(const tvm::tirx::CallNode *op) {
+     this->PrintLine("});");
+     this->PrintLine("if (", metal_result, " != 0) return ", metal_result, ";");
+   }
++  return result;
+ }
+ 
+ std::string CodeGenCHost::GetPackedName(const tvm::tirx::CallNode *op) {
+@@ -388,10 +389,18 @@ void CodeGenCHost::VisitExpr_(const tvm::tirx::CallNode *op,
+       this->stream << "TVMFFIAny " << stack_name << "[" << size << "];\n";
+     }
+     os << stack_name;
+-  } else if (op->op.same_as(builtin::tvm_call_packed_lowered())) {
+-    this->PrintCallPacked(op);
+-  } else if (op->op.same_as(builtin::tvm_call_cpacked_lowered())) {
+-    this->PrintCallPacked(op);
++  } else if (op->op.same_as(builtin::tvm_call_packed_lowered()) ||
++             op->op.same_as(builtin::tvm_call_cpacked_lowered())) {
++    // Runtime queries (for example, mapped host addresses) use the returned
++    // scalar or opaque pointer, unlike kernel launches with ignored results.
++    std::string result = this->PrintCallPacked(op);
++    os << "((";
++    PrintType(op->dtype, os);
++    os << ")" << result
++       << (op->dtype.is_handle()  ? ".v_ptr"
++           : op->dtype.is_float() ? ".v_float64"
++                                  : ".v_int64")
++       << ")";
+   } else if (op->op.same_as(builtin::tvm_throw_last_error())) {
+     this->PrintIndent();
+     this->stream << "return -1;\n";
+diff --git a/src/backend/common/codegen/codegen_c_host.h b/src/backend/common/codegen/codegen_c_host.h
+index a1c81b2c..07889ead 100644
+--- a/src/backend/common/codegen/codegen_c_host.h
++++ b/src/backend/common/codegen/codegen_c_host.h
+@@ -91,7 +91,7 @@ private:
+   std::string GetPackedName(const tvm::tirx::CallNode *op);
+   void PrintGetFuncFromBackend(const std::string &func_name,
+                                const std::string &packed_func_name);
+-  void PrintCallPacked(const tvm::tirx::CallNode *op);
++  std::string PrintCallPacked(const tvm::tirx::CallNode *op);
+   /*!
+    * \brief Print ternary conditional operator implementing binary `op`
+    * Forces the operands to be in SSA form.
+diff --git a/src/cuda/runtime.cc b/src/cuda/runtime.cc
+index a3627b34..f03fb638 100644
+--- a/src/cuda/runtime.cc
++++ b/src/cuda/runtime.cc
+@@ -18,6 +18,44 @@ namespace tl {
+ 
+ using namespace ffi;
+ 
++// Both launchers use the current CUDA context. Registration and mapping are
++// owned by the caller, and are never created as a side effect of a launch.
++TVM_FFI_STATIC_INIT_BLOCK() {
++  reflection::GlobalDef()
++      .def("tl.cuda.current_device",
++           []() {
++             CUdevice device;
++             CUresult result = cuCtxGetDevice(&device);
++             TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
++                 << "Cannot determine the current CUDA device: " << result;
++             return static_cast<int32_t>(device);
++           })
++      .def("tl.cuda.get_host_mapped_pointer", [](void *host_ptr) -> void * {
++        // Empty buffers have no storage to map.
++        if (host_ptr == nullptr) {
++          return nullptr;
++        }
++        unsigned int flags;
++        CUresult result = cuMemHostGetFlags(&flags, host_ptr);
++        if (result != CUDA_SUCCESS) {
++          TVM_FFI_THROW(ValueError)
++              << "Host-mapped buffer requires CUDA-registered pinned host "
++                 "memory; ordinary pageable CPU memory is not supported "
++                 "(cuMemHostGetFlags error "
++              << result << ")";
++        }
++        CUdeviceptr device_ptr;
++        result = cuMemHostGetDevicePointer(&device_ptr, host_ptr, 0);
++        if (result != CUDA_SUCCESS) {
++          TVM_FFI_THROW(ValueError)
++              << "Host-mapped buffer is not accessible from the current CUDA "
++                 "context (cuMemHostGetDevicePointer error "
++              << result << ")";
++        }
++        return reinterpret_cast<void *>(device_ptr);
++      });
++}
++
+ #if 1
+ // Thread-local storage for restoring the L2 persisting cache limit
+ static thread_local size_t __tl_prev_persisting_l2_cache_size = 0;
+diff --git a/src/cuda/stubs/cuda.cc b/src/cuda/stubs/cuda.cc
+index 96a5393e..a10741e5 100644
+--- a/src/cuda/stubs/cuda.cc
++++ b/src/cuda/stubs/cuda.cc
+@@ -149,6 +149,17 @@ CUresult CUDAAPI cuCtxGetDevice(CUdevice *device) {
+   return CUDADriverAPI::get()->cuCtxGetDevice_(device);
+ }
+ 
++CUresult CUDAAPI cuMemHostGetFlags(unsigned int *flags, void *ptr) {
++  return CUDADriverAPI::get()->cuMemHostGetFlags_(flags, ptr);
++}
++
++CUresult CUDAAPI cuMemHostGetDevicePointer_v2(CUdeviceptr *device_ptr,
++                                              void *host_ptr,
++                                              unsigned int flags) {
++  return CUDADriverAPI::get()->cuMemHostGetDevicePointer_v2_(device_ptr,
++                                                             host_ptr, flags);
++}
++
+ CUresult CUDAAPI cuCtxGetLimit(size_t *pvalue, CUlimit limit) {
+   return CUDADriverAPI::get()->cuCtxGetLimit_(pvalue, limit);
+ }
+diff --git a/src/cuda/stubs/cuda.h b/src/cuda/stubs/cuda.h
+index 17f67a16..39ba859c 100644
+--- a/src/cuda/stubs/cuda.h
++++ b/src/cuda/stubs/cuda.h
+@@ -60,10 +60,14 @@
+ // X-macro for listing all required CUDA driver API functions.
+ // Format: _(function_name)
+ // These are the core functions used by TVM/tilelang CUDA runtime.
++// Keep cuMemHostGetDevicePointer_v2 explicit: symbol lookup stringifies these
++// names without expanding CUDA aliases, and the old entry has a 32-bit ABI.
+ #define TILELANG_LIBCUDA_API_REQUIRED(_)                                       \
+   _(cuGetErrorName)                                                            \
+   _(cuGetErrorString)                                                          \
+   _(cuCtxGetDevice)                                                            \
++  _(cuMemHostGetFlags)                                                         \
++  _(cuMemHostGetDevicePointer_v2)                                              \
+   _(cuCtxGetLimit)                                                             \
+   _(cuCtxSetLimit)                                                             \
+   _(cuCtxResetPersistingL2Cache)                                               \
+@@ -164,6 +168,10 @@ TILELANG_CUDA_STUB_API CUresult cuGetErrorName(CUresult error,
+ TILELANG_CUDA_STUB_API CUresult cuGetErrorString(CUresult error,
+                                                  const char **pStr);
+ TILELANG_CUDA_STUB_API CUresult cuCtxGetDevice(CUdevice *device);
++TILELANG_CUDA_STUB_API CUresult cuMemHostGetFlags(unsigned int *flags,
++                                                  void *ptr);
++TILELANG_CUDA_STUB_API CUresult cuMemHostGetDevicePointer_v2(
++    CUdeviceptr *device_ptr, void *host_ptr, unsigned int flags);
+ TILELANG_CUDA_STUB_API CUresult cuCtxGetLimit(size_t *pvalue, CUlimit limit);
+ TILELANG_CUDA_STUB_API CUresult cuCtxSetLimit(CUlimit limit, size_t value);
+ TILELANG_CUDA_STUB_API CUresult cuCtxResetPersistingL2Cache(void);
+diff --git a/src/transform/make_packed_api.cc b/src/transform/make_packed_api.cc
+index 9592121a..e60d7e3b 100644
+--- a/src/transform/make_packed_api.cc
++++ b/src/transform/make_packed_api.cc
+@@ -447,6 +447,28 @@ MakePackedAPI(PrimFunc func,
+   TVMFFIABIBuilder binder(&vmap);
+   TVMFFIABIBuilder output_binder(&vmap);
+ 
++  std::unordered_set<const VarNode *> host_mapped_buffers;
++  if (auto indices = func->GetAttr<Array<Integer>>("tl.host_mapped_params")) {
++    ICHECK_EQ(target_device_type, kDLCUDA)
++        << "Host-mapped buffers require a CUDA target";
++    for (Integer index : indices.value()) {
++      int i = index.IntValue();
++      ICHECK(i >= 0 && i < static_cast<int>(func->params.size()));
++      Var param = func->params[i];
++      ICHECK(func->buffer_map.count(param));
++      host_mapped_buffers.insert(func->buffer_map[param]->data.get());
++    }
++  }
++  if (!host_mapped_buffers.empty()) {
++    // The current context owns the launch stream and the host mappings. Bind
++    // it before processing tensors, including signatures with host buffers
++    // first or with no device-resident tensor at all.
++    binder.Bind(device_id,
++                Call(DataType::Int(32), builtin::tvm_call_packed(),
++                     {StringImm("tl.cuda.current_device")}),
++                name_hint + ".device_id", true);
++  }
++
+   // ---------------------------
+   // local function definitions
+   // load i-th argument as type t
+@@ -775,7 +797,8 @@ MakePackedAPI(PrimFunc func,
+   }
+ 
+   binder.BindDLTensors(buffer_def, device_type, device_id, name_hint,
+-                       used_param_buffers, detector.used_shape_vars);
++                       used_param_buffers, detector.used_shape_vars,
++                       host_mapped_buffers);
+   for (const auto &[var, buffer] : buffer_def) {
+     // Prefer buffer data var name in diagnostics to avoid exposing low-level
+     // handle vars
+diff --git a/src/transform/tvm_ffi_binder.cc b/src/transform/tvm_ffi_binder.cc
+index 17a96dca..8c09ba95 100644
+--- a/src/transform/tvm_ffi_binder.cc
++++ b/src/transform/tvm_ffi_binder.cc
+@@ -332,7 +332,8 @@ void TVMFFIABIBuilder::BindDLTensors(
+     const PrimExpr &device_type, const PrimExpr &device_id,
+     const std::string &func_name,
+     const std::unordered_set<const VarNode *> &used_param_buffers,
+-    const std::unordered_set<const VarNode *> &used_shape_vars) {
++    const std::unordered_set<const VarNode *> &used_shape_vars,
++    const std::unordered_set<const VarNode *> &host_mapped_buffers) {
+   Array<Buffer> buffers;
+   Array<Var> handles;
+ 
+@@ -980,17 +981,22 @@ void TVMFFIABIBuilder::BindDLTensors(
+         TVMArrayGet(DataType::Int(32), handle, builtin::kDLTensorDeviceId),
+         make_zero(DataType::Int(32)));
+ 
+-    // Bind device_id to a safe expression (0 when NULL handle)
+-    BindNullable(device_id, actual_dev_id, arg_name + ".device_id", true,
+-                 is_null);
++    // Host storage has no CUDA device id. Only device-resident parameters
++    // participate in the execution-device consistency check.
++    bool host_mapped = host_mapped_buffers.count(buffer->data.get());
++    if (!host_mapped) {
++      BindNullable(device_id, actual_dev_id, arg_name + ".device_id", true,
++                   is_null);
++    }
+     // Check device_type consistency (device_id equality is implicitly ensured
+     // by binding above)
+     {
+-      PrimExpr ok = (device_type == actual_dev_type);
++      PrimExpr expected_dev_type = host_mapped ? Integer(kDLCPU) : device_type;
++      PrimExpr ok = (expected_dev_type == actual_dev_type);
+       std::ostringstream device_msg;
+       device_msg << "kernel " << kernel_nm << " input " << buf_nm
+                  << " device_type mismatch";
+-      if (const auto *const_device_type = device_type.as<IntImmNode>()) {
++      if (const auto *const_device_type = expected_dev_type.as<IntImmNode>()) {
+         device_msg << ", expected "
+                    << runtime::DLDeviceType2Str(
+                           static_cast<int>(const_device_type->value));
+@@ -1010,6 +1016,11 @@ void TVMFFIABIBuilder::BindDLTensors(
+           Not(is_null),
+           TVMArrayGet(DataType::Handle(), handle, builtin::kDLTensorData),
+           make_zero(DataType::Handle()));
++      if (host_mapped) {
++        data_ptr =
++            Call(DataType::Handle(), builtin::tvm_call_packed(),
++                 {StringImm("tl.cuda.get_host_mapped_pointer"), data_ptr});
++      }
+       BindNullable(buffer->data, data_ptr, arg_name + ".data", true, is_null);
+ 
+       // Check if the data pointer is NULL.  This check is skipped for
+diff --git a/src/transform/tvm_ffi_binder.h b/src/transform/tvm_ffi_binder.h
+index 9cc7e011..414b934d 100644
+--- a/src/transform/tvm_ffi_binder.h
++++ b/src/transform/tvm_ffi_binder.h
+@@ -101,12 +101,13 @@ public:
+    * \param func_name The function name.
+    * \param used_param_buffers The used param buffers.
+    */
+-  void
+-  BindDLTensors(const std::vector<std::pair<Var, Buffer>> &buffer_def,
+-                const PrimExpr &device_type, const PrimExpr &device_id,
+-                const std::string &func_name,
+-                const std::unordered_set<const VarNode *> &used_param_buffers,
+-                const std::unordered_set<const VarNode *> &used_shape_vars);
++  void BindDLTensors(
++      const std::vector<std::pair<Var, Buffer>> &buffer_def,
++      const PrimExpr &device_type, const PrimExpr &device_id,
++      const std::string &func_name,
++      const std::unordered_set<const VarNode *> &used_param_buffers,
++      const std::unordered_set<const VarNode *> &used_shape_vars,
++      const std::unordered_set<const VarNode *> &host_mapped_buffers = {});
+ 
+   /*! \return The defs generated in binding. */
+   const std::vector<Var> &Defs() const { return defs_; }
+diff --git a/testing/python/jit/test_tilelang_jit_host_mapped.py b/testing/python/jit/test_tilelang_jit_host_mapped.py
+new file mode 100644
+index 00000000..879538b8
+--- /dev/null
++++ b/testing/python/jit/test_tilelang_jit_host_mapped.py
+@@ -0,0 +1,254 @@
++"""Direct GPU access to explicit, mapped host tensor parameters."""
++
++import pytest
++import torch
++
++import tilelang
++import tilelang.language as T
++import tilelang.testing
++
++BACKENDS = ["cython", "tvm_ffi"]
++
++
++@tilelang.testing.requires_cuda
++def test_host_mapped_cuda_stub_pointer_query():
++    import ctypes
++
++    from tilelang.libinfo import find_lib_path
++
++    try:
++        stub_path = find_lib_path("stub_cuda")
++    except RuntimeError:
++        pytest.skip("requires a CUDA stub build")
++
++    # Call the stub explicitly: ELF symbol interposition can otherwise route
++    # the runtime helper directly to an already-loaded CUDA driver library.
++    stub = ctypes.CDLL(stub_path)
++    get_pointer = stub.cuMemHostGetDevicePointer_v2
++    get_pointer.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
++    get_pointer.restype = ctypes.c_int
++
++    torch.empty(1, device="cuda")  # Ensure a CUDA context is current.
++    storage = torch.empty(128, pin_memory=True)
++    base_pointer = ctypes.c_uint64()
++    status = get_pointer(ctypes.byref(base_pointer), ctypes.c_void_p(storage.data_ptr()), 0)
++    assert status == 0, f"CUDA stub mapping failed with error {status}"
++    assert base_pointer.value != 0
++
++    view = storage[4:]
++    view_pointer = ctypes.c_uint64()
++    status = get_pointer(ctypes.byref(view_pointer), ctypes.c_void_p(view.data_ptr()), 0)
++    assert status == 0, f"CUDA stub view mapping failed with error {status}"
++    assert view_pointer.value == base_pointer.value + 4 * storage.element_size()
++
++
++def _affine(n=4099, stride=1, annotated=True):
++    @T.prim_func
++    def kernel(src: T.Tensor((n,), T.float32), dst: T.StridedTensor((n,), (stride,), T.float32)):
++        if annotated:
++            T.annotate_host_mapped_buffers(dst)
++        with T.Kernel(T.ceildiv(n, 128), threads=128) as block:
++            for lane in T.Parallel(128):
++                i = block * 128 + lane
++                if i < n:
++                    dst[i] = src[i] * 2 + 1
++
++    return kernel
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("stride", [1, 2])
++@tilelang.testing.requires_cuda
++def test_host_mapped_eager_and_graph(backend, stride):
++    n = 4099
++    kernel = tilelang.compile(_affine(n, stride), target="cuda", execution_backend=backend)
++    base = torch.arange(n, dtype=torch.float32)
++    src = base.cuda()
++    sentinel = -777.0
++    storage = torch.full((n * stride + 8,), sentinel, pin_memory=True)
++    dst = storage[4 : 4 + n * stride : stride]
++    guard = torch.ones_like(storage, dtype=torch.bool)
++    guard[4 : 4 + n * stride : stride] = False
++
++    def check(expected):
++        torch.testing.assert_close(dst, expected, rtol=0, atol=0)
++        assert bool((storage[guard] == sentinel).all())
++
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(stream):
++        kernel(src, dst)
++    stream.synchronize()
++    check(base * 2 + 1)
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=stream):
++        kernel(src, dst)
++    for replay in range(3):
++        values = base + (replay + 1) * 17
++        src.copy_(values)
++        torch.cuda.synchronize()
++        storage.fill_(sentinel)
++        graph.replay()
++        torch.cuda.synchronize()
++        check(values * 2 + 1)
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@tilelang.testing.requires_cuda
++def test_host_mapped_preserves_validation(backend):
++    n = 33
++    kernel = tilelang.compile(_affine(n), target="cuda", execution_backend=backend)
++    src = torch.arange(n, dtype=torch.float32, device="cuda")
++    good = torch.empty(n, pin_memory=True)
++    invalid_outputs = [
++        (torch.empty(n), "registered|pinned|mapped"),
++        (torch.empty(n, device="cuda"), "device|host|Host"),
++        (torch.empty(n, dtype=torch.int32, pin_memory=True), "dtype"),
++        (torch.empty(n - 1, pin_memory=True), "shape"),
++        (torch.empty((1, n), pin_memory=True), "shape|ndim|dimensions"),
++        (torch.empty(n * 2, pin_memory=True)[::2], "stride|contiguous"),
++    ]
++    for dst, message in invalid_outputs:
++        with pytest.raises((ValueError, TypeError, RuntimeError), match=message):
++            kernel(src, dst)
++    with pytest.raises((ValueError, TypeError, RuntimeError), match="device"):
++        kernel(src.cpu(), good)
++
++    # The opt-in applies only to the annotated parameter of this function.
++    normal = tilelang.compile(_affine(n, annotated=False), target="cuda", execution_backend=backend)
++    with pytest.raises((ValueError, TypeError, RuntimeError), match="device"):
++        normal(src, good)
++    device_dst = torch.empty_like(src)
++    normal(src, device_dst)
++    torch.testing.assert_close(device_dst, src * 2 + 1, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@tilelang.testing.requires_cuda
++def test_host_mapped_first_parameter_and_host_only(backend):
++    @T.prim_func
++    def host_first(dst: T.Tensor((33,), T.float32), src: T.Tensor((33,), T.float32)):
++        T.annotate_host_mapped_buffers(dst)
++        with T.Kernel(1, threads=64):
++            for i in T.Parallel(33):
++                dst[i] = src[i] + 1
++
++    @T.prim_func
++    def host_only(dst: T.Tensor((33,), T.float32), src: T.Tensor((33,), T.float32)):
++        T.annotate_host_mapped_buffers(dst, src)
++        with T.Kernel(1, threads=64):
++            for i in T.Parallel(33):
++                dst[i] = src[i] + 2
++
++    src = torch.arange(33, dtype=torch.float32, pin_memory=True)
++    dst = torch.empty_like(src, pin_memory=True)
++    first = tilelang.compile(host_first, target="cuda", execution_backend=backend)
++    device_src = src.cuda()
++    first(dst, device_src)
++    torch.cuda.synchronize()
++    torch.testing.assert_close(dst, src + 1, rtol=0, atol=0)
++    only = tilelang.compile(host_only, target="cuda", execution_backend=backend)
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream):
++        only(dst, src)
++    stream.synchronize()
++    torch.testing.assert_close(dst, src + 2, rtol=0, atol=0)
++
++    # With no CUDA tensor argument, the launcher must still use Torch's stream.
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=stream):
++        only(dst, src)
++    torch.cuda.synchronize()
++    src.add_(17)
++    dst.fill_(-777)
++    graph.replay()
++    torch.cuda.synchronize()
++    torch.testing.assert_close(dst, src + 2, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@tilelang.testing.requires_cuda
++def test_host_mapped_eager_jit(backend):
++    @tilelang.jit(target="cuda", execution_backend=backend)
++    def kernel(src, dst):
++        src: T.Tensor((33,), T.float32)
++        dst: T.Tensor((33,), T.float32)
++        T.annotate_host_mapped_buffers(dst)
++        with T.Kernel(1, threads=64):
++            for i in T.Parallel(33):
++                dst[i] = src[i] + 3
++
++    src = torch.arange(33, dtype=torch.float32, device="cuda")
++    dst = torch.empty(33, pin_memory=True)
++    kernel(src, dst)
++    torch.cuda.synchronize()
++    torch.testing.assert_close(dst, src.cpu() + 3, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@tilelang.testing.requires_cuda
++def test_host_input_with_automatic_device_output(backend):
++    @T.prim_func
++    def kernel(src: T.Tensor((33,), T.float32), dst: T.Tensor((33,), T.float32)):
++        T.annotate_host_mapped_buffers(src)
++        with T.Kernel(1, threads=64):
++            for i in T.Parallel(33):
++                dst[i] = src[i] + 4
++
++    compiled = tilelang.compile(kernel, out_idx=[1], target="cuda", execution_backend=backend)
++    src = torch.arange(33, dtype=torch.float32, pin_memory=True)
++    dst = compiled(src)
++    assert dst.device.type == "cuda"
++    torch.testing.assert_close(dst.cpu(), src + 4, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@tilelang.testing.requires_cuda
++def test_host_mapping_uses_execution_device(backend):
++    if torch.cuda.device_count() < 2:
++        pytest.skip("requires two CUDA devices")
++    with torch.cuda.device(0):
++        dst = torch.empty(33, pin_memory=True)
++    with torch.cuda.device(1):
++        kernel = tilelang.compile(_affine(33), target="cuda", execution_backend=backend)
++        src = torch.arange(33, dtype=torch.float32, device="cuda:1")
++        kernel(src, dst)
++        torch.cuda.synchronize()
++        torch.testing.assert_close(dst, src.cpu() * 2 + 1, rtol=0, atol=0)
++    with torch.cuda.device(0), pytest.raises((ValueError, RuntimeError), match="device"):
++        kernel(src, dst)
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@tilelang.testing.requires_cuda
++def test_host_mapped_disk_cache(backend, tmp_path, monkeypatch):
++    from tilelang.backend import create_backend_context
++    from tilelang.cache import _dispatch_map
++    from tilelang.env import env
++    from tilelang import tvm
++    from tilelang.jit.kernel import JITKernel
++
++    monkeypatch.setattr(env, "TILELANG_CACHE_DIR", str(tmp_path / "cache"))
++    func = _affine(33)
++    kernel = JITKernel(func, target="cuda", execution_backend=backend)
++    cache = _dispatch_map[backend]
++    key = "host-mapped-round-trip"
++    cache._save_kernel_to_disk(key, kernel)
++    restored_func = tvm.ir.load_json(tvm.ir.save_json(func))
++    restored = cache._load_kernel_from_disk(
++        key,
++        backend_context=create_backend_context("cuda", execution_backend=backend),
++        out_idx=[],
++        pass_configs=None,
++        compile_flags=None,
++        func=restored_func,
++    )
++    assert restored is not None
++    src = torch.arange(33, dtype=torch.float32, device="cuda")
++    dst = torch.empty(33, pin_memory=True)
++    restored(src, dst)
++    torch.cuda.synchronize()
++    torch.testing.assert_close(dst, src.cpu() * 2 + 1, rtol=0, atol=0)
++    with pytest.raises((ValueError, RuntimeError), match="registered|pinned|mapped"):
++        restored(src, torch.empty(33))
+diff --git a/testing/python/language/test_tilelang_language_host_mapped.py b/testing/python/language/test_tilelang_language_host_mapped.py
+new file mode 100644
+index 00000000..55e359fe
+--- /dev/null
++++ b/testing/python/language/test_tilelang_language_host_mapped.py
+@@ -0,0 +1,72 @@
++import pytest
++
++import tilelang
++import tilelang.language as T
++from tilelang import tvm
++from tilelang.engine.host_mapped import get_host_mapped_params
++from tilelang.jit.exceptions import JITNoBuilderError
++
++
++def test_annotation_is_function_metadata_and_round_trips():
++    @T.prim_func
++    def kernel(src: T.Tensor((16,), T.float32), dst: T.Tensor((16,), T.float32)):
++        T.annotate_host_mapped_buffers(dst)
++        with T.Kernel(1, threads=32):
++            T.annotate_host_mapped_buffers(src, dst)
++            for i in T.Parallel(16):
++                dst[i] = src[i]
++
++    assert get_host_mapped_params(kernel) == (0, 1)
++    assert all(buf.scope() == "global" for buf in kernel.buffer_map.values())
++    restored = tvm.ir.load_json(tvm.ir.save_json(kernel))
++    assert get_host_mapped_params(restored) == (0, 1)
++    tvm.ir.assert_structural_equal(kernel, restored)
++
++
++def test_annotation_requires_buffer():
++    with pytest.raises(TypeError, match="expects Buffer"):
++
++        @T.prim_func
++        def kernel(dst: T.Tensor((16,), T.float32)):
++            T.annotate_host_mapped_buffers(1)
++            T.evaluate(0)
++
++
++@pytest.mark.parametrize("scope", ["shared", "global"])
++def test_annotation_rejects_internal_allocation(scope):
++    with pytest.raises(ValueError, match="global buffers|function parameter"):
++
++        @T.prim_func
++        def kernel(dst: T.Tensor((16,), T.float32)):
++            with T.Kernel(1, threads=32):
++                tmp = T.alloc_global((16,), T.float32, scope=scope)
++                T.annotate_host_mapped_buffers(tmp)
++                T.evaluate(0)
++
++
++@pytest.mark.parametrize("backend", ["nvrtc", "cutedsl"])
++def test_unsupported_launcher_rejects_annotation(backend):
++    from tilelang.engine.host_mapped import validate_host_mapped_params
++
++    @T.prim_func
++    def kernel(dst: T.Tensor((16,), T.float32)):
++        T.annotate_host_mapped_buffers(dst)
++        T.evaluate(0)
++
++    with pytest.raises(ValueError, match="currently require"):
++        validate_host_mapped_params(kernel, tvm.target.Target("cuda"), backend)
++
++
++def test_host_mapped_output_must_be_explicit():
++    @T.prim_func
++    def kernel(dst: T.Tensor((16,), T.float32)):
++        T.annotate_host_mapped_buffers(dst)
++        T.evaluate(0)
++
++    with pytest.raises(ValueError, match="preallocated"):
++        tilelang.compile(kernel, target="cuda", execution_backend="cython", out_idx=[0])
++
++
++def test_annotation_requires_builder():
++    with pytest.raises(JITNoBuilderError):
++        T.annotate_host_mapped_buffers()
+diff --git a/tilelang/engine/host_mapped.py b/tilelang/engine/host_mapped.py
+new file mode 100644
+index 00000000..a38b1027
+--- /dev/null
++++ b/tilelang/engine/host_mapped.py
+@@ -0,0 +1,40 @@
++"""Parameter contracts for device-accessible mapped host memory."""
++
++from __future__ import annotations
++
++from tvm import tirx
++
++HOST_MAPPED_PARAMS_ATTR = "tl.host_mapped_params"
++
++
++def get_host_mapped_params(func: tirx.PrimFunc) -> tuple[int, ...]:
++    """Read and validate parameter indices, including on cache restoration."""
++    indices = []
++    attrs = getattr(func, "attrs", None)
++    for index in attrs.get(HOST_MAPPED_PARAMS_ATTR, []) if attrs else []:
++        if not isinstance(index, (int, tirx.IntImm)):
++            raise ValueError(f"{HOST_MAPPED_PARAMS_ATTR} must contain parameter indices")
++        index = int(index)
++        if index < 0 or index >= len(func.params) or func.params[index] not in func.buffer_map:
++            raise ValueError(f"Invalid host-mapped buffer parameter index: {index}")
++        if func.buffer_map[func.params[index]].scope() != "global":
++            raise ValueError("Host-mapped parameters must be global buffers")
++        if index not in indices:
++            indices.append(index)
++    return tuple(indices)
++
++
++def validate_host_mapped_params(func, target, execution_backend, out_idx=None) -> tuple[int, ...]:
++    """Reject unsupported execution and allocation paths before compilation."""
++    indices = get_host_mapped_params(func)
++    if not indices:
++        return indices
++    if target.kind.name != "cuda" or execution_backend not in ("cython", "tvm_ffi"):
++        raise ValueError("Host-mapped buffers currently require target='cuda' and execution_backend='cython' or 'tvm_ffi'")
++    outputs = out_idx if out_idx is not None else func.attrs.get("tilelang_out_idx", [])
++    if isinstance(outputs, int):
++        outputs = [outputs]
++    outputs = {int(i) if int(i) >= 0 else int(i) + len(func.params) for i in outputs}
++    if outputs.intersection(indices):
++        raise ValueError("Host-mapped buffers must be preallocated and passed explicitly; out_idx/T.empty is not supported for them")
++    return indices
+diff --git a/tilelang/engine/lower.py b/tilelang/engine/lower.py
+index 0e3a2fbb..8c4786ed 100644
+--- a/tilelang/engine/lower.py
++++ b/tilelang/engine/lower.py
+@@ -127,6 +127,12 @@ def lower_to_host_device_ir(
+             target = context.target
+             target_host = context.target_host
+ 
++            from tilelang.engine.host_mapped import validate_host_mapped_params
++
++            for func in mod.functions.values():
++                if isinstance(func, tirx.PrimFunc):
++                    validate_host_mapped_params(func, target, context.execution_backend.name)
++
+             _is_host_call = get_host_call(is_device_c=is_cpu_device_backend(target))
+             _is_device_call = get_device_call(is_device_c=is_cpu_device_backend(target))
+ 
+diff --git a/tilelang/jit/adapter/cython/adapter.py b/tilelang/jit/adapter/cython/adapter.py
+index e7e657f7..53c0f260 100644
+--- a/tilelang/jit/adapter/cython/adapter.py
++++ b/tilelang/jit/adapter/cython/adapter.py
+@@ -10,6 +10,7 @@ from collections.abc import Callable
+ from tilelang import tvm as tvm
+ from tvm.target import Target
+ from tilelang.engine.param import KernelParam
++from tilelang.engine.host_mapped import get_host_mapped_params
+ from tvm import tirx
+ from tvm.relax import TensorType
+ 
+@@ -171,7 +172,9 @@ class CythonKernelAdapter(BaseKernelAdapter):
+             error_msg += f"\n{self.lib_code}"
+             raise RuntimeError(f"Initialization failed: {error_msg}")
+ 
+-        self.cython_wrapper = CythonKernelWrapper(self.result_idx, self.params, self.lib, *_device_providers())
++        self.cython_wrapper = CythonKernelWrapper(
++            self.result_idx, self.params, self.lib, *_device_providers(), host_mapped_indices=get_host_mapped_params(self.prim_func)
++        )
+         self.cython_wrapper.set_dynamic_symbolic_map(self.dynamic_symbolic_map)
+         self.cython_wrapper.set_dynamic_symbolic_sources(self.dynamic_symbolic_sources)
+         self.cython_wrapper.set_output_scalar_dim_map(get_output_scalar_dim_map(self.prim_func, self.result_idx))
+@@ -236,7 +239,13 @@ class CythonKernelAdapter(BaseKernelAdapter):
+             error_msg = adapter.lib.get_last_error().decode("utf-8")
+             raise RuntimeError(f"Initialization failed: {error_msg}")
+ 
+-        adapter.cython_wrapper = CythonKernelWrapper(adapter.result_idx, adapter.params, adapter.lib, *_device_providers())
++        adapter.cython_wrapper = CythonKernelWrapper(
++            adapter.result_idx,
++            adapter.params,
++            adapter.lib,
++            *_device_providers(),
++            host_mapped_indices=get_host_mapped_params(adapter.prim_func),
++        )
+         adapter.cython_wrapper.set_dynamic_symbolic_map(adapter.dynamic_symbolic_map)
+         adapter.cython_wrapper.set_dynamic_symbolic_sources(adapter.dynamic_symbolic_sources)
+         adapter.cython_wrapper.set_output_scalar_dim_map(get_output_scalar_dim_map(adapter.prim_func, adapter.result_idx))
+@@ -418,6 +427,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
+         params = func.params
+         buffer_map = func.buffer_map
+         buffer_device_map = {}
++        host_mapped_params = get_host_mapped_params(func)
+         device = None
+         if is_cuda_target(self.target) or is_hip_target(self.target):
+             device = torch.device("cuda")
+@@ -434,7 +444,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
+             if param in buffer_map:
+                 buffer = buffer_map[param]
+                 name = buffer.name
+-                buffer_device_map[name] = (i, device)
++                buffer_device_map[name] = (i, torch.device("cpu") if i in host_mapped_params else device)
+         return buffer_device_map
+ 
+     def _forward_from_prebuild_lib(self, *args, stream: int | None = None):
+diff --git a/tilelang/jit/adapter/cython/cython_wrapper.pyx b/tilelang/jit/adapter/cython/cython_wrapper.pyx
+index e8a9b1e7..05e5c02d 100644
+--- a/tilelang/jit/adapter/cython/cython_wrapper.pyx
++++ b/tilelang/jit/adapter/cython/cython_wrapper.pyx
+@@ -29,12 +29,18 @@ cdef class CythonKernelWrapper:
+         list param_shapes              # Cache for parameter shapes as native Python lists
+         object get_current_device
+         object get_current_stream      # Raw-stream provider injected by the adapter (None = CUDA default)
++        object host_mapped_indices
++        object get_host_mapped_pointer
+ 
+-    def __cinit__(self, result_idx, params, lib, get_current_device=None, get_current_stream=None):
++    def __cinit__(self, result_idx, params, lib, get_current_device=None, get_current_stream=None, host_mapped_indices=()):
+         # Initialize wrapper with kernel configuration
+         self.result_idx = result_idx
+         self.params = params
+         self.lib = lib
++        self.host_mapped_indices = frozenset(host_mapped_indices)
++        if self.host_mapped_indices:
++            from tvm import get_global_func
++            self.get_host_mapped_pointer = get_global_func("tl.cuda.get_host_mapped_pointer")
+         # Convert TVM types to native Python types during initialization
+         # Convert tvm.DataType to torch.dtype for tensor creation
+         self.param_dtypes = [param.torch_dtype() for param in params]
+@@ -101,6 +107,10 @@ cdef class CythonKernelWrapper:
+                     device.index is None or
+                     tensor_device.index == device.index
+                 )
++                if self.host_mapped_indices and device.type == "cuda":
++                    current_device = self.get_current_device()
++                    device = current_device if isinstance(current_device, torch.device) else torch.device("cuda", current_device)
++                    device_index_match = tensor_device.index == device.index
+                 if not (device_type_match and device_index_match):
+                     raise ValueError(
+                         f"Buffer device mismatch for parameter {param}: "
+@@ -173,6 +183,8 @@ cdef class CythonKernelWrapper:
+     cdef object _infer_output_device(self, list inputs):
+         for tensor in inputs:
+             if isinstance(tensor, torch.Tensor):
++                if self.host_mapped_indices and tensor.device.type == "cpu":
++                    continue
+                 return tensor.device
+         return self.get_current_device()
+ 
+@@ -280,8 +292,24 @@ cdef class CythonKernelWrapper:
+             torch.bool: ctypes.c_bool,
+         }
+ 
++        # Validate before querying mappings or constructing launch arguments.
++        if not skip_tensor_validation:
++            self._check_buffer_device(tensor_list)
++            self._check_buffer_dtype(tensor_list)
++            self._check_static_shape(tensor_list)
++            self._check_static_strides(tensor_list)
++            self._check_static_contiguous(tensor_list)
++
+         call_args = []
+         for i, tensor in enumerate(tensor_list):
++            if i in self.host_mapped_indices:
++                if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
++                    raise ValueError(f"Host-mapped parameter {i} must be a CPU tensor")
++                # Resolve on every eager call. A raw address cache could survive
++                # unregister/free/reallocation and incorrectly reuse a mapping.
++                pointer = self.get_host_mapped_pointer(ctypes.c_void_p(tensor.data_ptr()))
++                call_args.append(pointer)
++                continue
+             if isinstance(tensor, torch.Tensor):
+                 call_args.append(ctypes.c_void_p(tensor.data_ptr()))
+             elif isinstance(tensor, (int, float, bool)):
+@@ -297,14 +325,6 @@ cdef class CythonKernelWrapper:
+             else:
+                 raise ValueError(f"Unsupported tensor type: {type(tensor)}")
+ 
+-        # Check buffer device
+-        if not skip_tensor_validation:
+-            self._check_buffer_device(tensor_list)
+-            self._check_buffer_dtype(tensor_list)
+-            self._check_static_shape(tensor_list)
+-            self._check_static_strides(tensor_list)
+-            self._check_static_contiguous(tensor_list)
+-
+         # Add dynamic dimension values to kernel arguments
+         for var, (ref_id, buffer_idx, shape_idx, stride_scale) in self.dynamic_symbolic_map.items():
+             # Cascaded resolution across all carrier buffers to handle None
+diff --git a/tilelang/jit/adapter/tvm_ffi.py b/tilelang/jit/adapter/tvm_ffi.py
+index 22c5fec6..873e821a 100644
+--- a/tilelang/jit/adapter/tvm_ffi.py
++++ b/tilelang/jit/adapter/tvm_ffi.py
+@@ -13,6 +13,7 @@ import sys
+ import threading
+ 
+ import torch
++from tvm_ffi import use_torch_stream
+ from tilelang import tvm
+ from tvm import runtime, tirx
+ from tvm.target import Target
+@@ -22,6 +23,7 @@ from tilelang.jit.abi import CALLEE_ALLOCATED_OUTPUTS_ATTR
+ from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
+ from tilelang.utils.language import retrieve_func_from_module
+ from tilelang.engine.param import KernelParam
++from tilelang.engine.host_mapped import get_host_mapped_params
+ from tilelang.language.dtypes import dtype
+ 
+ 
+@@ -223,6 +225,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
+             return self._convert_ffi_callee_allocated_output_func()
+ 
+         current_device_functor = None
++        has_host_mapped_params = bool(get_host_mapped_params(self.prim_func))
+ 
+         # Convert TVM types to native Python types during initialization
+         # Convert tvm.DataType to torch.dtype for tensor creation
+@@ -274,7 +277,11 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
+             # Resolve the device used for outputs. Prefer the first tensor input's device
+             # if available, otherwise use PyTorch's current device.
+             out_device: torch.device | None = next(
+-                (input.device for input in inputs if isinstance(input, torch.Tensor)),
++                (
++                    input.device
++                    for input in inputs
++                    if isinstance(input, torch.Tensor) and (not has_host_mapped_params or input.device.type != "cpu")
++                ),
+                 None,
+             )
+ 
+@@ -345,7 +352,13 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
+             if out_device is not None:
+                 self._prepare_torch_device(out_device)
+             executable = self._get_executable()
+-            executable(*tensor_list)
++            if has_host_mapped_params and out_device is None:
++                # CPU tensors do not propagate a CUDA stream through DLPack.
++                # All-host signatures still follow Torch's stream/capture.
++                with use_torch_stream():
++                    executable(*tensor_list)
++            else:
++                executable(*tensor_list)
+ 
+             # Return outputs in the requested form
+             if len(self.result_idx) == 1:
+@@ -357,6 +370,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
+     def _convert_ffi_callee_allocated_output_func(self) -> Callable[..., Any]:
+         """Create a Torch callable whose outputs are allocated by TVM-FFI."""
+         current_device_functor = None
++        has_host_mapped_params = bool(get_host_mapped_params(self.prim_func))
+         expected_inputs = len(self.params) - len(self.result_idx)
+ 
+         def func(*inputs: torch.Tensor | Any):
+@@ -364,7 +378,14 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
+             if len(inputs) != expected_inputs:
+                 raise ValueError(f"Kernel expected {expected_inputs} inputs, but {len(inputs)} are provided.")
+ 
+-            allocator_anchor = next((value for value in inputs if isinstance(value, torch.Tensor)), None)
++            allocator_anchor = next(
++                (
++                    value
++                    for value in inputs
++                    if isinstance(value, torch.Tensor) and (not has_host_mapped_params or value.device.type != "cpu")
++                ),
++                None,
++            )
+             if allocator_anchor is None:
+                 if current_device_functor is None:
+                     current_device_functor = self.get_current_device_functor()
+diff --git a/tilelang/jit/kernel.py b/tilelang/jit/kernel.py
+index e7b77fd7..61ea6fc4 100644
+--- a/tilelang/jit/kernel.py
++++ b/tilelang/jit/kernel.py
+@@ -119,6 +119,11 @@ class JITKernel(Generic[_P, _T]):
+         self.execution_backend_spec = backend_context.execution_backend
+         self.execution_backend = self.execution_backend_spec.name
+ 
++        if func is not None:
++            from tilelang.engine.host_mapped import validate_host_mapped_params
++
++            validate_host_mapped_params(func, self.target, self.execution_backend, out_idx)
++
+         if self.execution_backend == "cython":
+             from tilelang.contrib.cc import get_cplus_compiler
+ 
+diff --git a/tilelang/language/annotations.py b/tilelang/language/annotations.py
+index 9d72b9b6..065e2429 100644
+--- a/tilelang/language/annotations.py
++++ b/tilelang/language/annotations.py
+@@ -15,6 +15,7 @@ __all__ = [
+     "annotate_safe_value",
+     "annotate_l2_hit_ratio",
+     "annotate_restrict_buffers",
++    "annotate_host_mapped_buffers",
+     "annotate_min_blocks_per_sm",
+     "annotate_ws_pipeline_depth",
+     "annotate_ws_schedule",
+@@ -109,6 +110,45 @@ def annotate_min_blocks_per_sm(n: int):
+     return attr(None, "tl.min_blocks_per_sm", n)
+ 
+ 
++def annotate_host_mapped_buffers(*buffers):
++    """Declare tensor parameters backed by device-accessible mapped host memory.
++
++    Example::
++
++        @T.prim_func
++        def kernel(src: T.Tensor((N,), T.float32), dst: T.Tensor((N,), T.float32)):
++            T.annotate_host_mapped_buffers(dst)
++            with T.Kernel(T.ceildiv(N, 128), threads=128) as block:
++                ...
++
++    Currently supported by the CUDA Cython and TVM-FFI launchers. Annotated
++    buffers must be supplied explicitly as CPU tensors with registered/mapped
++    storage (for example, PyTorch tensors allocated with ``pin_memory=True``).
++    Other tensor checks remain enabled. This annotation does not allocate,
++    register, copy, or synchronize memory. The caller must keep the storage
++    and mapping alive until GPU work completes, and throughout graph replay,
++    and synchronize before accessing or reusing that storage on the CPU.
++
++    The contract applies to the whole function, even when this declaration is
++    inside a kernel block. Repeated declarations are merged.
++    """
++    from tvm.tirx import Buffer
++    from tilelang.language.eager.builder import Builder
++    from tilelang.jit.exceptions import JITNoBuilderError
++
++    builder = Builder.current()
++    if builder is None:
++        raise JITNoBuilderError("T.annotate_host_mapped_buffers() requires @T.prim_func or @tilelang.jit")
++    if builder.eager_jit == "phase1":
++        return
++    for buf in buffers:
++        if not isinstance(buf, Buffer):
++            raise TypeError(f"annotate_host_mapped_buffers expects Buffer arguments, got {type(buf)}")
++        if buf.scope() != "global":
++            raise ValueError("Host-mapped parameters must be global buffers")
++        builder.host_mapped_buffers.append(buf)
++
++
+ def annotate_restrict_buffers(*buffers):
+     """Mark the given buffer parameters as non-restrict.
+ 
+diff --git a/tilelang/language/common.py b/tilelang/language/common.py
+index 69eb89f3..7cf89bae 100644
+--- a/tilelang/language/common.py
++++ b/tilelang/language/common.py
+@@ -148,6 +148,7 @@ from .annotations import (  # noqa: F401
+     annotate_layout,
+     annotate_safe_value,
+     annotate_restrict_buffers,
++    annotate_host_mapped_buffers,
+     annotate_ws_pipeline_depth,
+     annotate_ws_schedule,
+     ws_op,
+@@ -237,6 +238,7 @@ _LOCAL_EXPORTS = (
+     "allocate",
+     "annotate_layout",
+     "annotate_restrict_buffers",
++    "annotate_host_mapped_buffers",
+     "annotate_safe_value",
+     "annotate_ws_pipeline_depth",
+     "annotate_ws_schedule",
+diff --git a/tilelang/language/eager/builder.py b/tilelang/language/eager/builder.py
+index c4589f2e..ab704f3c 100644
+--- a/tilelang/language/eager/builder.py
++++ b/tilelang/language/eager/builder.py
+@@ -252,6 +252,7 @@ class Builder(BaseBuilder):
+         self.eager_jit_subs: dict[str, PrimExpr] = {}
+         self.func_pass_configs: dict[str, Any] | None = None
+         self.func_compile_flags: list[str] | str | None = None
++        self.host_mapped_buffers: list[Buffer] = []
+         self.current_file = "<unknown>"
+         self.current_line = 0
+         self.current_macro_name = "<unknown-macro>"
+@@ -1265,6 +1266,16 @@ def annotate_pass_configs(configs: dict[str, Any]) -> None:
+ 
+ def _patch_prim_func_attrs(pf: PrimFunc, builder: Builder) -> PrimFunc:
+     """Attach function-level out_idx, pass_configs and compile_flags as PrimFunc attrs."""
++    if builder.host_mapped_buffers:
++        from tilelang.engine.host_mapped import HOST_MAPPED_PARAMS_ATTR, get_host_mapped_params
++
++        indices = set(get_host_mapped_params(pf))
++        for buffer in builder.host_mapped_buffers:
++            matches = [i for i, param in enumerate(pf.params) if param in pf.buffer_map and pf.buffer_map[param].data.same_as(buffer.data)]
++            if not matches:
++                raise ValueError(f"Host-mapped buffer {buffer.name!r} must be a function parameter")
++            indices.update(matches)
++        pf = pf.with_attr(HOST_MAPPED_PARAMS_ATTR, sorted(indices))
+     if builder.out_idx:
+         pf = pf.with_attr("tilelang_out_idx", builder.out_idx)
+     if builder.func_pass_configs is not None:
+-- 
+2.43.0
+

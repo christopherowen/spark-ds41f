@@ -1,0 +1,944 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:29:58 +0000
+Subject: [PATCH 19/19] [WarpSpecialize] Guard prelude placement, outer-if
+ partitions, and loop-carried postludes
+
+Upstream-base: tile-ai/tilelang@2123e412ce2217b324c50c4ec967213906456ac5
+Upstream-commit: 438e2db04ff52b263f8ad36ed89e0c878930262a
+Upstream-pr: https://github.com/tile-ai/tilelang/pull/3869, https://github.com/tile-ai/tilelang/pull/3883
+
+Rationale: Fix three correctness hazards in ProducerConsumerWarpSpecialized:
+1. Keep shared-prelude statements at their original control-flow position instead of hoisting them across sibling statements, and keep producer-free branches guarded to the consumer thread range (#3663 / #3685).
+2. When a warp-specialized T.Pipelined loop sits alone inside a thread-invariant IfThenElse whose condition does not read buffers written by the branch, split the producer and consumer partitions outside the if so setmaxnreg instructions execute uniformly at the partition root (#3869, fixes #3664).
+3. Decline warp specialization when a T.Pipelined loop inside an outer serial loop has post-pipeline local buffer writes that feed pre-pipeline producer reads on the next outer iteration without an inter-iteration barrier (#3883, fixes #3842).
+
+Quality: Prevents miscompilation of warp-specialized pipelines under outer conditionals and serial loops while keeping all 33 existing spark-ds41f:1107 kernels byte-for-byte unchanged.
+
+Tests: testing/python/transform/test_tilelang_transform_producer_consumer_ws_persistent.py across two GPU boots on SM121.
+
+Upstream-status: Backported from tile-ai/tilelang#3685 (commit 438e2db04ff5), open PR tile-ai/tilelang#3869, and open PR tile-ai/tilelang#3883.
+---
+ src/cuda/transform/producer_consumer_ws.cc    | 270 ++++++++++--
+ ...tilelang_transform_producer_consumer_ws.py |  32 ++
+ ...ansform_producer_consumer_ws_persistent.py | 400 ++++++++++++++++++
+ 3 files changed, 657 insertions(+), 45 deletions(-)
+
+diff --git a/src/cuda/transform/producer_consumer_ws.cc b/src/cuda/transform/producer_consumer_ws.cc
+index 86e3583d..25066feb 100644
+--- a/src/cuda/transform/producer_consumer_ws.cc
++++ b/src/cuda/transform/producer_consumer_ws.cc
+@@ -32,6 +32,7 @@
+ #include <tvm/tirx/stmt.h>
+ #include <tvm/tirx/stmt_functor.h>
+ #include <tvm/tirx/transform.h>
++#include <unordered_set>
+ #include <utility>
+ 
+ #include "backend/common/target_utils.h"
+@@ -1197,6 +1198,12 @@ private:
+         static_cast<int>(Downcast<Integer>(num_stages_anno.value())->value);
+     if (num_stages < 1)
+       return StmtExprMutator::VisitStmt_(op);
++    // The loop finder descends through every statement kind, but the WS block
++    // can only be rebuilt through the kinds ReplacePipelineLoopInStmt handles
++    // (no While yet). Decline so the pass falls back instead of failing.
++    if (!PipelineLoopContainmentChecker::Contains(orig_block->body,
++                                                  pipeline_loop))
++      return StmtExprMutator::VisitStmt_(op);
+ 
+     // Flatten the loop body.
+     Array<Stmt> flat_stmts;
+@@ -1959,6 +1966,7 @@ private:
+     shared_prelude_live_seed_ = {};
+     producer_prelude_live_seed_ = {};
+     consumer_prelude_live_seed_ = {};
++    shared_prelude_buffers_ = {};
+     producer_prelude_live_seed_.AddUses(LocalAccessCollector::Collect(
+         rewritten_producer, buffer_data_to_buffer_));
+     consumer_prelude_live_seed_.AddUses(LocalAccessCollector::Collect(
+@@ -1969,6 +1977,7 @@ private:
+     // uses of the values defined by each prelude statement.
+     extracted_producer_init_ = {};
+     extracted_consumer_init_ = {};
++    guarded_producer_prelude_ = {};
+ 
+     Array<IntImm> ws_partition = {Downcast<IntImm>(producer_extent),
+                                   Downcast<IntImm>(consumer_extent)};
+@@ -1981,6 +1990,7 @@ private:
+                                dummy_producer, dummy_consumer);
+     dummy_ws =
+         AttrStmt(ws_partition, attr::kWarpSpecializationScope, 0, dummy_ws);
++    guarded_postlude_stmts_ = {};
+     Optional<Stmt> replaced =
+         ReplacePipelineLoopInStmt(orig_block->body, pipeline_loop, dummy_ws,
+                                   producer_extent, consumer_extent);
+@@ -1995,6 +2005,11 @@ private:
+     // LayoutInference can infer an independent producer-side thread range.
+     BufferRemap producer_buffer_remap;
+     Array<Buffer> producer_private_buffers;
++    // A statement after the pipeline is executed by the consumer only (and is
++    // later sunk into the consumer branch). If it writes a value that the
++    // producer reads, warp specialization would leave the producer with the
++    // value of the previous run, so decline the transformation.
++    bool declined_loop_carried_postlude = false;
+     {
+       BufferSet block_alloc_buffers;
+       for (const auto &buffer : orig_block->alloc_buffers) {
+@@ -2007,10 +2022,25 @@ private:
+             &producer_access,
+             LocalAccessCollector::Collect(stmt, buffer_data_to_buffer_));
+       }
++      for (const auto &guard : guarded_producer_prelude_) {
++        MergeLocalAccessSummary(&producer_access,
++                                LocalAccessCollector::Collect(
++                                    guard->then_case, buffer_data_to_buffer_));
++      }
++      LocalLiveSet producer_reads;
++      producer_reads.AddUses(producer_access);
++      for (const auto &postlude : guarded_postlude_stmts_) {
++        if (producer_reads.NeedsAnyDef(LocalAccessCollector::Collect(
++                postlude, buffer_data_to_buffer_))) {
++          declined_loop_carried_postlude = true;
++          break;
++        }
++      }
+       auto maybe_clone = [&](const Buffer &buffer) {
+         if (!buffer.defined() ||
+             !(IsFragmentBuffer(buffer) || IsLocalBuffer(buffer)) ||
+             !block_alloc_buffers.count(buffer) ||
++            shared_prelude_buffers_.count(buffer) ||
+             producer_buffer_remap.count(buffer)) {
+           return;
+         }
+@@ -2025,6 +2055,14 @@ private:
+         maybe_clone(buffer);
+       }
+     }
++    if (declined_loop_carried_postlude) {
++      // The producer would read a stale value on the next run of the pipeline.
++      // Keep the regular (non-WS) pipeline instead.
++      DLOG(WARNING) << "[WS] declined: a post-pipeline statement writes a "
++                       "value the producer reads on the next run";
++      guarded_postlude_stmts_ = {};
++      return GetRef<Stmt>(orig_realize);
++    }
+     if (!producer_buffer_remap.empty()) {
+       rewritten_producer =
+           RemapBuffers(rewritten_producer, producer_buffer_remap);
+@@ -2036,10 +2074,24 @@ private:
+       extracted_producer_init_ = remapped_producer_init;
+     }
+ 
++    // Placeholder statements of the first-pass result and their final form.
++    StmtRewriteMap final_stmts;
++    if (!producer_buffer_remap.empty()) {
++      for (const auto &guard : guarded_producer_prelude_) {
++        final_stmts.emplace(
++            guard,
++            IfThenElse(guard->condition,
++                       RemapBuffers(guard->then_case, producer_buffer_remap)));
++      }
++    }
++
+     // If branch-local prelude init/copy was extracted, rebuild with it inside
+     // the corresponding WS branch so each branch initializes its own local
+-    // state before entering the pipelined loop.
+-    if (!extracted_producer_init_.empty() ||
++    // state before entering the pipelined loop. The same rebuild is needed
++    // when only the producer's buffers were cloned: the placeholder still
++    // holds the pre-remap loop, which would read the original buffers while
++    // the guarded prelude writes the clones.
++    if (!producer_buffer_remap.empty() || !extracted_producer_init_.empty() ||
+         !extracted_consumer_init_.empty()) {
+       Stmt enriched_producer = rewritten_producer;
+       if (!extracted_producer_init_.empty()) {
+@@ -2068,28 +2120,24 @@ private:
+                                 scoped_producer, scoped_consumer);
+       ws_body =
+           AttrStmt(ws_partition, attr::kWarpSpecializationScope, 0, ws_body);
+-      // Second pass: replace again with the enriched WS body.
+-      // extracted_consumer_init_ is already empty (stmts were removed
+-      // from the prelude in the first pass result).
+-      // We need to replace in the ALREADY-modified body from pass 1.
+-      // The pipeline loop has already been replaced by dummy_ws in that
+-      // tree, so do a direct substitution of the placeholder WS body.
+-      // Since dummy_ws appears exactly once in replaced.stmt, do a
+-      // simple statement replacement on the full placeholder stmt.
+-      class SubstWsBody : public StmtExprMutator {
++      final_stmts.emplace(dummy_ws, ws_body);
++    }
++    // Second pass: substitute the placeholders in the first-pass result.
++    // Each of them appears exactly once there.
++    if (!final_stmts.empty()) {
++      class SubstPlaceholders : public StmtExprMutator {
+       public:
+-        SubstWsBody(const Stmt &old_ws, const Stmt &new_ws)
+-            : old_(old_ws), new_(new_ws) {}
++        explicit SubstPlaceholders(const StmtRewriteMap &final_stmts)
++            : final_stmts_(final_stmts) {}
+         Stmt VisitStmt(const Stmt &stmt) final {
+-          if (stmt.same_as(old_)) {
+-            return new_;
++          if (auto it = final_stmts_.find(stmt); it != final_stmts_.end()) {
++            return it->second;
+           }
+           return StmtExprMutator::VisitStmt(stmt);
+         }
+-        Stmt old_, new_;
++        const StmtRewriteMap &final_stmts_;
+       };
+-      SubstWsBody subst(dummy_ws, ws_body);
+-      replaced_stmt = subst(replaced_stmt);
++      replaced_stmt = SubstPlaceholders(final_stmts)(replaced_stmt);
+     }
+     Stmt new_block_body = SinkGuardedConsumerPostlude::Rewrite(
+         replaced_stmt, thread_iv_->var, producer_extent);
+@@ -2288,7 +2336,7 @@ private:
+       ICHECK(branch_ptr->else_case.defined());
+       branch_ptr->else_case =
+           AppendToStmt(branch_ptr->else_case.value(), consumer_postlude);
+-      if (container.same_as(branch)) {
++      if (!container->IsInstance<AttrStmtNode>()) {
+         return branch;
+       }
+       AttrStmt attr = Downcast<AttrStmt>(container);
+@@ -2296,6 +2344,70 @@ private:
+       return attr;
+     }
+ 
++    // Buffers `stmt` may write: stored to, written by a tile op, or passed by
++    // pointer.
++    static VarSet PossiblyWrittenBuffers(const Stmt &stmt) {
++      VarSet written;
++      PostOrderVisit(stmt, [&](const ObjectRef &obj) {
++        if (const auto *store = obj.as<BufferStoreNode>()) {
++          written.insert(store->buffer->data);
++        } else if (const auto *call = obj.as<CallNode>()) {
++          if (auto tile_op = ParseOperator(GetRef<Call>(call));
++              tile_op.defined()) {
++            // Tile ops (e.g. a TMA copy) name their destination as a region.
++            for (const BufferRegion &region :
++                 tile_op->GetAccessRegions().writes) {
++              written.insert(region->buffer->data);
++            }
++          } else if (call->op.same_as(builtin::tvm_access_ptr()) &&
++                     call->args.size() > 1) {
++            if (const auto *data = call->args[1].as<VarNode>()) {
++              written.insert(GetRef<Var>(data));
++            }
++          } else if ((call->op.same_as(tl::access_ptr()) ||
++                      call->op.same_as(builtin::address_of())) &&
++                     !call->args.empty()) {
++            if (const auto *base = call->args[0].as<BufferLoadNode>()) {
++              written.insert(base->buffer->data);
++            }
++          }
++        }
++      });
++      return written;
++    }
++
++    // `if (cond) { <WS branch> }` with a side-effect-free `cond` that neither
++    // depends on the thread index nor reads memory the branch writes. Every
++    // thread evaluates `cond` once, to the same value, whether it is tested
++    // around the WS branch or at the start of the partition it runs, so the
++    // `if` can be moved into both partitions.
++    bool IsWSBranchUnderIf(const Stmt &stmt, PrimExpr *cond, Stmt *container,
++                           IfThenElse *branch) const {
++      const auto *if_node = stmt.as<IfThenElseNode>();
++      if (!if_node || if_node->else_case.defined() ||
++          SideEffect(if_node->condition) > CallEffectKind::kReadState ||
++          UsesVar(if_node->condition, [this](const VarNode *var) {
++            return var == thread_var_.get();
++          })) {
++        return false;
++      }
++      if (!IsWSBranch(if_node->then_case, container, branch)) {
++        return false;
++      }
++      VarSet written = PossiblyWrittenBuffers(if_node->then_case);
++      bool reads_written = false;
++      PostOrderVisit(if_node->condition, [&](const ObjectRef &obj) {
++        if (const auto *load = obj.as<BufferLoadNode>()) {
++          reads_written = reads_written || written.count(load->buffer->data);
++        }
++      });
++      if (reads_written) {
++        return false;
++      }
++      *cond = if_node->condition;
++      return true;
++    }
++
+     Stmt VisitStmt_(const SeqStmtNode *op) final {
+       Array<Stmt> visited;
+       for (const auto &stmt : op->seq) {
+@@ -2306,7 +2418,10 @@ private:
+       for (int i = 0; i < static_cast<int>(visited.size()); ++i) {
+         Stmt ws_container;
+         IfThenElse ws_branch;
+-        if (!IsWSBranch(visited[i], &ws_container, &ws_branch)) {
++        PrimExpr outer_cond;
++        if (!IsWSBranch(visited[i], &ws_container, &ws_branch) &&
++            !IsWSBranchUnderIf(visited[i], &outer_cond, &ws_container,
++                               &ws_branch)) {
+           rebuilt.push_back(visited[i]);
+           continue;
+         }
+@@ -2324,6 +2439,16 @@ private:
+           rebuilt.push_back(visited[i]);
+           continue;
+         }
++        if (outer_cond.defined()) {
++          // Split the partitions outside the `if` so that the postlude joins
++          // the consumer partition: code after a join of the two partitions
++          // would run under neither partition's register budget.
++          ws_branch =
++              IfThenElse(ws_branch->condition,
++                         IfThenElse(outer_cond, ws_branch->then_case),
++                         IfThenElse(outer_cond, ws_branch->else_case.value()),
++                         ws_branch->span);
++        }
+ 
+         rebuilt.push_back(UpdateWSBranchContainer(ws_container, ws_branch,
+                                                   consumer_postlude));
+@@ -2429,18 +2554,20 @@ private:
+       Optional<Stmt> rewritten_loop = VisitStmt(op->seq[loop_idx]);
+       ICHECK(rewritten_loop.defined())
+           << "ProducerConsumerWS: failed to replace pipeline loop child";
++      bool across_control_flow = crossed_control_flow_;
+ 
+       // Rewrite the child containing the pipeline loop before classifying this
+       // level's prelude.  The recursive rewrite propagates liveness from
+       // nested post-loop consumers, which outer prelude BindNodes need in
+       // order to stay shared when they feed both pre-loop shared work and the
+       // producer/consumer branches.
+-      PropagatePreludeLiveness(op, loop_idx);
+-      AppendClassifiedPrelude(op, loop_idx, &new_seq);
++      PropagatePreludeLiveness(op, loop_idx, across_control_flow);
++      AppendClassifiedPrelude(op, loop_idx, across_control_flow, &new_seq);
+ 
+       new_seq.push_back(rewritten_loop.value());
+ 
+       for (int i = loop_idx + 1; i < static_cast<int>(op->seq.size()); ++i) {
++        rewriter_->guarded_postlude_stmts_.push_back(op->seq[i]);
+         new_seq.push_back(GuardConsumerOnly(op->seq[i]));
+       }
+       return new_seq.size() == 1 ? new_seq[0] : SeqStmt(new_seq);
+@@ -2492,6 +2619,7 @@ private:
+       if (!found) {
+         return Optional<Stmt>();
+       }
++      crossed_control_flow_ = true;
+       Stmt new_then =
+           then_result.defined() ? then_result.value() : op->then_case;
+       return IfThenElse(op->condition, new_then, new_else, op->span);
+@@ -2502,6 +2630,7 @@ private:
+       if (!body.defined()) {
+         return Optional<Stmt>();
+       }
++      crossed_control_flow_ = true;
+       For new_for = GetRef<For>(op);
+       new_for.CopyOnWrite()->body = body.value();
+       return new_for;
+@@ -2521,7 +2650,8 @@ private:
+                         rewritten);
+     }
+ 
+-    void PropagatePreludeLiveness(const SeqStmtNode *op, int loop_idx) {
++    void PropagatePreludeLiveness(const SeqStmtNode *op, int loop_idx,
++                                  bool across_control_flow) {
+       LocalLiveSet shared_live = rewriter_->shared_prelude_live_seed_;
+       LocalLiveSet producer_live = rewriter_->producer_prelude_live_seed_;
+       LocalLiveSet consumer_live = rewriter_->consumer_prelude_live_seed_;
+@@ -2541,7 +2671,10 @@ private:
+       for (int i = loop_idx - 1; i >= 0; --i) {
+         LocalAccessSummary summary = LocalAccessCollector::Collect(
+             op->seq[i], rewriter_->buffer_data_to_buffer_);
+-        if (!summary.HasTrackedDefs()) {
++        // Across control flow, bindings stay in place for every thread (see
++        // AppendClassifiedPrelude), so whatever they read is shared too.
++        if (!summary.HasTrackedDefs() ||
++            (across_control_flow && op->seq[i].as<BindNode>())) {
+           shared_live.AddUses(summary);
+           continue;
+         }
+@@ -2564,35 +2697,70 @@ private:
+     }
+ 
+     void AppendClassifiedPrelude(const SeqStmtNode *op, int loop_idx,
++                                 bool across_control_flow,
+                                  Array<Stmt> *new_seq) {
+       // Classify pre-loop statements using branch-private def/use sets.
+       // Shared-prelude statements stay in place; branch-private definitions
+       // move next to the branch that consumes them, or are duplicated when
+       // both producer and consumer need the same definition.
++      //
++      // Moving a statement into the WS branches is only valid when no loop or
++      // condition separates it from the pipeline loop: otherwise it would run
++      // once per outer iteration (after that iteration's own prelude) or be
++      // skipped together with the loop.  Such statements stay in place and
++      // are guarded to the partition that needs them instead.
+       for (int i = 0; i < loop_idx; ++i) {
+-        switch (ClassifyPreludeStmt(op->seq[i],
+-                                    rewriter_->buffer_data_to_buffer_,
+-                                    rewriter_->shared_prelude_live_seed_,
+-                                    rewriter_->producer_prelude_live_seed_,
+-                                    rewriter_->consumer_prelude_live_seed_)) {
+-        case PreludeStmtPlacement::kProducerOnly:
+-          rewriter_->extracted_producer_init_.push_back(op->seq[i]);
+-          break;
+-        case PreludeStmtPlacement::kConsumerOnly:
+-          rewriter_->extracted_consumer_init_.push_back(op->seq[i]);
+-          break;
+-        case PreludeStmtPlacement::kDuplicateToBoth:
+-          rewriter_->extracted_producer_init_.push_back(op->seq[i]);
+-          rewriter_->extracted_consumer_init_.push_back(op->seq[i]);
+-          break;
+-        case PreludeStmtPlacement::kKeepSharedPrelude:
+-          if (auto it = rewriter_->common_prelude_rewrites_.find(op->seq[i]);
++        const Stmt &stmt = op->seq[i];
++        PreludeStmtPlacement placement =
++            ClassifyPreludeStmt(stmt, rewriter_->buffer_data_to_buffer_,
++                                rewriter_->shared_prelude_live_seed_,
++                                rewriter_->producer_prelude_live_seed_,
++                                rewriter_->consumer_prelude_live_seed_);
++        if (across_control_flow && stmt.as<BindNode>()) {
++          placement = PreludeStmtPlacement::kKeepSharedPrelude;
++        }
++        bool to_producer = placement == PreludeStmtPlacement::kProducerOnly ||
++                           placement == PreludeStmtPlacement::kDuplicateToBoth;
++        bool to_consumer = placement == PreludeStmtPlacement::kConsumerOnly ||
++                           placement == PreludeStmtPlacement::kDuplicateToBoth;
++        if (placement == PreludeStmtPlacement::kKeepSharedPrelude) {
++          Stmt kept = stmt;
++          if (auto it = rewriter_->common_prelude_rewrites_.find(stmt);
+               it != rewriter_->common_prelude_rewrites_.end()) {
+-            new_seq->push_back(it->second);
+-          } else {
+-            new_seq->push_back(op->seq[i]);
++            kept = it->second;
+           }
+-          break;
++          // The statement runs for every thread before the split, so the
++          // buffers it touches keep their block-wide layout and must not be
++          // cloned for the producer.
++          LocalAccessSummary kept_access = LocalAccessCollector::Collect(
++              kept, rewriter_->buffer_data_to_buffer_);
++          rewriter_->shared_prelude_buffers_.insert(
++              kept_access.read_buffers.begin(), kept_access.read_buffers.end());
++          rewriter_->shared_prelude_buffers_.insert(
++              kept_access.write_buffers.begin(),
++              kept_access.write_buffers.end());
++          new_seq->push_back(kept);
++          continue;
++        }
++        if (!across_control_flow) {
++          if (to_producer) {
++            rewriter_->extracted_producer_init_.push_back(stmt);
++          }
++          if (to_consumer) {
++            rewriter_->extracted_consumer_init_.push_back(stmt);
++          }
++          continue;
++        }
++        if (to_producer) {
++          // Producer-private buffers are cloned only after replacement, so
++          // BuildWSBlock remaps the body of this guard afterwards.
++          IfThenElse guard(LT(rewriter_->thread_iv_->var, producer_extent_),
++                           stmt);
++          rewriter_->guarded_producer_prelude_.push_back(guard);
++          new_seq->push_back(guard);
++        }
++        if (to_consumer) {
++          new_seq->push_back(GuardConsumerOnly(stmt));
+         }
+       }
+     }
+@@ -2602,6 +2770,9 @@ private:
+     Stmt ws_body_;
+     PrimExpr producer_extent_;
+     PrimExpr consumer_extent_;
++    // Set once the pipeline loop was found under a For or IfThenElse below
++    // the statement being visited.
++    bool crossed_control_flow_{false};
+   };
+ 
+   Optional<Stmt> ReplacePipelineLoopInStmt(const Stmt &stmt,
+@@ -2655,6 +2826,15 @@ private:
+   LocalLiveSet consumer_prelude_live_seed_;
+   Array<Stmt> extracted_producer_init_;
+   Array<Stmt> extracted_consumer_init_;
++  Array<IfThenElse> guarded_producer_prelude_;
++  // Statements after the pipeline loop that GuardConsumerOnly holds to the
++  // consumer partition. Checked against the producer's reads so a loop-carried
++  // scalar update cannot be sunk into the consumer alone.
++  Array<Stmt> guarded_postlude_stmts_;
++  // Buffers touched by statements that stay in the shared prelude. They cannot
++  // be cloned for the producer: the shared statement runs before the partition
++  // split, so both branches must keep pointing at the same buffer.
++  BufferSet shared_prelude_buffers_;
+ };
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/testing/python/transform/test_tilelang_transform_producer_consumer_ws.py b/testing/python/transform/test_tilelang_transform_producer_consumer_ws.py
+index d63abb4e..9a35f2d7 100644
+--- a/testing/python/transform/test_tilelang_transform_producer_consumer_ws.py
++++ b/testing/python/transform/test_tilelang_transform_producer_consumer_ws.py
+@@ -912,6 +912,37 @@ def test_tiled_ws_wide_linear_smem_three_stages():
+     _run_wide_linear_reduce(kernel, 48, 2, 768, "float32")
+ 
+ 
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(9, 0)
++def test_tiled_ws_pipeline_under_if_with_postlude():
++    """A pipeline inside an `if`, followed by consumer code, splits the
++    partitions outside the `if`; the code after it otherwise straddles the
++    producer and consumer register budgets and fails register allocation (#3664)."""
++    import torch
++
++    @T.prim_func
++    def main(A: T.Tensor((64, 128), T.float16), B: T.Tensor((64, 128), T.float16), C: T.Tensor((64, 64), T.float32), n: T.int32):
++        with T.Kernel(1, threads=128):
++            A_s = T.alloc_shared((64, 32), T.float16)
++            B_s = T.alloc_shared((64, 32), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            if n > 0:
++                T.clear(C_l)
++                for k in T.Pipelined(4, num_stages=2):
++                    T.copy(A[0, k * 32], A_s)
++                    T.copy(B[0, k * 32], B_s)
++                    T.gemm(A_s, B_s, C_l, transpose_B=True)
++            T.copy(C_l, C[0, 0])
++
++    kernel = _compile_tvm_ffi(main, out_idx=[2])
++    src = kernel.get_kernel_source()
++    assert "warpgroup_reg_alloc" in src
++    assert src.find("if (((int)threadIdx.x) < 128)") < src.find("if (0 < n)")
++    A = torch.randn(64, 128, dtype=torch.float16, device="cuda")
++    B = torch.randn(64, 128, dtype=torch.float16, device="cuda")
++    torch.testing.assert_close(kernel(A, B, 1), A.float() @ B.float().T, rtol=1e-2, atol=1e-2)
++
++
+ if __name__ == "__main__":
+     test_tiled_ws_skips_device_bound_tma_descriptor_base()
+     test_tiled_ws_places_producer_in_first_warp_group()
+@@ -930,3 +961,4 @@ if __name__ == "__main__":
+     test_tiled_ws_multi_versioned_wide_linear_smem_keeps_tma()
+     test_tiled_ws_wide_linear_smem_multi_way_box_split()
+     test_tiled_ws_wide_linear_smem_three_stages()
++    test_tiled_ws_pipeline_under_if_with_postlude()
+diff --git a/testing/python/transform/test_tilelang_transform_producer_consumer_ws_persistent.py b/testing/python/transform/test_tilelang_transform_producer_consumer_ws_persistent.py
+index 49ae2e45..56f5690c 100644
+--- a/testing/python/transform/test_tilelang_transform_producer_consumer_ws_persistent.py
++++ b/testing/python/transform/test_tilelang_transform_producer_consumer_ws_persistent.py
+@@ -691,5 +691,405 @@ def test_ws_persistent_guarded_deep_pipeline_matches_wsoff_reference():
+     torch.testing.assert_close(got, ref, rtol=1e-2, atol=1e-2)
+ 
+ 
++def pipelined_matmul_under_while(K=128, block_K=32, num_stages=2):
++    """A ``T.Pipelined`` loop with TMA copies nested in a ``while`` (stream-K shape)."""
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, K), T.float16),
++        B: T.Tensor((64, K), T.float16),
++        C: T.Tensor((64, 64), T.float32),
++        n: T.int32,
++    ):
++        with T.Kernel(1, threads=128) as _:
++            A_s = T.alloc_shared((64, block_K), T.float16)
++            B_s = T.alloc_shared((64, block_K), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            it = T.alloc_var(T.int32)
++            it = 0
++            T.clear(C_l)
++            while it < n:
++                for k in T.Pipelined(K // block_K, num_stages=num_stages):
++                    T.copy(A[0, k * block_K], A_s)
++                    T.copy(B[0, k * block_K], B_s)
++                    T.gemm(A_s, B_s, C_l, transpose_B=True)
++                it = it + 1
++            T.copy(C_l, C[0, 0])
++
++    return main
++
++
++@tilelang.testing.requires_cuda
++def test_ws_pass_declines_pipelined_loop_under_while():
++    """WS cannot rebuild a ``while`` yet: it must decline (and drop the pipeline
++    annotation) instead of failing with "failed to replace pipeline loop"."""
++    mod = _apply_ws_pass(pipelined_matmul_under_while())
++    script = mod["main"].script()
++    assert "tl_tiled_ws_applied" not in script
++    assert "num_stages" not in script
++
++
++@tilelang.testing.requires_cuda
++def test_ws_declined_while_kernel_matches_reference():
++    import torch
++
++    kernel = tilelang.compile(pipelined_matmul_under_while(), target=determine_target(), out_idx=[2])
++    torch.manual_seed(0)
++    A = torch.randn(64, 128, dtype=torch.float16, device="cuda")
++    B = torch.randn(64, 128, dtype=torch.float16, device="cuda")
++    ref = A.float() @ B.float().T
++    for n in (0, 1, 3):
++        torch.testing.assert_close(kernel(A, B, n), ref * n, rtol=1e-2, atol=1e-2)
++
++
++def prelude_before_outer_serial():
++    """A fill that runs once before the outer loop, overridden by every
++    iteration's own clear (issue #3663)."""
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, 128), T.float16),
++        B: T.Tensor((64, 128), T.float16),
++        C: T.Tensor((128, 64), T.float32),
++    ):
++        with T.Kernel(1, threads=128) as _:
++            A_s = T.alloc_shared((64, 32), T.float16)
++            B_s = T.alloc_shared((64, 32), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            T.fill(C_l, 7)
++            for p in T.serial(2):
++                T.clear(C_l)
++                for k in T.Pipelined(4, num_stages=2):
++                    T.copy(A[0, k * 32], A_s)
++                    T.copy(B[0, k * 32], B_s)
++                    T.gemm(A_s, B_s, C_l, transpose_B=True)
++                T.copy(C_l, C[p * 64, 0])
++
++    return main
++
++
++def prelude_before_nested_serial():
++    """Each level's prelude must run once per iteration of its own loop: the
++    accumulator is cleared per ``q`` and accumulates across ``p``."""
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, 128), T.float16),
++        B: T.Tensor((64, 128), T.float16),
++        C: T.Tensor((256, 64), T.float32),
++    ):
++        with T.Kernel(1, threads=128) as _:
++            A_s = T.alloc_shared((64, 32), T.float16)
++            B_s = T.alloc_shared((64, 32), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            T.fill(C_l, 7)
++            for q in T.serial(2):
++                T.clear(C_l)
++                for p in T.serial(2):
++                    for k in T.Pipelined(4, num_stages=2):
++                        T.copy(A[0, k * 32], A_s)
++                        T.copy(B[0, k * 32], B_s)
++                        T.gemm(A_s, B_s, C_l, transpose_B=True)
++                    T.copy(C_l, C[(q * 2 + p) * 64, 0])
++
++    return main
++
++
++def prelude_before_guarded_pipeline():
++    """A prelude in front of a condition must still run when the condition
++    skips the pipelined loop.
++
++    Register reallocation stays off: ptxas cannot allocate registers for a
++    consumer statement after the condition once setmaxnreg runs inside it
++    (#3664).
++    """
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, 128), T.float16),
++        B: T.Tensor((64, 128), T.float16),
++        C: T.Tensor((64, 64), T.float32),
++        n: T.int32,
++    ):
++        with T.Kernel(1, threads=128) as _:
++            A_s = T.alloc_shared((64, 32), T.float16)
++            B_s = T.alloc_shared((64, 32), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            T.disable_warp_group_reg_alloc()
++            T.fill(C_l, 7)
++            if n > 0:
++                for k in T.Pipelined(4, num_stages=2):
++                    T.copy(A[0, k * 32], A_s)
++                    T.copy(B[0, k * 32], B_s)
++                    T.gemm(A_s, B_s, C_l, transpose_B=True)
++            T.copy(C_l, C[0, 0])
++
++    return main
++
++
++def producer_prelude_before_outer_serial():
++    """A producer-only local defined before the outer loop."""
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, 160), T.float16),
++        B: T.Tensor((64, 160), T.float16),
++        C: T.Tensor((128, 64), T.float32),
++    ):
++        with T.Kernel(1, threads=128) as _:
++            A_s = T.alloc_shared((64, 32), T.float16)
++            B_s = T.alloc_shared((64, 32), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            k_off = T.alloc_local((1,), T.int32)
++            k_off[0] = 1
++            for p in T.serial(2):
++                T.clear(C_l)
++                for k in T.Pipelined(4, num_stages=2):
++                    T.copy(A[0, (k + k_off[0]) * 32], A_s)
++                    T.copy(B[0, (k + k_off[0]) * 32], B_s)
++                    T.gemm(A_s, B_s, C_l, transpose_B=True)
++                T.copy(C_l, C[p * 64, 0])
++
++    return main
++
++
++def producer_prelude_only_before_outer_serial():
++    """Only the producer has a prelude, and it sits before the outer loop.
++
++    Nothing is extracted into a branch, so the rebuilt WS body is the only
++    thing that can point the pipelined copy at the cloned local. The
++    accumulator is never cleared here: this shape is for the transform's
++    output, not for numerics.
++    """
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, 160), T.float16),
++        B: T.Tensor((64, 160), T.float16),
++        C: T.Tensor((128, 64), T.float32),
++    ):
++        with T.Kernel(1, threads=128) as _:
++            A_s = T.alloc_shared((64, 32), T.float16)
++            B_s = T.alloc_shared((64, 32), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            k_off = T.alloc_local((1,), T.int32)
++            k_off[0] = 1
++            for p in T.serial(2):
++                for k in T.Pipelined(4, num_stages=2):
++                    T.copy(A[0, (k + k_off[0]) * 32], A_s)
++                    T.copy(B[0, (k + k_off[0]) * 32], B_s)
++                    T.gemm(A_s, B_s, C_l, transpose_B=True)
++                T.copy(C_l, C[p * 64, 0])
++
++    return main
++
++
++def producer_prelude_bind_before_outer_serial():
++    """A ``T.bind`` that must stay in the shared prelude reads a block local.
++
++    The pipeline loop sits under another loop, so the bind cannot be moved into
++    a branch and stays where it is, reading the original ``k_off``. The producer
++    partition uses that same local in its copy index, which is exactly the case
++    where cloning it for the producer would leave the clone uninitialized.
++    """
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((64, 160), T.float16),
++        B: T.Tensor((64, 160), T.float16),
++        C: T.Tensor((128, 64), T.float32),
++    ):
++        with T.Kernel(1, threads=128) as _:
++            A_s = T.alloc_shared((64, 32), T.float16)
++            B_s = T.alloc_shared((64, 32), T.float16)
++            C_l = T.alloc_fragment((64, 64), T.float32)
++            k_off = T.alloc_local((1,), T.int32)
++            k_off[0] = 1
++            shift = T.bind(k_off[0])
++            for p in T.serial(2):
++                T.clear(C_l)
++                for k in T.Pipelined(4, num_stages=2):
++                    T.copy(A[0, (k + k_off[0]) * 32], A_s)
++                    T.copy(B[0, (k + shift) * 32], B_s)
++                    T.gemm(A_s, B_s, C_l, transpose_B=True)
++                T.copy(C_l, C[p * 64, 0])
++
++    return main
++
++
++def _compile_ws(func):
++    assert "tl_tiled_ws_applied" in _apply_ws_pass(func)["main"].script()
++    return tilelang.compile(
++        func,
++        target=determine_target(),
++        out_idx=[2],
++        pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False},
++    )
++
++
++def _prelude_inputs(K=128):
++    import torch
++
++    torch.manual_seed(0)
++    A = torch.randn(64, K, dtype=torch.float16, device="cuda")
++    B = torch.randn(64, K, dtype=torch.float16, device="cuda")
++    return A, B, A.float() @ B.float().T
++
++
++@tilelang.testing.requires_cuda
++def test_ws_prelude_only_before_outer_loop_uses_the_cloned_local():
++    """The guarded prelude writes the cloned local, so the loop must read it."""
++    script = _apply_ws_pass(producer_prelude_only_before_outer_serial())["main"].script()
++    assert "tl_tiled_ws_applied" in script
++    assert "k_off_producer_ws[0] = 1" in script, "guarded prelude does not initialize the clone"
++    assert "k_off_producer_ws[0]) * 32" in script, "pipelined copy reads the original local"
++    assert "k_off[0]) * 32" not in script
++
++
++@tilelang.testing.requires_cuda
++def test_ws_shared_prelude_bind_keeps_the_original_local():
++    """The bind stays in the shared prelude, so its local must not be cloned."""
++    script = _apply_ws_pass(producer_prelude_bind_before_outer_serial())["main"].script()
++    assert "tl_tiled_ws_applied" in script
++    assert "shift: T.int32 = k_off[0]" in script
++    assert "k_off_producer_ws" not in script, "producer clone would never be initialized"
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(9, 0)
++def test_ws_shared_prelude_bind_runs():
++    import torch
++
++    kernel = _compile_ws(producer_prelude_bind_before_outer_serial())
++    torch.manual_seed(0)
++    A = torch.randn(64, 160, dtype=torch.float16, device="cuda")
++    B = torch.randn(64, 160, dtype=torch.float16, device="cuda")
++    # ``k_off`` is 1, so the copies read K tiles 1..4 instead of 0..3.
++    ref = sum(A[:, (k + 1) * 32 : (k + 2) * 32].float() @ B[:, (k + 1) * 32 : (k + 2) * 32].float().T for k in range(4))
++    torch.testing.assert_close(kernel(A, B), ref.repeat(2, 1), rtol=1e-2, atol=1e-2)
++
++
++@tilelang.testing.requires_cuda
++def test_ws_pass_keeps_prelude_outside_outer_loop():
++    script = _apply_ws_pass(prelude_before_outer_serial())["main"].script()
++    assert "tl_tiled_ws_applied" in script
++    fill = script.index("T.fill(T.region(C_l[0, 0], 2, 64, 64), 7)")
++    assert fill < script.index("for p in range(2)")
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(9, 0)
++def test_ws_prelude_before_outer_loop_runs_once():
++    import torch
++
++    kernel = _compile_ws(prelude_before_outer_serial())
++    A, B, ref = _prelude_inputs()
++    torch_ref = ref.repeat(2, 1)
++    torch.testing.assert_close(kernel(A, B), torch_ref, rtol=1e-2, atol=1e-2)
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(9, 0)
++def test_ws_prelude_of_each_nested_loop_level():
++    import torch
++
++    kernel = _compile_ws(prelude_before_nested_serial())
++    A, B, ref = _prelude_inputs()
++    torch_ref = torch.cat([ref, 2 * ref, ref, 2 * ref])
++    torch.testing.assert_close(kernel(A, B), torch_ref, rtol=1e-2, atol=1e-2)
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(9, 0)
++def test_ws_prelude_before_condition_runs_when_loop_is_skipped():
++    import torch
++
++    kernel = _compile_ws(prelude_before_guarded_pipeline())
++    A, B, ref = _prelude_inputs()
++    for n in (0, 1):
++        torch.testing.assert_close(kernel(A, B, n), ref * n + 7, rtol=1e-2, atol=1e-2)
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(9, 0)
++def test_ws_producer_prelude_before_outer_loop():
++    import torch
++
++    kernel = _compile_ws(producer_prelude_before_outer_serial())
++    A, B, _ = _prelude_inputs(K=160)
++    ref = A[:, 32:].float() @ B[:, 32:].float().T
++    torch.testing.assert_close(kernel(A, B), ref.repeat(2, 1), rtol=1e-2, atol=1e-2)
++
++
++def cross_run_producer_scalar_update(
++    M=256,
++    N=256,
++    K=256,
++    block_M=64,
++    block_N=64,
++    block_K=32,
++    num_stages=2,
++    runs=2,
++    dtype="float16",
++    threads=128,
++):
++    """Issue #3842: the running K offset is updated after each pipeline run.
++
++    The producer reads ``start`` when it evaluates the copy indices of the next
++    run, so the update cannot be sunk into the consumer branch.
++    """
++    iterations = K // block_K
++    step = (iterations + runs - 1) // runs
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, K), dtype),
++        B: T.Tensor((K, N), dtype),
++        C: T.Tensor((M, N), dtype),
++    ):
++        with T.Kernel(N // block_N, M // block_M, threads=threads) as (bx, by):
++            A_s = T.alloc_shared((block_M, block_K), dtype)
++            B_s = T.alloc_shared((block_K, block_N), dtype)
++            C_l = T.alloc_fragment((block_M, block_N), "float32")
++            start = T.alloc_var(T.int32, init=0)
++            T.clear(C_l)
++            for _ in T.serial(runs):
++                k0 = T.alloc_var(T.int32, init=start)
++                k1 = T.alloc_var(T.int32, init=T.min(iterations, k0 + step))
++                for ko in T.Pipelined(k1 - k0, num_stages=num_stages):
++                    T.copy(A[by * block_M, (k0 + ko) * block_K], A_s)
++                    T.copy(B[(k0 + ko) * block_K, bx * block_N], B_s)
++                    T.gemm(A_s, B_s, C_l)
++                start = start + (k1 - k0)
++            T.copy(C_l, C[by * block_M, bx * block_N])
++
++    return main
++
++
++@tilelang.testing.requires_cuda
++def test_ws_pass_declines_loop_carried_producer_scalar_update():
++    """A post-pipeline write read by the producer's next run must decline WS."""
++    script = _apply_ws_pass(cross_run_producer_scalar_update())["main"].script()
++    assert "tl_tiled_ws_applied" not in script, "WS must decline when a post-pipeline update feeds the producer's next run"
++
++
++@tilelang.testing.requires_cuda
++@tilelang.testing.requires_cuda_compute_version(9, 0)
++def test_ws_declined_loop_carried_update_matches_reference():
++    import torch
++
++    kernel = tilelang.compile(
++        cross_run_producer_scalar_update(),
++        target=determine_target(),
++        out_idx=[2],
++        pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False},
++    )
++    torch.manual_seed(0)
++    A = torch.randn(256, 256, dtype=torch.float16, device="cuda")
++    B = torch.randn(256, 256, dtype=torch.float16, device="cuda")
++    ref = A.float() @ B.float()
++    torch.testing.assert_close(kernel(A, B).float(), ref, rtol=1e-2, atol=1e-2)
++
++
+ if __name__ == "__main__":
+     tilelang.testing.main()
+-- 
+2.43.0
+
