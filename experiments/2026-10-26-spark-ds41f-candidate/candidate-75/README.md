@@ -94,9 +94,45 @@ Measured on `dgx1..dgx3` (`tp3-triangle`, `tp3-dev.json`, receipts in `receipts/
    - Added `@tilelang.jit` `dfly2_swiglu_kernel` with `pdl.chain()` for `DFly2HiddenCorrection._mlp_local` (`5x` calls at `B=8` improved from `0.105 ms` -> `0.018 ms`, bit-exact `max_diff = 0.0`).
    - Kept the compact FP8/FP4 `sparse_mla_fwd_v41` path in `DFly2AttentiveCorrection` after SM121 profiling showed all `5x` calls combined take `0.045 ms` (`B=1`) / `0.087 ms` (`B=8`) from L2 cache (`215 KB` compact records vs `640 KB` BF16).
 4. **Linux repo unit suite (`dgx4`)**: **`955 passed, 0 failed`** (`39.4 s`).
-5. **In-image `175`-file `release-tests` gate bundle on `spark-ds41f:candidate-75-r2` (`dgx4`)**: running (`receipts/release-tests/verdict.json` pending completion).
+5. **In-image `175`-file `release-tests` gate bundle on `spark-ds41f:candidate-75-r2` (`dgx4`, `3,028 s`)**: **PASS (`exit 0`): `12,089 passed, 356 skipped, 0 failed, 0 errors`** (`receipts/release-tests/verdict.json`).
+
+## Measured `tp3-triangle` performance (`spark-ds41f:candidate-75-r2` vs `candidate-75` and `spark-ds41f-1126`)
+
+Measured on `dgx1..dgx3` (`tp3-triangle`, `tp3-dev.json`, receipts in `receipts/tp3-triangle-r2/`):
+- **Boot 1 (`+23/+23/+23` changed kernels compiled)**: ready `+108.4 s`, `lowest MemAvailable`: `dgx1 6.448 GiB`, `dgx2 7.671 GiB`, `dgx3 7.729 GiB`.
+- **Boot 2 (warm JIT, stopped after `model` and `grid` per owner direction to run the `0910` diagnostic)**: ready **`+77.4 s`** (`+0/+0/+0` JIT files, vs `1126`'s `+78.5 s`), `lowest MemAvailable`: `dgx1 6.519 GiB`, `dgx2 8.259 GiB`, `dgx3 8.083 GiB`.
+
+### Headline suites (`candidate-75-r2` Boot 1 vs `spark-ds41f-1126`)
+
+| Suite / Step | `candidate-75-r2` (DFly2) | `candidate-75` (Build 1) | `spark-ds41f-1126` (DSpark) | Delta (`r2` vs `1126`) |
+| --- | ---: | ---: | ---: | ---: |
+| `screen-tp3` `model` (`128` prompts) | `rank1 = 1.0`, `ppl = 1.3161` | `rank1 = 1.0`, `ppl = 1.3161` | `rank1 = 1.0`, `ppl = 1.3161` | Identical |
+| `single-stream` `c1` (`tok/s`) | **`54.40`** (`±5.7%`, `acc = 1.425`) | `54.76` (`acc = 1.421`) | **`71.28`** (`acc = 1.470`) | **`-23.7%`** |
+| `screen-tp3` `c8` (`tok/s`) | **`151.05`** (`±2.0%`, `acc = 1.368`) | `151.40` (`acc = 1.372`) | **`172.33`** (`acc = 1.424`) | **`-12.3%`** |
+| `sampled` `c1` (`tok/s`) | **`52.80`** (`acc = 1.336`) | `53.07` (`acc = 1.338`) | **`69.12`** (`acc = 1.374`) | **`-23.6%`** |
+| `sampled` `c8` (`tok/s`) | **`148.15`** (`acc = 1.319`) | `148.73` (`acc = 1.319`) | **`167.07`** (`acc = 1.333`) | **`-11.3%`** |
+| `sampled` `c16` (`tok/s`) | **`196.84`** (`±0.9%`, `acc = 1.400`) | `198.02` (`acc = 1.417`) | **`219.95`** (`acc = 1.452`) | **`-10.5%`** |
+| `prefill` `32K` (`tok/s`) | **`7,009.5`** (`±1.09%`) | `7,037.8` | **`7,326.6`** (`±1.30%`) | **`-4.3%`** |
+| `prefill` `262K` (`tok/s`) | **`7,181.7`** (`±0.31%`) | `7,254.3` | **`7,543.7`** (`±0.36%`) | **`-4.8%`** |
+
+`r2` reduced `grid.json` `drafter_ms` by `0.06–0.23 ms` across all 15 shapes (`1x2 @4K: 12.42 -> 12.31 ms`, `1x6 @4K: 12.63 -> 12.41 ms`, `2x12 @4K: 13.67 -> 13.44 ms`, `4x8 @4K: 14.85 -> 14.65 ms`, `8x24 @4K: 16.06 -> 15.95 ms`, `8x48 @4K: 16.11 -> 16.03 ms`).
+
+## Native `0910` target diagnostic (`tp3-0910.json`)
+
+`AngelSlim/DS-V4.1-Flash-DFly2-B6` declares `base_model: deepseek-ai/DeepSeek-V4.1-Flash` (`0910`, `v41-flash`), whereas `spark-ds41f-1126` serves `DeepSeek-V4.1-Flash-1017` (`v41-flash-1017`). To isolate whether checkpoint drift explained the acceptance numbers, `tp3-0910.json` swapped only `model` to `v41-flash` (`single-stream c1`, receipts in `receipts/tp3-triangle-r2/0910-single-stream/`):
+
+| Configuration (`single-stream c1`, `tp3-triangle`) | `tok/s` | `accepted / draft` (`τ`) | `drafts / step` | `survival` at pos `0..4` | `coverage` at pos `0..4` |
+| --- | ---: | ---: | ---: | --- | --- |
+| `1017` + `DSpark` (`1126`) | **`71.28`** | `1.470` (`2.470`) | `2.720` | `0.676 / 0.396 / 0.218 / 0.114 / 0.065` | `1.00 / 0.78 / 0.50 / 0.28 / 0.16` |
+| `1017` + `DFly2-B6` (`candidate-75-r2`) | `54.40` | `1.425` (`2.425`) | `2.736` | `0.654 / 0.380 / 0.210 / 0.111 / 0.066` | `1.00 / 0.78 / 0.51 / 0.28 / 0.16` |
+| `0910` + `DFly2-B6` (`tp3-0910.json`) | **`55.22`** (`±3.7%`) | **`1.475`** (`2.475`) | `2.879` | **`0.668 / 0.398 / 0.222 / 0.117 / 0.071`** | `1.00 / 0.84 / 0.55 / 0.31 / 0.18` |
+
+- Switching to DFly2's native `0910` weights recovers `+0.050` tokens/draft (`1.425 -> 1.475`, `+0.82 tok/s`), tying `1017`'s `DSpark` (`1.470`) while submitting slightly more drafts (`2.879` vs `2.720`).
+- Even at position 0 (`100%` coverage, zero adaptive pruning), `0910` + `DFly2-B6` accepts `66.8%` vs `DSpark`'s `67.6%`. Checkpoint drift is therefore real but small (`+3.5%` acceptance), not the primary gap.
+- A follow-up unpruned arm (`tp3-0910-k5.json`, `enable_adaptive_verification: false`) failed startup validation because `adaptive_verification_row_cost` was still inherited in `--speculative-config`; the window cleanup automatically restored `spark-ds41f:1126` production (`+84.7 s`, `doctor --live` OK).
 
 ## Conclusion
 
-- `DFly2-B6` integrates cleanly on SM121 (`0` KV cache overhead, `0` prefill drafter work, `+79.5 s` warm boot, `6.50–8.29 GiB` memory headroom, exact target quality `rank1 = 1.0`, `perplexity = 1.3161`), and `candidate-75-r2` resolves all gate-test and integration defects.
-- However, on GB10 (`273 GB/s` LPDDR5X UMA), `DFly2`'s architectural 3-layer backbone + 5 sequential `HiddenCorrection`/`AttentiveCorrection` steps + 5 sequential `ParallelLMHead` sweeps stream `~3.2 GB`/rank per step (`drafter_ms = 12.42–16.21 ms` vs `DSpark`'s `2.39–3.57 ms`), while native co-trained `DSpark` (`1017`) also edges out distilled `DFly2-B6` on acceptance (`1.470 / 1.424 / 1.452` vs `1.421 / 1.372 / 1.417`). `config/cluster.json` remains on promoted `spark-ds41f:1126` (`DSpark`).
+- `DFly2-B6` integrates cleanly on SM121 (`0` KV cache overhead, `0` prefill drafter work, `+77.4 s` warm boot, `6.52–8.26 GiB` memory headroom, exact target quality `rank1 = 1.0`, `perplexity = 1.3161`), and `candidate-75-r2` passes the full `175`-file `release-tests` gate (`12,089 passed, 356 skipped, 0 failed`).
+- On GB10 (`273 GB/s` LPDDR5X UMA), however, `DFly2`'s architecture hits a hard memory-bandwidth and latency floor: `5×` sequential `ParallelLMHead` sweeps (`331 MB`/rank × `5` = `1.65 GB`/rank at `TP3`, `~6–7 ms` floor alone) plus the 3-layer MoE backbone, `5×` sequential `HiddenCorrection`/`AttentiveCorrection` steps, and `~30` sequential TP collectives yield `drafter_ms = 12.31–16.14 ms` vs `DSpark`'s `2.39–3.57 ms` (`+10.0 to +12.5 ms/step`), while acceptance on Sonar's `default` chat workload ties `DSpark` even on `0910` (`1.475` vs `1.470`) and trails slightly on `1017` (`1.425` vs `1.470`).
+- **Not promoted.** `config/cluster.json` remains on promoted `spark-ds41f:1126` (`DSpark`).
