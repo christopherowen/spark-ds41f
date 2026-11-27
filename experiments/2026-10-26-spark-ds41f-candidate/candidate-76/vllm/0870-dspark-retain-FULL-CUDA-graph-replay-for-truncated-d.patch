@@ -18,7 +18,7 @@ retain the existing eager path.
 Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354 + candidate-74 (0001..0869)
 Quality impact: none (identical outputs at fixed K=5; preserves exact calibration masking when K < 5)
 Tests: tests/v1/spec_decode/test_dspark_truncated_cudagraph.py
-Upstream status: local candidate-76-r2 patch
+Upstream status: local candidate-76-r3 patch
 ---
  .../test_dspark_truncated_cudagraph.py        | 30 +++++++++++++++++++
  .../gpu/spec_decode/dflash/speculator.py      | 19 +++++++++++-
@@ -66,16 +66,16 @@ diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worke
 index ecdd54851b..b4f22a6aad 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-@@ -508,6 +508,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -507,6 +507,12 @@ class DFlashSpeculator(DraftModelSpeculator):
          super().reset_attn()
  
-     @torch.inference_mode()
 +    def _can_replay_truncated_graph(self) -> bool:
 +        """Whether a captured full-depth CUDA graph can safely replay when
 +        ``0 < active_spec < self.num_speculative_steps`` by masking tail
 +        calibration slots before replay and zeroing tail confidence outputs."""
 +        return False
 +
+     @torch.inference_mode()
      def _run_model(
          self,
          num_tokens: int,
