@@ -1,0 +1,37 @@
+{
+  "notes": "External site receipt: spark-ds41f-1126 on the recipe's tp3-switched shape (three GX10 on a switch). Sizing is tp3-switched's own (16 sequences, 6,144 batched tokens, 4.9062 GiB KV). Site settings: 1017 snapshot+blobs, fan_control false, no GLP name, 64 images, no display carve-out (Errno 38 on this site's boards). The head address is a documentation address. The measured runs used candidate-arm-tp3-c1.json, which adds the C1 overlay.",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp3-switched"
+  },
+  "set": {
+    "models": {
+      "site-1017": {
+        "snapshot": "{home}/ds41f-1017/snapshot",
+        "blobs": "{home}/ds41f-1017/blobs",
+        "notes": "DeepSeek-V4.1-Flash-1017 rev 1bae0e10, sha256-verified on the head; the other ranks read the blobs over read-only NFS from the head, Engram shards 47/48 local."
+      }
+    },
+    "model": "site-1017",
+    "host": {
+      "fan_control": false
+    },
+    "distributed": {
+      "master_addr": "192.0.2.1"
+    },
+    "deployment": {
+      "launch_enabled": true
+    },
+    "nodes_config": "config/nodes-switched3.local.json",
+    "environment": {
+      "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS": "0"
+    }
+  },
+  "serve_options": {
+    "--limit-mm-per-prompt": "{\"image\":64}"
+  },
+  "unset": [
+    "glp",
+    "deployment.branch"
+  ]
+}

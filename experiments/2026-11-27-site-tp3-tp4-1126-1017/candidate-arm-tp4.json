@@ -1,0 +1,39 @@
+{
+  "notes": "External site receipt: spark-ds41f-1126 on the recipe's tp4-switched shape (four GX10 on a switch), at the site's batch budget of 8,192. 1126 needs threshold + 203 decode rows <= the budget, so the site's 1107 pair (8,192 / 8,096) refused at startup; the threshold is now 7,936. Otherwise 1126's sizing: 32 sequences, 16.5 GiB KV. Site settings as in candidate-arm-tp3.json. The measured runs used candidate-arm-tp4-c1.json, which adds the C1 overlay.",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp4-switched"
+  },
+  "set": {
+    "models": {
+      "site-1017": {
+        "snapshot": "{home}/ds41f-1017/snapshot",
+        "blobs": "{home}/ds41f-1017/blobs",
+        "notes": "DeepSeek-V4.1-Flash-1017 rev 1bae0e10, sha256-verified on the head; the other ranks read the blobs over read-only NFS from the head, Engram shards 47/48 local."
+      }
+    },
+    "model": "site-1017",
+    "host": {
+      "fan_control": false
+    },
+    "distributed": {
+      "master_addr": "192.0.2.1"
+    },
+    "deployment": {
+      "launch_enabled": true
+    },
+    "nodes_config": "config/nodes-switched.local.json",
+    "environment": {
+      "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS": "0"
+    }
+  },
+  "serve_options": {
+    "--max-num-batched-tokens": "8192",
+    "--long-prefill-token-threshold": "7936",
+    "--limit-mm-per-prompt": "{\"image\":64}"
+  },
+  "unset": [
+    "glp",
+    "deployment.branch"
+  ]
+}

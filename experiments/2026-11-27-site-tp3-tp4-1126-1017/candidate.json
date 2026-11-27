@@ -1,0 +1,32 @@
+{
+  "intended_variables": [
+    "release 1107 -> 1126 on the same three switched nodes",
+    "tp3-switched -> tp4-switched on 1126 (the fourth node added)"
+  ],
+  "configuration_delta": {
+    "arms": [
+      "candidate-arm-tp3-c1.json",
+      "candidate-arm-tp4-c1.json"
+    ],
+    "unset": [
+      "glp",
+      "deployment.branch"
+    ],
+    "serve_options": {
+      "tp3-switched": "the shape's own sizing (16 sequences, 6,144 batched tokens, 4.91 GiB KV)",
+      "tp4-switched": "--max-num-batched-tokens 8192, --long-prefill-token-threshold 7936 (site budget), 32 sequences, 16.5 GiB KV",
+      "--limit-mm-per-prompt": "{\"image\":64}"
+    },
+    "host.fan_control": false,
+    "environment": {
+      "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS": "0"
+    },
+    "model": "snapshot+blobs profile; blobs over read-only NFS from the head, shards 47/48 local on every node",
+    "memguard": "site policy: scripts/memguard.sh logs a rate-limited WARN instead of killing the container"
+  },
+  "source_delta": [
+    "none in the image",
+    "site C1 overlay: read-only bind mount over vllm/v1/core/sched/utils.py (overlay/c1-utils.diff; served file sha256 49750acf, base 1859400d)"
+  ],
+  "image_digest": "sha256:0fe3e0aea413bd8c2aa37204c80b9d3a3bd69404f480277d562bff6476bf0eb4"
+}
