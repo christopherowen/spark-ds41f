@@ -1,0 +1,23 @@
+--- a/vllm/v1/core/sched/utils.py
++++ b/vllm/v1/core/sched/utils.py
+@@ -436,14 +436,13 @@
+     if not (thinking_loop_break or request.thinking_loop_breaks > 0):
+         return False
+     loop_info = detect_thinking_loop(request._output_token_ids, start_idx=start_idx)
+-    if request.thinking_loop_breaks > 0:
+-        # Reasoning already looped: stop the answer at its first loop.
+-        if loop_info is None:
+-            return False
+-        request.last_loop_info = loop_info
+-        return _finish_repetition(request)
++    # Site patch (C1): an answer after a reasoning
++    # break is judged by the same persistence rules as any other answer. Stock
++    # 1107 stopped it at its first loop here, which cut legitimate repetitive
++    # output the model had drafted in its reasoning (a 24-token draft forces
++    # the break, then the requested file is the answer's "first loop").
+ 
+-    # The visible answer of a request whose reasoning did not loop. Legitimate
++    # The visible answer of a request, whether or not its reasoning looped. Legitimate
+     # answers repeat too (a zero-filled array, a table rule, a file written
+     # through a tool call) and then move on; a degenerate loop does not. Stop
+     # only a loop that persists (token soup OUTPUT_SOUP_PERSIST tokens, any
