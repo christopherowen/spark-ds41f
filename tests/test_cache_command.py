@@ -558,6 +558,36 @@ class ClearTest(unittest.TestCase):
         self.assertEqual(run.code, 1)
         self.assertIn(f"ERROR: dgx1: {HOST_JIT}/vllm (vllm): not cleared: exit 0", run.err)
 
+    def test_multi_root_tilelang_cache_status_and_clear(self) -> None:
+        profile = cluster({"TILELANG_CACHE_DIR": "/cache/a/write:/cache/a/shared-ro"})
+        found, unset, refused = spark.profile_caches(profile, {"tilelang": spark.JIT_CACHES["tilelang"]})
+        self.assertEqual((unset, refused), ([], []))
+        self.assertEqual([d["container"] for d in found], ["/cache/a/write", "/cache/a/shared-ro"])
+        self.assertFalse(found[0].get("read_only", False))
+        self.assertTrue(found[1].get("read_only", False))
+
+        # cache status reports both roots and marks the fallback root read-only
+        status_run = Run(spark.command_cache_status, profile=profile)
+        self.assertEqual(status_run.code, 0)
+        self.assertIn("tilelang: TILELANG_CACHE_DIR=/cache/a/write\n", status_run.out)
+        self.assertIn(
+            "tilelang: TILELANG_CACHE_DIR=/cache/a/shared-ro (read-only lookup root; cache clear does not empty it)\n",
+            status_run.out,
+        )
+
+        # cache clear empties only the writable first root, never the read-only fallback root
+        clear_run = Run(spark.command_cache_clear, apply=True, only=["tilelang"], profile=profile)
+        self.assertEqual(clear_run.code, 0)
+        cleared_dirs = [script.splitlines()[1] for _, script in clear_run.scripts("clear")]
+        self.assertTrue(all(d.endswith("/a/write") for d in cleared_dirs), cleared_dirs)
+        self.assertFalse(any("shared-ro" in d for d in cleared_dirs), cleared_dirs)
+
+        # empty segment in multi-root path is refused
+        bad = cluster({"TILELANG_CACHE_DIR": "/cache/a/write:"})
+        _, _, bad_refused = spark.profile_caches(bad, {"tilelang": spark.JIT_CACHES["tilelang"]})
+        self.assertEqual(len(bad_refused), 1)
+        self.assertIn("empty segments", bad_refused[0])
+
 
 class ParserTest(unittest.TestCase):
     def test_the_commands_are_wired(self) -> None:

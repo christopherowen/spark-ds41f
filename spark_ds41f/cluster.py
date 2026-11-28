@@ -1331,26 +1331,67 @@ def cache_host_directory(cluster: dict, container_path: str) -> str:
     return str(PurePosixPath(cache_mount_source(cluster)) / below)
 
 
-def profile_caches(cluster: dict, caches: dict[str, tuple[str, ...]]) -> tuple[list[dict], list[str], list[str]]:
+MULTI_ROOT_CACHE_VARIABLES = frozenset({"TILELANG_CACHE_DIR"})
+
+
+def profile_caches(
+    cluster: dict,
+    caches: dict[str, tuple[str, ...]],
+    *,
+    include_read_only: bool = True,
+) -> tuple[list[dict], list[str], list[str]]:
     """The node directories of the named caches, as the profile's environment sets them:
     the directories, a note for each cache the profile does not set, and each value the
-    path guard refuses."""
+    path guard refuses.
+
+    Variables in ``MULTI_ROOT_CACHE_VARIABLES`` (such as TileLang's ``TILELANG_CACHE_DIR``,
+    TileLang #3807) accept colon-separated roots where the first root is writable and
+    subsequent roots are read-only lookup directories. ``cache status`` inspects all roots;
+    ``cache clear`` passes ``include_read_only=False`` so read-only roots are never emptied."""
     environment = cluster.get("environment", {})
     directories, unset, refused = [], [], []
     for name, variables in caches.items():
-        values: dict[str, list[str]] = {}
+        # Preserve insertion order of (path, read_only) -> list of variable names
+        values: dict[str, tuple[list[str], bool]] = {}
+        any_set = False
         for variable in variables:
-            if environment.get(variable):
-                values.setdefault(str(environment[variable]), []).append(variable)
-        if not values:
+            raw = environment.get(variable)
+            if not raw:
+                continue
+            any_set = True
+            raw_str = str(raw)
+            if variable in MULTI_ROOT_CACHE_VARIABLES and ":" in raw_str:
+                parts = raw_str.split(":")
+                if any(not part for part in parts):
+                    refused.append(
+                        f"{name}: {variable}={raw_str}: multi-root cache path must not contain empty segments"
+                    )
+                    continue
+                entries = [(part, idx > 0) for idx, part in enumerate(parts)]
+            else:
+                entries = [(raw_str, False)]
+            for part, read_only in entries:
+                if read_only and not include_read_only:
+                    continue
+                if part in values:
+                    named, prev_ro = values[part]
+                    if variable not in named:
+                        named.append(variable)
+                    values[part] = (named, prev_ro and read_only)
+                else:
+                    values[part] = ([variable], read_only)
+        if not any_set:
             unset.append(f"{name}: the profile sets no {' or '.join(variables)}; skipped")
-        for value, named in values.items():
+        for value, (named, read_only) in values.items():
             try:
                 host = cache_host_directory(cluster, value)
             except ValueError as error:
                 refused.append(f"{name}: {', '.join(named)}={value}: {error}")
                 continue
-            directories.append({"name": name, "variables": named, "container": value, "host": host})
+            entry = {"name": name, "variables": named, "container": value, "host": host}
+            if read_only:
+                entry["read_only"] = True
+            directories.append(entry)
     return directories, unset, refused
 
 
@@ -1463,8 +1504,13 @@ def command_cache_status(args: argparse.Namespace) -> int:
     directories, unset, refused = profile_caches(cluster, {**JIT_CACHES, **JIT_CACHE_PARENT})
     print(f"profile: {config_relative} on {', '.join(node['name'] for node in nodes['nodes'])}")
     for directory in directories:
-        parent = " (shown only; cache clear does not empty it)" if directory["name"] in JIT_CACHE_PARENT else ""
-        print(f"{directory['name']}: {', '.join(directory['variables'])}={directory['container']}{parent}")
+        if directory["name"] in JIT_CACHE_PARENT:
+            note = " (shown only; cache clear does not empty it)"
+        elif directory.get("read_only"):
+            note = " (read-only lookup root; cache clear does not empty it)"
+        else:
+            note = ""
+        print(f"{directory['name']}: {', '.join(directory['variables'])}={directory['container']}{note}")
     for note in unset:
         print(note)
     for problem in refused:
@@ -1526,7 +1572,9 @@ def command_cache_clear(args: argparse.Namespace) -> int:
     cluster, nodes, _ = configuration(args)
     _, config_relative = cluster_config_path(args)
     selected = list(dict.fromkeys(getattr(args, "only", None) or JIT_CACHES))
-    directories, unset, refused = profile_caches(cluster, {name: JIT_CACHES[name] for name in selected})
+    directories, unset, refused = profile_caches(
+        cluster, {name: JIT_CACHES[name] for name in selected}, include_read_only=False
+    )
     print(f"profile: {config_relative} on {', '.join(node['name'] for node in nodes['nodes'])}")
     for note in unset:
         print(note)

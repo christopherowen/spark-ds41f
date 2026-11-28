@@ -219,12 +219,14 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
 
 
 def compile_workers() -> int | None:
-    """Compile threads: the deployment's compile parallelism (``MAX_JOBS``), since every
-    compile holds host memory, which on unified-memory GPUs is the device's; all CPUs
-    when it is unset."""
+    """Compile parallelism: the deployment's ``MAX_JOBS`` when set, otherwise a
+    bounded fraction of available CPUs (capped at 12 on unified-memory GPUs)."""
+    import os
     from vllm import envs
 
-    return int(envs.MAX_JOBS) if envs.MAX_JOBS else None
+    if envs.MAX_JOBS:
+        return int(envs.MAX_JOBS)
+    return max(1, min(os.cpu_count() or 8, 12))
 
 
 def _fast_load_workers(count: int) -> int:
@@ -235,21 +237,179 @@ def _fast_load_workers(count: int) -> int:
     return max(1, min(count, cpus, 8))
 
 
-def _prepare_index_provenance(cache_dir: str) -> str:
-    """Content-addressed digest of all DeepSeek V4.1 TileLang Python sources,
-    cache namespace, GPU capability, and codegen-affecting environment vars.
+def _prepare_compile_in_process(item: tuple[Any, Any]) -> str:
+    """Top-level worker entry point for single-pool ``spawn`` compilation (#3903)."""
+    from tilelang.jit import _compile_in_process
 
-    Any 1-byte source change, TileLang build change, overlay mount, or codegen
-    env var change produces a distinct digest and cleanly bypasses old indexes.
+    config, task = item
+    return _compile_in_process(config, task)
+
+
+def _use_process_prepare(miss_count: int) -> bool:
+    import os
+
+    mode = os.environ.get("TILELANG_PREPARE_EXECUTOR", "process").strip().lower()
+    if mode in ("thread", "threads", "0", "false", "off"):
+        return False
+    return miss_count >= 4
+
+
+def _prepare_misses_in_processes(
+    miss_calls: list[TileLangCall],
+    workers: int,
+    progress: Callable[[int, int], None] | None,
+) -> list[Any] | None:
+    """Compile all cold-cache misses across all option groups in one shared
+    ``spawn`` process pool (TileLang #3903), isolating TVM/LLVM/glibc compiler
+    heaps from the long-lived serving worker on unified-memory GPUs.
+
+    Returns the list of compiled ``JITKernel`` objects aligned with
+    ``miss_calls``, or ``None`` if process compilation is unavailable so the
+    caller can fall back to threaded ``tilelang.prepare()``.
     """
+    import concurrent.futures
+    import multiprocessing
+    import os
+    from tilelang import env as tl_env
+    from tilelang.cache import _resolve_cache_dispatch
+    from tilelang.jit import (
+        _ProcessCompileConfig,
+        _ProcessCompileTask,
+        _merge_func_compile_args,
+    )
+    from tilelang.transform.pass_config import normalize_pass_configs
+
+    if not tl_env.is_cache_enabled():
+        return None
+    cache_dir = os.pathsep.join(tl_env.get_cache_read_dirs())
+
+    results: list[Any] = [None] * len(miss_calls)
+    # Per unique (impl, key) -> list of call indices
+    call_meta: list[tuple[Any, Any]] = []
+    # Deduplicated cache-miss jobs keyed by (id(cache), cache_key)
+    jobs: dict[tuple[int, str], tuple[Any, Any, bool, _ProcessCompileConfig, _ProcessCompileTask, list[int]]] = {}
+    done = 0
+
+    for idx, (impl, args, kwargs) in enumerate(miss_calls):
+        kw = dict(kwargs)
+        kw.update(kw.pop("__tune_params", {}))
+        impl.initialize_jit_mode(*args, **kw)
+        if not impl.is_lazy_mode():
+            return None
+        key = impl.func.parse_args(*args, **kw)[0]
+        call_meta.append((impl, key))
+        existing = impl._get_prepared_kernel(key)
+        if existing is not None:
+            results[idx] = existing
+            done += 1
+            continue
+        impl._prepared_kernel_cache.pop(key, None)
+        pf = impl.get_tir(*args, **kw)
+        cache, bc, resolved_verbose = _resolve_cache_dispatch(
+            impl.target, impl.target_host, impl.execution_backend, impl.verbose
+        )
+        if not getattr(cache, "supports_disk_cache", False):
+            return None
+        out_idx, pc, cf = _merge_func_compile_args(
+            pf, impl.out_idx, impl.pass_configs, impl.compile_flags
+        )
+        npc = normalize_pass_configs(pc)
+        ckey, cached_kernel = cache.lookup(
+            func=pf,
+            out_idx=out_idx,
+            backend_context=bc,
+            pass_configs=npc,
+            compile_flags=cf,
+            verbose=resolved_verbose,
+        )
+        if cached_kernel is not None:
+            impl._record_prepared_kernel(key, cached_kernel)
+            results[idx] = cached_kernel
+            done += 1
+            continue
+        job_id = (id(cache), ckey)
+        if job_id in jobs:
+            jobs[job_id][5].append(idx)
+        else:
+            cfg = _ProcessCompileConfig(
+                cache_dir=cache_dir,
+                target=str(bc.target),
+                target_host=str(bc.target_host) if bc.target_host is not None else None,
+                execution_backend=bc.execution_backend.name,
+                verbose=resolved_verbose,
+            )
+            task = _ProcessCompileTask(
+                key=ckey,
+                func=pf,
+                out_idx=out_idx,
+                pass_configs=npc,
+                compile_flags=cf,
+            )
+            jobs[job_id] = (cache, bc, resolved_verbose, cfg, task, [idx])
+
+    total = len(miss_calls)
+    if progress is not None:
+        progress(done, total)
+    if not jobs:
+        return results
+
+    pool_workers = max(1, min(len(jobs), workers))
+    pool = concurrent.futures.ProcessPoolExecutor(
+        pool_workers, mp_context=multiprocessing.get_context("spawn")
+    )
+    try:
+        future_to_job = {
+            pool.submit(_prepare_compile_in_process, (cfg, task)): (
+                cache,
+                bc,
+                resolved_verbose,
+                task,
+                waiters,
+            )
+            for cache, bc, resolved_verbose, cfg, task, waiters in jobs.values()
+        }
+        for future in concurrent.futures.as_completed(future_to_job):
+            cache, bc, resolved_verbose, task, waiters = future_to_job[future]
+            cache_path = future.result()
+            kernel = cache.load_published_entry(
+                task.key,
+                cache_path,
+                func=task.func,
+                out_idx=task.out_idx,
+                backend_context=bc,
+                pass_configs=task.pass_configs,
+                compile_flags=task.compile_flags,
+                verbose=resolved_verbose,
+            )
+            for idx in waiters:
+                impl, key = call_meta[idx]
+                impl._record_prepared_kernel(key, kernel)
+                results[idx] = kernel
+                done += 1
+            if progress is not None:
+                progress(done, total)
+    except BaseException:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+
+    return results
+
+
+def _prepare_index_provenance(cache_namespace: str) -> str:
+    """Content-addressed digest of all DeepSeek V4.1 TileLang Python sources,
+    cache namespace (root-independent so read-only multi-root caches share
+    warm indexes under TileLang #3807), GPU capability, and codegen-affecting
+    environment vars."""
     import hashlib
     import os
     from pathlib import Path
     import torch
 
     h = hashlib.sha256()
-    h.update(b"vllm-ds41-prepare-index-v2\0")
-    h.update(cache_dir.encode("utf-8"))
+    h.update(b"vllm-ds41-prepare-index-v3\0")
+    h.update(cache_namespace.encode("utf-8"))
     h.update(b"\0")
     if torch.cuda.is_available():
         cap = torch.cuda.get_device_capability()
@@ -265,7 +425,7 @@ def _prepare_index_provenance(cache_dir: str) -> str:
                 "SPARK_DS41F_",
             )
         ):
-            if key in ("TILELANG_CACHE_DIR",):
+            if key in ("TILELANG_CACHE_DIR", "TILELANG_PREPARE_EXECUTOR"):
                 continue
             h.update(f"{key}={os.environ[key]}\0".encode("utf-8"))
 
@@ -353,25 +513,41 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
         )
         get_cache_path = getattr(default_kc, "_get_write_cache_path", None) or default_kc._get_cache_path
         cache_dir = get_cache_path("")
+        cache_namespace = default_kc._get_cache_namespace()
+        read_roots = (
+            tl_env.get_cache_read_dirs()
+            if hasattr(tl_env, "get_cache_read_dirs")
+            else [str(Path(cache_dir).parent.parent)]
+        )
     except Exception:
         cache_dir = None
+        cache_namespace = None
+        read_roots = []
 
-    if not cache_dir:
+    if not cache_dir or not cache_namespace:
         tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
         return
 
-    prov = _prepare_index_provenance(cache_dir)
-    index_path = Path(cache_dir).parent / f"prepare-index-{prov[:16]}.json"
+    prov = _prepare_index_provenance(cache_namespace)
+    index_name = f"prepare-index-{prov[:16]}.json"
+    index_path = Path(cache_dir).parent / index_name
     index: dict[str, dict[str, Any]] = {}
-    if index_path.is_file():
+    # Load warm-index entries across all multi-root cache directories (#3807)
+    # in reverse lookup order so higher-priority roots override lower ones.
+    index_candidates = [Path(root) / cache_namespace / index_name for root in read_roots]
+    if index_path not in index_candidates:
+        index_candidates.insert(0, index_path)
+    for cand_path in reversed(index_candidates):
+        if not cand_path.is_file():
+            continue
         try:
-            loaded = json.loads(index_path.read_text(encoding="utf-8"))
+            loaded = json.loads(cand_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and loaded.get("provenance") == prov:
                 entries = loaded.get("entries")
                 if isinstance(entries, dict):
-                    index = entries
+                    index.update(entries)
         except Exception:
-            index = {}
+            continue
 
     fast_jobs: list[tuple[Any, tuple[Any, ...], dict[str, Any], Any, str, dict[str, Any]]] = []
     miss_items: list[tuple[TileLangCall, str | None]] = []
@@ -449,7 +625,9 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
             if k is None:
                 import shutil
                 get_kc_path = getattr(kc, "_get_write_cache_path", None) or kc._get_cache_path
-                shutil.rmtree(get_kc_path(ckey), ignore_errors=True)
+                write_entry = get_kc_path(ckey)
+                if os.path.exists(write_entry):
+                    shutil.rmtree(write_entry, ignore_errors=True)
             else:
                 with kc._lock:
                     existing = kc._memory_cache.get(ckey)
@@ -478,9 +656,25 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
         def _miss_progress(done: int, _tot: int) -> None:
             PROGRESS.report(base_done + done, total_count)
 
-        compiled = tilelang.prepare(
-            miss_calls, num_workers=compile_workers(), progress=_miss_progress
-        )
+        workers = compile_workers() or 8
+        compiled = None
+        compile_backend = "thread"
+        if _use_process_prepare(len(miss_calls)):
+            try:
+                compiled = _prepare_misses_in_processes(
+                    miss_calls, workers, _miss_progress
+                )
+                if compiled is not None:
+                    compile_backend = "process"
+            except Exception as exc:
+                logger.warning(
+                    "TileLang process-based prepare fell back to threads: %s", exc
+                )
+                compiled = None
+        if compiled is None:
+            compiled = tilelang.prepare(
+                miss_calls, num_workers=workers, progress=_miss_progress
+            )
         updated = False
         for (_, sig), kernel in zip(miss_items, compiled or ()):
             if sig is None:
@@ -513,9 +707,10 @@ def _prepare_with_warm_index(calls: list[TileLangCall]) -> None:
                 pass
 
     logger.info(
-        "TileLang warm index: %d fast-loaded, %d compiled/missed in %.2f s (index=%s)",
+        "TileLang warm index: %d fast-loaded, %d compiled/missed (%s) in %.2f s (index=%s)",
         done_count,
         len(miss_items),
+        compile_backend if miss_items else "warm",
         time.monotonic() - t_start,
         index_path.name,
     )
