@@ -1,0 +1,283 @@
+From 722c448976e89fdf9d133946211c369c94e82393 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 08:28:49 +0100
+Subject: [PATCH] distributed: add ring4_relay, all_to_all_rows, and SparkNet
+ collective hooks
+
+---
+ vllm/distributed/communication_op.py          |   7 ++
+ .../device_communicators/cuda_communicator.py |  39 +++++++
+ .../device_communicators/pynccl.py            | 107 ++++++++++++++++++
+ vllm/distributed/parallel_state.py            |  44 +++++++
+ 4 files changed, 197 insertions(+)
+
+diff --git a/vllm/distributed/communication_op.py b/vllm/distributed/communication_op.py
+index 5ad99e4e1592d321fdc67e177664dd92981c4dcd..ef9e6334bad6063fd12e34968529badf9940e684 100644
+--- a/vllm/distributed/communication_op.py
++++ b/vllm/distributed/communication_op.py
+@@ -41,3 +41,10 @@ def broadcast_tensor_dict(
+     if not torch.distributed.is_initialized():
+         return tensor_dict
+     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
++
++
++def tensor_model_parallel_all_to_all_rows(
++    input_: torch.Tensor, send_counts: list[int], recv_counts: list[int]
++) -> torch.Tensor:
++    """All-to-all variable row counts across the tensor model parallel group."""
++    return get_tp_group().all_to_all_rows(input_, send_counts, recv_counts)
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 11c8de67d9476120f218fea1b0bd66719d6e7c4a..0e1fa3e4c9588db1ace99d1ccfcf8111651abefb 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -1144,3 +1144,42 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             pynccl_comm.batch_isend_irecv(p2p_ops)
+         else:
+             raise ValueError("No PyNCCL communicator found")
++
++    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
++        """Use NCCL's aliasing contract for a caller-donated intermediate."""
++        if self._roce_policy:
++            # The policy reduces with the one-shot runtime or the rank-order
++            # exchange. NCCL's in-place ring adds in another order, and no model
++            # served on this policy reduces in place.
++            raise RuntimeError("RoCEnante policy has no in-place all-reduce")
++        pynccl_comm = self.pynccl_comm
++        if (
++            pynccl_comm is None
++            or pynccl_comm.disabled
++            or pynccl_comm.all_reduce(input_, out_tensor=input_) is None
++        ):
++            torch.distributed.all_reduce(input_, group=self.device_group)
++        return input_
++
++    def all_to_all_rows(self, input_: torch.Tensor, rows: int) -> torch.Tensor:
++        """Row blocks of ``rows``: block r goes to rank r; the output's [s] holds
++        rank s's block (rows past this rank's real rows unwritten)."""
++        self._require_roce_policy()
++        b12x_ar_comm = self.b12x_ar_comm
++        should_a2a = getattr(b12x_ar_comm, "should_all_to_all_rows", None)
++        a2a = getattr(b12x_ar_comm, "all_to_all_rows", None)
++        if (
++            b12x_ar_comm is not None
++            and not b12x_ar_comm.disabled
++            and should_a2a is not None
++            and should_a2a(input_, rows)
++        ):
++            assert a2a is not None
++            return a2a(input_, rows)
++        pynccl_comm = self.pynccl_comm
++        if pynccl_comm is None or pynccl_comm.disabled:
++            raise RuntimeError("all_to_all_rows needs the PyNCCL communicator")
++        input_ = input_.contiguous()
++        output = input_.new_empty((self.world_size, rows, *input_.shape[1:]))
++        pynccl_comm.all_to_all_rows(output, input_, rows)
++        return output
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index 8361b9c9cda457970cdc26e58269523b675ebe74..1b2af1bdc44fd226df4c68f430455b58c886a92b 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -4,6 +4,8 @@
+ 
+ # ===================== import region =====================
+ import contextlib
++import functools
++import os
+ import threading
+ 
+ import torch
+@@ -30,6 +32,17 @@ logger = init_logger(__name__)
+ _warmup_tls = threading.local()
+ 
+ 
++@functools.cache
++def ring4_relay() -> bool:
++    """Whether a four-rank exchange relays the opposite rank's rows through a
++    neighbour, as a switchless four-node ring needs (ranks two apart share no
++    cable). Only a fabric that reaches every peer in one hop says so: sparknet's
++    ``direct`` topology (``SPARKNET_ROCE_TOPOLOGY=direct``: every rank behind one
++    switch) exchanges straight with every peer. Any other value, or none, keeps
++    the relay, which works on every fabric."""
++    return os.environ.get("SPARKNET_ROCE_TOPOLOGY") != "direct"
++
++
+ def _warmup_deferred() -> bool:
+     return getattr(_warmup_tls, "deferred", False)
+ 
+@@ -638,6 +651,100 @@ class PyNcclCommunicator:
+             cudaStream_t(stream.cuda_stream),
+         )
+ 
++    def all_to_all_rows(
++        self,
++        output: torch.Tensor,
++        input_: torch.Tensor,
++        rows: int,
++        stream=None,
++        *,
++        copy_self: bool = True,
++    ):
++        """Row blocks of ``rows``: rank r receives ``input_``'s rows
++        ``[r * rows, (r + 1) * rows)``, the last ranks' blocks short or empty when
++        ``input_`` has fewer rows; ``output[s, :n]`` receives rank s's block for this
++        rank (n its real rows, the same from every rank), and later rows are not
++        written. With ``copy_self=False``, ``output[me, :mine]`` is already written in
++        place by the caller and is not copied from ``input_``. One grouped send/recv
++        per peer; at four ranks, neighbours only (``_all_to_all_rows_ring``) unless the
++        fabric is ``direct`` (``ring4_relay``)."""
++        if self.disabled:
++            return
++        world, me, total = self.world_size, self.rank, input_.shape[0]
++        if output.shape[:2] != (world, rows) or output.shape[2:] != input_.shape[1:]:
++            raise ValueError(
++                f"all_to_all_rows: {tuple(input_.shape)} in blocks of {rows} rows "
++                f"cannot fill {tuple(output.shape)}"
++            )
++
++        def real(rank: int) -> int:
++            return max(0, min(rows, total - rank * rows))
++
++        if stream is None:
++            stream = current_stream()
++        mine = real(me)
++        if copy_self and mine:
++            output[me, :mine].copy_(input_[me * rows : me * rows + mine])
++        if world == 4 and ring4_relay():
++            self._all_to_all_rows_ring(output, input_, rows, real, stream)
++            return
++        self.group_start()
++        for peer in range(world):
++            if peer == me:
++                continue
++            if real(peer):
++                self.send(input_[peer * rows : peer * rows + real(peer)], peer, stream)
++            if mine:
++                self.recv(output[peer, :mine], peer, stream)
++        self.group_end()
++
++    def _all_to_all_rows_ring(self, output, input_, rows, real, stream) -> None:
++        """``all_to_all_rows`` over a switchless four-node ring (sparknet's ring4
++        cable order): ranks two apart share no cable, so NCCL cannot connect them.
++        Each rank sends its neighbours their blocks and each half of the opposite
++        rank's block through one neighbour, which forwards it in a second group, as
++        the rank-order reduce-scatter does (``deepseek_v4_1.tilelang.collectives.
++        exchange_into``); the four links carry equal bytes. Blocks keep their real
++        lengths, the same on both ends of every transfer."""
++        me = self.rank
++        nxt, prv, opp = (me + 1) % 4, (me + 3) % 4, (me + 2) % 4
++
++        def block(rank: int) -> torch.Tensor:
++            return input_[rank * rows : rank * rows + real(rank)]
++
++        def half(rank: int) -> int:  # rows of a block for ``rank`` that go the next way
++            return -(-real(rank) // 2)
++
++        def send(tensor: torch.Tensor, peer: int) -> None:
++            if tensor.shape[0]:
++                self.send(tensor, peer, stream)
++
++        def recv(tensor: torch.Tensor, peer: int) -> None:
++            if tensor.shape[0]:
++                self.recv(tensor, peer, stream)
++
++        mine, tail = real(me), input_.shape[1:]
++        # In transit: the previous rank's block for the next rank (its first half),
++        # and the next rank's block for the previous rank (its second half).
++        relay_a = input_.new_empty((half(nxt), *tail))
++        relay_b = input_.new_empty((real(prv) - half(prv), *tail))
++        self.group_start()
++        send(block(nxt), nxt)
++        send(block(opp)[: half(opp)], nxt)
++        send(block(prv), prv)
++        send(block(opp)[half(opp) :], prv)
++        recv(output[prv, :mine], prv)
++        recv(relay_a, prv)
++        recv(output[nxt, :mine], nxt)
++        recv(relay_b, nxt)
++        self.group_end()
++        self.group_start()
++        send(relay_a, nxt)
++        send(relay_b, prv)
++        recv(output[opp, : half(me)], prv)
++        recv(output[opp, half(me) : mine], nxt)
++        self.group_end()
++
+     def group_start(self):
+         self.nccl.ncclGroupStart()
+ 
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index a5edf716a4cd4e8fb5addb20e28836b88e876d66..ea426471d09857e05d7f0f3a7f5e306e6b75695d 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -244,6 +244,22 @@ def all_gather_fake(
+     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
+ 
+ 
++def all_to_all_rows(
++    tensor: torch.Tensor, rows: int, world_size: int, group_name: str
++) -> torch.Tensor:
++    assert group_name in _groups, f"Group {group_name} is not found."
++    group = _groups[group_name]()
++    if group is None:
++        raise ValueError(f"Group {group_name} is destroyed.")
++    return group._all_to_all_rows_out_place(tensor, rows)
++
++
++def all_to_all_rows_fake(
++    tensor: torch.Tensor, rows: int, world_size: int, group_name: str
++) -> torch.Tensor:
++    return tensor.new_empty((world_size, rows, *tensor.shape[1:]))
++
++
+ def patched_fused_scaled_matmul_reduce_scatter_fake(
+     A: torch.Tensor,
+     B: torch.Tensor,
+@@ -414,6 +430,12 @@ direct_register_custom_op(
+     fake_impl=all_gather_fake,
+ )
+ 
++direct_register_custom_op(
++    op_name="all_to_all_rows",
++    op_func=all_to_all_rows,
++    fake_impl=all_to_all_rows_fake,
++)
++
+ # TODO: Remove this once the pytorch fix
+ # (https://github.com/pytorch/pytorch/pull/165086) gets released,
+ # in either 2.9.1 or 2.10
+@@ -791,6 +813,25 @@ class GroupCoordinator:
+             raise ValueError("No device communicator found")
+         return self.device_communicator.all_gather(input_, dim)
+ 
++    def all_to_all_rows(self, input_: torch.Tensor, rows: int) -> torch.Tensor:
++        """Row blocks of ``rows``: block r of the input goes to rank r (the last
++        ranks' blocks short or empty), and the output's [s] holds rank s's block
++        for this rank; rows past this rank's real rows are not written."""
++        if self.world_size == 1:
++            return input_.unsqueeze(0)
++        if self.use_custom_op_call:
++            return torch.ops.vllm.all_to_all_rows(
++                input_, rows, self.world_size, group_name=self.unique_name
++            )
++        return self._all_to_all_rows_out_place(input_, rows)
++
++    def _all_to_all_rows_out_place(
++        self, input_: torch.Tensor, rows: int
++    ) -> torch.Tensor:
++        if self.device_communicator is None:
++            raise ValueError("No device communicator found")
++        return self.device_communicator.all_to_all_rows(input_, rows)
++
+     def all_gatherv(
+         self,
+         input_: torch.Tensor | list[torch.Tensor],
+@@ -866,6 +907,9 @@ class GroupCoordinator:
+         # Bypass the function if we are using only 1 GPU.
+         if self.world_size == 1:
+             return input_
++        if getattr(self.device_communicator, "owns_broadcast", False):
++            # A collective policy keeps serving off the PyTorch process group.
++            return self.device_communicator.broadcast(input_, src)
+         # Broadcast.
+         torch.distributed.broadcast(
+             input_, src=self.ranks[src], group=self.device_group

@@ -1,0 +1,130 @@
+From 2a9ae41515bb9ee98423fcf5e40d2faa880f9572 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 08:28:49 +0100
+Subject: [PATCH] worker: add preallocated workspace, MoE buffer, and
+ CircularBufferSpec
+
+---
+ vllm/v1/kv_cache_interface.py | 40 ++++++++++++++++++++++++++++++
+ vllm/v1/worker/workspace.py   | 46 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 743274fa16c9610788b574b7dc45f0dbef3f35b5..4db77359060dbd772e2f2686654acf4a81105d86 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -972,3 +972,43 @@ class KVCacheConfig:
+                 if isinstance(spec, AttentionSpec)
+             )
+         return len(kv_cache_precisions) > 1
++
++
++@dataclass(frozen=True, kw_only=True)
++class CircularBufferSpec(AttentionSpec):
++    """One block per request holding the raw keys of the token group that
++    is still being compressed.
++
++    ``block_size`` is the ring capacity. It must exceed the compression ratio
++    by the speculative lookahead: a speculative step stores all of its rows,
++    drafts included, before acceptance is known, while the next step still
++    reads the open group's committed keys from the ring.
++
++    The worker maps every real row into that block at its position modulo
++    ``block_size`` and padding rows to the pad slot; owners write only rows
++    with a valid slot.
++    """
++
++    @property
++    def block_table_token_alignment(self) -> int | None:
++        return None
++
++    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
++        # The ring occupies one block per request for its whole lifetime.
++        del vllm_config
++        return self.page_size_bytes
++
++    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
++        del vllm_config, max_len
++        return 1
++
++    def is_uniform_with_collection(
++        self, kv_cache_specs: dict[str, KVCacheSpec]
++    ) -> bool:
++        return all(
++            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
++        )
++
++    @property
++    def prefix_cacheable(self) -> bool:
++        return False
+diff --git a/vllm/v1/worker/workspace.py b/vllm/v1/worker/workspace.py
+index 5abbcf56f8bd5917c47d36c15d916357b0fd3c85..ec51876d16baa8ea1af8b4cb8db5932c61a88432 100644
+--- a/vllm/v1/worker/workspace.py
++++ b/vllm/v1/worker/workspace.py
+@@ -3,7 +3,8 @@
+ 
+ import inspect
+ import os
+-from collections.abc import Callable, Generator, Hashable
++from typing import Any
++from collections.abc import Iterator, Callable, Generator, Hashable
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from contextvars import ContextVar
+ from itertools import accumulate
+@@ -50,6 +51,46 @@ def use_workspace_lane(lane: int) -> Generator[None]:
+         _workspace_lane.reset(token)
+ 
+ 
++
++_preallocated_workspace: ContextVar[torch.Tensor | None] = ContextVar(
++    "_preallocated_workspace", default=None
++)
++_cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
++    "_cuda_graph_capture_resources", default=None
++)
++
++
++@contextmanager
++def use_preallocated_workspace(workspace: torch.Tensor | None) -> Iterator[None]:
++    token = _preallocated_workspace.set(workspace)
++    try:
++        yield
++    finally:
++        _preallocated_workspace.reset(token)
++
++
++def current_preallocated_workspace() -> torch.Tensor | None:
++    return _preallocated_workspace.get()
++
++
++@contextmanager
++def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
++    resources: list[Any] = []
++    token = _cuda_graph_capture_resources.set(resources)
++    try:
++        yield resources
++    finally:
++        _cuda_graph_capture_resources.reset(token)
++
++
++def retain_cuda_graph_capture_resource(resource: Any) -> bool:
++    resources = _cuda_graph_capture_resources.get()
++    if resources is None:
++        return False
++    resources.append(resource)
++    return True
++
++
+ class WorkspaceManager:
+     """Manager for workspace allocation.
+ 
+@@ -82,6 +123,9 @@ class WorkspaceManager:
+         self._retained: list[tuple[Hashable, int] | None] = [
+             None for _ in self._current_workspaces
+         ]
++        self._moe_output_buffers: list[torch.Tensor | None] = [None] * (
++            self._num_ubatches * self._num_lanes
++        )
+         self._locked: bool = False
+ 
+     @staticmethod

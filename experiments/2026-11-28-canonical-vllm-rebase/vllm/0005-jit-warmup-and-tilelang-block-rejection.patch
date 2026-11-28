@@ -1,0 +1,281 @@
+From 74e9b2e79d736be53f0aff190c2d8555d44f269f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 08:41:28 +0100
+Subject: [PATCH] spec-decode: wire jit_warmup active registry and TileLang
+ block rejection
+
+---
+ vllm/model_executor/warmup/jit_warmup.py      | 54 ++++++++++-
+ .../gpu/spec_decode/rejection_sampler.py      | 21 ++++
+ .../spec_decode/rejection_sampler_utils.py    | 96 +++++++++++++++++--
+ 3 files changed, 156 insertions(+), 15 deletions(-)
+
+diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
+index a048fbc55d73b39768bd4191b48afd74e19f2918..ded96ba6dc33eef27f085c0fcbeb0fe9aa97e6bb 100644
+--- a/vllm/model_executor/warmup/jit_warmup.py
++++ b/vllm/model_executor/warmup/jit_warmup.py
+@@ -1009,6 +1009,24 @@ def _same_registration(
+     ) and all(_same_value(left_kwargs[k], right_kwargs[k]) for k in left_kwargs)
+ 
+ 
++_FAST_KEY_ATOMS = (int, float, str, bytes, bool, type(None), type)
++
++
++def _fast_registration_key(value: Any) -> Any:
++    if isinstance(value, _FAST_KEY_ATOMS):
++        return (type(value), value)
++    if callable(value):
++        return (id, id(value))
++    if isinstance(value, tuple):
++        return (tuple, tuple(_fast_registration_key(x) for x in value))
++    if isinstance(value, dict) and all(isinstance(k, str) for k in value):
++        return (
++            dict,
++            tuple((k, _fast_registration_key(value[k])) for k in sorted(value)),
++        )
++    raise TypeError
++
++
+ class JitWarmupRegistry:
+     """Collect and compile JIT kernels selected during runner setup."""
+ 
+@@ -1023,6 +1041,11 @@ class JitWarmupRegistry:
+             VllmJitKernel[Any],
+             list[tuple[tuple[Any, ...], dict[str, Any]]],
+         ] = {}
++        self._fast_registration_keys: dict[VllmJitKernel[Any], set[Any]] = {}
++        self._slow_registrations: dict[
++            VllmJitKernel[Any],
++            list[tuple[tuple[Any, ...], dict[str, Any]]],
++        ] = {}
+ 
+     @classmethod
+     def capture(cls, init_fn: Callable[..., None]) -> Callable[..., None]:
+@@ -1046,6 +1069,11 @@ class JitWarmupRegistry:
+         finally:
+             self._active.reset(token)
+ 
++    @classmethod
++    def active(cls) -> JitWarmupRegistry | None:
++        """The registry collecting registrations in this context, if any."""
++        return cls._active.get()
++
+     @classmethod
+     def register(
+         cls,
+@@ -1071,16 +1099,32 @@ class JitWarmupRegistry:
+         # get_warmup_keys once per distinct registration is sufficient. Dedup on
+         # identity-or-equality -- identity short-circuits shared singletons like
+         # vllm_config before any deep __eq__.
+-        if any(
+-            _same_registration(registered, (args, kwargs))
+-            for registered in registrations
+-        ):
+-            return
++        try:
++            fast_key = _fast_registration_key((args, kwargs))
++        except TypeError:
++            slow = self._slow_registrations.setdefault(kernel, [])
++            if any(
++                _same_registration(registered, (args, kwargs))
++                for registered in slow
++            ):
++                return
++            slow.append((args, kwargs))
++        else:
++            fast_keys = self._fast_registration_keys.setdefault(kernel, set())
++            if fast_key in fast_keys:
++                return
++            fast_keys.add(fast_key)
+         registrations.append((args, kwargs))
+ 
+     def __len__(self) -> int:
+         return sum(len(registrations) for registrations in self._registrations.values())
+ 
++    def registrations(
++        self,
++    ) -> list[tuple[VllmJitKernel[Any], list[tuple[tuple[Any, ...], dict[str, Any]]]]]:
++        """Each registered kernel and its distinct registrations."""
++        return [(kernel, list(regs)) for kernel, regs in self._registrations.items()]
++
+     def warmup(self) -> None:
+         """Expand registrations and compile each wrapper/key pair once."""
+         from tqdm import tqdm
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index c1844c2013b4b0fcfbf9c7814f60a6784edb6e76..8645917221440d80d499ea4376e41abf592b0822 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
++    register_rejection_sample_warmups,
+     rejection_sample,
+ )
+ 
+@@ -260,6 +261,26 @@ class RejectionSampler:
+             "watermark_key": self.watermark_key,
+         }
+ 
++    def register_warmups(
++        self,
++        logits: list[tuple[torch.dtype, int]],
++        vocab_size: int,
++        num_speculative_steps: int,
++        *,
++        dead_rows: bool = False,
++    ) -> None:
++        if self.watermarking is not None:
++            return
++        register_rejection_sample_warmups(
++            logits=logits,
++            vocab_size=vocab_size,
++            num_speculative_steps=num_speculative_steps,
++            synthetic_mode=self.synthetic_conditional_rates is not None,
++            use_block_verification=self.use_block_verification,
++            use_fp64=self.use_fp64,
++            dead_rows=dead_rows,
++        )
++
+     def _verify(
+         self,
+         logits: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 4350c2cd22c54c1d908301fc1fc46418d055f3d4..3c75b96ece7f6db4bb71ba4e5635f4f328b80a22 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1,7 +1,18 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections.abc import Sequence
++
+ import torch
+ 
++from spark_ds41.sampling.tilelang_rejection import (
++    register_block_verification,
++    verify_and_resample,
++)
++from spark_ds41.sampling.tilelang_resampled import (
++    insert_resampled,
++    register_insert,
++)
++
+ from vllm.triton_utils import tl, tldevice, triton
+ from vllm.v1.worker.gpu.sample.gumbel import (
+     gumbel_block_argmax,
+@@ -1158,11 +1169,17 @@ def rejection_sample(
+     fly_entropy_threshold: float = 0.3,
+     fly_entropy_top_k: int = 3,
+     skip_masked_vocab_blocks: bool = False,
++    dead_row_cut: torch.Tensor | None = None,
++    kernel_steps: int | None = None,
++    apply_temperature: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
+     draft_logits = None
+     draft_logits_row_mapping = None
+-    if draft_logits_cache is not None:
++    if isinstance(draft_logits_cache, torch.Tensor):
++        draft_logits = draft_logits_cache
++        draft_logits_row_mapping = None
++    elif draft_logits_cache is not None:
+         draft_logits = draft_logits_cache.values
+         draft_logits_row_mapping = draft_logits_cache.row_mapping
+     assert draft_logits is None or (
+@@ -1175,6 +1192,45 @@ def rejection_sample(
+     assert watermark == (watermarking is not None) == (watermark_key is not None), (
+         "contexts, watermarking and watermark_key must be set together."
+     )
++    if (
++        draft_logits is None
++        and use_block_verification
++        and synthetic_conditional_rates is None
++        and not watermark
++        and not use_fp64
++        and fly_window_size == 0
++    ):
++        sampled, num_sampled, resampled_local_argmax, resampled_local_max = (
++            verify_and_resample(
++                target_logits,
++                draft_sampled,
++                cu_num_logits,
++                pos,
++                idx_mapping,
++                expanded_idx_mapping,
++                expanded_local_pos,
++                temperature,
++                seed,
++                num_speculative_steps,
++                dead_row_cut,
++                kernel_steps,
++                apply_temperature,
++            )
++        )
++        insert_resampled(
++            sampled,
++            num_sampled,
++            resampled_local_argmax,
++            resampled_local_max,
++            cu_num_logits,
++            expanded_idx_mapping,
++            temperature,
++        )
++        return sampled, num_sampled
++    assert dead_row_cut is None or not use_block_verification, (
++        "Block verification with dead rows runs as the TileLang kernels only: "
++        "one-hot drafts, FP32 draws, no watermark."
++    )
+     assert watermarking_skip_mask is None or watermark, (
+         "watermarking_skip_mask requires watermarking."
+     )
+@@ -1448,21 +1504,41 @@ def rejection_sample(
+     )
+ 
+     # Insert the resampled tokens into the output sampled.
+-    _insert_resampled_kernel[(num_reqs,)](
++    insert_resampled(
+         sampled,
+-        sampled.stride(0),
+         num_sampled,
+         resampled_local_argmax,
+-        resampled_local_argmax.stride(0),
+         resampled_local_max,
+-        resampled_local_max.stride(0),
+-        resample_num_blocks,
+         cu_num_logits,
+         expanded_idx_mapping,
+         temperature,
+-        PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+-        # The kernel reads and updates num_sampled in place. Multiple warps can
+-        # observe the increment before loading the original resampling index.
+-        num_warps=1,
++        dead_row_cut,
+     )
+     return sampled, num_sampled
++
++
++_RESAMPLE_BLOCK_SIZE = 1024
++
++
++def register_rejection_sample_warmups(
++    *,
++    logits: Sequence[tuple[torch.dtype, int]],
++    vocab_size: int,
++    num_speculative_steps: int,
++    synthetic_mode: bool,
++    use_block_verification: bool,
++    use_fp64: bool,
++    dead_rows: bool = False,
++) -> None:
++    if use_block_verification and not synthetic_mode and not use_fp64:
++        register_block_verification(
++            [logits_dtype for logits_dtype, _ in logits],
++            vocab_size,
++            num_speculative_steps,
++            dead_rows,
++            logits_strides=logits,
++        )
++    register_insert(
++        triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
++        dead_rows=dead_rows and not (use_block_verification and not synthetic_mode and not use_fp64),
++    )
