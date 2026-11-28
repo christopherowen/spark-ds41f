@@ -1,18 +1,20 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 15:14:14 +0100
-Subject: [PATCH 5/9] Add JIT warmup registry hook and TileLang block rejection
- and acceptance estimator hooks
+From: Christopher Owen <christopher@owen.dev>
+Date: Sat, 28 Nov 2026 15:00:00 +0000
+Subject: [PATCH] Add JIT warmup registry hook and TileLang block, rejection,
+ and warmup paths
 
 ---
  vllm/model_executor/warmup/jit_warmup.py      | 54 +++++++++-
  vllm/utils/jit_monitor.py                     |  2 +
- vllm/v1/worker/gpu/sample/output.py           |  4 +-
- vllm/v1/worker/gpu/spec_decode/__init__.py    |  6 ++
+ vllm/v1/worker/gpu/attn_utils.py              | 33 +++++++
+ vllm/v1/worker/gpu/block_table.py             | 78 +++++++++++++++
+ vllm/v1/worker/gpu/metrics/logits.py          | 37 +------
  .../gpu/spec_decode/rejection_sampler.py      | 35 +++++--
  .../spec_decode/rejection_sampler_utils.py    | 98 +++++++++++++++++--
- vllm/v1/worker/gpu/spec_decode/speculator.py  | 32 +++++-
- 7 files changed, 203 insertions(+), 28 deletions(-)
+ vllm/v1/worker/gpu/structured_outputs.py      | 67 ++++++++++---
+ vllm/v1/worker/gpu/warmup.py                  | 51 +++++++---
+ 9 files changed, 367 insertions(+), 88 deletions(-)
 
 diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
 index a048fbc..ded96ba 100644
@@ -118,45 +120,233 @@ index be753f1..c527787 100644
      if mode not in ("warn", "error"):
          raise ValueError(f"Unsupported JIT monitor mode: {mode!r}")
      _active = True
-diff --git a/vllm/v1/worker/gpu/sample/output.py b/vllm/v1/worker/gpu/sample/output.py
-index 028eed6..20a46de 100644
---- a/vllm/v1/worker/gpu/sample/output.py
-+++ b/vllm/v1/worker/gpu/sample/output.py
-@@ -4,7 +4,7 @@ from __future__ import annotations
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index fbf5670..ab4a42c 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -28,6 +28,7 @@ from vllm.v1.hisparse.binding import (
+ )
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
++    KVCacheGroupSpec,
+     KVCacheLayerConfig,
+     KVCacheSpec,
+     MambaSpec,
+@@ -311,6 +312,38 @@ def init_attn_backend(
+     return attn_groups, attn_cg_support_info, kernel_block_sizes
  
- from collections.abc import Sequence
- from dataclasses import dataclass
--from typing import NamedTuple
-+from typing import Any, NamedTuple
  
- import numpy as np
++def select_kernel_block_sizes(
++    kv_cache_groups: list[KVCacheGroupSpec], vllm_config: VllmConfig
++) -> list[int]:
++    from typing import cast
++    layer_type = cast(type[Any], AttentionLayerBase)
++    attn_groups: list[list[AttentionGroup]] = []
++    for kv_cache_group_id, kv_cache_group in enumerate(kv_cache_groups):
++        if not kv_cache_group.kv_cache_spec.has_layer_views:
++            attn_groups.append([])
++            continue
++        attn_layers = get_layers_from_vllm_config(
++            vllm_config, layer_type, kv_cache_group.layer_names
++        )
++        attn_groups.append(
++            [
++                AttentionGroup(
++                    layer.get_attn_backend(),
++                    [layer_name],
++                    kv_cache_group.kv_cache_spec,
++                    kv_cache_group_id,
++                )
++                for layer_name, layer in attn_layers.items()
++            ]
++        )
++    return prepare_kernel_block_sizes(
++        KVCacheConfig(
++            num_blocks=0, kv_cache_tensors=[], kv_cache_groups=kv_cache_groups
++        ),
++        attn_groups,
++    )
++
++
+ def get_attn_cg_support(
+     attn_groups: list[list[AttentionGroup]],
+     vllm_config: VllmConfig,
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index 9d93f10..6fee048 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -7,6 +7,11 @@ import torch
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.math_utils import round_up
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
++
++
++def slot_mapping_mode(layer_spec: KVCacheSpec) -> tuple[bool, bool]:
++    return layer_spec.uses_slot_mapping, isinstance(layer_spec, CircularBufferSpec)
+ from vllm.v1.worker.gpu.buffer_utils import (
+     FusedStagedWriter,
+     StagedWriteTensor,
+@@ -48,6 +53,8 @@ class BlockTables:
+         slot_mapping_enabled: list[bool] | None = None,
+         dcp_sharded: list[bool] | None = None,
+         sliding_window_reach: list[int] | None = None,
++        slot_mapping_circular: list[bool] | None = None,
++        kernel_block_sizes: list[int] | None = None,
+     ):
+         self.block_sizes = block_sizes
+         self.max_num_reqs = max_num_reqs
+@@ -64,6 +71,12 @@ class BlockTables:
+             slot_mapping_enabled = [True] * self.num_kv_cache_groups
+         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
+         self._slot_mapping_enabled = slot_mapping_enabled
++        if slot_mapping_circular is None:
++            slot_mapping_circular = [False] * self.num_kv_cache_groups
++        assert len(slot_mapping_circular) == self.num_kv_cache_groups
++        self._slot_mapping_circular = slot_mapping_circular
++        self.kernel_block_sizes = list(kernel_block_sizes) if kernel_block_sizes is not None else list(block_sizes)
++        self.group_cp_sizes_list = [cp_size if sharded else 1 for sharded in (dcp_sharded or [True] * self.num_kv_cache_groups)]
+         if dcp_sharded is None:
+             dcp_sharded = [True] * self.num_kv_cache_groups
+         assert len(dcp_sharded) == self.num_kv_cache_groups
+@@ -134,6 +147,30 @@ class BlockTables:
+             self._sliding_window_reach, dtype=torch.int32, device=self.device
+         )
+         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
++        self._block_table_ptrs_i64 = self.block_table_ptrs.view(torch.int64)
++        self._input_block_table_ptrs_i64 = self.input_block_table_ptrs.view(torch.int64)
++        self.kernel_block_sizes_tensor = torch.tensor(
++            self.kernel_block_sizes, dtype=torch.int32, device=self.device
++        )
++        self.slot_mapping_circular = torch.tensor(
++            self._slot_mapping_circular, dtype=torch.bool, device=self.device
++        )
++        self.group_cp_sizes = torch.tensor(
++            self.group_cp_sizes_list, dtype=torch.int32, device=self.device
++        )
++        try:
++            from spark_ds41.sampling import tilelang_inputs
++            self._gather_chunks = tilelang_inputs.gather_chunks(
++                [b.gpu.stride(0) for b in self.block_tables], self.device
++            )
++        except Exception:
++            self._gather_chunks = None
++
++    def get_group_cp_parameters(self, group_id: int) -> tuple[int, int, int]:
++        group_cp_size = self.group_cp_sizes_list[group_id]
++        if group_cp_size == 1:
++            return 0, 1, 1
++        return self.cp_rank, group_cp_size, self.cp_interleave
+ 
+     def append_block_ids(
+         self,
+@@ -206,6 +243,19 @@ class BlockTables:
+         else:
+             assert out_ptrs is not None
+             assert len(out) == self.num_kv_cache_groups
++        if not mask_sliding_window and self._gather_chunks is not None:
++            from spark_ds41.sampling import tilelang_inputs
++            dst_ptrs = self._input_block_table_ptrs_i64 if out_ptrs is self.input_block_table_ptrs else out_ptrs.view(torch.int64)
++            tilelang_inputs.gather_block_tables(
++                idx_mapping,
++                self._block_table_ptrs_i64,
++                dst_ptrs,
++                self.block_table_strides,
++                self.num_blocks.gpu,
++                self._gather_chunks,
++                num_rows,
++            )
++            return tuple(t[:num_reqs_padded] for t in out)
+         # Also clear rows left by a larger batch in the shared buffer.
+         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
+             idx_mapping,
+@@ -257,6 +307,26 @@ class BlockTables:
+         num_reqs = idx_mapping.shape[0]
+         num_groups = self.num_kv_cache_groups
+         slot_mappings = self.slot_mappings if out is None else out
++        if self._gather_chunks is not None:
++            from spark_ds41.sampling import tilelang_inputs
++            tilelang_inputs.compute_slot_mappings(
++                idx_mapping,
++                query_start_loc,
++                positions,
++                self._block_table_ptrs_i64,
++                self.block_table_strides,
++                self.num_blocks.gpu,
++                self.block_sizes_tensor,
++                self.kernel_block_sizes_tensor,
++                self.slot_mapping_enabled,
++                self.slot_mapping_circular,
++                self.group_cp_sizes,
++                slot_mappings[:, :num_tokens_padded],
++                self.cp_rank,
++                self.cp_size,
++                self.cp_interleave,
++            )
++            return slot_mappings[:, :num_tokens_padded]
+         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
+             slot_mappings.shape[1],
+             idx_mapping,
+@@ -430,3 +500,11 @@ def _compute_slot_mappings_kernel(
+ 
+         slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
+         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
++
++
++def declare_block_table_kernels(*, cp_size: int, cp_interleave: int) -> None:
++    from spark_ds41.sampling import tilelang_inputs
++
++    tilelang_inputs.declare(
++        lambda: tilelang_inputs.block_table_calls(cp_size, cp_interleave)
++    )
+diff --git a/vllm/v1/worker/gpu/metrics/logits.py b/vllm/v1/worker/gpu/metrics/logits.py
+index 2e5e6cf..2c12ad0 100644
+--- a/vllm/v1/worker/gpu/metrics/logits.py
++++ b/vllm/v1/worker/gpu/metrics/logits.py
+@@ -2,41 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  import torch
-@@ -22,6 +22,8 @@ class SamplerOutput:
-     num_sampled: torch.Tensor
-     num_rejected: torch.Tensor
-     sampling_mask_tensors: SamplingMaskTensors | None = None
-+    sink_alternates: Any = None
-+    sink: Any = None
+ 
+-from vllm.triton_utils import tl, triton
+-from vllm.triton_utils import tldevice as libdevice
+-
+-
+-@triton.jit
+-def _num_nans_kernel(
+-    logits_ptr,
+-    logits_stride,
+-    num_nans_ptr,
+-    vocab_size,
+-    BLOCK_SIZE: tl.constexpr,
+-):
+-    req_idx = tl.program_id(0)
+-    num_nans = 0
+-    for i in range(0, vocab_size, BLOCK_SIZE):
+-        block = i + tl.arange(0, BLOCK_SIZE)
+-        mask = block < vocab_size
+-        logits = tl.load(
+-            logits_ptr + req_idx * logits_stride + block, mask=mask, other=0
+-        )
+-        logits = logits.to(tl.float32)
+-        is_nan = libdevice.isnan(logits).to(tl.int1)
+-        num_nans += tl.sum(is_nan).to(tl.int32)
+-    tl.store(num_nans_ptr + req_idx, num_nans)
++from spark_ds41.sampling import tilelang_auxiliary
  
  
- @triton.jit
-diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
-index 6ec9afd..6a8a6f9 100644
---- a/vllm/v1/worker/gpu/spec_decode/__init__.py
-+++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
-@@ -31,6 +31,12 @@ def init_speculator(
-     assert speculative_config is not None
-     speculator_config = speculative_config.speculator_config
-     qualname = speculator_config.speculator_class
-+    if (
-+        speculative_config.method == "dspark"
-+        and getattr(vllm_config.model_config, "architecture", None)
-+        == "DeepseekV41ForCausalLM"
-+    ):
-+        qualname = "spark_ds41.spec_decode.dspark.DSparkSpeculator"
-     if qualname is None:
-         raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
-     speculator_cls = resolve_obj_by_qualname(qualname)
+ def get_num_nans(logits: torch.Tensor) -> torch.Tensor:
+-    num_reqs, vocab_size = logits.shape
+-    BLOCK_SIZE = 8192
+-    num_nans = torch.empty(num_reqs, dtype=torch.int32, device=logits.device)
+-    _num_nans_kernel[(num_reqs,)](
+-        logits,
+-        logits.stride(0),
+-        num_nans,
+-        vocab_size,
+-        BLOCK_SIZE=BLOCK_SIZE,
+-    )
+-    return num_nans
++    return tilelang_auxiliary.count_nans(logits)
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 index c1844c2..df86a84 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
@@ -361,70 +551,169 @@ index 4350c2c..32ef430 100644
 +        num_speculative_steps + 1,
 +        limits=(False, True) if dead_rows else (False,),
 +    )
-diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
-index 8ce2229..7631592 100644
---- a/vllm/v1/worker/gpu/spec_decode/speculator.py
-+++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
-@@ -41,9 +41,14 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
- from vllm.v1.worker.gpu.sample.batch_shard import batch_sharded_sampling_enabled
- from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
- from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
--from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
--    OnlineAcceptanceEstimator,
--)
-+try:
-+    from spark_ds41.spec_decode.acceptance_estimator import (
-+        OnlineAcceptanceEstimator,
-+    )
-+except ImportError:
-+    from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
-+        OnlineAcceptanceEstimator,
-+    )
- from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
- from vllm.v1.worker.utils import (
-     AttentionGroup,
-@@ -673,6 +678,8 @@ class DraftModelSpeculator(BaseSpeculator):
-         idx_mapping: torch.Tensor,
-         num_sampled: torch.Tensor,
-         num_rejected: torch.Tensor,
-+        dead_row_cut: torch.Tensor | None = None,
-+        copy_int_state: torch.Tensor | None = None,
-     ) -> None:
-         """Fold the target's verdict on the last drafts into the estimator.
+diff --git a/vllm/v1/worker/gpu/structured_outputs.py b/vllm/v1/worker/gpu/structured_outputs.py
+index dc5d23d..1d3d39f 100644
+--- a/vllm/v1/worker/gpu/structured_outputs.py
++++ b/vllm/v1/worker/gpu/structured_outputs.py
+@@ -30,6 +30,29 @@ class StructuredOutputsWorker:
+         self.copy_stream = torch.cuda.Stream()
+         self.mask_stride = mask_stride
  
-@@ -680,7 +687,13 @@ class DraftModelSpeculator(BaseSpeculator):
-         features the verdict grades.
-         """
-         if self.acceptance_estimator is not None:
--            self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
-+            self.acceptance_estimator.step(
-+                idx_mapping,
-+                num_sampled,
-+                num_rejected,
-+                dead_row_cut=dead_row_cut,
-+                copy_int_state=copy_int_state,
++    def register_warmups(
++        self,
++        *,
++        logits,
++        vocab_size: int,
++        invalid_spec_tokens: bool,
++    ) -> None:
++        from spark_ds41.sampling import tilelang_structured
++        from spark_ds41.sampling.tilelang_sampling import _call, declare
++
++        declare(
++            lambda: [
++                _call(
++                    tilelang_structured.grammar_bitmask_kernel,
++                    *tilelang_structured.grammar_bitmask_key(
++                        dtype, self.mask_stride, has_invalid
++                    ),
++                )
++                for dtype in dict.fromkeys(dt for dt, _ in logits)
++                for has_invalid in ((False, True) if invalid_spec_tokens else (False,))
++            ]
++        )
++
+     def apply_grammar_bitmask(
+         self,
+         logits: torch.Tensor,
+@@ -69,22 +92,34 @@ class StructuredOutputsWorker:
+         current_stream = torch.cuda.current_stream()
+         current_stream.wait_stream(self.copy_stream)
+ 
+-        num_masks = bitmask.shape[0]
+-        assert num_masks == len(mapping)
+-        vocab_size = logits.shape[-1]
+-        BLOCK_SIZE = GRAMMAR_BITMASK_BLOCK_SIZE
+-        grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
+-        _apply_grammar_bitmask_kernel[grid](
+-            logits,
+-            logits.stride(0),
+-            logits_indices,
+-            input_batch.cu_num_logits,
+-            bitmask,
+-            bitmask.stride(0),
+-            vocab_size,
+-            MASK_STRIDE=self.mask_stride,
+-            BLOCK_SIZE=BLOCK_SIZE,
+-        )
++        assert bitmask.shape[0] == len(mapping)
++        if logits.is_cuda:
++            from spark_ds41.sampling import tilelang_structured
++            tilelang_structured.apply_grammar_bitmask(
++                logits,
++                logits_indices,
++                input_batch.cu_num_logits,
++                None,
++                None,
++                bitmask,
++                self.mask_stride,
++            )
++        else:
++            num_masks = bitmask.shape[0]
++            vocab_size = logits.shape[-1]
++            BLOCK_SIZE = GRAMMAR_BITMASK_BLOCK_SIZE
++            grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
++            _apply_grammar_bitmask_kernel[grid](
++                logits,
++                logits.stride(0),
++                logits_indices,
++                input_batch.cu_num_logits,
++                bitmask,
++                bitmask.stride(0),
++                vocab_size,
++                MASK_STRIDE=self.mask_stride,
++                BLOCK_SIZE=BLOCK_SIZE,
 +            )
  
-     def prepare_watermarking(
-         self,
-@@ -703,10 +716,19 @@ class DraftModelSpeculator(BaseSpeculator):
-         num_sampled: torch.Tensor,
-         num_rejected: torch.Tensor,
-         sampler: "Sampler",
-+        *,
-+        dead_row_cut: torch.Tensor | None = None,
-+        copy_int_state: torch.Tensor | None = None,
-     ) -> None:
-         """Per-step work between verifying the last drafts and the next
-         `propose`."""
--        self.observe_verification(input_batch.idx_mapping, num_sampled, num_rejected)
-+        self.observe_verification(
-+            input_batch.idx_mapping,
-+            num_sampled,
-+            num_rejected,
-+            dead_row_cut=dead_row_cut,
-+            copy_int_state=copy_int_state,
+         # Ensure the copy stream waits for the device tensors to finish being used
+         # before it re-uses or deallocates them
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index 94f85b0..22f9ee0 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -541,33 +541,53 @@ def run_kv_cache_sizing_warmup(
+ 
+ 
+ @torch.inference_mode()
++def _sink_draft_zero(model_runner: GPUModelRunner) -> bool:
++    sink = getattr(model_runner, "sink", None)
++    return sink is not None and sink.rejection
++
++
+ def warmup_kernels(
+     model_runner: GPUModelRunner,
+     worker_execute_model: Callable[[SchedulerOutput], Any],
+     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
++    *,
++    post_capture: bool = False,
+ ) -> None:
+     """Run scheduler-realistic prefill and decode steps to JIT compile kernels.
+ 
+     We must call the provided worker's execute_model for pipeline parallel
+     coordination.
+     """
+-    with _fixed_draft_counts(model_runner):
+-        _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
+-        # All PP ranks must run the same forwards to match sends and receives.
+-        if model_runner.speculative_config is not None:
+-            # Greedy batches skip logits processing, so rejection kernels
+-            # also see model-dtype logits instead of FP32.
++    sink = getattr(model_runner, "sink", None)
++    if sink is not None:
++        sink.warming = True
++    try:
++        with _fixed_draft_counts(model_runner):
+             _warmup_kernels(
+-                model_runner, worker_execute_model, worker_sample_tokens, greedy=True
++                model_runner,
++                worker_execute_model,
++                worker_sample_tokens,
++                post_capture=post_capture,
+             )
+-    adaptive_verification = model_runner.adaptive_verification
+-    if adaptive_verification is not None:
+-        adaptive_verification.warmup_budget_kernel()
+-    acceptance_estimator = getattr(
+-        model_runner.speculator, "acceptance_estimator", None
+-    )
+-    if acceptance_estimator is not None:
+-        acceptance_estimator.warmup()
++            if model_runner.speculative_config is not None and not post_capture:
++                _warmup_kernels(
++                    model_runner,
++                    worker_execute_model,
++                    worker_sample_tokens,
++                    greedy=True,
++                )
++    finally:
++        if sink is not None:
++            sink.end_warmup()
++    if not post_capture:
++        adaptive_verification = model_runner.adaptive_verification
++        if adaptive_verification is not None:
++            adaptive_verification.warmup_budget_kernel()
++        acceptance_estimator = getattr(
++            model_runner.speculator, "acceptance_estimator", None
 +        )
-         if isinstance(sampler, GPUWatermarkSampler):
-             self.prepare_watermarking(sampler, input_batch.idx_mapping)
-         if self.draft_logits is not None:
++        if acceptance_estimator is not None:
++            acceptance_estimator.warmup()
+ 
+ 
+ def _warmup_kernels(
+@@ -575,6 +595,7 @@ def _warmup_kernels(
+     worker_execute_model: Callable[[SchedulerOutput], Any],
+     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+     greedy: bool = False,
++    post_capture: bool = False,
+ ) -> None:
+     if model_runner.vllm_config.is_mm_encoder_only:
+         return

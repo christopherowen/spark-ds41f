@@ -26,7 +26,6 @@ from vllm.v1.worker.workspace import (
 )
 
 from . import prepare
-from .block_shortlist import STATE_BYTES, summarize_blocks
 from .indexer import (
     CANDIDATE_BLOCK,
     CANDIDATE_BLOCKS,
@@ -38,13 +37,7 @@ from .indexer import (
     quantize_mxfp4,
     write_index_keys,
 )
-from .paged_shortlist import PageShortlistPlan
-from .query_reuse import QueryReusePlan as BlockMeanShortlistPlan
 from .sparse_mla import SparseMlaV41Plan
-
-
-def _lsa_enabled() -> bool:
-    return os.environ.get("VLLM_DS41_LSA") == "1"
 
 
 class DeepseekV41TileLangBackend(DeepseekV41Backend):
@@ -75,61 +68,14 @@ def _mla_calls(*shape) -> list:
     return SparseMlaV41Plan.calls(*args, **kwargs)
 
 
-def _shortlist_options(width, candidates, candidate_blocks):
-    if not _lsa_enabled() or candidates:
-        return None
-    budget = 1024 if candidate_blocks else 64
-    if width <= budget * 64:
-        return None
-    return dict(candidate_blocks=candidate_blocks, budget=budget, row_cap=256)
-
-
-def _source_short_options(width, candidates, candidate_blocks):
-    options = _shortlist_options(width, candidates, candidate_blocks)
-    if (
-        options is None
-        or not candidate_blocks
-        or options["budget"] <= 512
-        or width <= 512 * 64
-    ):
-        return None
-    return {**options, "budget": 512}
-
-
 @functools.cache
 def _index_plan(width, page_size, candidates, candidate_blocks):
-    options = _shortlist_options(width, candidates, candidate_blocks)
-    if options is not None:
-        return BlockMeanShortlistPlan(width, page_size, **options)
     return IndexerV41Plan(
         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
     )
 
 
-@functools.cache
-def _source_short_plan(width, page_size, candidates, candidate_blocks):
-    options = _source_short_options(width, candidates, candidate_blocks)
-    if options is None:
-        return None
-    return BlockMeanShortlistPlan(width, page_size, **options)
-
-
 def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
-    options = _shortlist_options(width, candidates, candidate_blocks)
-    if options is not None:
-        calls = [
-            *BlockMeanShortlistPlan.calls(width, page_size, **options),
-            *IndexerV41Plan.calls(
-                width,
-                page_size,
-                candidates=candidates,
-                candidate_blocks=candidate_blocks,
-            ),
-        ]
-        short_options = _source_short_options(width, candidates, candidate_blocks)
-        if short_options is not None:
-            calls.extend(BlockMeanShortlistPlan.calls(width, page_size, **short_options))
-        return calls
     return IndexerV41Plan.calls(
         width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
     )
@@ -203,12 +149,6 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                     rope_dim=self.rotary_emb.cos_sin_cache.shape[1],
                 )
             )  # _quantize_index_query
-        if (
-            self.compressor is not None
-            and self.indexer is not None
-            and _lsa_enabled()
-        ):
-            calls.append(prepare.call(summarize_blocks, self._index_page))
         if self.compressor is not None:
             from .gemm import bf16_shards
 
@@ -237,15 +177,6 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         with torch.inference_mode(False):
             self._prepare(self.rotary_emb.cos_sin_cache.device)
         self._tilelang_plans = self._build_tilelang_plans()
-        self._page_summary = (
-            summarize_blocks(self._index_page)
-            if (
-                self.compressor is not None
-                and self.indexer is not None
-                and _lsa_enabled()
-            )
-            else None
-        )
 
     def _tilelang(self) -> SimpleNamespace:
         """This layer's plans (built when its kernels are bound; the cache pages
@@ -282,9 +213,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
                 (
                     "index K",
                     self.indexer.k_cache.kv_cache,
-                    self._index_page * STATE_BYTES
-                    if _lsa_enabled()
-                    else page_bytes(self._index_page),
+                    page_bytes(self._index_page),
                 )
             )
         for name, cache, page in caches:
@@ -302,18 +231,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
             else None
         )
         index = {mode: _index_plan(*args) for mode, args in index_args.items()}
-        source_short = (
-            _source_short_plan(*index_args["prefill"])
-            if "prefill" in index_args
-            else None
-        )
-        native_index = {
-            mode: IndexerV41Plan(
-                args[0], args[1], candidates=args[2], candidate_blocks=args[3]
-            )
-            for mode, args in index_args.items()
-            if isinstance(index[mode], PageShortlistPlan)
-        }
+
         # The largest scratch each phase borrows: indexing, then the attention
         # metadata arena with the decode route's segment workspace. They are
         # reserved in the workspace lane this layer runs in, before profiling
@@ -329,18 +247,10 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
         overlap_specs = self._decode_overlap_workspace_specs(self.DECODE_CHUNK)
         self._scratch_reservations = (
             *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
-            *(
-                (source_short.scratch_specs(chunks["prefill"]),)
-                if source_short is not None
-                else ()
-            ),
-            *(plan.scratch_specs(chunks[mode]) for mode, plan in native_index.items()),
             *((overlap_specs,) if overlap_specs else ()),
             *mla_reservations,
         )
-        return SimpleNamespace(
-            mla=mla, index=index, native_index=native_index, source_short=source_short
-        )
+        return SimpleNamespace(mla=mla, index=index)
 
     def reserve_profile_scratch(self) -> None:
         """Reserve this layer's largest borrows (``_build_tilelang_plans``) in the
@@ -389,10 +299,6 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
             write_index_keys(
                 key, self.indexer.k_cache.kv_cache, slot_mapping, self._index_page
             )
-        page_summary = getattr(self, "_page_summary", None)
-        if page_summary is not None:
-            pool = self.indexer.k_cache.kv_cache
-            page_summary(pool, pool.view(torch.float8_e4m3fn), slot_mapping)
 
     def _index_chunk(
         self,
@@ -413,28 +319,6 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
     ):
         plans = self._tilelang()
         plan = plans.index[mode]
-        if (
-            mode == "decode"
-            and isinstance(plan, PageShortlistPlan)
-            and rows < 2
-            and (score_width is None or score_width < 262144)
-        ):
-            plan = plans.native_index[mode]
-        # Outside graph capture, the existing conservative extent can
-        # prove that every key would be kept. Avoid the entire coarse pipeline.
-        if (
-            score_width is not None
-            and isinstance(plan, PageShortlistPlan)
-            and score_width <= plan.budget * 64 + plan.page - 1
-        ):
-            short = getattr(plans, "source_short", None)
-            if (
-                short is not None
-                and score_width > short.budget * 64 + short.page - 1
-            ):
-                plan = short
-            else:
-                plan = plans.native_index[mode]
         scratch = current_workspace_manager().get_simultaneous(
             *plan.scratch_specs(rows)
         )

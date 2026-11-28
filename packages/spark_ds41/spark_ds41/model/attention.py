@@ -111,11 +111,10 @@ class _Cache(nn.Module, AttentionLayerBase):
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=512 if self.kind == "swa" else 68,
-            # Optional FP8 block-8 shortlist storage is admitted only when enabled.
             state_content_bytes=(
                 528
                 if self.kind == "swa"
-                else (84 if os.environ.get("VLLM_DS41_LSA") == "1" else 68)
+                else 68
             ),
             dtype=torch.uint8,
             tokens_per_state=self.ratio,
@@ -137,7 +136,7 @@ class _Cache(nn.Module, AttentionLayerBase):
             state_content_bytes=(
                 528
                 if self.kind == "swa"
-                else (84 if os.environ.get("VLLM_DS41_LSA") == "1" else 68)
+                else 68
             ),
             dtype=torch.uint8,
             tokens_per_state=self.ratio,
@@ -2053,10 +2052,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 if pad_mask is not None
                 else im.cache_lengths
             )
-            lsa_enabled = os.environ.get("VLLM_DS41_LSA") == "1"
             score_width = None
             if (
-                (mode == "extend" or lsa_enabled)
+                mode == "extend"
                 and self.layer_id <= self.candidate_source_layer
                 and not torch.cuda.is_current_stream_capturing()
             ):
@@ -2066,31 +2064,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
             index_pages = self._index_pages
-            decode_mode = "decode"
-            decode_pages = self._index_pages
             if (
-                score_width is not None
+                mode == "extend"
+                and score_width is not None
                 and score_width <= 16384
                 and self._short_index_shape is not None
             ):
-                if mode == "extend" or (lsa_enabled and rows >= 2):
-                    index_mode = "prefill_short"
-                    chunk_rows = (
-                        self.DECODE_CHUNK
-                        if mode == "decode"
-                        else self._short_index_shape[0]
-                    )
-                    index_pages = self._short_index_pages
-                if lsa_enabled and decode_rows >= 2:
-                    decode_mode = "prefill_short"
-                    decode_pages = self._short_index_pages
+                index_mode = "prefill_short"
+                chunk_rows = self._short_index_shape[0]
+                index_pages = self._short_index_pages
             rest = (index_mode, chunk_rows, index_pages, score_width)
-            decode = (
-                decode_mode,
-                self.DECODE_CHUNK,
-                decode_pages,
-                score_width if lsa_enabled else None,
-            )
+            decode = ("decode", self.DECODE_CHUNK, self._index_pages, None)
 
             def select(query, first, selected):
                 # Decode requests' rows (global rows below decode_rows) take the

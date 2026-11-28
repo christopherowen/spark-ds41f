@@ -1,13 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 15:14:14 +0100
-Subject: [PATCH 9/9] Add GLP steered alias serving, SSE keep-alive, thinking
- switch, and tokenizer config reuse
+From: Christopher Owen <christopher@owen.dev>
+Date: Sat, 28 Nov 2026 15:00:00 +0000
+Subject: [PATCH] Add GLP steered alias serving, SSE keep-alive/abort
+ shielding, thinking toggle, and DS4.1 encoding fix
 
 ---
  vllm/entrypoints/anthropic/api_router.py      | 10 ++++-
  .../entrypoints/launchers/api_server/entry.py |  6 +++
  .../openai/chat_completion/api_router.py      | 10 +++--
+ .../openai/chat_completion/batch_serving.py   |  7 +++-
  .../openai/chat_completion/protocol.py        | 11 +++++-
  .../openai/chat_completion/serving.py         |  1 +
  .../openai/completion/api_router.py           | 10 +++--
@@ -16,9 +17,12 @@ Subject: [PATCH 9/9] Add GLP steered alias serving, SSE keep-alive, thinking
  vllm/entrypoints/openai/responses/serving.py  |  1 +
  vllm/entrypoints/serve/engine/serving.py      | 12 ++++++
  vllm/entrypoints/serve/tokenize/serving.py    |  1 +
+ vllm/entrypoints/serve/utils/api_utils.py     | 31 +++++++++++++--
  .../entrypoints/serve/utils/sse_keep_alive.py | 39 ++++++++++++++++++-
+ vllm/tokenizers/deepseek_v41_encoding.py      | 19 ++++++++-
  vllm/tokenizers/registry.py                   | 10 ++++-
- 13 files changed, 114 insertions(+), 14 deletions(-)
+ vllm/v1/engine/async_llm.py                   | 15 ++++++-
+ 17 files changed, 180 insertions(+), 20 deletions(-)
 
 diff --git a/vllm/entrypoints/anthropic/api_router.py b/vllm/entrypoints/anthropic/api_router.py
 index 5d00ab3..87aa1d8 100644
@@ -94,6 +98,25 @@ index 0997e8d..3037c91 100644
          media_type="text/event-stream",
      )
  
+diff --git a/vllm/entrypoints/openai/chat_completion/batch_serving.py b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+index cdf9e07..f9fb2db 100644
+--- a/vllm/entrypoints/openai/chat_completion/batch_serving.py
++++ b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+@@ -177,8 +177,13 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+                 single_request, supports_default_mm_loras=True
+             )
+             sampling_params = single_request.to_sampling_params(
+-                max_tokens, self.default_sampling_params
++                max_tokens,
++                self._default_sampling_params_for(single_request)
++                if hasattr(self, "_default_sampling_params_for")
++                else self.default_sampling_params,
+             )
++            if hasattr(self, "_mark_steering"):
++                self._mark_steering(single_request, sampling_params)
+             self._log_inputs(
+                 sub_request_id,
+                 engine_prompt,
 diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
 index 3c48595..78eed0e 100644
 --- a/vllm/entrypoints/openai/chat_completion/protocol.py
@@ -287,6 +310,63 @@ index 7eb9d07..3e6dd79 100644
      def __init__(
          self,
          models: OpenAIServingModels | OpenAIModelRegistry,
+diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
+index 5afc9ab..ccd77b2 100644
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -183,6 +183,31 @@ def decrement_server_load(request: Request):
+     request.app.state.server_load_metrics -= 1
+ 
+ 
++async def finalize_response_load(
++    request: Request, response: Response
++) -> None:
++    import asyncio
++    import anyio
++    try:
++        if isinstance(response, StreamingResponse):
++            aclose = getattr(response.body_iterator, "aclose", None)
++            if aclose is not None:
++                with anyio.CancelScope(shield=True):
++                    close_task = asyncio.create_task(aclose())
++                    interrupted = None
++                    while not close_task.done():
++                        try:
++                            await asyncio.wait((close_task,))
++                        except asyncio.CancelledError as exc:
++                            interrupted = exc
++                    if not close_task.cancelled():
++                        close_task.exception()
++                    if interrupted is not None:
++                        raise interrupted
++    finally:
++        decrement_server_load(request)
++
++
+ def load_aware_call(func):
+     @functools.wraps(func)
+     async def wrapper(*args, **kwargs):
+@@ -209,9 +234,9 @@ def load_aware_call(func):
+ 
+         if isinstance(response, Response):
+             if response.background is None:
+-                response.background = BackgroundTask(decrement_server_load, raw_request)
++                response.background = BackgroundTask(finalize_response_load, raw_request, response)
+             elif isinstance(response.background, BackgroundTasks):
+-                response.background.add_task(decrement_server_load, raw_request)
++                response.background.add_task(finalize_response_load, raw_request, response)
+             elif isinstance(response.background, BackgroundTask):
+                 # Convert the single BackgroundTask to BackgroundTasks
+                 # and chain the decrement_server_load task to it
+@@ -221,7 +246,7 @@ def load_aware_call(func):
+                     *response.background.args,
+                     **response.background.kwargs,
+                 )
+-                tasks.add_task(decrement_server_load, raw_request)
++                tasks.add_task(finalize_response_load, raw_request, response)
+                 response.background = tasks
+         else:
+             raw_request.app.state.server_load_metrics -= 1
 diff --git a/vllm/entrypoints/serve/utils/sse_keep_alive.py b/vllm/entrypoints/serve/utils/sse_keep_alive.py
 index 9904b76..85e6297 100644
 --- a/vllm/entrypoints/serve/utils/sse_keep_alive.py
@@ -344,6 +424,49 @@ index 9904b76..85e6297 100644
  ) -> AsyncGenerator[str, None]:
      """Emit an SSE keep-alive comment when `generator` is idle.
  
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 0ba68db..b7e8b15 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -327,6 +327,21 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+     return last_user_index
+ 
+ 
++def _assistant_opens_thinking(msg: Dict[str, Any]) -> bool:
++    return bool(msg.get("reasoning_content")) or bool(msg.get("wo_eos"))
++
++
++def _next_turn_opens_thinking(index: int, messages: List[Dict[str, Any]]) -> bool:
++    for follow_idx in range(index + 1, len(messages)):
++        follow_role = messages[follow_idx].get("role")
++        if follow_role == "latest_reminder":
++            continue
++        if follow_role == "assistant":
++            return _assistant_opens_thinking(messages[follow_idx])
++        return True
++    return True
++
++
+ def render_message(
+     index: int,
+     messages: List[Dict[str, Any]],
+@@ -475,13 +490,15 @@ def render_message(
+             )
+ 
+         summary_content = content or ""
++        if tool_calls and summary_content.endswith("\n\n"):
++            summary_content = summary_content[:-2]
+         rc = reasoning_content or ""
+ 
+         # Check if previous message has a task - if so, this is a task output (no thinking)
+         prev_has_task = index - 1 >= 0 and messages[index - 1].get("task") is not None
+ 
+         if thinking_mode == "thinking" and not prev_has_task:
+-            if not drop_thinking or index > last_user_idx:
++            if (not drop_thinking or index > last_user_idx) and _assistant_opens_thinking(msg):
+                 thinking_part = (
+                     thinking_template.format(reasoning_content=rc) + thinking_end_token
+                 )
 diff --git a/vllm/tokenizers/registry.py b/vllm/tokenizers/registry.py
 index 84a922b..d85ef4d 100644
 --- a/vllm/tokenizers/registry.py
@@ -365,3 +488,36 @@ index 84a922b..d85ef4d 100644
          if not envs.VLLM_USE_MODELSCOPE and str(tokenizer_name) != requested_name:
              # AutoTokenizer selects some tokenizer classes by Hub ID
              config = copy(config)
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 34617d7..7f53430 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator, Iterable, Mapping
+ from copy import copy
+ from typing import Any
+ 
++import anyio
+ import vllm.envs as envs
+ from vllm import TokensPrompt
+ from vllm.config import VllmConfig
+@@ -985,7 +986,19 @@ class AsyncLLM(EngineClient):
+             (request_id,) if isinstance(request_id, str) else as_list(request_id)
+         )
+         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+-        await self.engine_core.abort_requests_async(all_request_ids)
++        with anyio.CancelScope(shield=True):
++            abort_task = asyncio.create_task(
++                self.engine_core.abort_requests_async(all_request_ids)
++            )
++            interrupted = None
++            while not abort_task.done():
++                try:
++                    await asyncio.wait((abort_task,))
++                except asyncio.CancelledError as exc:
++                    interrupted = exc
++            await abort_task
++            if interrupted is not None:
++                raise interrupted
+ 
+         if self.log_requests:
+             logger.info("Aborted request(s) %s.", ",".join(request_ids))

@@ -1033,14 +1033,3 @@ def maybe_create_adaptive_verification_manager(
             or 0
         ),
     )
-
-
-_TRITON_REFS = frozenset(("_assign_draft_token_budget",))
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REFS:
-        from spark_ds41.sampling import _triton_refs
-
-        return getattr(_triton_refs, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

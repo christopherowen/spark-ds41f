@@ -174,14 +174,3 @@ def use_penalty(sampling_params: SamplingParams) -> bool:
         or sampling_params.frequency_penalty != 0.0
         or sampling_params.presence_penalty != 0.0
     )
-
-
-_TRITON_REFS = frozenset(("_penalties_kernel", "_bincount_kernel"))
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REFS:
-        from spark_ds41.sampling import _triton_refs
-
-        return getattr(_triton_refs, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

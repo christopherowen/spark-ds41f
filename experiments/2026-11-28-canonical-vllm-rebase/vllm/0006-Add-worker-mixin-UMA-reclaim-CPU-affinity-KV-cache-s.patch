@@ -1,18 +1,226 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 15:14:14 +0100
-Subject: [PATCH 6/9] Add worker mixin, KV cache spec, workspace, and dense
- varlen CUDA graph hooks
+From: Christopher Owen <christopher@owen.dev>
+Date: Sat, 28 Nov 2026 15:00:00 +0000
+Subject: [PATCH] Add worker mixin, UMA reclaim, CPU affinity, KV-cache
+ spec/preemption, and workspace
 
 ---
- vllm/v1/executor/multiproc_executor.py |  40 +++++++
- vllm/v1/kv_cache_interface.py          | 140 +++++++++++++++++++++++++
- vllm/v1/worker/gpu/cudagraph_utils.py  | 102 ++++++++++++++++--
- vllm/v1/worker/gpu_worker.py           |  77 ++++++++++++--
- vllm/v1/worker/utils.py                |  10 ++
- vllm/v1/worker/workspace.py            |  46 +++++++-
- 6 files changed, 395 insertions(+), 20 deletions(-)
+ vllm/entrypoints/cli/serve.py                |  10 ++
+ vllm/utils/mem_utils.py                      |  31 +++-
+ vllm/v1/attention/backend.py                 |   6 +-
+ vllm/v1/attention/backends/registry.py       |   1 +
+ vllm/v1/core/kv_cache_manager.py             |   6 +
+ vllm/v1/core/kv_cache_utils.py               |  12 +-
+ vllm/v1/core/single_type_kv_cache_manager.py |   5 +-
+ vllm/v1/executor/multiproc_executor.py       |  40 ++++++
+ vllm/v1/kv_cache_interface.py                | 140 +++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py                 |  77 ++++++++--
+ vllm/v1/worker/utils.py                      |  10 ++
+ vllm/v1/worker/workspace.py                  |  46 +++++-
+ 12 files changed, 371 insertions(+), 13 deletions(-)
 
+diff --git a/vllm/entrypoints/cli/serve.py b/vllm/entrypoints/cli/serve.py
+index abf0105..8978bcd 100644
+--- a/vllm/entrypoints/cli/serve.py
++++ b/vllm/entrypoints/cli/serve.py
+@@ -229,7 +229,14 @@ def run_headless(args: argparse.Namespace):
+             head_node_address,
+         )
+ 
++        from spark_ds41.worker.cpu_affinity import (
++            apply_role_cpu_affinity,
++            get_container_cpuset,
++        )
++
++        get_container_cpuset(record_env=True)
+         executor = MultiprocExecutor(vllm_config, monitor_workers=False)
++        apply_role_cpu_affinity("engine_core")
+         executor.start_worker_monitor(inline=True)
+         return
+ 
+@@ -355,6 +362,9 @@ def run_multi_api_server(args: argparse.Namespace):
+     zmq_listeners = bind_engine_zmq_listeners(vllm_config, num_api_servers)
+     addresses = zmq_listeners.addresses
+ 
++    from spark_ds41.worker.cpu_affinity import get_container_cpuset
++
++    get_container_cpuset(record_env=True)
+     with launch_core_engines(
+         vllm_config, executor_class, collect_stats, addresses
+     ) as engine_launch:
+diff --git a/vllm/utils/mem_utils.py b/vllm/utils/mem_utils.py
+index 1cc9284..1208f7f 100644
+--- a/vllm/utils/mem_utils.py
++++ b/vllm/utils/mem_utils.py
+@@ -48,6 +48,29 @@ _UMA_PRESSURE_THRESHOLD = 0.8
+ _UMA_MIN_RELEASE_BYTES = 512 * MiB_bytes
+ 
+ 
++def trim_host_heap() -> None:
++    try:
++        from spark_ds41.worker.mem_utils import trim_host_heap as _trim
++        _trim()
++    except ImportError:
++        pass
++
++
++def release_memory_to_os(
++    device: torch.device | None = None,
++    *,
++    synchronize: bool = True,
++    empty_cache: bool = True,
++) -> None:
++    try:
++        from spark_ds41.worker.mem_utils import release_memory_to_os as _release
++        _release(device=device, synchronize=synchronize, empty_cache=empty_cache)
++    except ImportError:
++        gc.collect()
++        if empty_cache:
++            torch.accelerator.empty_cache()
++
++
+ def release_device_memory_under_pressure(device: torch.device) -> bool:
+     """On integrated (UMA) GPUs, release caching-allocator memory back to the
+     OS when system memory pressure is high. The OS may start thrashing before
+@@ -71,8 +94,10 @@ def release_device_memory_under_pressure(device: torch.device) -> bool:
+     if mem.available > (1 - _UMA_PRESSURE_THRESHOLD) * mem.total:
+         return False
+ 
++    gc.collect()
+     torch.accelerator.synchronize(device)
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+     logger.debug(
+         "Released %sGiB of cached device memory under memory pressure",
+         format_gib(releasable),
+@@ -87,6 +112,7 @@ class DeviceMemoryProfiler:
+     def current_memory_usage(self) -> float:
+         # Return the memory usage in bytes.
+         gc.collect()
++        trim_host_heap()
+         return current_platform.get_current_memory_usage(self.device)
+ 
+     def __enter__(self):
+@@ -98,8 +124,9 @@ class DeviceMemoryProfiler:
+         self.final_memory = self.current_memory_usage()
+         self.consumed_memory = self.final_memory - self.initial_memory
+ 
+-        # Force garbage collection
++        # Force garbage collection and return host arena slack to the OS.
+         gc.collect()
++        trim_host_heap()
+ 
+ 
+ def device_memory_info(device: torch.types.Device = None) -> tuple[int, int]:
+@@ -298,6 +325,7 @@ def memory_profiling(
+     """
+     gc.collect()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+     torch.accelerator.reset_peak_memory_stats(baseline_snapshot.device_)
+ 
+     result = MemoryProfilingResult(
+@@ -312,6 +340,7 @@ def memory_profiling(
+ 
+     gc.collect()
+     torch.accelerator.empty_cache()
++    trim_host_heap()
+ 
+     result.after_profile.measure()
+ 
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 9a18576..536f506 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -595,7 +595,11 @@ def max_decode_query_len(vllm_config: "VllmConfig") -> int:
+     # query.
+     return (
+         1
+-        + speculative_config.num_speculative_tokens
++        + getattr(
++            vllm_config,
++            "num_verification_tokens",
++            speculative_config.num_speculative_tokens,
++        )
+         + speculative_config.max_num_new_slots_for_drafting
+     )
+ 
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 6d44621..70749e2 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -128,6 +128,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+         "vllm.models.deepseek_v41.sparse_mla.FlashMLAMegaAttnBackend"
+     )
+     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
++    TILELANG = "spark_ds41.tilelang.attention.DeepseekV41TileLangBackend"
+     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
+     FLASH_ATTN_MLA_SPARSE = (
+         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index f353aea..b27e1e9 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -349,6 +349,12 @@ class KVCacheManager:
+         # num_computed_tokens to be block-size aligned. Removing this limitation
+         # could slightly improve performance in the future.
+         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
++        replay_tokens = getattr(self.coordinator, "prefill_replay_tokens", 0)
++        if replay_tokens and getattr(request, "streaming_queue", None) is None:
++            max_cache_hit_length = min(
++                max_cache_hit_length,
++                max(0, request.num_prompt_tokens - max(1, replay_tokens)),
++            )
+         computed_blocks, num_new_computed_tokens, num_uncached = (
+             self.coordinator.find_longest_cache_hit(
+                 request.block_hashes, max_cache_hit_length, request.num_tokens
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 9dc9865..b952c0e 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -20,6 +20,7 @@ from typing import (
+     overload,
+ )
+ 
++from spark_ds41.direct_io import weightless
+ from vllm import envs
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
+@@ -705,8 +706,17 @@ def generate_block_hash_extra_keys(
+         request, start_token_idx, end_token_idx
+     )
+ 
++    steering_keys: list[Any] = (
++        [weightless.BLOCK_HASH_KEY]
++        if start_token_idx == 0 and weightless.is_marked(request.sampling_params)
++        else []
++    )
+     extra_keys: list[Any] = (
+-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
++        lora_extra_keys
++        + mm_extra_keys
++        + cache_salt_keys
++        + prompt_embeds_keys
++        + steering_keys
+     )
+ 
+     if not extra_keys:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index ae88ebf..e74577b 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -226,7 +226,10 @@ class SingleTypeKVCacheManager(ABC):
+         self.max_admission_blocks_per_request = max_admission_blocks_per_request
+         # Record newly allocated block ids only when worker-side zeroing will
+         # consume them and this manager's blocks get zeroed.
+-        self._record_new_block_ids = needs_kv_cache_zeroing and self.zeroes_new_blocks
++        import vllm.envs as _envs
++        self._record_new_block_ids = needs_kv_cache_zeroing and (
++            self.zeroes_new_blocks or _envs.VLLM_KV_CACHE_POISON
++        )
+         self.new_block_ids: list[int] = []
+ 
+         # Mapping from request ID to blocks to track the blocks allocated
 diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
 index d9582fb..1f2721b 100644
 --- a/vllm/v1/executor/multiproc_executor.py
@@ -233,140 +441,6 @@ index 743274f..7df733e 100644
 +            and spec.prefill_replay_tokens == self.prefill_replay_tokens
 +            for spec in kv_cache_specs.values()
 +        )
-diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index fe2fbfd..dc37390 100644
---- a/vllm/v1/worker/gpu/cudagraph_utils.py
-+++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -318,23 +318,40 @@ class CudaGraphManager:
-         # With one routine for every batch, decode batches take token-keyed graphs.
-         capture_decode = separate_decode_routine and decode_mode != CUDAGraphMode.NONE
-         if capture_decode and self.varlen_decode:
--            # Varlen decode graphs take any mix of 1..decode_query_len tokens per
--            # request, worst case 1 token per request (or max_num_reqs).
-+            max_cg_capture_size = compilation_config.max_cudagraph_capture_size or 0
-+            for num_active_loras, (dense_num_reqs, num_tokens) in product(
-+                self.lora_capture_cases,
-+                dense_varlen_decode_shapes(
-+                    self.max_num_reqs,
-+                    self.decode_query_len,
-+                    max_cg_capture_size,
-+                    getattr(self.vllm_config, "uniform_decode_query_len", None),
-+                ),
-+            ):
-+                desc = BatchExecutionDescriptor(
-+                    cg_mode=decode_mode,
-+                    num_tokens=num_tokens,
-+                    num_reqs=dense_num_reqs,
-+                    max_query_len=self.decode_query_len,
-+                    num_active_loras=num_active_loras,
-+                )
-+                if desc not in token_keyed_descs:
-+                    token_keyed_descs.append(desc)
-             varlen_sizes = self.vllm_config.get_varlen_decode_cudagraph_token_sizes(
-                 self.decode_query_len
-             )
-             for num_tokens, num_active_loras in product(
-                 varlen_sizes, self.lora_capture_cases
-             ):
--                token_keyed_descs.append(
--                    BatchExecutionDescriptor(
--                        cg_mode=decode_mode,
--                        num_tokens=num_tokens,
--                        num_reqs=min(num_tokens, self.max_num_reqs),
--                        max_query_len=self.decode_query_len,
--                        num_active_loras=num_active_loras,
--                    )
-+                desc = BatchExecutionDescriptor(
-+                    cg_mode=decode_mode,
-+                    num_tokens=num_tokens,
-+                    num_reqs=min(num_tokens, self.max_num_reqs),
-+                    max_query_len=self.decode_query_len,
-+                    num_active_loras=num_active_loras,
-                 )
-+                if desc not in token_keyed_descs:
-+                    token_keyed_descs.append(desc)
-         elif capture_decode:
-             # Attention backends size CUDA graph buffers and pick graph-compatible
-             # paths by the recorded max (e.g. FA3 max_num_splits, FlashInfer's
-@@ -547,10 +564,13 @@ class CudaGraphManager:
-                             torch.accelerator.synchronize()
-                             free_after = torch.accelerator.get_memory_info()[0]
-                             self._capture_mem_samples.append(free_before - free_after)
--                        self.graphs[desc] = graph
-+                        from spark_ds41.runner.cudagraph import instantiate_priority_graph
-+                        self.graphs[desc] = instantiate_priority_graph(graph)
-                         compilation_counter.num_cudagraph_captured += 1
- 
-         self._graphs_captured = True
-+        from spark_ds41.worker.mem_utils import trim_host_heap
-+        trim_host_heap()
- 
-     def captured_token_counts(self) -> list[int]:
-         """Sorted token counts with a captured graph, ignoring LoRA variants."""
-@@ -1181,3 +1201,63 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
-     runner.maybe_remove_all_loras(runner.lora_config)
-     gc.collect()
-     torch.accelerator.empty_cache()
-+
-+
-+_DENSE_VARLEN_DECODE_MAX_REQS = 2
-+_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16
-+
-+
-+def dense_varlen_decode_shapes(
-+    max_num_reqs: int,
-+    decode_query_len: int,
-+    max_capture_tokens: int,
-+    uniform_query_len: int | None = None,
-+) -> tuple[tuple[int, int], ...]:
-+    """Return request and token counts of exact variable-length decode graphs.
-+
-+    Covers every valid token total for low-concurrency batches (``1`` to
-+    ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
-+    adaptively trimmed totals) and the full-depth speculative batch for each
-+    higher request count up to ``_FULL_DEPTH_VARLEN_DECODE_MAX_REQS`` (above
-+    which the 8-row/16-row padded ladder already covers ``104+`` rows). When
-+    copy drafts widen the verification limit, retain ordinary full-depth row
-+    totals with room for any valid request count, using ``uniform_query_len``.
-+    """
-+    dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
-+    full_depth_reqs = min(_FULL_DEPTH_VARLEN_DECODE_MAX_REQS, max_num_reqs)
-+    has_copy_width = (
-+        uniform_query_len is not None and 1 < uniform_query_len < decode_query_len
-+    )
-+    full_depth_tokens = min(
-+        max_capture_tokens,
-+        (
-+            full_depth_reqs * uniform_query_len + (decode_query_len - uniform_query_len)
-+            if has_copy_width
-+            else full_depth_reqs * decode_query_len
-+        ),
-+    )
-+    dense = (
-+        (num_reqs, num_tokens)
-+        for num_reqs in range(1, dense_reqs + 1)
-+        for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
-+        if num_tokens <= max_capture_tokens
-+    )
-+    widths = {decode_query_len}
-+    uniform = (
-+        (num_reqs, num_reqs * width)
-+        for num_reqs in range(dense_reqs + 1, full_depth_reqs + 1)
-+        for width in sorted(widths)
-+        if width > 1 and num_reqs * width <= full_depth_tokens
-+    )
-+    native_rows = ()
-+    if has_copy_width:
-+        native_rows = (
-+            (min(rows, max_num_reqs), rows)
-+            for rows in range(
-+                uniform_query_len,
-+                full_depth_reqs * uniform_query_len + 1,
-+                uniform_query_len,
-+            )
-+            if rows <= full_depth_tokens
-+        )
-+    return tuple(dict.fromkeys((*dense, *uniform, *native_rows)))
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
 index fb7d00e..8fbf170 100644
 --- a/vllm/v1/worker/gpu_worker.py

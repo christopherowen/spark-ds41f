@@ -15,14 +15,3 @@ def apply_min_p(
     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
 ) -> None:
     tilelang_controls.apply_min_p(logits, expanded_idx_mapping, min_p)
-
-
-_TRITON_REFS = frozenset(("_min_p_kernel",))
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REFS:
-        from spark_ds41.sampling import _triton_refs
-
-        return getattr(_triton_refs, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

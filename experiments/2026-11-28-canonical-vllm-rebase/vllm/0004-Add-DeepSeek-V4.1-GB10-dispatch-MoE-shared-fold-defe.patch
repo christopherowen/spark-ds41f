@@ -1,78 +1,42 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 15:14:14 +0100
-Subject: [PATCH 4/9] Add DeepSeek V4.1 GB10 dispatch, MoE shared-fold, packed
- LM head, and GLP CLI shim
+From: Christopher Owen <christopher@owen.dev>
+Date: Sat, 28 Nov 2026 15:00:00 +0000
+Subject: [PATCH] Add DeepSeek-V4.1 GB10 dispatch, MoE shared-fold, deferred
+ arena, and packed-BF16 LM head
 
 ---
- vllm/forward_context.py                       |  12 ++
+ vllm/model_executor/layers/fused_moe/layer.py |   4 +
  .../layers/fused_moe/modular_kernel.py        |   6 +-
  .../layers/fused_moe/oracle/mxfp4.py          |  15 +-
  .../layers/fused_moe/runner/moe_runner.py     | 196 +++++++++++++++---
  .../layers/fused_moe/runner/shared_experts.py |  15 ++
  .../model_executor/layers/logits_processor.py |  60 +++++-
+ .../layers/quantization/mxfp4.py              | 142 +++++++++----
  .../layers/vocab_parallel_embedding.py        |   8 +
  vllm/model_executor/models/config.py          |   6 +
+ vllm/model_executor/utils.py                  |   5 +
  vllm/models/deepseek_v41/__init__.py          |  16 ++
  vllm/models/deepseek_v4_1/__init__.py         |   1 +
  vllm/models/deepseek_v4_1/glp.py              |   5 +
- vllm/v1/attention/backend.py                  |   6 +-
- vllm/v1/attention/backends/registry.py        |   1 +
- 13 files changed, 315 insertions(+), 32 deletions(-)
+ 13 files changed, 407 insertions(+), 72 deletions(-)
  create mode 100644 vllm/models/deepseek_v4_1/__init__.py
  create mode 100644 vllm/models/deepseek_v4_1/glp.py
 
-diff --git a/vllm/forward_context.py b/vllm/forward_context.py
-index eb25b32..255e41e 100644
---- a/vllm/forward_context.py
-+++ b/vllm/forward_context.py
-@@ -133,6 +133,14 @@ class DPMetadata:
-         return torch.cumsum(num_tokens_across_sp_cpu, dim=0)
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 8dc895a..a72162f 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -467,6 +467,10 @@ def FusedMoEFactory(
+     if runner_cls is None:
+         runner_cls = MoERunner
  
- 
-+@dataclass(frozen=True)
-+class MoEPrefillMetadata:
-+    """Semantic prefill ranges in a target forward's padded token ordering."""
++    routed_experts._router_indices_dtype = getattr(router, "indices_dtype", None)
++    if (router_max_rows := getattr(router, "max_rows", None)) is not None:
++        routed_experts._router_max_rows = router_max_rows
 +
-+    num_tokens: int
-+    prefill_ranges: tuple[tuple[int, int], ...]
-+
-+
- @dataclass
- class ForwardContext:
-     # copy from vllm_config.compilation_config.static_forward_context
-@@ -148,6 +156,7 @@ class ForwardContext:
-     """
-     # set dynamically for each forward pass
-     dp_metadata: DPMetadata | None = None
-+    moe_prefill_metadata: MoEPrefillMetadata | None = None
-     # determine the cudagraph style at runtime to be FULL, PIECEWISE, or NONE.
-     # by default NONE, no cudagraph is used.
-     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
-@@ -234,6 +243,7 @@ def create_forward_context(
-     additional_kwargs: dict[str, Any] | None = None,
-     skip_compiled: bool = False,
-     is_padding: torch.Tensor | None = None,
-+    moe_prefill_metadata: MoEPrefillMetadata | None = None,
- ):
-     if vllm_config.compilation_config.fast_moe_cold_start:
-         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
-@@ -282,6 +292,7 @@ def set_forward_context(
-     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
-     skip_compiled: bool = False,
-     is_padding: torch.Tensor | None = None,
-+    moe_prefill_metadata: MoEPrefillMetadata | None = None,
- ):
-     """A context manager that stores the current forward context,
-     can be attention metadata, etc.
-@@ -349,6 +360,7 @@ def set_forward_context(
-         additional_kwargs,
-         skip_compiled,
-         is_padding=is_padding,
-+        moe_prefill_metadata=moe_prefill_metadata,
-     )
- 
-     try:
+     runner = runner_cls(
+         layer_name=layer_name,
+         moe_config=moe_config,
 diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
 index 4a29afe..0eb7348 100644
 --- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
@@ -549,6 +513,207 @@ index 4be952a..faac926 100644
 +        and head.weight.is_cuda
 +        and head.weight.is_contiguous()
 +    )
+diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
+index da6a0df..03660c3 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4.py
++++ b/vllm/model_executor/layers/quantization/mxfp4.py
+@@ -785,31 +785,75 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+         layer.num_experts = num_experts
+         self.intermediate_size = intermediate_size_per_partition
+         self.hidden_size = hidden_size
++        import vllm.envs as envs
++        from spark_ds41.direct_io.direct_loader import (
++            is_deferring_arena_weight_alloc,
++        )
++
+         weight_loader = extra_weight_attrs.pop("weight_loader")
+         scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
+ 
++        slot_target = envs.VLLM_DS41_EXPERT_SLOTS
++        prefix = getattr(layer, "prefix", None) or getattr(layer, "layer_name", "") or ""
++        is_draft_layer = "dspark" in prefix or "mtp" in prefix
++        if not is_draft_layer and "layers." in prefix:
++            from vllm.model_executor.models.utils import extract_layer_index
++
++            try:
++                is_draft_layer = extract_layer_index(prefix) >= 40
++            except ValueError:
++                pass
++        use_slot_meta = (
++            slot_target != 0
++            and not is_draft_layer
++            and (slot_target < 0 or slot_target < num_experts)
++        )
++        defer_arena_meta = (not use_slot_meta) and is_deferring_arena_weight_alloc()
++        if use_slot_meta:
++            self.uses_meta_device = True
++            alloc_fn = lambda shape, dt: torch.empty(
++                shape, dtype=dt, device=torch.device("meta")
++            )
++        elif defer_arena_meta:
++            alloc_fn = lambda shape, dt: torch.empty((1,), dtype=dt).expand(shape)
++        else:
++            alloc_fn = lambda shape, dt: torch.zeros(shape, dtype=dt)
++
++        def _mark_deferred(param: torch.nn.Parameter) -> torch.nn.Parameter:
++            if defer_arena_meta:
++                param._direct_deferred_alloc = True
++            return param
++
+         # Fused gate_up_proj (column parallel)
+-        w13_weight = torch.nn.Parameter(
+-            torch.zeros(
+-                num_experts,
+-                self.moe.w13_num_shards * intermediate_size_per_partition,
+-                hidden_size // 2,
+-                dtype=weight_dtype,
+-            ),
+-            requires_grad=False,
++        w13_weight = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                        hidden_size // 2,
++                    ),
++                    weight_dtype,
++                ),
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w13_weight", w13_weight)
+         set_weight_attrs(w13_weight, extra_weight_attrs)
+         set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
+ 
+-        w13_weight_scale = torch.nn.Parameter(
+-            torch.zeros(
+-                num_experts,
+-                self.moe.w13_num_shards * intermediate_size_per_partition,
+-                hidden_size // mxfp4_block,
+-                dtype=scale_dtype,
+-            ),
+-            requires_grad=False,
++        w13_weight_scale = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                        hidden_size // mxfp4_block,
++                    ),
++                    scale_dtype,
++                ),
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w13_weight_scale", w13_weight_scale)
+         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+@@ -817,27 +861,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+         w13_weight_scale.quant_method = "block"
+ 
+         # down_proj (row parallel)
+-        w2_weight = torch.nn.Parameter(
+-            torch.zeros(
+-                num_experts,
+-                hidden_size,
+-                intermediate_size_per_partition // 2,
+-                dtype=weight_dtype,
+-            ),
+-            requires_grad=False,
++        w2_weight = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        hidden_size,
++                        intermediate_size_per_partition // 2,
++                    ),
++                    weight_dtype,
++                ),
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w2_weight", w2_weight)
+         set_weight_attrs(w2_weight, extra_weight_attrs)
+         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
+ 
+-        w2_weight_scale = torch.nn.Parameter(
+-            torch.zeros(
+-                num_experts,
+-                hidden_size,
+-                intermediate_size_per_partition // mxfp4_block,
+-                dtype=scale_dtype,
+-            ),
+-            requires_grad=False,
++        w2_weight_scale = _mark_deferred(
++            torch.nn.Parameter(
++                alloc_fn(
++                    (
++                        num_experts,
++                        hidden_size,
++                        intermediate_size_per_partition // mxfp4_block,
++                    ),
++                    scale_dtype,
++                ),
++                requires_grad=False,
++            )
+         )
+         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+@@ -846,10 +898,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+ 
+         if self.moe.has_bias:
+             w13_bias = torch.nn.Parameter(
+-                torch.zeros(
+-                    num_experts,
+-                    self.moe.w13_num_shards * intermediate_size_per_partition,
+-                    dtype=torch.bfloat16,
++                alloc_fn(
++                    (
++                        num_experts,
++                        self.moe.w13_num_shards * intermediate_size_per_partition,
++                    ),
++                    torch.bfloat16,
+                 ),
+                 requires_grad=False,
+             )
+@@ -858,17 +912,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             set_weight_attrs(w13_bias, {"weight_loader": weight_loader})
+ 
+             w2_bias = torch.nn.Parameter(
+-                torch.zeros(
+-                    num_experts,
+-                    hidden_size,
+-                    dtype=torch.bfloat16,
+-                ),
++                alloc_fn((num_experts, hidden_size), torch.bfloat16),
+                 requires_grad=False,
+             )
+             layer.register_parameter("w2_bias", w2_bias)
+             set_weight_attrs(w2_bias, extra_weight_attrs)
+             set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
+ 
++        if use_slot_meta:
++            from vllm.model_executor.model_loader.reload.layerwise import (
++                initialize_online_processing,
++            )
++
++            initialize_online_processing(layer)
++
+     def _setup_kernel(
+         self,
+         layer: RoutedExperts,
+@@ -1031,6 +1088,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             self.moe_kernel.fused_experts.keep_constants(layer)
+ 
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
++        if getattr(layer, "_already_called_process_weights_after_loading", False):
++            return
++        layer._already_called_process_weights_after_loading = True
+         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+             return
+ 
 diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
 index 3cdd289..2da63a5 100644
 --- a/vllm/model_executor/layers/vocab_parallel_embedding.py
@@ -613,6 +778,22 @@ index f33779d..ac314c8 100644
  
  
  class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
+diff --git a/vllm/model_executor/utils.py b/vllm/model_executor/utils.py
+index 0a4a060..0dda33e 100644
+--- a/vllm/model_executor/utils.py
++++ b/vllm/model_executor/utils.py
+@@ -98,6 +98,11 @@ def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+     a CPU temporary. Sources with at most one element are skipped: they count
+     as contiguous with any stride, which `view(torch.uint8)` rejects.
+     """
++    from spark_ds41.direct_io.weight_transfer import _writer
++
++    writer = _writer.get()
++    if writer is not None and not dst.is_meta and writer(dst, src):
++        return dst
+     if (
+         src.dtype != dst.dtype
+         and src.dtype in _BYTE_CONTAINERS
 diff --git a/vllm/models/deepseek_v41/__init__.py b/vllm/models/deepseek_v41/__init__.py
 index b69e1c6..1ebfbd3 100644
 --- a/vllm/models/deepseek_v41/__init__.py
@@ -665,32 +846,3 @@ index 0000000..2374027
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
-diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
-index 9a18576..536f506 100644
---- a/vllm/v1/attention/backend.py
-+++ b/vllm/v1/attention/backend.py
-@@ -595,7 +595,11 @@ def max_decode_query_len(vllm_config: "VllmConfig") -> int:
-     # query.
-     return (
-         1
--        + speculative_config.num_speculative_tokens
-+        + getattr(
-+            vllm_config,
-+            "num_verification_tokens",
-+            speculative_config.num_speculative_tokens,
-+        )
-         + speculative_config.max_num_new_slots_for_drafting
-     )
- 
-diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
-index 6d44621..70749e2 100644
---- a/vllm/v1/attention/backends/registry.py
-+++ b/vllm/v1/attention/backends/registry.py
-@@ -128,6 +128,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
-         "vllm.models.deepseek_v41.sparse_mla.FlashMLAMegaAttnBackend"
-     )
-     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
-+    TILELANG = "spark_ds41.tilelang.attention.DeepseekV41TileLangBackend"
-     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
-     FLASH_ATTN_MLA_SPARSE = (
-         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"

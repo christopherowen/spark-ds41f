@@ -1,47 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 15:14:14 +0100
-Subject: [PATCH 8/9] Add scheduler prefill-yield, late admission, weightless
- prefix hash, and role affinity hooks
+From: Christopher Owen <christopher@owen.dev>
+Date: Sat, 28 Nov 2026 15:00:00 +0000
+Subject: [PATCH] Add scheduler prefill-yield, late admission, and weightless
+ steering hooks
 
 ---
- vllm/v1/core/kv_cache_utils.py  |  12 ++-
  vllm/v1/core/sched/interface.py |   4 +
  vllm/v1/core/sched/scheduler.py | 125 +++++++++++++++++++++++++++++++-
  vllm/v1/engine/core.py          |  31 ++++++++
- 4 files changed, 167 insertions(+), 5 deletions(-)
+ vllm/v1/outputs.py              |   4 +
+ vllm/v1/request.py              |   2 +
+ vllm/v1/utils.py                |  23 ++++++
+ 6 files changed, 185 insertions(+), 4 deletions(-)
 
-diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 9dc9865..b952c0e 100644
---- a/vllm/v1/core/kv_cache_utils.py
-+++ b/vllm/v1/core/kv_cache_utils.py
-@@ -20,6 +20,7 @@ from typing import (
-     overload,
- )
- 
-+from spark_ds41.direct_io import weightless
- from vllm import envs
- from vllm.config import VllmConfig
- from vllm.logger import init_logger
-@@ -705,8 +706,17 @@ def generate_block_hash_extra_keys(
-         request, start_token_idx, end_token_idx
-     )
- 
-+    steering_keys: list[Any] = (
-+        [weightless.BLOCK_HASH_KEY]
-+        if start_token_idx == 0 and weightless.is_marked(request.sampling_params)
-+        else []
-+    )
-     extra_keys: list[Any] = (
--        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
-+        lora_extra_keys
-+        + mm_extra_keys
-+        + cache_salt_keys
-+        + prompt_embeds_keys
-+        + steering_keys
-     )
- 
-     if not extra_keys:
 diff --git a/vllm/v1/core/sched/interface.py b/vllm/v1/core/sched/interface.py
 index 80d25d3..bc5319b 100644
 --- a/vllm/v1/core/sched/interface.py
@@ -345,3 +316,72 @@ index 5ccab0c..f317b9f 100644
          try:
              parallel_config: ParallelConfig = vllm_config.parallel_config
              data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 4b8ccd5..f2e6b2d 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -318,6 +318,10 @@ class ModelRunnerOutput:
+     # req_ids order.
+     num_verified_tokens_per_req: list[int] | None = None
+ 
++    # Copy drafts: per request, the drafts its copy state asks the scheduler
++    # to lay out for the step after the next one. None without copy drafts.
++    copy_draft_alloc: list[int] | None = None
++
+     aux_output_connector_output: dict[str, AuxRequestOutput] | None = None
+ 
+     # ``None`` when ``return_sampling_mask`` is off.
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index bbda79a..54b3c23 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -236,6 +236,8 @@ class Request:
+         # the scheduler when --per-request-spec-decode-metrics is set (eagerly on
+         # add_request, then observed each verify step); stays None otherwise.
+         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
++        # Copy drafts: drafts requested by the worker copy state for next steps.
++        self.copy_draft_alloc = 0
+ 
+         # Prompt block hashes precomputed by the frontend; the hasher continues
+         # from the first block they don't cover. Hidden from the cyclic GC: it
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+index b28681a..4cda291 100644
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -108,6 +108,27 @@ class ConstantList(Generic[T], Sequence):
+         return self._x.copy()
+ 
+ 
++
++_LIBC_MLOCK = None
++
++
++def mlock_memory(addr: int, nbytes: int) -> bool:
++    global _LIBC_MLOCK
++    if _LIBC_MLOCK is False:
++        return False
++    if _LIBC_MLOCK is None:
++        try:
++            import ctypes
++            libc = ctypes.CDLL(None, use_errno=True)
++            libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
++            libc.mlock.restype = ctypes.c_int
++            _LIBC_MLOCK = libc.mlock
++        except Exception:
++            _LIBC_MLOCK = False
++            return False
++    return _LIBC_MLOCK(addr, nbytes) == 0
++
++
+ class CpuGpuBuffer:
+     """Buffer to easily copy tensors between CPU and GPU."""
+ 
+@@ -124,6 +145,8 @@ class CpuGpuBuffer:
+             self.cpu = torch.zeros(
+                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
+             )
++            if pin_memory and self.cpu.nbytes > 0:
++                mlock_memory(self.cpu.data_ptr(), self.cpu.nbytes)
+             self.gpu = torch.zeros_like(self.cpu, device=device)
+         self.np: np.ndarray
+         # To keep type hints simple (avoiding generics and subclasses), we

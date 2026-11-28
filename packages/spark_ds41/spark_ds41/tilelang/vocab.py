@@ -58,20 +58,6 @@ SHARED_MEMORY = 101_376  # dynamic shared memory per block on SM120 / SM121
 GREEDY_PART = 2048
 
 
-def nvfp4_shared_memory_bytes(
-    block_M: int,
-    block_N: int,
-    num_stages: int,
-    step_groups: int = 1,
-    act_stages: int | None = None,
-) -> int:
-    """Shared memory for ``nvfp4_vocab_projection`` across ``step_groups`` groups
-    per step."""
-    a_stages = num_stages if act_stages is None else act_stages
-    act = a_stages * (block_M * GROUP * 2)
-    packed = num_stages * (block_N * (GROUP // 2 + GROUP // NVFP4_GROUP))
-    decoded = block_N * GROUP * 2
-    return step_groups * (act + packed + decoded)
 
 
 @dataclass(frozen=True)
@@ -793,16 +779,6 @@ def _decode(low, code, base_minus_one):
     return T.reinterpret(T.Cast(T.uint16, bits), T.bfloat16)
 
 
-def _decode_e2m1(nibble):
-    """The FP32 value of a 4-bit E2M1 nibble (1 sign bit + 3 magnitude bits)."""
-    n = T.Cast(T.int32, nibble)
-    mag = n & 0x07
-    sign = (n >> 3) & 1
-    fp32_bits = 0x3F000000 + (mag << 22)
-    val = T.reinterpret(T.Cast(T.uint32, fp32_bits), T.float32)
-    val = T.if_then_else(mag == 0, T.float32(0.0), val)
-    val = T.if_then_else(mag == 1, T.float32(0.5), val)
-    return T.if_then_else(sign == 1, -val, val)
 
 
 _GREEDY_HEADER = r"""
@@ -3405,209 +3381,8 @@ def finish_bf16_markov_top2_exact(
     return finish_bf16_markov_top2_exact_kernel
 
 
-@tilelang.jit
-def nvfp4_vocab_projection(
-    N: int,
-    K: int,
-    block_M: int = 16,
-    block_N: int = 64,
-    num_stages: int = 3,
-    threads: int = 128,
-    step_groups: int = 1,
-    act_stages: int | None = None,
-    out_dtype: T.dtype = T.bfloat16,
-):
-    """``C[M, N] = A @ W^T`` for BF16 ``A[M, K]`` and online NVFP4 ``W``
-    (packed E2M1 nibbles ``W[N, K // 2]``, group-16 E4M3 scales
-    ``W_scale[N, K // 16]``, and FP32 ``W_global_scale[1]``), accumulated in FP32
-    and written as ``out_dtype``."""
-    assert K % (GROUP * step_groups) == 0
-    assert (
-        nvfp4_shared_memory_bytes(
-            block_M, block_N, num_stages, step_groups, act_stages=act_stages
-        )
-        <= SHARED_MEMORY
-    )
-    STEP = GROUP * step_groups
-    steps = K // STEP
-    packed_cols = K // 2
-    scale_cols = K // NVFP4_GROUP
-    step_packed = STEP // 2
-    step_scales = STEP // NVFP4_GROUP
-    items = block_N * step_scales
-    M = T.dynamic("M")
-
-    @T.prim_func
-    def vocab_nvfp4_projection(
-        A: T.Tensor((M, K), T.bfloat16),
-        W: T.Tensor((N, packed_cols), T.uint8),
-        W_scale: T.Tensor((N, scale_cols), T.float8_e4m3fn),
-        W_global_scale: T.Tensor((1,), T.float32),
-        C: T.Tensor((M, N), out_dtype),
-    ):
-        with T.Kernel(
-            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
-        ) as (by, bx):
-            A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
-            packed_shared = T.alloc_shared((block_N, step_packed), T.uint8)
-            scale_shared = T.alloc_shared((block_N, step_scales), T.float8_e4m3fn)
-            B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
-            C_local = T.alloc_fragment((block_M, block_N), T.float32)
-            packed_local = T.alloc_local((NVFP4_PACKED,), T.uint8)
-            out_local = T.alloc_local((NVFP4_GROUP,), T.bfloat16)
-            tx = T.get_thread_binding()
-            T.clear(C_local)
-            last = num_stages - 1
-            act_stage = 0 if act_stages is None else last - act_stages + 1
-            for s in (
-                T.serial(steps)
-                if num_stages <= 1
-                else T.Pipelined(
-                    steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
-                )
-            ):
-                T.copy(A[by * block_M, s * STEP], A_shared)
-                T.copy(W[bx * block_N, s * step_packed], packed_shared)
-                T.copy(W_scale[bx * block_N, s * step_scales], scale_shared)
-                for step in T.serial(T.ceildiv(items, threads)):
-                    item = step * threads + tx
-                    if item < items:
-                        j = item // step_scales
-                        g = item % step_scales
-                        scale = T.Cast(T.float32, scale_shared[j, g])
-                        for v in T.vectorized(NVFP4_PACKED):
-                            packed_local[v] = packed_shared[j, g * NVFP4_PACKED + v]
-                        for v in T.unroll(NVFP4_PACKED):
-                            out_local[2 * v] = T.Cast(
-                                T.bfloat16, _decode_e2m1(packed_local[v] & 0xF) * scale
-                            )
-                            out_local[2 * v + 1] = T.Cast(
-                                T.bfloat16, _decode_e2m1(packed_local[v] >> 4) * scale
-                            )
-                        for v in T.vectorized(NVFP4_GROUP):
-                            B_shared[j, g * NVFP4_GROUP + v] = out_local[v]
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
-            global_scale = W_global_scale[0]
-            for i, j in T.Parallel(block_M, block_N):
-                C_local[i, j] = C_local[i, j] * global_scale
-            T.copy(C_local, C[by * block_M, bx * block_N])
-
-    return vocab_nvfp4_projection
 
 
-@tilelang.jit
-def nvfp4_vocab_greedy_partials(
-    N: int,
-    K: int,
-    block_M: int = 16,
-    block_N: int = 64,
-    num_stages: int = 3,
-    threads: int = 128,
-    step_groups: int = 1,
-    act_stages: int | None = None,
-    out_dtype: T.dtype = T.bfloat16,
-):
-    """Per-tile ``(max, shard index)`` of ``A @ W^T`` for BF16 ``A[M, K]`` and
-    online NVFP4 ``W``, reduced in each CTA's epilogue without writing ``[M, N]``
-    logits to DRAM."""
-    assert K % (GROUP * step_groups) == 0
-    assert (
-        nvfp4_shared_memory_bytes(
-            block_M, block_N, num_stages, step_groups, act_stages=act_stages
-        )
-        <= SHARED_MEMORY
-    )
-    STEP = GROUP * step_groups
-    steps = K // STEP
-    packed_cols = K // 2
-    scale_cols = K // NVFP4_GROUP
-    step_packed = STEP // 2
-    step_scales = STEP // NVFP4_GROUP
-    items = block_N * step_scales
-    num_tiles = (N + block_N - 1) // block_N
-    warps_n = (threads // 32) // (1 if block_M == 16 else 2)
-    M = T.dynamic("M")
-
-    @T.prim_func
-    def vocab_nvfp4_greedy_partials(
-        A: T.Tensor((M, K), T.bfloat16),
-        W: T.Tensor((N, packed_cols), T.uint8),
-        W_scale: T.Tensor((N, scale_cols), T.float8_e4m3fn),
-        W_global_scale: T.Tensor((1,), T.float32),
-        partial_vals: T.Tensor((M, num_tiles), T.float32),
-        partial_idxs: T.Tensor((M, num_tiles), T.int32),
-        vocab: T.int32,
-    ):
-        with T.Kernel(
-            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
-        ) as (by, bx):
-            T.import_source(_GREEDY_HEADER)
-            A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
-            packed_shared = T.alloc_shared((block_N, step_packed), T.uint8)
-            scale_shared = T.alloc_shared((block_N, step_scales), T.float8_e4m3fn)
-            B_shared = T.alloc_shared((block_N, STEP), T.bfloat16)
-            smem_v = T.alloc_shared((block_M * warps_n,), T.float32)
-            smem_i = T.alloc_shared((block_M * warps_n,), T.int32)
-            C_local = T.alloc_fragment((block_M, block_N), T.float32)
-            packed_local = T.alloc_local((NVFP4_PACKED,), T.uint8)
-            out_local = T.alloc_local((NVFP4_GROUP,), T.bfloat16)
-            tx = T.get_thread_binding()
-            T.clear(C_local)
-            last = num_stages - 1
-            act_stage = 0 if act_stages is None else last - act_stages + 1
-            for s in (
-                T.serial(steps)
-                if num_stages <= 1
-                else T.Pipelined(
-                    steps, order=[0, 1, 2, 3, 4], stage=[act_stage, 0, 0, last, last]
-                )
-            ):
-                T.copy(A[by * block_M, s * STEP], A_shared)
-                T.copy(W[bx * block_N, s * step_packed], packed_shared)
-                T.copy(W_scale[bx * block_N, s * step_scales], scale_shared)
-                for step in T.serial(T.ceildiv(items, threads)):
-                    item = step * threads + tx
-                    if item < items:
-                        j = item // step_scales
-                        g = item % step_scales
-                        scale = T.Cast(T.float32, scale_shared[j, g])
-                        for v in T.vectorized(NVFP4_PACKED):
-                            packed_local[v] = packed_shared[j, g * NVFP4_PACKED + v]
-                        for v in T.unroll(NVFP4_PACKED):
-                            out_local[2 * v] = T.Cast(
-                                T.bfloat16, _decode_e2m1(packed_local[v] & 0xF) * scale
-                            )
-                            out_local[2 * v + 1] = T.Cast(
-                                T.bfloat16, _decode_e2m1(packed_local[v] >> 4) * scale
-                            )
-                        for v in T.vectorized(NVFP4_GROUP):
-                            B_shared[j, g * NVFP4_GROUP + v] = out_local[v]
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
-            global_scale = W_global_scale[0]
-            for i, j in T.Parallel(block_M, block_N):
-                val = C_local[i, j] * global_scale
-                if out_dtype == T.bfloat16:
-                    val = T.Cast(T.float32, T.Cast(T.bfloat16, val))
-                C_local[i, j] = val
-            T.call_extern(
-                "handle",
-                "vllm_vocab_tile_argmax_clocal",
-                        block_M,
-                        block_N,
-                        threads,
-                T.address_of(smem_v[0]),
-                T.address_of(smem_i[0]),
-                T.address_of(partial_vals[0, 0]),
-                T.address_of(partial_idxs[0, 0]),
-                by,
-                bx,
-                M,
-                vocab,
-                num_tiles,
-                tx,
-            )
-
-    return vocab_nvfp4_greedy_partials
 
 
 
@@ -4594,46 +4369,8 @@ def _packed_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dic
     }
 
 
-def _nvfp4_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
-    """An online NVFP4 head's projection for every token tile, as calls."""
-    n = int(layer.weight.shape[0])
-    k = getattr(layer, "nvfp4_in_features", int(layer.weight.shape[1]) * 2)
-    return {
-        block_M: prepare.call(
-            nvfp4_vocab_projection,
-            n,
-            k,
-            block_M=block_M,
-            out_dtype=_OUT[out_dtype],
-            **tile_config(block_M, k),
-        )
-        for block_M in _head_row_tiles(layer)
-    }
 
 
-def _nvfp4_head_greedy_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
-    """An online NVFP4 head's fused greedy-pair projection and reduction for every
-    token tile, as calls."""
-    n = int(layer.weight.shape[0])
-    k = getattr(layer, "nvfp4_in_features", int(layer.weight.shape[1]) * 2)
-    partials = {}
-    finishes = {}
-    for block_M in _head_row_tiles(layer):
-        config = tile_config(block_M, k)
-        num_tiles = (n + config["block_N"] - 1) // config["block_N"]
-        partials[block_M] = prepare.call(
-            nvfp4_vocab_greedy_partials,
-            n,
-            k,
-            block_M=block_M,
-            out_dtype=_OUT[out_dtype],
-            **config,
-        )
-        finishes.setdefault(
-            num_tiles,
-            prepare.call(finish_vocab_greedy_pairs, num_tiles),
-        )
-    return {"partials": partials, "finishes": finishes}
 
 
 def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
@@ -4947,41 +4684,6 @@ def prepare_packed_head(
         )
 
 
-def prepare_nvfp4_head(
-    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
-) -> None:
-    """Declare an online NVFP4 head's projection and fused greedy pairs for every
-    token tile, writing ``out_dtype`` logits."""
-    if not hasattr(layer, "nvfp4_in_features"):
-        layer.nvfp4_in_features = int(layer.weight.shape[1]) * 2
-    _declare_head(layer, _nvfp4_head_kernels(layer, out_dtype), out_dtype)
-    greedy = _nvfp4_head_greedy_kernels(layer, out_dtype)
-    partials = greedy["partials"]
-    finishes = greedy["finishes"]
-
-    def bind_greedy() -> None:
-        n, k = int(layer.weight.shape[0]), layer.nvfp4_in_features
-        compiled_finishes = {
-            num_tiles: function(*args, **kwargs)
-            for num_tiles, (function, args, kwargs) in finishes.items()
-        }
-        layer.tilelang_vocab_greedy = {
-            block_M: (
-                function(*args, **kwargs),
-                compiled_finishes[
-                    (n + tile_config(block_M, k)["block_N"] - 1)
-                    // tile_config(block_M, k)["block_N"]
-                ],
-                (n + tile_config(block_M, k)["block_N"] - 1)
-                // tile_config(block_M, k)["block_N"],
-            )
-            for block_M, (function, args, kwargs) in partials.items()
-        }
-
-    prepare.declare(
-        lambda: list(partials.values()) + list(finishes.values()),
-        bind=bind_greedy,
-    )
 
 
 def prepare_bf16_head(
@@ -5777,9 +5479,6 @@ __all__ = [
     "WINDOW",
     "bf16_vocab_markov_greedy_partials",
     "finish_vocab_greedy_pairs",
-    "nvfp4_shared_memory_bytes",
-    "nvfp4_vocab_greedy_partials",
-    "nvfp4_vocab_projection",
     "pack",
     "pack_bf16_weight",
     "packed_bf16_exception_count",
@@ -5789,7 +5488,6 @@ __all__ = [
     "packed_vocab_markov_greedy_partials",
     "packed_vocab_projection",
     "prepare_bf16_head",
-    "prepare_nvfp4_head",
     "prepare_packed_head",
     "project_head",
     "project_head_greedy_pairs",

@@ -220,14 +220,3 @@ def compute_prompt_logprobs_with_chunking(
         )
 
     return token_ids, scores, ranks
-
-
-_TRITON_REFS = frozenset(("_prompt_logprobs_token_ids_kernel",))
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REFS:
-        from spark_ds41.sampling import _triton_refs
-
-        return getattr(_triton_refs, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

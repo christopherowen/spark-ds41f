@@ -1,17 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 15:14:14 +0100
-Subject: [PATCH 3/9] Add DirectModelLoader, buddy sponge, layerwise direct
- load, and mlock hooks
+From: Christopher Owen <christopher@owen.dev>
+Date: Sat, 28 Nov 2026 15:00:00 +0000
+Subject: [PATCH] Add DirectModelLoader, buddy sponge, layerwise direct load,
+ and dummy arena
 
 ---
  vllm/model_executor/model_loader/__init__.py  |  4 ++
  .../model_loader/base_loader.py               | 12 ++++++
+ .../model_loader/dummy_loader.py              | 23 +++++++++++
  .../model_loader/reload/layerwise.py          | 41 +++++++++++++++++--
  vllm/model_executor/model_loader/utils.py     | 28 ++++++++++++-
- vllm/model_executor/utils.py                  |  5 +++
- vllm/v1/utils.py                              | 23 +++++++++++
- 6 files changed, 108 insertions(+), 5 deletions(-)
+ .../model_loader/weight_utils.py              |  2 +-
+ 6 files changed, 104 insertions(+), 6 deletions(-)
 
 diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
 index ef97147..c7d54d4 100644
@@ -52,6 +52,40 @@ index 17ed747..2f9e5a6 100644
  
              gc.collect()
              torch.accelerator.empty_cache()
+diff --git a/vllm/model_executor/model_loader/dummy_loader.py b/vllm/model_executor/model_loader/dummy_loader.py
+index ff732f6..eb2f8bc 100644
+--- a/vllm/model_executor/model_loader/dummy_loader.py
++++ b/vllm/model_executor/model_loader/dummy_loader.py
+@@ -32,6 +32,29 @@ class DummyModelLoader(BaseModelLoader):
+     def download_model(self, model_config: ModelConfig) -> None:
+         pass  # Nothing to download
+ 
++    def create_model(
++        self, vllm_config, model_config: ModelConfig, prefix: str = ""
++    ) -> nn.Module:
++        import os
++        import torch
++
++        from vllm.model_executor.model_loader.base_loader import _has_online_quant
++
++        model = super().create_model(vllm_config, model_config, prefix)
++        if (
++            os.environ.get("VLLM_DUMMY_WEIGHT_ARENA", "1").strip()
++            not in ("0", "false", "none")
++            and not _has_online_quant(model)
++        ):
++            device = torch.device(
++                self.load_config.device or vllm_config.device_config.device
++            )
++            if device.type == "cuda":
++                from spark_ds41.direct_io.direct_loader import bind_weight_arena
++
++                bind_weight_arena(model, device, retain_sponge=True)
++        return model
++
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+         for layer in model.modules():
+             info = get_layerwise_info(layer)
 diff --git a/vllm/model_executor/model_loader/reload/layerwise.py b/vllm/model_executor/model_loader/reload/layerwise.py
 index 2f55589..46501de 100644
 --- a/vllm/model_executor/model_loader/reload/layerwise.py
@@ -175,60 +209,16 @@ index 07999c4..be99d4e 100644
      finalize_model_weights(model, target_device)
  
  
-diff --git a/vllm/model_executor/utils.py b/vllm/model_executor/utils.py
-index 0a4a060..0dda33e 100644
---- a/vllm/model_executor/utils.py
-+++ b/vllm/model_executor/utils.py
-@@ -98,6 +98,11 @@ def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-     a CPU temporary. Sources with at most one element are skipped: they count
-     as contiguous with any stride, which `view(torch.uint8)` rejects.
-     """
-+    from spark_ds41.direct_io.weight_transfer import _writer
-+
-+    writer = _writer.get()
-+    if writer is not None and not dst.is_meta and writer(dst, src):
-+        return dst
-     if (
-         src.dtype != dst.dtype
-         and src.dtype in _BYTE_CONTAINERS
-diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
-index b28681a..4cda291 100644
---- a/vllm/v1/utils.py
-+++ b/vllm/v1/utils.py
-@@ -108,6 +108,27 @@ class ConstantList(Generic[T], Sequence):
-         return self._x.copy()
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index f79dca7..c7fef83 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -1699,7 +1699,7 @@ def initialize_single_dummy_weight(
+         return
  
- 
-+
-+_LIBC_MLOCK = None
-+
-+
-+def mlock_memory(addr: int, nbytes: int) -> bool:
-+    global _LIBC_MLOCK
-+    if _LIBC_MLOCK is False:
-+        return False
-+    if _LIBC_MLOCK is None:
-+        try:
-+            import ctypes
-+            libc = ctypes.CDLL(None, use_errno=True)
-+            libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-+            libc.mlock.restype = ctypes.c_int
-+            _LIBC_MLOCK = libc.mlock
-+        except Exception:
-+            _LIBC_MLOCK = False
-+            return False
-+    return _LIBC_MLOCK(addr, nbytes) == 0
-+
-+
- class CpuGpuBuffer:
-     """Buffer to easily copy tensors between CPU and GPU."""
- 
-@@ -124,6 +145,8 @@ class CpuGpuBuffer:
-             self.cpu = torch.zeros(
-                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
-             )
-+            if pin_memory and self.cpu.nbytes > 0:
-+                mlock_memory(self.cpu.data_ptr(), self.cpu.nbytes)
-             self.gpu = torch.zeros_like(self.cpu, device=device)
-         self.np: np.ndarray
-         # To keep type hints simple (avoiding generics and subclasses), we
+     if not torch.is_floating_point(param):
+-        if current_platform.is_rocm():
++        if current_platform.is_rocm() or current_platform.is_cuda():
+             # On ROCm, integer params (e.g. GPTQ qweight/qzeros) are left
+             # as torch.empty() by default, giving non-deterministic values
+             # across processes. Zero them for reproducibility.

@@ -214,23 +214,3 @@ def sample_greedy_markov(
     tilelang_sampling.sample_greedy_markov(
         base_logits, markov_bias, output, partial_values, partial_indices
     )
-
-
-_TRITON_REFS = frozenset(
-    (
-        "_first_argmax",
-        "_partial_argmax",
-        "_partial_argmax_logits",
-        "_finish_argmax",
-        "_finish_argmax_pair",
-        "_select_first_argmax",
-    )
-)
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REFS:
-        from spark_ds41.sampling import _triton_refs
-
-        return getattr(_triton_refs, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -291,14 +291,3 @@ def register_sampled_verification_warmups(
         step_widths=step_widths,
         dead_rows=dead_rows,
     )
-
-
-_TRITON_REFS = frozenset(("_greedy_rejection_kernel",))
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REFS:
-        from spark_ds41.sampling import _triton_refs
-
-        return getattr(_triton_refs, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

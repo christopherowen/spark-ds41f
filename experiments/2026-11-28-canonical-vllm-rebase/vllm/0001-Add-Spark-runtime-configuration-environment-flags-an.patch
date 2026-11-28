@@ -1,21 +1,23 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 15:14:13 +0100
-Subject: [PATCH 1/9] Add Spark runtime configuration, environment flags, and
- CLI arguments
+From: Christopher Owen <christopher@owen.dev>
+Date: Sat, 28 Nov 2026 15:00:00 +0000
+Subject: [PATCH] Add Spark runtime configuration, environment flags, and
+ sampling params
 
 ---
  requirements/cuda.txt        |   2 +-
- vllm/config/engram.py        |  11 ++
+ vllm/config/engram.py        |  11 +++
  vllm/config/kernel.py        |   2 +
  vllm/config/model.py         |   1 +
  vllm/config/observability.py |   2 +-
  vllm/config/scheduler.py     |   7 ++
- vllm/config/speculative.py   | 108 +++++++++++++++++++
- vllm/config/vllm.py          | 106 +++++++++++++++++--
+ vllm/config/speculative.py   | 108 +++++++++++++++++++++
+ vllm/config/vllm.py          | 106 +++++++++++++++++++--
  vllm/engine/arg_utils.py     |  29 ++++++
- vllm/envs.py                 | 195 +++++++++++++++++++++++++++++++++++
- 10 files changed, 453 insertions(+), 10 deletions(-)
+ vllm/envs.py                 | 179 +++++++++++++++++++++++++++++++++++
+ vllm/forward_context.py      |  12 +++
+ vllm/sampling_params.py      |   4 +
+ 12 files changed, 453 insertions(+), 10 deletions(-)
 
 diff --git a/requirements/cuda.txt b/requirements/cuda.txt
 index 4a8d286..86a3943 100644
@@ -488,18 +490,14 @@ index e39bed0..cc136d6 100644
                  self.long_prefill_token_threshold_adaptive
              ),
 diff --git a/vllm/envs.py b/vllm/envs.py
-index b5a83e5..09498ca 100644
+index b5a83e5..2977f08 100644
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -364,6 +364,62 @@ if TYPE_CHECKING:
+@@ -364,6 +364,58 @@ if TYPE_CHECKING:
      VLLM_USE_SIMPLE_KV_OFFLOAD: bool = False
      VLLM_USE_SPINLOOP_EXT: bool = False
      VLLM_SKIP_VERSION_SUFFIX: bool = False
 +    # Spark DS4.1 / RoCE / direct-loader / GLP environment knobs
-+    VLLM_DFLASH_AUX_BF16_STAGING: bool = False
-+    VLLM_DFLASH_AUX_MXFP8_STREAMING: bool = False
-+    VLLM_DFLASH_COMPACT_ROPE: bool = False
-+    VLLM_DFLASH_SHARD_AUX_PROJECTION: bool = False
 +    VLLM_DFLASH_VOCAB_PARALLEL_DRAFT: bool = False
 +    VLLM_DS41_EXPERT_CACHE_DIR: str | None = None
 +    VLLM_DS41_EXPERT_DYNAMIC_SLOTS: int = 48
@@ -554,23 +552,11 @@ index b5a83e5..09498ca 100644
  
  
  def get_default_cache_root():
-@@ -2459,6 +2515,145 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -2459,6 +2511,133 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_REQUEST_BODY_LOG_LEVEL": lambda: os.getenv(
          "VLLM_REQUEST_BODY_LOG_LEVEL", "DEBUG"
      ).upper(),
 +    # Spark DS4.1 / RoCE / direct-loader / GLP environment knobs
-+    "VLLM_DFLASH_AUX_BF16_STAGING": lambda: bool(
-+        int(os.getenv("VLLM_DFLASH_AUX_BF16_STAGING", "0"))
-+    ),
-+    "VLLM_DFLASH_AUX_MXFP8_STREAMING": lambda: bool(
-+        int(os.getenv("VLLM_DFLASH_AUX_MXFP8_STREAMING", "0"))
-+    ),
-+    "VLLM_DFLASH_COMPACT_ROPE": lambda: bool(
-+        int(os.getenv("VLLM_DFLASH_COMPACT_ROPE", "0"))
-+    ),
-+    "VLLM_DFLASH_SHARD_AUX_PROJECTION": lambda: bool(
-+        int(os.getenv("VLLM_DFLASH_SHARD_AUX_PROJECTION", "0"))
-+    ),
 +    "VLLM_DFLASH_VOCAB_PARALLEL_DRAFT": lambda: (
 +        os.getenv("VLLM_DFLASH_VOCAB_PARALLEL_DRAFT", "0") == "1"
 +    ),
@@ -700,3 +686,69 @@ index b5a83e5..09498ca 100644
  }
  
  
+diff --git a/vllm/forward_context.py b/vllm/forward_context.py
+index eb25b32..255e41e 100644
+--- a/vllm/forward_context.py
++++ b/vllm/forward_context.py
+@@ -133,6 +133,14 @@ class DPMetadata:
+         return torch.cumsum(num_tokens_across_sp_cpu, dim=0)
+ 
+ 
++@dataclass(frozen=True)
++class MoEPrefillMetadata:
++    """Semantic prefill ranges in a target forward's padded token ordering."""
++
++    num_tokens: int
++    prefill_ranges: tuple[tuple[int, int], ...]
++
++
+ @dataclass
+ class ForwardContext:
+     # copy from vllm_config.compilation_config.static_forward_context
+@@ -148,6 +156,7 @@ class ForwardContext:
+     """
+     # set dynamically for each forward pass
+     dp_metadata: DPMetadata | None = None
++    moe_prefill_metadata: MoEPrefillMetadata | None = None
+     # determine the cudagraph style at runtime to be FULL, PIECEWISE, or NONE.
+     # by default NONE, no cudagraph is used.
+     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
+@@ -234,6 +243,7 @@ def create_forward_context(
+     additional_kwargs: dict[str, Any] | None = None,
+     skip_compiled: bool = False,
+     is_padding: torch.Tensor | None = None,
++    moe_prefill_metadata: MoEPrefillMetadata | None = None,
+ ):
+     if vllm_config.compilation_config.fast_moe_cold_start:
+         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
+@@ -282,6 +292,7 @@ def set_forward_context(
+     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+     skip_compiled: bool = False,
+     is_padding: torch.Tensor | None = None,
++    moe_prefill_metadata: MoEPrefillMetadata | None = None,
+ ):
+     """A context manager that stores the current forward context,
+     can be attention metadata, etc.
+@@ -349,6 +360,7 @@ def set_forward_context(
+         additional_kwargs,
+         skip_compiled,
+         is_padding=is_padding,
++        moe_prefill_metadata=moe_prefill_metadata,
+     )
+ 
+     try:
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index 2d025fe..c750493 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -581,6 +581,10 @@ class SamplingParams(
+         self.thinking_token_budget = validate_thinking_token_budget(
+             self.thinking_token_budget
+         )
++        if isinstance(self.repetition_detection, dict):
++            self.repetition_detection = RepetitionDetectionParams(
++                **self.repetition_detection
++            )
+ 
+         if self.stop is None:
+             self.stop = []

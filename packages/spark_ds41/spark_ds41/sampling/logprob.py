@@ -181,20 +181,3 @@ class LogprobTokenIdsState:
 
     def max_num_token_ids(self, idx_mapping_np: np.ndarray) -> int:
         return int(self.num_token_ids.np[idx_mapping_np].max(initial=0))
-
-
-_TRITON_REFS = frozenset(
-    (
-        "_topk_log_softmax_kernel",
-        "_ranks_kernel",
-        "_fill_logprob_token_ids_kernel",
-    )
-)
-
-
-def __getattr__(name: str):
-    if name in _TRITON_REFS:
-        from spark_ds41.sampling import _triton_refs
-
-        return getattr(_triton_refs, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
