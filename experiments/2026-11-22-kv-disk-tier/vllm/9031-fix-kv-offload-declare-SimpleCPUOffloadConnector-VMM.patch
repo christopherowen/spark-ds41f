@@ -1,0 +1,196 @@
+From c136ecae75c6ad11602e0d00146e648b291f7a74 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:43:32 +0000
+Subject: [PATCH] fix(kv-offload): declare SimpleCPUOffloadConnector VMM-safe
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patch 9030 of this
+series.
+
+Rationale: VllmConfig._verify_kv_transfer_compat raises a ValueError
+when PYTORCH_CUDA_ALLOC_CONF holds expandable_segments:True and the
+connector does not declare itself safe under VMM remapping. The check
+exists for connectors that register GPU physical pages, such as NIXL
+through ibv_reg_mr and Mooncake, because a remap leaves their
+registrations on stale pages and the first remote transfer then fails
+with IBV_WC_REM_ACCESS_ERR. This connector registers no GPU pages. It
+reaches the GPU cache through virtual addresses at copy time
+(cuMemcpyBatchAsync on data_ptr() bases, in cuda_mem_ops.build_params and
+copy_blocks), and the only memory it pins is host memory, either the CPU
+pool or the disk staging slots, through cudaHostRegister. The disk
+backend reads and writes the file with pwritev and preadv on those host
+slots, and the KV cache tensor lives as long as the engine, so its
+virtual range stays mapped. The spark-ds41f launch sets
+expandable_segments:True, so this patch makes SimpleCPUOffloadConnector
+implement SupportsVmmSafeTransfers and return True for its two backends,
+"cpu" and "disk", and leaves the allocator setting of the recipe as it
+is. An unknown backend name is not declared safe.
+
+Quality implications: the patch does not change outputs, and the check
+stays in force for every other connector.
+
+Tests: tests/v1/simple_kv_offload/test_ds41_offload.py checks that
+supports_vmm_safe_transfers() returns True for "disk", for "cpu", and for
+the default, and False for an unknown backend. It also checks that
+_verify_kv_transfer_compat passes with the PYTORCH_CUDA_ALLOC_CONF of the
+spark-ds41f launch (expandable_segments:True,garbage_collection_threshold:0.6),
+that the same call raised the ValueError before this patch, and that
+NixlConnector still raises it. On the CPU path the offload suite passed
+107 tests, with 2 CUDA-only modules skipped. On DGX Spark hardware the
+patch ran only as part of the whole series.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../v1/simple_kv_offload/test_ds41_offload.py | 74 ++++++++++++++++++-
+ .../v1/simple_cpu_offload_connector.py        | 22 +++++-
+ 2 files changed, 94 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_offload.py b/tests/v1/simple_kv_offload/test_ds41_offload.py
+index 7a8567927..659e29c3d 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_offload.py
++++ b/tests/v1/simple_kv_offload/test_ds41_offload.py
+@@ -139,7 +139,7 @@ def test_scheduler_boots_on_ds41_groups_unpatched_lookup(ds41_config) -> None:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# 0831: padded O_DIRECT slots
++# 0830: padded O_DIRECT slots
+ # ---------------------------------------------------------------------------
+ 
+ 
+@@ -368,3 +368,75 @@ def _wait_for(predicate, timeout_s: float = 10.0) -> None:
+             return
+         done.wait(0.01)
+     raise AssertionError("IO thread did not finish")
++
++
++# ---------------------------------------------------------------------------
++# 0831: expandable_segments declaration
++# ---------------------------------------------------------------------------
++
++
++def _transfer_config(backend: str | None = "disk"):
++    from vllm.config import KVTransferConfig
++
++    extra = {} if backend is None else {"kv_offload_backend": backend}
++    return KVTransferConfig(
++        kv_connector="SimpleCPUOffloadConnector",
++        kv_role="kv_both",
++        kv_connector_extra_config=extra,
++    )
++
++
++def _vmm_safe(config) -> bool:
++    from vllm.distributed.kv_transfer.kv_connector.v1 import (
++        supports_vmm_safe_transfers,
++    )
++    from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
++        SimpleCPUOffloadConnector,
++    )
++
++    return supports_vmm_safe_transfers(SimpleCPUOffloadConnector, config)
++
++
++@pytest.mark.parametrize("backend", ["disk", "cpu", None])
++def test_simple_cpu_offload_declares_vmm_safe(backend) -> None:
++    assert _vmm_safe(_transfer_config(backend))
++
++
++def test_unknown_backend_is_not_declared_vmm_safe() -> None:
++    assert not _vmm_safe(_transfer_config("gds"))
++
++
++def _verify(kv_transfer_config) -> None:
++    """Run VllmConfig._verify_kv_transfer_compat on the fields it reads."""
++    from vllm.config.vllm import VllmConfig
++
++    holder = SimpleNamespace(
++        kv_transfer_config=kv_transfer_config,
++        model_config=SimpleNamespace(
++            hf_text_config=SimpleNamespace(model_type="deepseek_v41_text"),
++            enable_cumem_allocator=False,
++        ),
++    )
++    holder._connector_supports_vmm_safe_transfers = lambda: (
++        VllmConfig._connector_supports_vmm_safe_transfers(holder)
++    )
++    VllmConfig._verify_kv_transfer_compat(holder)
++
++
++def test_live_allocator_conf_accepts_disk_tier(monkeypatch) -> None:
++    """The live engine's PYTORCH_CUDA_ALLOC_CONF no longer blocks the tier."""
++    monkeypatch.setenv(
++        "PYTORCH_CUDA_ALLOC_CONF",
++        "expandable_segments:True,garbage_collection_threshold:0.6",
++    )
++    _verify(_transfer_config("disk"))
++
++
++def test_registering_connector_still_rejected(monkeypatch) -> None:
++    """Control: a connector without the declaration still raises."""
++    from vllm.config import KVTransferConfig
++
++    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
++    config = KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_both")
++    with pytest.raises(ValueError, match="expandable_segments"):
++        _verify(config)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 21d5407db..03d239dcd 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorMetadata,
+     KVConnectorRole,
+     SupportsHMA,
++    SupportsVmmSafeTransfers,
+ )
+ from vllm.logger import init_logger
+ from vllm.v1.core.sched.output import SchedulerOutput
+@@ -30,6 +31,7 @@ from vllm.v1.simple_kv_offload.worker import (
+ )
+ 
+ if TYPE_CHECKING:
++    from vllm.config import KVTransferConfig
+     from vllm.forward_context import ForwardContext
+     from vllm.v1.attention.backend import AttentionMetadata
+     from vllm.v1.core.block_pool import BlockPool
+@@ -52,7 +54,9 @@ _DISK_ONLY_KEYS = (
+ )
+ 
+ 
+-class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
++class SimpleCPUOffloadConnector(
++    KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers
++):
+     """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
+ 
+     @classmethod
+@@ -60,6 +64,22 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+         # Aligned Qwen QSA restores are validated with this connector.
+         return True
+ 
++    @classmethod
++    def supports_vmm_safe_transfer_config(
++        cls, kv_transfer_config: "KVTransferConfig"
++    ) -> bool:
++        # Both backends reach the GPU KV cache only through virtual addresses
++        # resolved at copy time: cuMemcpyBatchAsync / hipMemcpyBatchAsync on
++        # data_ptr() bases (cuda_mem_ops.build_params, copy_blocks). The only
++        # registered memory is host memory, the CPU pool or the disk staging
++        # slots, pinned with cudaHostRegister. No RDMA, GPUDirect or GDS
++        # registration of GPU pages exists, so an expandable_segments remap
++        # cannot leave a stale registration behind. The disk backend reaches
++        # the file with pwritev/preadv on those host slots only.
++        extra = kv_transfer_config.kv_connector_extra_config or {}
++        backend = str(extra.get("kv_offload_backend", "cpu"))
++        return backend in VALID_KV_OFFLOAD_BACKENDS
++
+     @property
+     def requires_kv_delivery(self) -> bool:
+         # Runs as kv_both, but is a best-effort cache: a dropped save is just a
+-- 
+2.56.1
+

@@ -1,0 +1,206 @@
+From 067d7419eda78fd2c865ca06944d297c7a005d9a Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:44:36 +0000
+Subject: [PATCH] fix(kv-offload): cap external hits at the bounded-replay
+ boundary
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 and 9031
+of this series.
+
+Rationale: on DeepSeek-V4.1-Flash the CED decoder windows (layers 20 to
+39) and the DSpark drafter windows (layers 40 to 42) are not
+prefix-cached, because models/deepseek_v4_1/attention.py sets
+prefix_cache_enabled=False and prefill_replay_window=128 for them. A hit
+must therefore leave the last 128 prompt tokens to compute, so that
+those windows are rebuilt, and a hit in the GPU pool already stops
+there. The external lookup of the connector stopped only at
+num_tokens - 1 - local. Because hits land on 256-token boundaries, a new
+turn that ended 1 to 127 tokens past a boundary got a disk hit that left
+fewer than 128 tokens, so the decoder and the drafter would run on a
+partial window. The expected effect is a changed answer with no error,
+although no changed answer was observed; the tests below show only the
+short remainder. A preempted request could also take a hit that ran
+into its own generated tokens. This patch makes
+SimpleCPUOffloadScheduler.get_num_new_matched_tokens cap a CPU or disk
+hit with the rule that kv_cache_manager.get_computed_blocks applies to a
+hit in the GPU pool. The hit now ends at least max(1,
+prefill_replay_tokens) tokens before the end of the prompt, measured
+from the original prompt after a preemption, or before num_tokens for a
+model without bounded replay and for a streaming-input request.
+
+Quality implications: a disk hit can no longer leave less than the
+replay window to compute, which removes the expected cause of a changed
+answer after a short new turn. A disk hit now leaves the same replay
+suffix as a hit in the GPU pool, so a turn of 1 to 127 tokens past a
+boundary loads up to one block less from disk.
+
+Tests: tests/v1/simple_kv_offload/test_ds41_offload.py runs the lookup
+on the model's packed layout, with the scheduler config built as
+EngineCore builds it. For a cached 64K prompt followed by new turns of
+1, 2, 64, 127, 128, 129, 200, 255, 256, and 300 tokens, with no local
+hit and with 4 local blocks, the lookup cap is the prompt length less
+128 and less the local tokens, and every hit leaves at least 128 tokens
+to compute. Before this patch the 64-token turn left 64 tokens. A
+preempted 4,096-token prompt with 500 output tokens is now capped at
+3,968 tokens, where the old cap was 4,595. A model without replay groups
+keeps the cap at num_tokens - 1, and a 128-token prompt gets no external
+hit. On the CPU path the offload suite passed 130 tests, with 2
+CUDA-only modules skipped. On DGX Spark hardware the patch ran only as
+part of the whole series.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../v1/simple_kv_offload/test_ds41_offload.py | 104 ++++++++++++++++++
+ vllm/v1/simple_kv_offload/manager.py          |  20 +++-
+ 2 files changed, 121 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_offload.py b/tests/v1/simple_kv_offload/test_ds41_offload.py
+index 659e29c3d..a429c0514 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_offload.py
++++ b/tests/v1/simple_kv_offload/test_ds41_offload.py
+@@ -440,3 +440,107 @@ def test_registering_connector_still_rejected(monkeypatch) -> None:
+     config = KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_both")
+     with pytest.raises(ValueError, match="expandable_segments"):
+         _verify(config)
++
++
++# ---------------------------------------------------------------------------
++# 0832: bounded replay on external hits
++# ---------------------------------------------------------------------------
++
++
++class _RecordingCoordinator:
++    """Stands in for the CPU coordinator: records the cap it is given and
++    returns the longest hit the cap allows, aligned like a real hit."""
++
++    def __init__(self, inner, alignment: int):
++        self._inner = inner
++        self.alignment = alignment
++        self.caps: list[int] = []
++
++    def __getattr__(self, name):
++        return getattr(self._inner, name)
++
++    def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
++        self.caps.append(max_cache_hit_length)
++        hashed = len(block_hashes) * HASH_BLOCK_SIZE
++        hit = min(hashed, max_cache_hit_length) // self.alignment * self.alignment
++        groups = tuple([] for _ in self._inner.single_type_managers)
++        return groups, hit, 0
++
++
++def _ds41_request(num_prompt_tokens: int):
++    # make_request hashes at 16 tokens; rebuild the hasher at 128 tokens.
++    from tests.v1.simple_kv_offload.test_scheduler import make_request
++    from vllm.utils.hashing import sha256
++    from vllm.v1.core.kv_cache_utils import get_request_block_hasher
++    from vllm.v1.request import Request
++
++    base = make_request(num_blocks=1)
++    tokens = list(range(1_000_000, 1_000_000 + num_prompt_tokens))
++    return Request(
++        request_id=base.request_id + f"-{num_prompt_tokens}",
++        prompt_token_ids=tokens,
++        sampling_params=base.sampling_params,
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=get_request_block_hasher(HASH_BLOCK_SIZE, sha256),
++    )
++
++
++@pytest.mark.parametrize("new_tokens", [1, 2, 64, 127, 128, 129, 200, 255, 256, 300])
++@pytest.mark.parametrize("local_blocks", [0, 4])
++def test_external_hit_leaves_the_replay_suffix(
++    ds41_config, new_tokens: int, local_blocks: int
++) -> None:
++    """Every external hit leaves at least the 128 decoder/drafter replay tokens
++    to compute, as the local lookup (kv_cache_manager.get_computed_blocks)
++    does. A cached 64K prompt plus a new turn of 1 to 300 tokens."""
++    sched = _ds41_scheduler(ds41_config, disk_bytes=1 * GIB)
++    recorder = _RecordingCoordinator(sched.cpu_coordinator, SCHEDULER_BLOCK_SIZE)
++    sched.cpu_coordinator = recorder
++    prompt = 65536 + new_tokens
++    request = _ds41_request(prompt)
++    local = local_blocks * SCHEDULER_BLOCK_SIZE
++    hit, is_async = sched.get_num_new_matched_tokens(request, local)
++    computed = local + hit
++    assert request.num_prompt_tokens - computed >= 128
++    assert recorder.caps[-1] == prompt - 128 - local
++    if hit:
++        assert is_async
++        assert computed % SCHEDULER_BLOCK_SIZE == 0
++
++
++def test_external_hit_without_replay_groups_keeps_one_token() -> None:
++    """A model with no bounded-replay group keeps the old cap: all but one."""
++    from tests.v1.simple_kv_offload.test_scheduler import (
++        make_request,
++        make_scheduler,
++    )
++
++    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16)
++    sched = fix.scheduler
++    assert sched.cpu_coordinator.prefill_replay_tokens == 0
++    recorder = _RecordingCoordinator(sched.cpu_coordinator, 16)
++    sched.cpu_coordinator = recorder
++    request = make_request(num_blocks=4, extra_tokens=0)
++    sched.get_num_new_matched_tokens(request, 0)
++    assert recorder.caps[-1] == request.num_tokens - 1
++
++
++def test_external_hit_after_preemption_stops_at_prompt_replay(ds41_config) -> None:
++    """With output tokens appended (a preempted request), the cap stays at the
++    prompt's replay boundary, as for local hits."""
++    sched = _ds41_scheduler(ds41_config, disk_bytes=1 * GIB)
++    recorder = _RecordingCoordinator(sched.cpu_coordinator, SCHEDULER_BLOCK_SIZE)
++    sched.cpu_coordinator = recorder
++    request = _ds41_request(4096)
++    request.append_output_token_ids(list(range(500)))
++    assert request.num_tokens == 4596
++    hit, _ = sched.get_num_new_matched_tokens(request, 0)
++    assert recorder.caps[-1] == 4096 - 128
++    assert hit <= 4096 - 128
++
++
++def test_external_hit_too_short_for_replay_is_refused(ds41_config) -> None:
++    """A prompt at or under the replay window gets no external hit."""
++    sched = _ds41_scheduler(ds41_config, disk_bytes=1 * GIB)
++    assert sched.get_num_new_matched_tokens(_ds41_request(128), 0) == (0, False)
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 0e5c81db0..8dc1aff2f 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -376,9 +376,23 @@ class SimpleCPUOffloadScheduler:
+ 
+         if not remaining_hashes:
+             return 0, False
+-        # Must recompute at least the last token, matching the logic in
+-        # kv_cache_manager.get_computed_blocks().
+-        max_hit_len = request.num_tokens - 1 - num_computed_tokens
++        # Cap the hit as kv_cache_manager.get_computed_blocks() caps a local
++        # one: recompute at least the last token for logits, or the configured
++        # replay suffix that rebuilds request-private decoder state (128 tokens
++        # for the DeepSeek-V4.1 CED decoder and DSpark drafter windows, whose
++        # groups are not prefix-cached). After preemption that suffix ends at
++        # the original prompt, not at the generated tail. Without this cap a
++        # disk hit could leave fewer than 128 tokens to compute, and the
++        # decoder windows would run on a partial history: wrong output with no
++        # error.
++        replay_tokens = self.cpu_coordinator.prefill_replay_tokens
++        fixed_prompt = request.streaming_queue is None
++        replay_end = (
++            request.num_prompt_tokens
++            if replay_tokens and fixed_prompt
++            else request.num_tokens
++        )
++        max_hit_len = max(0, replay_end - max(1, replay_tokens)) - num_computed_tokens
+         if max_hit_len <= 0:
+             return 0, False
+         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
+-- 
+2.56.1
+

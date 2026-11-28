@@ -1,0 +1,901 @@
+From fa03f9b51ce5f77311e12276e744471980d86eba Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:47:58 +0000
+Subject: [PATCH] fix(kv-offload): limit the overrun mark to the cold retry
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9043
+of this series.
+
+Rationale: request_finished removed the overrun mark of 9043, but when a
+request ended while its load was in flight, request_finished ran before
+the failed load reached the connector. The mark then stayed until the
+engine restarted, one entry for each such request. A mark that lasted
+until the finish also made every later preemption of the request a full
+recompute while the tier still held the blocks, and the two sets of the
+disk backend kept one entry for each abandoned event for the life of
+the process. With this patch the scheduler marks a request whose load
+overran only while the request still waits for its retry, and ends the
+mark when the cold retry is admitted, which is the call to
+update_state_after_alloc with no external tokens. A request that
+finished while the load was in flight, through an abort, an error,
+kv_load_failure_policy "fail", or a reset, gets no mark, and after the
+cold retry is admitted a preemption may load from the tier again. The
+disk backend drops the abandon mark and the failure mark of an
+abandoned event once the IO thread is done with the event. The log line
+of the scheduler for an overrun now names a cache miss rather than a
+recompute, because under the policy "fail" the request ends with an
+error.
+
+Quality implications: the patch does not change outputs. On a path that
+stays slow, each preemption after the cold retry may overrun again and
+costs one more bound.
+
+Tests: on the CPU path the offload suite passed 219 tests, with 2
+CUDA-only modules skipped, and 14 of those tests are new. A new file,
+test_ds41_tier_overrun_core.py, runs the core scheduler with three
+simulated ranks through an abort after the first report, an abort
+before any report, five overruns under the policy "fail", a retry that
+computes the whole prompt with no second load, and a preemption after
+the cold retry that hits the tier again. The scheduler tests cover a
+finish during the load and after a reset, two requests in one overrun
+event, a retry with a local prefix, and the end of the mark at the
+admission. The worker tests check that each rank reports each overrun
+load once, that the overrun event is in the metadata of the same step,
+and that the backend holds no mark after two overruns. A further test
+checks that a degraded tier selects no store. Two timing tests no
+longer depend on a margin of the host scheduler: the steady-load test
+has a timeout of ten reads, and the drain test runs on a test clock with
+gated copies. The CUDA path of an overrun was not tested, and no load
+overran during the hardware run.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_faults.py                  |  18 ++
+ .../test_ds41_tier_overrun.py                 | 219 ++++++++++++++++
+ .../test_ds41_tier_overrun_core.py            | 248 ++++++++++++++++++
+ .../test_ds41_tier_timeouts.py                | 120 ++++++---
+ vllm/v1/simple_kv_offload/disk_backend.py     |  17 +-
+ vllm/v1/simple_kv_offload/manager.py          |  29 +-
+ 6 files changed, 612 insertions(+), 39 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_tier_overrun_core.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+index 87b89434b..0c708508c 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+@@ -394,6 +394,24 @@ def test_failed_load_without_fault_record_still_degrades() -> None:
+     assert sched.degraded
+ 
+ 
++def test_degraded_tier_selects_no_store() -> None:
++    """A degraded tier and a request with two confirmed blocks: the step
++    sends no store event and no GPU block to store."""
++    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16)
++    sched = fix.scheduler
++    sched._mark_degraded((1, "load", 4, errno.EIO, "OSError: read of slot 4"))
++    req = make_request(num_blocks=2)
++    kv_blocks = _alloc_and_register(fix, req, 2)
++    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
++    meta = sched.build_connector_meta(
++        make_scheduler_output(
++            {req.request_id: 32}, new_reqs={req.request_id: kv_blocks.get_block_ids()}
++        )
++    )
++    assert meta.store_event == -1
++    assert meta.store_gpu_blocks == [] and meta.store_cpu_blocks == []
++
++
+ def test_store_failed_on_one_rank_is_dropped_from_index() -> None:
+     fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16)
+     sched = fix.scheduler
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py b/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py
+index f25476166..403ec0faf 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py
+@@ -12,10 +12,19 @@ The scheduler remembers a request whose load overran and answers its later
+ lookups with a miss: each request overruns at most once, and other requests
+ still get their hits. An overrun store is dropped: reported complete and
+ failed, with no fault, and its blocks are never published.
++
++The mark lasts from the overrun to the admission of the cold retry, so a
++later preemption of the request may hit the tier again. A request that
++finished while the load was in flight (an abort, an error, a reset) gets no
++mark, since no request_finished call comes after the failed load. Each rank
++reports an overrun load once, in the same step as the overrun event, and the
++disk backend keeps no mark of an abandoned event after the IO thread is done
++with the event.
+ """
+ 
+ from __future__ import annotations
+ 
++import logging
+ import os
+ import time
+ 
+@@ -28,9 +37,14 @@ from tests.v1.simple_kv_offload.test_ds41_tier_faults import (  # noqa: F401
+     _rank_output,
+     _scheduler_with_pending_load,
+     _store,
++    _stored,
+     host_cuda,
+     tier,
+ )
++from tests.v1.simple_kv_offload.test_ds41_tier_timeouts import (
++    _slow_reads,
++    _submit_loads,
++)
+ from tests.v1.simple_kv_offload.test_scheduler import (
+     _alloc_and_register,
+     make_request,
+@@ -213,3 +227,208 @@ def test_overrun_store_is_dropped_from_the_index_with_the_tier_up() -> None:
+     stats = sched.get_stats()
+     assert stats["store_failed_blocks"] == 2 and stats["degraded"] == 0
+     assert "io_errors" not in stats
++
++
++# ---------------------------------------------------------------------------
++# The life of the mark, and the reports of one rank
++# ---------------------------------------------------------------------------
++
++
++def test_request_finished_during_the_load_keeps_no_overrun_mark() -> None:
++    """r2 finishes (a client abort) while the load is in flight, so
++    request_finished defers the load cleanup; the load then overruns on rank
++    1. No mark stays: no request_finished call comes after the failed load,
++    and the request gets no retry."""
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    agg = KVOutputAggregator(expected_finished_count=3)
++    sched.request_finished(req2, [])
++    assert sched._reqs_to_load["r2"].finished
++    _overrun_on_rank_1(sched, agg, "r2")
++    assert "r2" not in sched._reqs_to_load
++    assert sched._overrun_reqs == set()
++    assert not sched.degraded
++    assert sched.get_stats()["load_failures"] == 1
++
++
++def test_request_finished_after_a_reset_keeps_no_overrun_mark() -> None:
++    """A reset moves the in-flight load of r2 to the abandoned loads; r2 then
++    finishes and the load overruns on rank 1. The abandoned state is marked
++    finished too, so no mark stays."""
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    agg = KVOutputAggregator(expected_finished_count=3)
++    sched.reset()
++    assert "r2" in sched._abandoned_reqs_to_load
++    sched.request_finished(req2, [])
++    assert sched._abandoned_reqs_to_load["r2"].finished
++    event = sched._abandoned_reqs_to_load["r2"].load_event
++    overrun = SimpleCPUOffloadWorkerMetadata(
++        completed_store_events={}, overrun_load_events={event}
++    )
++    out = agg.aggregate(
++        [
++            _rank_output(["r2"]),
++            _rank_output(["r2"], ["r2"], overrun),
++            _rank_output(["r2"]),
++        ]
++    ).kv_connector_output
++    assert out.failed_recving == {"r2"}
++    sched.update_connector_output(out)
++    assert "r2" not in sched._abandoned_reqs_to_load
++    assert sched._overrun_reqs == set()
++    assert not sched.degraded
++
++
++def test_two_requests_in_one_overrun_event_both_retry_cold(caplog) -> None:
++    """r4 and r5, admitted in one step, share one load event, which overruns
++    on rank 1. Both retries miss; the tier stays up; the head logs the
++    overrun once, as a cache miss for the requests of the event."""
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    agg = KVOutputAggregator(expected_finished_count=3)
++    _overrun_on_rank_1(sched, agg, "r2")
++    rs, blocks_by = [], {}
++    for rid in ("r4", "r5"):
++        r = _same_prompt(req, rid)
++        hit, _ = sched.get_num_new_matched_tokens(r, 0)
++        assert hit == 32
++        blocks = KVCacheBlocks(blocks=(fix.gpu_block_pool.get_new_blocks(2),))
++        sched.update_state_after_alloc(r, blocks, num_external_tokens=hit)
++        blocks_by[rid] = blocks
++        rs.append(r)
++    meta = sched.build_connector_meta(
++        make_scheduler_output(
++            {"r4": 1, "r5": 1},
++            new_reqs={rid: b.get_block_ids() for rid, b in blocks_by.items()},
++        )
++    )
++    event = meta.load_event
++    assert sched._load_event_to_reqs[event] == ["r4", "r5"]
++    overrun = SimpleCPUOffloadWorkerMetadata(
++        completed_store_events={}, overrun_load_events={event}
++    )
++    both = ["r4", "r5"]
++    out = agg.aggregate(
++        [_rank_output(both), _rank_output(both, both, overrun), _rank_output(both)]
++    ).kv_connector_output
++    with caplog.at_level(logging.WARNING):
++        caplog.clear()
++        sched.update_connector_output(out)
++    lines = [r.getMessage() for r in caplog.records if "ran past" in r.getMessage()]
++    want = (
++        f"SimpleCPUOffload disk load event {event} ran past the total bound on a "
++        "rank: a cache miss for the requests of the event; the tier stays up"
++    )
++    assert lines == [want]
++    assert not sched.degraded
++    assert sched._overrun_reqs == {"r2", "r4", "r5"}
++    for r in rs:
++        assert sched.get_num_new_matched_tokens(r, 0) == (0, False), r.request_id
++
++
++def test_retry_with_a_local_prefix_still_misses() -> None:
++    """The core scheduler passes the block-aligned local hit to the lookup,
++    which is above 0 when the retry finds a GPU prefix. A new request with 16
++    local tokens gets an external hit; the retry of an overrun request with
++    the same 16 local tokens gets none."""
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    agg = KVOutputAggregator(expected_finished_count=3)
++    fresh = _same_prompt(req, "r7")
++    hit, is_async = sched.get_num_new_matched_tokens(fresh, 16)
++    sched.request_finished(fresh, [])
++    assert hit and hit > 0 and is_async
++    _overrun_on_rank_1(sched, agg, "r2")
++    assert sched.get_num_new_matched_tokens(req2, 16) == (0, False)
++
++
++def test_admission_of_the_cold_retry_ends_the_mark() -> None:
++    """r2 overruns; the retry's lookup misses and the retry is admitted with
++    no external tokens, which ends the mark. After a preemption the request
++    hits the tier again, as a new request with the same prompt does."""
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    agg = KVOutputAggregator(expected_finished_count=3)
++    _overrun_on_rank_1(sched, agg, "r2")
++    assert sched.get_num_new_matched_tokens(req2, 0) == (0, False)
++    assert sched._overrun_reqs == {"r2"}  # a lookup alone keeps the mark
++    blocks = KVCacheBlocks(blocks=(fix.gpu_block_pool.get_new_blocks(2),))
++    sched.update_state_after_alloc(req2, blocks, num_external_tokens=0)
++    assert sched._overrun_reqs == set()
++    fix.gpu_block_pool.free_blocks(blocks.blocks[0])
++    assert sched.get_num_new_matched_tokens(req2, 0) == (32, True)
++
++
++def test_overrun_load_is_reported_once_per_rank(tier, monkeypatch) -> None:
++    """KVOutputAggregator counts reports, not ranks, so a second report of
++    one load by one rank would release the request while another rank still
++    copies. r0 (12 slots at 0.1 s a read) overruns at 0.3 + 12 x 0.02 =
++    0.54 s with r1 queued behind r0: the rank reports each load finished
++    once, also while the abandoned load is still under I/O."""
++    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.02)
++    _stored(worker, [0, 1, 2, 3], [0, 1, 2, 3])
++    _slow_reads(monkeypatch, seconds=0.1)
++    slots = [0, 1, 2, 3] * 3
++    reqs = _submit_loads(worker, [(slots, slots), ([0], [4])])
++    reports = {r: 0 for r in reqs}
++    deadline = time.monotonic() + 3
++    while time.monotonic() < deadline:
++        res = worker.get_transfer_results(set())
++        for r in res.finished_recving & reqs:
++            reports[r] += 1
++        time.sleep(0.01)
++    assert reports == {"r0": 1, "r1": 1}
++    assert worker._backend.fault is None
++
++
++def test_overrun_reaches_the_scheduler_in_the_step_of_the_failure(
++    tier, monkeypatch
++) -> None:
++    """The step that reports the overrun load failed builds worker metadata
++    that names the overrun event, also with no store completed in that step:
++    without the event, the scheduler would see a failed load with no
++    explanation and degrade the tier."""
++    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.02)
++    _stored(worker, [0, 1, 2, 3], [0, 1, 2, 3])
++    worker.build_connector_worker_meta()  # drop any record of the setup's store
++    _slow_reads(monkeypatch, seconds=0.1)
++    slots = [0, 1, 2, 3] * 3
++    reqs = _submit_loads(worker, [(slots, slots)])
++    deadline = time.monotonic() + 5
++    while True:
++        assert time.monotonic() < deadline
++        res = worker.get_transfer_results(set())
++        meta = worker.build_connector_worker_meta()
++        if res.finished_recving:
++            assert res.failed_recving == reqs
++            assert meta is not None and meta.overrun_load_events == {0}
++            assert meta.completed_store_events == {} and meta.faults == []
++            break
++        assert meta is None
++        time.sleep(0.01)
++
++
++def test_backend_forgets_an_abandoned_event(tier, monkeypatch) -> None:
++    """Two loads overrun one after the other (12 slots at 0.1 s a read, a
++    0.54 s bound each). The worker reports each one at the abandon; once the
++    IO thread is done with both events, the backend holds no abandon mark and
++    no failure mark of either."""
++    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.02)
++    _stored(worker, [0, 1, 2, 3], [0, 1, 2, 3])
++    _slow_reads(monkeypatch, seconds=0.1)
++    slots = [0, 1, 2, 3] * 3
++    reqs = _submit_loads(worker, [(slots, slots), (slots, slots)])
++    failed: set = set()
++    deadline = time.monotonic() + 10
++    while failed != reqs:
++        assert time.monotonic() < deadline
++        failed |= worker.get_transfer_results(set()).failed_recving
++        time.sleep(0.01)
++    backend = worker._backend
++    while backend.running(False) is not None:
++        assert time.monotonic() < deadline
++        time.sleep(0.01)
++    assert backend.fault is None
++    assert backend._abandoned[False] == set()
++    assert backend._failed_events[False] == set()
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_overrun_core.py b/tests/v1/simple_kv_offload/test_ds41_tier_overrun_core.py
+new file mode 100644
+index 000000000..17dfee88b
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_overrun_core.py
+@@ -0,0 +1,248 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""An overrun load through the core scheduler (CPU-only).
++
++A real v1 Scheduler drives a real SimpleCPUOffloadConnector in disk mode
++(scheduler side only); three ranks are simulated through KVOutputAggregator.
++The core scheduler decides when request_finished runs: at an abort while the
++load is in flight, or, under kv_load_failure_policy "fail", before the
++connector sees the failed load. In both orders no overrun mark may stay
++behind. The cold retry of an overrun request computes the whole prompt with
++no second load, and after the admission of that retry a preemption may hit
++the tier again.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from tests.v1.kv_connector.unit.utils import create_scheduler, create_vllm_config
++from tests.v1.simple_kv_offload.test_scheduler import (
++    _BYTES_PER_BLOCK,
++    BLOCK_SIZE,
++    _make_kv_cache_config,
++)
++from vllm import SamplingParams
++from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_utils import get_request_block_hasher
++from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
++from vllm.v1.request import Request, RequestStatus
++from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++NUM_GPU_BLOCKS = 64
++NUM_TOKENS = 64  # 4 blocks of 16
++PROMPT = list(range(1000, 1000 + NUM_TOKENS))
++
++
++def _sched(tmp_path, policy="recompute"):
++    vllm_config = create_vllm_config(
++        kv_connector="SimpleCPUOffloadConnector",
++        kv_role="kv_both",
++        kv_connector_extra_config={
++            "cpu_bytes_to_use": _BYTES_PER_BLOCK * 32,
++            "kv_offload_backend": "disk",
++            "disk_path": str(tmp_path / "tier"),
++            "disk_capacity_bytes": 32 * 8192,
++        },
++        kv_load_failure_policy=policy,
++        block_size=BLOCK_SIZE,
++        max_num_batched_tokens=1024,
++    )
++    sched = create_scheduler(
++        vllm_config, NUM_GPU_BLOCKS, _make_kv_cache_config(NUM_GPU_BLOCKS)
++    )
++    mgr = sched.connector.scheduler_manager
++    assert mgr._slot_keys
++    mgr._expected_worker_count = 3
++    return sched, mgr
++
++
++def _req(rid, max_tokens=1):
++    sp = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
++    sp.update_from_generation_config({}, 2)
++    return Request(
++        request_id=rid,
++        prompt_token_ids=list(PROMPT),
++        sampling_params=sp,
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
++    )
++
++
++def _step(sched, agg, sched_out, per_rank):
++    """Feed one step's output; per_rank holds one KVConnectorOutput a rank."""
++    ids = list(sched_out.num_scheduled_tokens)
++    outs = [
++        ModelRunnerOutput(
++            req_ids=ids,
++            req_id_to_index={r: i for i, r in enumerate(ids)},
++            sampled_token_ids=[[7] for _ in ids],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=None,
++            kv_connector_output=kv,
++        )
++        for kv in per_rank
++    ]
++    return sched.update_from_output(sched_out, agg.aggregate(outs))
++
++
++def _empty3():
++    return [KVConnectorOutput(), KVConnectorOutput(), KVConnectorOutput()]
++
++
++def _seed_tier(sched, mgr, agg):
++    """One request computes PROMPT and finishes, the finish-time store lands
++    on all three ranks, and the GPU prefix cache is dropped: the next request
++    with PROMPT can only hit on the disk tier."""
++    a = _req("seed")
++    sched.add_request(a)
++    so = sched.schedule()
++    assert so.num_scheduled_tokens == {"seed": NUM_TOKENS}
++    _step(sched, agg, so, _empty3())
++    assert a.is_finished()
++    for _ in range(3):
++        so = sched.schedule()
++        ev = so.kv_connector_metadata.store_event
++        if ev >= 0:
++            break
++    assert ev >= 0
++    done = SimpleCPUOffloadWorkerMetadata(completed_store_events={ev: 1})
++    _step(sched, agg, so, [KVConnectorOutput(kv_connector_worker_meta=done)] * 3)
++    assert not mgr._store_event_to_blocks
++    assert sched.kv_cache_manager.reset_prefix_cache()
++
++
++def _start_load(sched, rid, max_tokens=1):
++    """A request with PROMPT: a disk hit, so the request waits for the load."""
++    b = _req(rid, max_tokens=max_tokens)
++    sched.add_request(b)
++    so = sched.schedule()
++    assert b.status == RequestStatus.WAITING_FOR_REMOTE_KVS
++    meta = so.kv_connector_metadata
++    assert meta.load_event >= 0 and meta.load_event_to_reqs[meta.load_event] == [rid]
++    return b, so, meta.load_event
++
++
++def _overrun(event, rid):
++    """The report of rank 1 for a load past the total bound: finished and
++    failed, with the event in the worker metadata of the same step."""
++    return KVConnectorOutput(
++        finished_recving={rid},
++        failed_recving={rid},
++        kv_connector_worker_meta=SimpleCPUOffloadWorkerMetadata(
++            completed_store_events={}, overrun_load_events={event}
++        ),
++    )
++
++
++def _done(rid):
++    return KVConnectorOutput(finished_recving={rid})
++
++
++def test_retry_is_cold_through_the_core_scheduler(tmp_path) -> None:
++    """Rank 1 reports the overrun in one step, ranks 0 and 2 finish the load
++    in the next. The retry computes all 64 tokens with no second load, the
++    tier stays up, and nothing of the request stays after the finish."""
++    sched, mgr = _sched(tmp_path)
++    agg = KVOutputAggregator(expected_finished_count=3)
++    _seed_tier(sched, mgr, agg)
++    b, so, ev = _start_load(sched, "B")
++    _step(sched, agg, so, [KVConnectorOutput(), _overrun(ev, "B"), KVConnectorOutput()])
++    assert ev in mgr._overrun_load_events and "B" not in mgr._overrun_reqs
++    so = sched.schedule()
++    assert b.status == RequestStatus.WAITING_FOR_REMOTE_KVS
++    _step(sched, agg, so, [_done("B"), KVConnectorOutput(), _done("B")])
++    assert mgr._overrun_reqs == {"B"}
++    so = sched.schedule()
++    assert so.num_scheduled_tokens.get("B") == NUM_TOKENS
++    assert so.kv_connector_metadata.load_event == -1
++    assert mgr._overrun_reqs == set()  # the cold retry is admitted
++    _step(sched, agg, so, _empty3())
++    assert b.is_finished() and not mgr.degraded
++    assert mgr._overrun_reqs == set() and not mgr._reqs_to_load
++
++
++def test_abort_during_the_overrun_load_keeps_no_mark(tmp_path) -> None:
++    """Rank 1 reports the overrun; the client goes away before ranks 0 and 2
++    report. The core scheduler calls request_finished at the abort, before
++    the aggregated failure reaches the connector; no mark stays."""
++    sched, mgr = _sched(tmp_path)
++    agg = KVOutputAggregator(expected_finished_count=3)
++    _seed_tier(sched, mgr, agg)
++    b, so, ev = _start_load(sched, "B")
++    _step(sched, agg, so, [KVConnectorOutput(), _overrun(ev, "B"), KVConnectorOutput()])
++    sched.finish_requests("B", RequestStatus.FINISHED_ABORTED)
++    so = sched.schedule()
++    _step(sched, agg, so, [_done("B"), KVConnectorOutput(), _done("B")])
++    so = sched.schedule()
++    _step(sched, agg, so, _empty3())
++    assert "B" not in sched.requests
++    assert mgr._overrun_reqs == set()
++    assert not mgr._reqs_to_load and not mgr.degraded
++
++
++def test_abort_before_any_rank_reports_keeps_no_mark(tmp_path) -> None:
++    """The abort comes before any rank reports; the overrun of rank 1 and the
++    loads of ranks 0 and 2 arrive in one step afterwards. No mark stays."""
++    sched, mgr = _sched(tmp_path)
++    agg = KVOutputAggregator(expected_finished_count=3)
++    _seed_tier(sched, mgr, agg)
++    b, so, ev = _start_load(sched, "B")
++    sched.finish_requests("B", RequestStatus.FINISHED_ABORTED)
++    _step(sched, agg, so, [_done("B"), _overrun(ev, "B"), _done("B")])
++    so = sched.schedule()
++    _step(sched, agg, so, _empty3())
++    assert "B" not in sched.requests
++    assert mgr._overrun_reqs == set()
++
++
++def test_policy_fail_keeps_no_mark(tmp_path) -> None:
++    """Under kv_load_failure_policy "fail" (the vLLM default) the core
++    scheduler ends each failed request with an error before the connector
++    sees the failed load. Five overruns in a row leave no mark."""
++    sched, mgr = _sched(tmp_path, policy="fail")
++    agg = KVOutputAggregator(expected_finished_count=3)
++    _seed_tier(sched, mgr, agg)
++    for k in range(5):
++        rid = f"F{k}"
++        b, so, ev = _start_load(sched, rid)
++        _step(sched, agg, so, [_done(rid), _overrun(ev, rid), _done(rid)])
++        assert b.status == RequestStatus.FINISHED_ERROR
++        assert rid not in sched.requests
++    assert mgr._overrun_reqs == set()
++    assert not mgr.degraded
++
++
++def test_preempted_after_the_cold_retry_hits_the_tier_again(tmp_path) -> None:
++    """After the cold retry the request decodes; a preemption then frees the
++    blocks of the request and the GPU prefix goes. The resumed request hits
++    the tier again, as a new request with the same prompt does: the mark
++    covered the retry only."""
++    sched, mgr = _sched(tmp_path)
++    agg = KVOutputAggregator(expected_finished_count=3)
++    _seed_tier(sched, mgr, agg)
++    b, so, ev = _start_load(sched, "B", max_tokens=50)
++    _step(sched, agg, so, [_done("B"), _overrun(ev, "B"), _done("B")])
++    so = sched.schedule()
++    assert so.num_scheduled_tokens == {"B": NUM_TOKENS}
++    _step(sched, agg, so, _empty3())
++    for _ in range(3):
++        so = sched.schedule()
++        _step(sched, agg, so, _empty3())
++    assert b.status == RequestStatus.RUNNING
++    sched.running.remove(b)
++    sched._preempt_request(b, 0.0)
++    assert sched.kv_cache_manager.reset_prefix_cache()
++    c = _req("C")
++    hit_c = mgr.get_num_new_matched_tokens(c, 0)
++    mgr.request_finished(c, [])
++    hit_b = mgr.get_num_new_matched_tokens(b, 0)
++    # The tier holds the 4 prompt blocks. C recomputes the last prompt token,
++    # so C takes 3 blocks; B has decoded tokens after the prompt and takes 4.
++    assert hit_c == (48, True)
++    assert hit_b == (64, True)
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+index 5d976b9bc..7e0232968 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+@@ -44,6 +44,7 @@ from tests.v1.simple_kv_offload.test_ds41_tier_faults import (  # noqa: F401
+     tier,
+ )
+ from vllm.v1.simple_kv_offload import disk_backend as disk_backend_mod
++from vllm.v1.simple_kv_offload import worker as worker_mod
+ from vllm.v1.simple_kv_offload.disk_backend import (
+     DEBUG_READ_DELAY_ENV,
+     DiskBackend,
+@@ -178,28 +179,32 @@ def test_long_store_that_progresses_does_not_degrade(tier, monkeypatch) -> None:
+ 
+ 
+ def test_slow_steady_transfer_misses_at_the_total_bound(tier, monkeypatch) -> None:
+-    """One load of 12 slots at 0.1 s a read, under a 0.3 s timeout: a slot
++    """One load of 24 slots at 0.1 s a read, under a 1 s timeout: a slot
+     completes every 0.1 s, so the progress check never fires, but the load
+-    runs past its total bound of 0.3 + 12 x 0.02 = 0.54 s and fails as a miss
+-    for its request only. No fault: the tier stays up, the thread moves on,
+-    and the load queued behind it runs and lands its bytes. The overrun
+-    reaches the scheduler in the worker metadata, with no fault record."""
+-    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.02)
++    runs past the total bound of 1 + 24 x 0.02 = 1.48 s and fails as a miss
++    for the request of the load only. No fault: the tier stays up, the
++    thread moves on, and the load queued behind the overrun runs and lands
++    the bytes of the load. The overrun reaches the scheduler in the worker
++    metadata, with no fault record. The timeout is ten reads wide, so a
++    stall of the IO thread under CPU load does not turn the overrun into a
++    fault."""
++    worker, gpu = tier(timeout_s=1.0, slot_budget_s=0.02)
+     _stored(worker, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4])
+     expected = gpu[4].clone()
+     gpu[5].zero_()
+     calls = _slow_reads(monkeypatch, seconds=0.1)
+-    slots = [0, 1, 2, 3] * 3
++    slots = [0, 1, 2, 3] * 6
+     seen: dict = {}
+     start = time.monotonic()
+     reqs = _submit_loads(worker, [(slots, slots), ([4], [5])])
+     failed = _poll_all(worker, reqs, seen=seen)
+     assert failed == {"r0"}
+     at, fault = seen["r0"]
+-    assert 0.54 <= at - start < 0.54 + 0.3
++    assert at - start >= 1.48  # not before the total bound
++    assert at <= seen["r1"][0]  # the overrun load first, then the queued one
+     assert fault is None and worker._backend.fault is None
+     assert torch.equal(gpu[5], expected)  # the queued load ran
+-    assert calls["n"] < 12  # the overrun load stopped before its last read
++    assert calls["n"] < 24  # the overrun load stopped before the last read
+     assert worker._backend.thread_alive(False)
+     meta = worker.build_connector_worker_meta()
+     assert meta.overrun_load_events == {0} and meta.faults == []
+@@ -492,14 +497,35 @@ def test_late_copy_lands_before_the_blocks_are_released(tmp_path, monkeypatch) -
+         load_stream.close()
+ 
+ 
++class _GatedStream(_DeferredStream):
++    """A late-copy stream whose n-th copy runs only once ``gates[n]`` is set,
++    so a test decides which copies are in flight."""
++
++    def __init__(self, gates) -> None:
++        self.gates = gates
++        super().__init__(delay_s=0.0)
++
++    def _run(self) -> None:
++        while (item := self.q.get()) is not None:
++            n, fn = item
++            self.gates[n].wait(timeout=10)
++            fn()
++            with self.cv:
++                self.done = n
++                self.cv.notify_all()
++
++
+ def test_overrun_drains_the_late_copies(tmp_path, monkeypatch) -> None:
+-    """A load of 8 slots at 0.1 s a read, with copies that run 0.2 s late on
+-    the load stream (2 staging slots). The load progresses (a slot at least
+-    every 0.2 s, under the 0.3 s timeout) but runs past its total bound of
+-    0.3 + 8 x 0.02 = 0.46 s with the copies of slots 2 and 3 in flight. The
+-    overrun abandons it with no fault; the drain waits for those copies
+-    before the request is released. The blocks then go to another request (a
+-    sentinel); no later copy of the load may change them."""
++    """A load of 8 slots on a test clock, with 2 staging slots and copies
++    that run only when the test opens the gate of each copy, so the overrun
++    lands with exactly two copies in flight (slots 4 and 5). Reads take no
++    time; the test opens copies 1 to 3 one by one and moves the clock 0.1 s
++    each time, so the load progresses under the 0.3 s timeout. At 0.5 s on
++    the clock the load is past the total bound of 0.3 + 8 x 0.02 = 0.46 s:
++    the worker abandons the load with no fault and drains the load stream,
++    and the request is released only after the test opens copies 4 and 5.
++    The blocks then go to another request (a sentinel); no later copy of
++    the load starts, and the IO thread stops after read 6."""
+     monkeypatch.setattr(disk_backend_mod, "pin_tensor", lambda t: None)
+     monkeypatch.setattr(disk_backend_mod, "build_params", _deferred_build_params)
+     monkeypatch.setattr(disk_backend_mod, "copy_blocks", _deferred_copy_blocks)
+@@ -511,10 +537,15 @@ def test_overrun_drains_the_late_copies(tmp_path, monkeypatch) -> None:
+     monkeypatch.setattr(torch, "Event", _DeferredEvent)
+     monkeypatch.setattr(torch.cuda, "current_stream", lambda: _HostStream())
+     monkeypatch.delenv(DEBUG_READ_DELAY_ENV, raising=False)
++    clock = {"now": 0.0}
++    test_time = SimpleNamespace(monotonic=lambda: clock["now"], sleep=time.sleep)
++    monkeypatch.setattr(disk_backend_mod, "time", test_time)
++    monkeypatch.setattr(worker_mod, "time", test_time)
+ 
+     gen = torch.Generator().manual_seed(9)
+     gpu = torch.randint(-128, 127, (16, BLOCK), dtype=torch.int8, generator=gen)
+-    load_stream = _DeferredStream(delay_s=0.2)
++    gates = {n: threading.Event() for n in range(1, 64)}
++    load_stream = _GatedStream(gates)
+     store_stream = _HostStream()
+     worker = SimpleCPUOffloadWorker(
+         vllm_config=MagicMock(),
+@@ -540,30 +571,55 @@ def test_overrun_drains_the_late_copies(tmp_path, monkeypatch) -> None:
+     worker._backend = backend
+     worker.load_stream = load_stream
+     worker.store_stream = store_stream
++
++    def wait_until(cond, what):
++        deadline = time.time() + 10
++        while not cond():
++            assert time.time() < deadline, what
++            time.sleep(0.005)
++
++    def slots_done(n):
++        running = backend.running(False)
++        return running is not None and running.done == n
++
+     try:
+         _stored(worker, list(range(8)), list(range(8)))
+-        calls = _slow_reads(monkeypatch, seconds=0.1)
+-        seen: dict = {}
+-        start = time.monotonic()
++        calls = _slow_reads(monkeypatch, seconds=0.0)
+         reqs = _submit_loads(worker, [(list(range(8)), list(range(8, 16)))])
+-        assert _poll_all(worker, reqs, seen=seen) == reqs
+-        released, fault = seen["r0"]
+-        assert fault is None  # an overrun, not a fault
+-        # released only after the copies in flight at the overrun landed
+-        assert released - start >= 0.65
+-        for i in range(3):
++        wait_until(lambda: slots_done(2), "reads 1 and 2")
++        for n in (1, 2, 3):  # one copy lands, one more read completes
++            clock["now"] += 0.1
++            gates[n].set()
++            wait_until(lambda n=n: slots_done(n + 2), f"read {n + 2}")
++        assert load_stream.enqueued == 5 and load_stream.done == 3
++        clock["now"] = 0.5  # past the bound, 0.2 s after the last slot
++        results = []
++        poll = threading.Thread(
++            target=lambda: results.append(worker.get_transfer_results(set()))
++        )
++        poll.start()
++        poll.join(timeout=0.3)
++        assert poll.is_alive()  # the drain waits for copies 4 and 5
++        gates[4].set()
++        gates[5].set()
++        poll.join(timeout=10)
++        assert not poll.is_alive()
++        res = results[0]
++        assert res.finished_recving == reqs and res.failed_recving == reqs
++        assert backend.fault is None  # an overrun, not a fault
++        assert worker.build_connector_worker_meta().overrun_load_events == {0}
++        for i in range(5):  # the five copies landed before the release
+             assert torch.equal(gpu[8 + i], gpu[i])
+         # the blocks now belong to another request
+         gpu[8:16].fill_(7)
+-        deadline = time.monotonic() + 5
+-        while backend.running(False) is not None:
+-            assert time.monotonic() < deadline
+-            time.sleep(0.01)
+-        time.sleep(0.5)
++        wait_until(lambda: backend.running(False) is None, "the IO thread")
++        assert load_stream.enqueued == 5  # no copy after the abandon
++        assert calls["n"] == 6  # read 6 ran, then the copy was refused
+         assert torch.all(gpu[8:16] == 7)
+-        assert calls["n"] < 8
+         assert backend.fault is None and backend.thread_alive(False)
+     finally:
++        for gate in gates.values():
++            gate.set()
+         backend.shutdown()
+         load_stream.close()
+ 
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 0c261a006..a8c18fc1f 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -199,7 +199,9 @@ class DiskBackend:
+         self._failed_events: dict[bool, set[int]] = {True: set(), False: set()}
+         # Events the worker abandoned after its I/O timeout. The IO threads
+         # check this under the lock before every DMA, so no copy of an
+-        # abandoned event starts after abandon() returns.
++        # abandoned event starts after abandon() returns. The worker reports
++        # an abandoned event at the abandon, so the IO thread drops both
++        # marks of the event once the thread is done with the event.
+         self._abandoned: dict[bool, set[int]] = {True: set(), False: set()}
+         self._abandon_lock = threading.Lock()
+         # Slot under I/O in each thread, for the fault report of a timeout.
+@@ -247,6 +249,17 @@ class DiskBackend:
+         with self._abandon_lock:
+             self._abandoned[is_store].add(event_idx)
+ 
++    def _forget_if_abandoned(self, is_store: bool, event_idx: int) -> None:
++        """Drop the abandon mark and the failure mark of an event that the
++        worker abandoned: the worker reported that event as failed at the
++        abandon and never asks for the event again, and event indices never
++        repeat. Called by the IO thread when the thread is done with the
++        event."""
++        with self._abandon_lock:
++            if event_idx in self._abandoned[is_store]:
++                self._abandoned[is_store].discard(event_idx)
++                self._failed_events[is_store].discard(event_idx)
++
+     def current_slot(self, is_store: bool) -> int:
+         return self._current_slot[is_store]
+ 
+@@ -305,6 +318,7 @@ class DiskBackend:
+             # Degraded: no I/O. The event still completes, as a failure.
+             self._failed_events[is_store].add(event_idx)
+             self._running[is_store] = None
++            self._forget_if_abandoned(is_store, event_idx)
+             return
+         try:
+             if is_store:
+@@ -324,6 +338,7 @@ class DiskBackend:
+         finally:
+             self._current_slot[is_store] = -1
+             self._running[is_store] = None
++            self._forget_if_abandoned(is_store, event_idx)
+ 
+     def _slot_tensor_views(
+         self, buffer: torch.Tensor, slot: int
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index cfc9374c3..4cf14d0b1 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -306,8 +306,12 @@ class SimpleCPUOffloadScheduler:
+         # Requests whose load overran: the core scheduler retries such a
+         # request from 0 tokens, and the same lookup would find the same hit
+         # and start the same slow load, without end while the slow path
+-        # lasts. Their later lookups miss, so the retry is a cold prefill and
+-        # each request overruns at most once. Forgotten in request_finished.
++        # lasts. Later lookups of such a request miss, so the retry is a
++        # cold prefill.
++        # Forgotten when the cold retry is admitted (update_state_after_alloc
++        # with no external tokens), so a later preemption may hit the tier
++        # again, and in request_finished. A request that finished while the
++        # load was in flight gets no retry and no entry.
+         self._overrun_reqs: set[str] = set()
+ 
+     @staticmethod
+@@ -491,6 +495,10 @@ class SimpleCPUOffloadScheduler:
+         pending_keys = self._pending_cpu_hit_keys.pop(req_id, None)
+ 
+         if num_external_tokens == 0:
++            # The cold retry after an overrun is admitted: the retry computes
++            # from here on, so a preemption later on may load from the tier
++            # again. A second overrun then needs a second preemption first.
++            self._overrun_reqs.discard(req_id)
+             if pending is not None:
+                 logger.warning(
+                     "SimpleCPUOffloadScheduler: update_state_after_alloc "
+@@ -1104,9 +1112,9 @@ class SimpleCPUOffloadScheduler:
+                 if event in self._load_event_to_reqs:
+                     if event not in self._overrun_load_events:
+                         logger.warning(
+-                            "SimpleCPUOffload disk load event %d ran past its "
+-                            "total bound on a rank: its requests recompute; "
+-                            "the tier stays up",
++                            "SimpleCPUOffload disk load event %d ran past the "
++                            "total bound on a rank: a cache miss for the "
++                            "requests of the event; the tier stays up",
+                             event,
+                         )
+                     self._overrun_load_events.add(event)
+@@ -1117,7 +1125,12 @@ class SimpleCPUOffloadScheduler:
+         # only; any other failed load degrades the tier.
+         unexplained = [r for r in failed_recving if not self._is_overrun(r)]
+         for req_id in failed_recving:
+-            if self._is_overrun(req_id):
++            state = self._reqs_to_load.get(req_id) or self._abandoned_reqs_to_load.get(
++                req_id
++            )
++            # A request that finished during the load (an abort, an error,
++            # policy "fail") gets no retry and no later request_finished.
++            if self._is_overrun(req_id) and not (state is not None and state.finished):
+                 self._overrun_reqs.add(req_id)
+         now = time.monotonic()
+         for req_id in list(connector_output.finished_recving or []):
+@@ -1390,6 +1403,10 @@ class SimpleCPUOffloadScheduler:
+                 load_state.finished = True  # Defer: load in-flight
+             else:
+                 self._cleanup_load_request(req_id)
++        abandoned = self._abandoned_reqs_to_load.get(req_id)
++        if abandoned is not None:
++            # A load in flight at reset(): the completion path cleans up.
++            abandoned.finished = True
+ 
+         # Handle store (eager mode only): defer cleanup if stores in-flight
+         if not self._lazy_mode:
+-- 
+2.56.1
+

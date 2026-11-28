@@ -1,0 +1,286 @@
+From 34982a37b09b6d342e9b5f61a1aed5d3f3575e3c Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 22:10:43 +0000
+Subject: [PATCH] test(kv-offload): compare the disk hit with the local hit on
+ DS41
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9035
+of this series.
+
+Rationale: the replay tests of 9032 stub the lookup with empty block
+lists, so the code that maps loaded blocks to GPU blocks never ran in
+them. This patch adds an end-to-end review harness for 9030 to 9032 as
+the test file tests/v1/simple_kv_offload/test_ds41_e2e_review.py. The
+harness runs the real KVCacheManager and SimpleCPUOffloadScheduler on
+the DS41 layout through chunked prefill with eager stores, a reset of
+the GPU prefix cache, the disk lookup, the allocation, and the load
+mapping, and it checks every pair of a GPU block and a CPU block. It
+runs 12 cases: new turns of 1, 64, 96, 128, 200, 300, and 1,000 tokens,
+a prompt whose length is not a multiple of 256, the 6,144-token prefill
+budget of the profile tp3-4k-b6144-m1m-kv35 in
+experiments/2026-11-22-kv-disk-tier, and prefixes shared up to a
+512-token checkpoint, to the middle of a block, and to 60% of a stored
+session. A regression case runs with the lookup cap from before 9032.
+
+Quality implications: the patch adds tests only.
+
+Tests: in all 12 cases the disk hit equals the hit in the GPU pool, at
+least 128 tokens stay to compute, and the harness finds no bad pair and
+no null GPU target, while the groups do not differ. With the lookup cap
+from before 9032, 3 of the first 6 cases take too large a hit and leave
+64, 1, and 96 tokens to compute. On the CPU path the offload suite
+passed 162 tests, with 2 CUDA-only modules skipped.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../simple_kv_offload/test_ds41_e2e_review.py | 234 ++++++++++++++++++
+ 1 file changed, 234 insertions(+)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_e2e_review.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_e2e_review.py b/tests/v1/simple_kv_offload/test_ds41_e2e_review.py
+new file mode 100644
+index 000000000..2129ec02c
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_e2e_review.py
+@@ -0,0 +1,234 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPU-local hit against disk-tier hit on the DeepSeek-V4.1 packed layout.
++
++The harness (``run``) is the independent reviewer's harness of 2026-11-22
++(``e2e_ds41.py``, review of patches 0830 to 0832), copied unchanged apart from
++the ``replay_cap`` switch, which restores the pre-0832 lookup cap for the
++regression case. It runs the real KVCacheManager and the real
++SimpleCPUOffloadScheduler: request A computes a prompt in chunks with eager
++stores, then request B (A's prompt plus a new turn) takes the GPU-local hit,
++the GPU prefix cache is reset, and B takes the disk path (lookup, allocation,
++update_state_after_alloc). It checks that the disk hit equals the local hit
++and that every (GPU block, CPU block) load pair carries the right hash at the
++right position. Unlike test_ds41_offload's replay tests, which stub the
++lookup, this runs the load mapping.
++"""
++
++from tests.v1.simple_kv_offload import ds41_layout
++from tests.v1.simple_kv_offload.test_scheduler import (
++    _make_vllm_config,
++    make_scheduler_output,
++    simulate_store_completion,
++)
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.kv_cache_utils import (
++    get_request_block_hasher,
++    make_block_hash_with_group_id,
++    resolve_block_hashes,
++)
++from vllm.v1.request import Request
++from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
++
++SB, HB = 256, 128
++GIB = 1024**3
++_n = [0]
++
++
++def req(tokens, rid):
++    return Request(
++        request_id=rid,
++        prompt_token_ids=list(tokens),
++        sampling_params=SamplingParams(max_tokens=1),
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=get_request_block_hasher(HB, sha256),
++    )
++
++
++def block_ids(mgr, r):
++    return mgr.get_blocks(r.request_id).get_block_ids()
++
++
++def run(prompt_len, new_turn, chunk=2048, shared=None, replay_cap=True):
++    cfg = ds41_layout.ds41_scheduler_kv_cache_config()
++    mgr = KVCacheManager(
++        cfg,
++        max_model_len=1 << 20,
++        scheduler_block_size=SB,
++        hash_block_size=HB,
++        enable_caching=True,
++    )
++    conn = SimpleCPUOffloadScheduler(
++        vllm_config=_make_vllm_config(),
++        kv_cache_config=cfg,
++        cpu_capacity_bytes=0,
++        scheduler_block_size=SB,
++        hash_block_size=HB,
++        lazy_offload=False,
++        disk_capacity_bytes=1 * GIB,
++        disk_use_page_cache=False,
++    )
++    conn.bind_gpu_block_pool(mgr.block_pool)
++    if not replay_cap:
++        # The lookup cap before patch 0832: num_tokens - 1 - local.
++        conn.cpu_coordinator.prefill_replay_tokens = 0
++    base = 7_000_000 + 100_000 * _n[0]
++    _n[0] += 1
++    prompt = list(range(base, base + prompt_len))
++
++    # ---- request A: chunked prefill with eager stores
++    a = req(prompt, "A")
++    blocks, nloc, _ = mgr.get_computed_blocks(a)
++    assert nloc == 0
++    assert conn.get_num_new_matched_tokens(a, 0) == (0, False)
++    done = 0
++    first = True
++    events = []
++    while done < prompt_len:
++        n = min(chunk, prompt_len - done)
++        new = mgr.allocate_slots(
++            a,
++            n,
++            num_new_computed_tokens=0,
++            new_computed_blocks=blocks if first else None,
++        )
++        assert new is not None
++        if first:
++            conn.update_state_after_alloc(a, mgr.get_blocks("A"), 0)
++            out = make_scheduler_output({"A": n}, new_reqs={"A": block_ids(mgr, a)})
++        else:
++            out = make_scheduler_output(
++                {"A": n}, cached_req_new_blocks={"A": new.get_block_ids()}
++            )
++        meta = conn.build_connector_meta(out)
++        if meta.store_event >= 0:
++            events.append(meta.store_event)
++        a.num_computed_tokens += n
++        done += n
++        first = False
++        for e in events:
++            simulate_store_completion(conn, e)
++        events.clear()
++    # one more step so the last chunk's blocks are confirmed and stored
++    out = make_scheduler_output({"A": 1}, cached_req_new_blocks={"A": None})
++    meta = conn.build_connector_meta(out)
++    if meta.store_event >= 0:
++        simulate_store_completion(conn, meta.store_event)
++    conn.request_finished_all_groups(a, tuple(block_ids(mgr, a)))
++    meta = conn.build_connector_meta(make_scheduler_output({}))
++    if meta.store_event >= 0:
++        simulate_store_completion(conn, meta.store_event)
++    mgr.free(a)
++
++    # ---- request B: local hit (reference)
++    turn = list(range(base + 90_000, base + 90_000 + new_turn))
++    head = prompt if shared is None else prompt[:shared]
++    b_local = req(head + turn, "Blocal")
++    lblocks, n_local, _ = mgr.get_computed_blocks(b_local)
++    local_pos = {}
++    for g, grp in enumerate(lblocks.blocks):
++        local_pos[g] = {i for i, blk in enumerate(grp) if not blk.is_null}
++
++    # ---- request B: disk hit after the GPU copy is gone
++    assert mgr.reset_prefix_cache(), "GPU prefix cache reset refused"
++    b = req(head + turn, "Bdisk")
++    eblocks, n0, _ = mgr.get_computed_blocks(b)
++    assert n0 == 0
++    ext, is_async = conn.get_num_new_matched_tokens(b, 0)
++    res = dict(prompt=prompt_len, shared=shared, turn=new_turn, local=n_local, ext=ext)
++    if not ext:
++        return res
++    new = mgr.allocate_slots(
++        b,
++        0,
++        num_new_computed_tokens=0,
++        new_computed_blocks=eblocks,
++        num_external_computed_tokens=ext,
++        delay_cache_blocks=True,
++    )
++    assert new is not None
++    conn.update_state_after_alloc(b, mgr.get_blocks("Bdisk"), ext)
++    tm = conn._reqs_to_load["Bdisk"].transfer_meta
++    tables = block_ids(mgr, b)
++    where = {}
++    for g, ids in enumerate(tables):
++        for i, bid in enumerate(ids):
++            if bid != 0:
++                where[bid] = (g, i)
++    bad = []
++    loaded_pos = {}
++    for gid, cid in zip(tm.gpu_block_ids, tm.cpu_block_ids):
++        g, i = where[gid]
++        gsize = conn.group_block_sizes[g]
++        want = make_block_hash_with_group_id(
++            resolve_block_hashes(b.block_hashes, HB, gsize)[i], g
++        )
++        cblk = conn.cpu_block_pool.blocks[cid]
++        hashes = {cblk.block_hash} | set(
++            conn.cpu_block_pool.cached_block_hashes_by_block.get(cid, ())
++        )
++        if want not in hashes:
++            bad.append((g, i, gid, cid))
++        loaded_pos.setdefault(g, set()).add(i)
++    res["bad_pairs"] = len(bad)
++    res["pairs"] = len(tm.gpu_block_ids)
++    res["null_gpu_targets"] = sum(1 for gid in tm.gpu_block_ids if gid == 0)
++    # positions a local hit of the same length provides that the disk load does not
++    diff = {}
++    if ext == n_local:
++        for g in local_pos:
++            if g not in conn.prefix_cacheable_group_ids:
++                continue
++            want = local_pos[g]
++            got = loaded_pos.get(g, set())
++            if want != got:
++                diff[g] = (sorted(want - got)[:4], sorted(got - want)[:4])
++    res["group_diffs"] = diff
++    res["left_to_compute"] = len(head) + new_turn - ext
++    return res
++
++
++import pytest  # noqa: E402
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++# (prompt, new turn, shared prefix or None, chunk)
++CASES = [
++    (8192, 64, None, 2048),
++    (8192, 1, None, 2048),
++    (8192, 96, None, 2048),
++    (8192, 128, None, 2048),
++    (8192, 200, None, 2048),
++    (8192, 300, None, 2048),
++    (8300, 64, None, 2048),  # prompt not a multiple of 256
++    (32768, 64, None, 6144),  # the live prefill budget
++    (32768, 1000, None, 6144),
++    (8192, 64, 4096, 2048),  # diverges at a 512-token checkpoint
++    (8192, 64, 4991, 2048),  # diverges mid-block
++    (16384, 200, 9830, 6144),  # shares 60% of a stored session
++]
++
++
++@pytest.mark.parametrize(("prompt", "turn", "shared", "chunk"), CASES)
++def test_disk_hit_equals_local_hit(prompt, turn, shared, chunk) -> None:
++    res = run(prompt, turn, chunk=chunk, shared=shared)
++    assert res["ext"] == res["local"]
++    assert res["left_to_compute"] >= 128
++    if res["ext"]:
++        assert res["bad_pairs"] == 0
++        assert res["null_gpu_targets"] == 0
++        assert res["group_diffs"] == {}
++
++
++def test_without_0832_three_of_six_cases_over_hit() -> None:
++    """Regression: with the pre-0832 cap, turns of 64, 1 and 96 tokens get a
++    disk hit past the local one and leave 64, 1 and 96 tokens to compute."""
++    over = {}
++    for prompt, turn, shared, chunk in CASES[:6]:
++        res = run(prompt, turn, chunk=chunk, shared=shared, replay_cap=False)
++        if res["ext"] > res["local"]:
++            over[turn] = res["left_to_compute"]
++    assert over == {64: 64, 1: 1, 96: 96}
+-- 
+2.56.1
+

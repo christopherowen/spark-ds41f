@@ -1,0 +1,845 @@
+From ca5e24b4a29e6bda78558b508598dc380472e240 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 08:41:57 +0000
+Subject: [PATCH] fix(kv-offload): treat an overrun of the total bound as a
+ miss
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9041
+of this series.
+
+Rationale: the per-slot time of an IO thread includes the thread's own
+Python work and its wait for the GIL, so busy Python threads in the same
+process stretch the per-slot time on a healthy disk. If a load past the
+total bound of 9041 counted as a fault, such a load would degrade the
+whole tier on every rank until the engine restarted. With this patch, a
+transfer that runs past the total bound while it still makes progress
+(an overrun) is abandoned and reported failed with no fault. A load then
+becomes a cache miss for its requests, a store is dropped, the IO thread
+moves on to the next transfer, and the tier stays up. The worker reports
+such loads in its metadata (overrun_load_events), and the scheduler does
+not degrade the tier for them, while any other failed load still
+degrades it. The progress check stays a fault and now also covers a
+transfer that was already abandoned at the bound, so a read that hangs
+after an overrun still fails the queue behind it. The worker logs one
+warning for each overrun, with the bound, the slots done, and the
+seconds, and a start line that names both bounds. disk_io_timeout_s and
+disk_io_slot_budget_s must now be finite, because NaN and infinity
+passed the old "> 0" check and turned a bound off. The submission times
+of loads and stores, which no bound read any more, are removed.
+
+Quality implications: the patch does not change outputs. An overrun
+costs one prefill of the affected request, and the tier stays up for
+other requests.
+
+Tests: on the CPU path the offload suite passed 201 tests, with 2
+CUDA-only modules skipped. In the new tests, a steady 0.1 s read misses
+at the load's bound of 0.54 s with no fault, and the load queued behind
+the slow load lands its bytes. A read that hangs after an overrun is a
+fault at the progress timeout, and the queued load fails with no I/O. An
+overrun with copies in flight on a late-copy stream drains the copies
+before the release, and blocks refilled after the release keep the new
+bytes. An overrun on one of three ranks is a miss, and the tier keeps
+answering lookups. Further tests check that the overrun events
+aggregate over the ranks, that the start line names both bounds, and
+that NaN, infinity, 0, and -1 fail for both keys. The CUDA path of an
+overrun was not tested, and no load overran during the hardware run.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_timeouts.py                | 287 ++++++++++++++++--
+ .../v1/simple_cpu_offload_connector.py        |  22 +-
+ vllm/v1/simple_kv_offload/disk_backend.py     |   6 +-
+ vllm/v1/simple_kv_offload/manager.py          |  32 +-
+ vllm/v1/simple_kv_offload/metadata.py         |   6 +-
+ vllm/v1/simple_kv_offload/worker.py           | 148 +++++----
+ 6 files changed, 412 insertions(+), 89 deletions(-)
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+index 16fc77e9a..46273ce00 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_timeouts.py
+@@ -2,19 +2,24 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """The disk tier's I/O timeout counts from the moment a transfer leaves its
+ queue and resets at every completed slot; a total bound per transfer, also
+-from the dequeue, catches a disk that is slow but not hung (CPU-only).
++from the dequeue, catches a transfer that is slow but not hung (CPU-only).
+ 
+ A burst of loads queued behind each other does not degrade the tier; a
+-transfer that stops making progress does, and so does one that runs past its
+-total bound; the transfers queued behind it fail at once. The debug read delay hangs one read on purpose. A copy still in
+-flight on the load stream when a load is abandoned lands before the load's
+-GPU blocks are released, so it never writes into blocks that another request
+-holds by then (the drain after the timeout).
++transfer that stops making progress does, and the transfers queued behind it
++fail at once. A transfer that runs past its total bound while it progresses
++is a miss for its requests only (an overrun): the tier stays up and the queue
++behind it runs on, unless the overrun transfer then stops making progress.
++The debug read delay hangs one read on purpose. A copy still in flight on the
++load stream when a load is abandoned, after a timeout or an overrun, lands
++before the load's GPU blocks are released, so it never writes into blocks
++that another request holds by then (the drain).
+ """
+ 
+ from __future__ import annotations
+ 
+ import errno
++import logging
++import math
+ import os
+ import queue
+ import threading
+@@ -44,7 +49,10 @@ from vllm.v1.simple_kv_offload.disk_backend import (
+     DiskBackend,
+     parse_debug_read_delay,
+ )
+-from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
++from vllm.v1.simple_kv_offload.metadata import (
++    SimpleCPUOffloadMetadata,
++    SimpleCPUOffloadWorkerMetadata,
++)
+ from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
+ 
+ pytestmark = pytest.mark.skip_global_cleanup
+@@ -91,12 +99,18 @@ def _submit_loads(worker, loads):
+     return {f"r{e}" for e in event_to_reqs}
+ 
+ 
+-def _poll_all(worker, reqs, timeout_s=10.0):
++def _poll_all(worker, reqs, timeout_s=10.0, seen=None):
++    """Poll until every request finished; returns the failed ones. ``seen``,
++    when given, gets (time.monotonic(), the backend's fault) for each request
++    at the poll that finished it."""
+     finished, failed = set(), set()
+     deadline = time.monotonic() + timeout_s
+     while finished != reqs:
+         assert time.monotonic() < deadline, f"finished {finished} of {reqs}"
+         res = worker.get_transfer_results(set())
++        if seen is not None:
++            for r in res.finished_recving - finished:
++                seen[r] = (time.monotonic(), worker._backend.fault)
+         finished |= res.finished_recving
+         failed |= res.failed_recving
+         time.sleep(0.01)
+@@ -163,26 +177,73 @@ def test_long_store_that_progresses_does_not_degrade(tier, monkeypatch) -> None:
+     assert worker._backend.fault is None
+ 
+ 
+-def test_slow_steady_transfer_hits_the_total_bound(tier, monkeypatch) -> None:
++def test_slow_steady_transfer_misses_at_the_total_bound(tier, monkeypatch) -> None:
+     """One load of 12 slots at 0.1 s a read, under a 0.3 s timeout: a slot
+     completes every 0.1 s, so the progress check never fires, but the load
+-    runs past its total bound of 0.3 + 12 x 0.02 = 0.54 s and fails; the tier
+-    degrades, and the load queued behind it fails at once with no I/O."""
++    runs past its total bound of 0.3 + 12 x 0.02 = 0.54 s and fails as a miss
++    for its request only. No fault: the tier stays up, the thread moves on,
++    and the load queued behind it runs and lands its bytes. The overrun
++    reaches the scheduler in the worker metadata, with no fault record."""
+     worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.02)
+-    _stored(worker, [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
++    _stored(worker, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4])
++    expected = gpu[4].clone()
++    gpu[5].zero_()
+     calls = _slow_reads(monkeypatch, seconds=0.1)
+-    slots = [0, 1, 2, 3, 4, 5] * 2
++    slots = [0, 1, 2, 3] * 3
++    seen: dict = {}
+     start = time.monotonic()
+-    reqs = _submit_loads(worker, [(slots, slots), ([0], [0])])
+-    failed = _poll_all(worker, reqs)
+-    waited = time.monotonic() - start
++    reqs = _submit_loads(worker, [(slots, slots), ([4], [5])])
++    failed = _poll_all(worker, reqs, seen=seen)
++    assert failed == {"r0"}
++    at, fault = seen["r0"]
++    assert 0.54 <= at - start < 0.54 + 0.3
++    assert fault is None and worker._backend.fault is None
++    assert torch.equal(gpu[5], expected)  # the queued load ran
++    assert calls["n"] < 12  # the overrun load stopped before its last read
++    assert worker._backend.thread_alive(False)
++    meta = worker.build_connector_worker_meta()
++    assert meta.overrun_load_events == {0} and meta.faults == []
++    assert worker.build_connector_worker_meta() is None  # reported once
++
++
++def test_hang_after_an_overrun_is_a_fault(tier, monkeypatch) -> None:
++    """A load of 4 slots: reads 1 and 2 take 0.1 s, read 3 hangs. The load
++    runs past its total bound (0.3 + 4 x 0.02 = 0.38 s) first and fails as a
++    miss with no fault; its thread is still blocked in read 3, so the load
++    queued behind it would wait for that read. The progress check covers the
++    abandoned load: 0.3 s after read 2 it is a fault, and the queued load
++    fails at once with no I/O."""
++    worker, gpu = tier(timeout_s=0.3, slot_budget_s=0.02)
++    _stored(worker, [0, 1, 2, 3], [0, 1, 2, 3])
++    real = os.preadv
++    calls = {"n": 0}
++    release = threading.Event()
++
++    def slow_then_hang(fd, bufs, offset):
++        calls["n"] += 1
++        if calls["n"] == 3:
++            release.wait(10)
++        else:
++            time.sleep(0.1)
++        return real(fd, bufs, offset)
++
++    monkeypatch.setattr(os, "preadv", slow_then_hang)
++    seen: dict = {}
++    start = time.monotonic()
++    reqs = _submit_loads(worker, [([0, 1, 2, 3], [0, 1, 2, 3]), ([0], [4])])
++    try:
++        failed = _poll_all(worker, reqs, timeout_s=5, seen=seen)
++    finally:
++        release.set()
+     assert failed == reqs
+-    assert 0.54 <= waited < 0.54 + 0.3
+-    fault = worker._backend.fault
+-    assert (fault.op, fault.errno) == ("load", errno.ETIMEDOUT)
+-    assert "ran past its 0.54 s bound (0.3 s + 12 slots x 0.02 s)" in fault.message
++    at0, fault0 = seen["r0"]
++    at1, fault1 = seen["r1"]
++    assert 0.38 <= at0 - start < 0.5 and fault0 is None  # the overrun: a miss
++    assert 0.5 <= at1 - start < 0.5 + 0.3  # the hang: a fault
++    assert (fault1.op, fault1.slot, fault1.errno) == ("load", 2, errno.ETIMEDOUT)
++    assert "load event 0 made no progress for 0.3 s" in fault1.message
++    assert calls["n"] == 3  # the queued load did no I/O
+     time.sleep(0.2)
+-    assert calls["n"] < 12  # abandoned before its last read
+     assert worker._backend.thread_alive(False)
+ 
+ 
+@@ -431,6 +492,82 @@ def test_late_copy_lands_before_the_blocks_are_released(tmp_path, monkeypatch) -
+         load_stream.close()
+ 
+ 
++def test_overrun_drains_the_late_copies(tmp_path, monkeypatch) -> None:
++    """A load of 8 slots at 0.1 s a read, with copies that run 0.2 s late on
++    the load stream (2 staging slots). The load progresses (a slot at least
++    every 0.2 s, under the 0.3 s timeout) but runs past its total bound of
++    0.3 + 8 x 0.02 = 0.46 s with the copies of slots 2 and 3 in flight. The
++    overrun abandons it with no fault; the drain waits for those copies
++    before the request is released. The blocks then go to another request (a
++    sentinel); no later copy of the load may change them."""
++    monkeypatch.setattr(disk_backend_mod, "pin_tensor", lambda t: None)
++    monkeypatch.setattr(disk_backend_mod, "build_params", _deferred_build_params)
++    monkeypatch.setattr(disk_backend_mod, "copy_blocks", _deferred_copy_blocks)
++    monkeypatch.setattr(
++        disk_backend_mod,
++        "current_platform",
++        SimpleNamespace(set_device=lambda device: None),
++    )
++    monkeypatch.setattr(torch, "Event", _DeferredEvent)
++    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _HostStream())
++    monkeypatch.delenv(DEBUG_READ_DELAY_ENV, raising=False)
++
++    gen = torch.Generator().manual_seed(9)
++    gpu = torch.randint(-128, 127, (16, BLOCK), dtype=torch.int8, generator=gen)
++    load_stream = _DeferredStream(delay_s=0.2)
++    store_stream = _HostStream()
++    worker = SimpleCPUOffloadWorker(
++        vllm_config=MagicMock(),
++        kv_cache_config=None,
++        cpu_capacity_bytes=0,
++        kv_offload_backend="disk",
++        disk_path=str(tmp_path / "unused"),
++        disk_capacity_bytes=SLOTS * SLOT,
++        disk_io_timeout_s=0.3,
++        disk_io_slot_budget_s=0.02,
++    )
++    backend = DiskBackend()
++    backend.init(
++        {"packed": gpu},
++        torch.device("cpu"),
++        load_stream,
++        store_stream,
++        str(_odirect_dir(tmp_path) / "overrun.rank_0"),
++        SLOTS,
++        BLOCK,
++        checksum="crc32",
++    )
++    worker._backend = backend
++    worker.load_stream = load_stream
++    worker.store_stream = store_stream
++    try:
++        _stored(worker, list(range(8)), list(range(8)))
++        calls = _slow_reads(monkeypatch, seconds=0.1)
++        seen: dict = {}
++        start = time.monotonic()
++        reqs = _submit_loads(worker, [(list(range(8)), list(range(8, 16)))])
++        assert _poll_all(worker, reqs, seen=seen) == reqs
++        released, fault = seen["r0"]
++        assert fault is None  # an overrun, not a fault
++        # released only after the copies in flight at the overrun landed
++        assert released - start >= 0.65
++        for i in range(3):
++            assert torch.equal(gpu[8 + i], gpu[i])
++        # the blocks now belong to another request
++        gpu[8:16].fill_(7)
++        deadline = time.monotonic() + 5
++        while backend.running(False) is not None:
++            assert time.monotonic() < deadline
++            time.sleep(0.01)
++        time.sleep(0.5)
++        assert torch.all(gpu[8:16] == 7)
++        assert calls["n"] < 8
++        assert backend.fault is None and backend.thread_alive(False)
++    finally:
++        backend.shutdown()
++        load_stream.close()
++
++
+ # ---------------------------------------------------------------------------
+ # The slowest load, as a gauge
+ # ---------------------------------------------------------------------------
+@@ -453,3 +590,111 @@ def test_slowest_load_is_reported_once_it_rises() -> None:
+     assert 2.5 <= stats["load_seconds_max"] < 3.5
+     assert sched._load_event_time == {}  # forgotten with its last request
+     assert sched.get_stats() is None  # not repeated while it does not rise
++
++
++# ---------------------------------------------------------------------------
++# An overrun at the scheduler; the start line; NaN and infinity
++# ---------------------------------------------------------------------------
++
++
++def test_overrun_on_one_rank_is_a_miss_and_keeps_the_tier() -> None:
++    """Rank 1 abandons r2's load at its total bound (no fault), ranks 0 and
++    2 load it: the aggregator releases r2 as failed when all three ranks have
++    reported, the scheduler counts a load failure and keeps the tier up. A
++    failed load with no overrun report still degrades it
++    (test_failed_load_without_fault_record_still_degrades)."""
++    from tests.v1.simple_kv_offload.test_ds41_tier_faults import (
++        _rank_output,
++        _scheduler_with_pending_load,
++    )
++    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
++    from vllm.v1.request import Request
++
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    (event,) = sched._load_event_time
++    agg = KVOutputAggregator(expected_finished_count=3)
++    overrun = SimpleCPUOffloadWorkerMetadata(
++        completed_store_events={}, overrun_load_events={event}
++    )
++    step1 = agg.aggregate(
++        [_rank_output(["r2"]), _rank_output(["r2"], ["r2"], overrun), _rank_output()]
++    )
++    sched.update_connector_output(step1.kv_connector_output)
++    step2 = agg.aggregate([_rank_output(), _rank_output(), _rank_output(["r2"])])
++    out2 = step2.kv_connector_output
++    assert out2.finished_recving == {"r2"} and out2.failed_recving == {"r2"}
++    sched.update_connector_output(out2)
++    assert not sched.degraded
++    assert "r2" not in sched._reqs_to_load
++    assert sched._overrun_load_events == set()  # forgotten with the event
++    stats = sched.get_stats()
++    assert stats["load_failures"] == 1 and stats["degraded"] == 0
++    assert "io_errors" not in stats
++    req3 = Request(
++        request_id="r3",
++        prompt_token_ids=req.prompt_token_ids,
++        sampling_params=req.sampling_params,
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=req._block_hasher,
++    )
++    hit, _ = sched.get_num_new_matched_tokens(req3, 0)
++    assert hit == 32  # the tier still answers
++
++
++def test_overrun_events_aggregate_over_ranks() -> None:
++    a = SimpleCPUOffloadWorkerMetadata(
++        completed_store_events={}, overrun_load_events={1}
++    )
++    b = SimpleCPUOffloadWorkerMetadata(
++        completed_store_events={}, overrun_load_events={2}
++    )
++    assert a.aggregate(b).overrun_load_events == {1, 2}
++
++
++def test_start_line_names_both_bounds(tmp_path, host_cuda, caplog_vllm) -> None:
++    """The worker's [DISK] start line names the timeout and the slot budget,
++    so a boot log shows that the total bound is active (window gate 1)."""
++    gpu = torch.zeros((6, BLOCK), dtype=torch.int8)
++    worker = SimpleCPUOffloadWorker(
++        vllm_config=MagicMock(),
++        kv_cache_config=None,
++        cpu_capacity_bytes=0,
++        kv_offload_backend="disk",
++        disk_path=str(_odirect_dir(tmp_path) / "start"),
++        disk_capacity_bytes=SLOTS * SLOT,
++        disk_io_timeout_s=15.0,
++        disk_io_slot_budget_s=0.02,
++    )
++    worker.load_stream = _HostStream()
++    worker.store_stream = _HostStream()
++    with caplog_vllm.at_level(logging.INFO):
++        worker._init_disk_mode({"packed": gpu}, BLOCK, torch.device("cpu"))
++    try:
++        assert (
++            "SimpleCPUOffloadWorker [DISK]: disk_io_timeout_s=15 (no progress: a "
++            "fault), disk_io_slot_budget_s=0.02 (past the total bound: a miss)"
++        ) in caplog_vllm.text
++    finally:
++        worker._backend.shutdown()
++
++
++@pytest.mark.parametrize("key", ["disk_io_timeout_s", "disk_io_slot_budget_s"])
++@pytest.mark.parametrize("value", [math.nan, math.inf, 0.0, -1.0])
++def test_bounds_must_be_finite_and_positive(key, value) -> None:
++    """NaN and infinity would turn the bound off: NaN <= 0 is False, and so is
++    now - t > NaN. Python's json accepts both."""
++    from tests.v1.kv_connector.unit.test_simple_cpu_offload_connector import (
++        _make_connector,
++    )
++
++    with pytest.raises(ValueError, match=f"requires {key} > 0"):
++        _make_connector(
++            extra_config={
++                "kv_offload_backend": "disk",
++                "disk_path": "/tmp/fake",
++                "disk_capacity_bytes": SLOTS * SLOT,
++                key: value,
++            }
++        )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 9acb3a3c8..133eeca06 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
+ 
++import math
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, Any
+ 
+@@ -75,11 +76,14 @@ _DISK_ONLY_KEYS = (
+ DEFAULT_DISK_IO_TIMEOUT_S = 15.0
+ # Seconds a slot adds to the total bound of a disk transfer: a transfer that
+ # runs longer than disk_io_timeout_s plus this for each of its slots, counted
+-# from its dequeue, is abandoned even while it makes progress
+-# (kv_connector_extra_config "disk_io_slot_budget_s"). 0.02 s is about 87
+-# times a 229,376-byte read at 1 GB/s and below the cost of recomputing a
+-# 256-token block on DS41 at 500K context (an estimate: about 70 s for
+-# 1,960 blocks).
++# from its dequeue, is abandoned even while it makes progress, as a cache miss
++# for its requests and not as a fault: the tier stays up
++# (kv_connector_extra_config "disk_io_slot_budget_s"). The per-slot time
++# includes the IO thread's Python work, which waits for the GIL behind the
++# worker's other threads, not only the device time. 0.02 s is below the
++# estimated cost of recomputing a 256-token block on DS41 at 500K context
++# (about 70 s for 1,960 blocks): a load slower than that costs more than the
++# recompute that replaces it.
+ DEFAULT_DISK_IO_SLOT_BUDGET_S = 0.02
+ 
+ 
+@@ -181,11 +185,15 @@ class SimpleCPUOffloadConnector(
+                 raise ValueError(
+                     'kv_offload_backend="disk" requires disk_capacity_bytes > 0.'
+                 )
+-            if disk_io_timeout_s <= 0:
++            # NaN and infinity would turn a bound off without a word: NaN <= 0
++            # is False, and so is any comparison against NaN.
++            if not (math.isfinite(disk_io_timeout_s) and disk_io_timeout_s > 0):
+                 raise ValueError(
+                     'kv_offload_backend="disk" requires disk_io_timeout_s > 0.'
+                 )
+-            if disk_io_slot_budget_s <= 0:
++            if not (
++                math.isfinite(disk_io_slot_budget_s) and disk_io_slot_budget_s > 0
++            ):
+                 raise ValueError(
+                     'kv_offload_backend="disk" requires disk_io_slot_budget_s > 0.'
+                 )
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 615723494..0c261a006 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -111,6 +111,8 @@ class RunningTransfer(NamedTuple):
+     progressed_at: float
+     # slots the transfer reads or writes
+     slots: int
++    # slots completed so far
++    done: int = 0
+ 
+ 
+ class DiskFault(NamedTuple):
+@@ -268,7 +270,9 @@ class DiskBackend:
+     def _progress(self, is_store: bool) -> None:
+         running = self._running[is_store]
+         if running is not None:
+-            self._running[is_store] = running._replace(progressed_at=time.monotonic())
++            self._running[is_store] = running._replace(
++                progressed_at=time.monotonic(), done=running.done + 1
++            )
+ 
+     def _copy_unless_abandoned(
+         self,
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index cd6b7a328..ff28b7cd0 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -299,6 +299,10 @@ class SimpleCPUOffloadScheduler:
+         # slowest since the engine started is a gauge.
+         self._load_event_time: dict[int, float] = {}
+         self._load_seconds_max = 0.0
++        # Load events that a rank abandoned at their total bound while they
++        # still made progress (an overrun, not a fault): their failed
++        # requests do not degrade the tier. Forgotten with the event.
++        self._overrun_load_events: set[int] = set()
+ 
+     @staticmethod
+     def _derive_cpu_config(
+@@ -1087,9 +1091,22 @@ class SimpleCPUOffloadScheduler:
+                 self._count("io_errors", len(meta.faults))
+                 self._mark_degraded(meta.faults[0])
+             self._failed_store_events.update(meta.failed_store_events)
++            for event in sorted(meta.overrun_load_events):
++                if event in self._load_event_to_reqs:
++                    if event not in self._overrun_load_events:
++                        logger.warning(
++                            "SimpleCPUOffload disk load event %d ran past its "
++                            "total bound on a rank: its requests recompute; "
++                            "the tier stays up",
++                            event,
++                        )
++                    self._overrun_load_events.add(event)
+ 
+         # --- Load completions ---
+         failed_recving = connector_output.failed_recving or set()
++        # A load abandoned at its total bound is a miss for its requests
++        # only; any other failed load degrades the tier.
++        unexplained = [r for r in failed_recving if not self._is_overrun(r)]
+         now = time.monotonic()
+         for req_id in list(connector_output.finished_recving or []):
+             if req_id in self._reqs_to_load:
+@@ -1106,7 +1123,7 @@ class SimpleCPUOffloadScheduler:
+                     self._load_seconds_max = now - sent
+                     self._stats["load_seconds_max"] = round(self._load_seconds_max, 3)
+             self._cleanup_load_request(req_id)
+-        if failed_recving and not self.degraded:
++        if unexplained and not self.degraded:
+             # A rank failed a load without a fault record reaching here yet.
+             self._mark_degraded(None)
+ 
+@@ -1275,6 +1292,18 @@ class SimpleCPUOffloadScheduler:
+             self._gpu_block_pool.blocks[bid] for bid in transfer.gpu_block_ids
+         )
+ 
++    def _is_overrun(self, req_id: str) -> bool:
++        """Whether a failed request's load event ran past its total bound
++        on a rank (reported in the worker metadata), not into a fault."""
++        state = self._reqs_to_load.get(req_id) or self._abandoned_reqs_to_load.get(
++            req_id
++        )
++        return (
++            state is not None
++            and state.load_event is not None
++            and state.load_event in self._overrun_load_events
++        )
++
+     def _count(self, key: str, n: int = 1) -> None:
+         self._stats[key] = self._stats.get(key, 0) + n
+ 
+@@ -1495,6 +1524,7 @@ class SimpleCPUOffloadScheduler:
+                 if not reqs:
+                     self._load_event_to_reqs.pop(state.load_event, None)
+                     self._load_event_time.pop(state.load_event, None)
++                    self._overrun_load_events.discard(state.load_event)
+ 
+         if state.transfer_meta is not None:
+             # Free CPU touch refs
+diff --git a/vllm/v1/simple_kv_offload/metadata.py b/vllm/v1/simple_kv_offload/metadata.py
+index aed43cdb7..149cb9afe 100644
+--- a/vllm/v1/simple_kv_offload/metadata.py
++++ b/vllm/v1/simple_kv_offload/metadata.py
+@@ -55,12 +55,15 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
+     a store completion only when count reaches ``world_size``; a store that
+     failed on any rank is dropped instead of published.
+     ``faults`` carries each rank's first disk fault once, as
+-    (rank, op, slot, errno, message).
++    (rank, op, slot, errno, message). ``overrun_load_events`` holds the load
++    events that a rank abandoned at their total bound while they still made
++    progress: their requests fall back to a miss, and the tier stays up.
+     """
+ 
+     completed_store_events: dict[int, int]
+     failed_store_events: set[int] = field(default_factory=set)
+     faults: list[tuple[int, str, int, int, str]] = field(default_factory=list)
++    overrun_load_events: set[int] = field(default_factory=set)
+ 
+     def aggregate(
+         self, other: "KVConnectorWorkerMetadata"
+@@ -73,4 +76,5 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
+             completed_store_events=merged,
+             failed_store_events=self.failed_store_events | other.failed_store_events,
+             faults=self.faults + other.faults,
++            overrun_load_events=self.overrun_load_events | other.overrun_load_events,
+         )
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index 19c27dc4d..cf496559c 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -90,25 +90,30 @@ class SimpleCPUOffloadWorker:
+ 
+         # Disk fault handling (disk mode). A transfer under I/O that has made
+         # no progress for disk_io_timeout_s (no slot completed since its IO
+-        # thread took it from the queue or since its last slot) is abandoned
+-        # and reported failed; time in the queue does not count. So is every
+-        # pending transfer of an IO thread that is not running, and every
+-        # transfer still queued on a rank whose tier has a fault. A transfer
+-        # also fails when it runs longer than disk_io_timeout_s plus
+-        # disk_io_slot_budget_s for each of its slots, counted from its
+-        # dequeue, however steady its progress (a disk that is slow but not
+-        # hung). A failed load is still reported finished, so all ranks release the
+-        # request together, and it is also reported in failed_recving, which
+-        # the scheduler turns into a cache miss (kv_load_failure_policy
++        # thread took it from the queue or since its last slot) is a fault:
++        # it is abandoned and reported failed, and the tier on this rank
++        # degrades; time in the queue does not count. So is every pending
++        # transfer of an IO thread that is not running, and every transfer
++        # still queued on a rank whose tier has a fault. A transfer that runs
++        # longer than disk_io_timeout_s plus disk_io_slot_budget_s for each
++        # of its slots, counted from its dequeue, while it still makes
++        # progress, is an overrun: it is abandoned and reported failed with
++        # no fault, and the queue behind it runs on. The IO thread's own
++        # Python work (GIL handoffs) counts against that bound, so an overrun
++        # is not a disk fault. No bound counts from submission. A failed load
++        # is still reported finished, so all ranks release the request
++        # together, and it is also reported in failed_recving, which the
++        # scheduler turns into a cache miss (kv_load_failure_policy
+         # "recompute"). A failed store is reported complete and failed, so
+         # the scheduler drops its blocks instead of publishing them.
+         self.disk_io_timeout_s = disk_io_timeout_s
+         self.disk_io_slot_budget_s = disk_io_slot_budget_s
+         self.disk_checksum = disk_checksum
+         self.disk_preallocate = disk_preallocate
+-        self._load_submit_time: dict[int, float] = {}
+-        self._store_submit_time: dict[int, float] = {}
+         self._forced_failed_loads: set[int] = set()
++        # Load events abandoned at their total bound since the last worker
++        # metadata, so the scheduler keeps the tier up for them.
++        self._overrun_load_events: set[int] = set()
+         self._failed_store_events: set[int] = set()
+         self._fault_reported = False
+         self._rank = 0
+@@ -240,6 +245,12 @@ class SimpleCPUOffloadWorker:
+             total_bytes_per_block,
+             slot_bytes,
+         )
++        logger.info(
++            "SimpleCPUOffloadWorker [DISK]: disk_io_timeout_s=%g (no progress: "
++            "a fault), disk_io_slot_budget_s=%g (past the total bound: a miss)",
++            self.disk_io_timeout_s,
++            self.disk_io_slot_budget_s,
++        )
+ 
+         assert self.disk_path is not None
+         rank_path = f"{self.disk_path}.rank_{device.index or 0}"
+@@ -320,7 +331,6 @@ class SimpleCPUOffloadWorker:
+         if metadata is not None and metadata.load_cpu_blocks:
+             backend = self._backend
+             assert backend is not None
+-            self._load_submit_time[metadata.load_event] = time.monotonic()
+             keys = (
+                 {"keys": metadata.load_keys or None}
+                 if isinstance(backend, DiskBackend)
+@@ -354,7 +364,6 @@ class SimpleCPUOffloadWorker:
+             if self._store_compute_done is None:
+                 self._store_compute_done = torch.Event()
+             self._store_compute_done.record(torch.cuda.current_stream())
+-            self._store_submit_time[metadata.store_event] = time.monotonic()
+             keys = (
+                 {"keys": metadata.store_keys or None}
+                 if isinstance(backend, DiskBackend)
+@@ -407,7 +416,6 @@ class SimpleCPUOffloadWorker:
+             load_wm = self._poll_stream_events(is_store=False)
+             for j in [j for j in self._pending_load_event_indices if j <= load_wm]:
+                 self._pending_load_event_indices.discard(j)
+-                self._load_submit_time.pop(j, None)
+                 req_ids = reqs_of(j)
+                 finished_recving.update(req_ids)
+                 backend = self._backend
+@@ -423,7 +431,6 @@ class SimpleCPUOffloadWorker:
+             store_wm = self._poll_stream_events(is_store=True)
+             for j in [j for j in self._pending_store_event_indices if j <= store_wm]:
+                 self._pending_store_event_indices.discard(j)
+-                self._store_submit_time.pop(j, None)
+                 self._completed_store_events[j] = 1
+                 backend = self._backend
+                 if isinstance(backend, DiskBackend) and backend.take_failed(True, j):
+@@ -434,66 +441,85 @@ class SimpleCPUOffloadWorker:
+         )
+ 
+     def _check_overdue_transfers(self) -> None:
+-        """Abandon disk transfers that stopped making progress.
+-
+-        Bound: a transfer under I/O is reported failed at the first
+-        get_finished call after disk_io_timeout_s with no completed slot,
+-        counted from the moment its IO thread took it from the queue or from
+-        its last completed slot. Time in the queue does not count, so a burst
+-        of loads queued behind each other does not fail. A transfer that
+-        keeps completing slots fails at its total bound instead:
+-        disk_io_timeout_s plus disk_io_slot_budget_s for each of its slots,
+-        from the moment it left the queue. Every
+-        pending transfer fails at once when its IO thread is not running, and
+-        every transfer still queued fails at once when the rank's tier has a
+-        fault (its thread may be blocked in a hung read). Abandoned copies
+-        stop before their next DMA (DiskBackend.abandon); copies already
+-        queued on the load stream are drained before the request's blocks
+-        are released.
++        """Abandon disk transfers that stopped making progress or that ran
++        past their total bound.
++
++        No progress: a transfer under I/O with no completed slot for
++        disk_io_timeout_s, counted from the moment its IO thread took it from
++        the queue or from its last completed slot, is a fault. It is reported
++        failed at the first get_finished call after that, the tier on this
++        rank degrades, and every transfer still queued fails at once (its
++        thread may be blocked in a hung read). The check also covers a
++        transfer already abandoned at its total bound: its thread runs
++        nothing else until it returns. Time in the queue does not count, so a
++        burst of loads queued behind each other does not fail.
++
++        Total bound: a transfer that keeps completing slots but runs longer
++        than disk_io_timeout_s plus disk_io_slot_budget_s for each of its
++        slots, from the moment it left the queue, is an overrun. It is
++        reported failed (a load becomes a cache miss, a store is dropped)
++        with no fault: its thread is alive and moves on to the next transfer
++        at its next slot, and the tier stays up. The IO thread's Python work
++        counts against the bound, so a busy GIL alone can cause an overrun.
++
++        Every pending transfer fails at once, as a fault, when its IO thread
++        is not running. Abandoned copies stop before their next DMA
++        (DiskBackend.abandon); copies already queued on the load stream are
++        drained before the request's blocks are released.
+         """
+         backend = self._backend
+         if not isinstance(backend, DiskBackend):
+             return
+         now = time.monotonic()
+-        for is_store, pending, submitted in (
+-            (False, self._pending_load_event_indices, self._load_submit_time),
+-            (True, self._pending_store_event_indices, self._store_submit_time),
++        for is_store, pending in (
++            (False, self._pending_load_event_indices),
++            (True, self._pending_store_event_indices),
+         ):
+             if not pending:
+                 continue
+             op = "store" if is_store else "load"
+-            dead = not backend.thread_alive(is_store)
+             overdue: list[int] = []
+-            if dead:
++            if not backend.thread_alive(is_store):
+                 overdue = list(pending)
+                 backend.record_fault(op, -1, errno.EPIPE, f"the {op} thread stopped")
+             else:
+                 running = backend.running(is_store)
+-                reason = None
+-                if running is not None and running.event_idx in pending:
++                if running is not None:
++                    elapsed = now - running.started_at
+                     bound = (
+                         self.disk_io_timeout_s
+                         + running.slots * self.disk_io_slot_budget_s
+                     )
+                     if now - running.progressed_at > self.disk_io_timeout_s:
+-                        reason = (
+-                            f"made no progress for {self.disk_io_timeout_s:g} s "
+-                            "(I/O timeout)"
++                        if running.event_idx in pending:
++                            overdue.append(running.event_idx)
++                        backend.record_fault(
++                            op,
++                            backend.current_slot(is_store),
++                            errno.ETIMEDOUT,
++                            f"{op} event {running.event_idx} made no progress "
++                            f"for {self.disk_io_timeout_s:g} s (I/O timeout)",
+                         )
+-                    elif now - running.started_at > bound:
+-                        reason = (
+-                            f"ran past its {bound:g} s bound "
+-                            f"({self.disk_io_timeout_s:g} s + {running.slots} "
+-                            f"slots x {self.disk_io_slot_budget_s:g} s)"
++                    elif running.event_idx in pending and elapsed > bound:
++                        overdue.append(running.event_idx)
++                        if not is_store:
++                            self._overrun_load_events.add(running.event_idx)
++                        logger.warning(
++                            "SimpleCPUOffloadWorker [DISK]: rank %d %s event %d "
++                            "ran past its %g s bound (%g s + %d slots x %g s), "
++                            "%d of %d slots in %.1f s; reported failed, the tier "
++                            "stays up",
++                            self._rank,
++                            op,
++                            running.event_idx,
++                            bound,
++                            self.disk_io_timeout_s,
++                            running.slots,
++                            self.disk_io_slot_budget_s,
++                            running.done,
++                            running.slots,
++                            elapsed,
+                         )
+-                if reason is not None:
+-                    overdue.append(running.event_idx)
+-                    backend.record_fault(
+-                        op,
+-                        backend.current_slot(is_store),
+-                        errno.ETIMEDOUT,
+-                        f"{op} event {running.event_idx} {reason}",
+-                    )
+                 if backend.fault is not None:
+                     overdue.extend(
+                         j
+@@ -510,7 +536,6 @@ class SimpleCPUOffloadWorker:
+                 self.load_stream.synchronize()
+             for j in overdue:
+                 pending.discard(j)
+-                submitted.pop(j, None)
+                 if is_store:
+                     self._completed_store_events[j] = 1
+                     self._failed_store_events.add(j)
+@@ -519,7 +544,8 @@ class SimpleCPUOffloadWorker:
+ 
+     def build_connector_worker_meta(self) -> SimpleCPUOffloadWorkerMetadata | None:
+         """Return completed store events since the last call, the failed ones
+-        among them, and this rank's first disk fault once."""
++        among them, the load events abandoned at their total bound, and this
++        rank's first disk fault once."""
+         faults: list[tuple[int, str, int, int, str]] = []
+         backend = self._backend
+         if (
+@@ -532,15 +558,21 @@ class SimpleCPUOffloadWorker:
+                 (self._rank, fault.op, fault.slot, fault.errno, fault.message)
+             )
+             self._fault_reported = True
+-        if not self._completed_store_events and not faults:
++        if (
++            not self._completed_store_events
++            and not faults
++            and not self._overrun_load_events
++        ):
+             return None
+         meta = SimpleCPUOffloadWorkerMetadata(
+             completed_store_events=self._completed_store_events,
+             failed_store_events=self._failed_store_events,
+             faults=faults,
++            overrun_load_events=self._overrun_load_events,
+         )
+         self._completed_store_events = {}
+         self._failed_store_events = set()
++        self._overrun_load_events = set()
+         return meta
+ 
+     def handle_preemptions(
+-- 
+2.56.1
+

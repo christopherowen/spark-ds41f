@@ -1,0 +1,868 @@
+From 285465b70369aecacedb49c972151529191ed043 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:29:40 +0000
+Subject: [PATCH] feat(kv-offload): name the block in each disk slot header
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9038
+of this series.
+
+Rationale: a later read of the code showed that the expected generation
+of a slot is the latest store of the rank to that slot, so a slot that
+was rewritten for another block between the lookup and the load still
+passed the header check. With this patch, every store and every load of
+the disk tier carries a block key for each slot, which is an 8-byte
+BLAKE2b digest of the block's hash together with the block's group id
+(disk_backend.slot_key). For a store the scheduler takes the keys from
+the hashes of the stored GPU blocks, and for a load it takes them from
+the CPU blocks that the lookup found, at the time of the lookup. The
+slot header (version 2, 40 bytes in the slot padding) stores the key,
+and the load compares it after the slot id and the generation and before
+any copy to the GPU. A mismatch is an EBADMSG fault, so the load fails
+on that rank, the request is a miss on all ranks, and the tier degrades
+as it does for any other disk fault. CPU mode sends no keys. The key is
+a digest and not a plain 8-byte prefix of the hash, because the hash of
+a block that spans two hash blocks starts with the hash of the smaller
+group's block at the same position, and the group id sits in the last 4
+bytes. The key comes from the hash and not from a per-slot store count
+in the scheduler, because the hash survives an engine restart, so a
+persisted index could check a header without keeping a count; that index
+is a design for a later change and is not part of this series.
+
+Quality implications: a correct load gives the same output as before,
+and a slot that holds another block now fails as a cache miss instead of
+serving the wrong block.
+
+Tests: on the CPU path, with VLLM_TARGET_DEVICE=cpu, the offload suite
+passed 177 tests, with 2 CUDA-only modules skipped. The new file
+test_ds41_tier_keys.py holds 5 tests. They check that keys separate the
+groups, that a slot rewritten for another key fails a load that expects
+the first key even when the generation matches, and that a matching key
+loads. One test runs a disk-mode scheduler with a real worker as rank 1
+of three: the second slot is rewritten between the lookup and the load
+and fails, the first slot loads, the aggregator releases the request as
+a miss, and the tier degrades. The last test checks that CPU mode sends
+no keys. On DGX Spark hardware the patch ran only as part of the whole
+series.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../simple_kv_offload/test_ds41_tier_keys.py  | 311 ++++++++++++++++++
+ vllm/v1/simple_kv_offload/disk_backend.py     |  99 ++++--
+ vllm/v1/simple_kv_offload/manager.py          |  44 ++-
+ vllm/v1/simple_kv_offload/metadata.py         |   7 +
+ vllm/v1/simple_kv_offload/worker.py           |  12 +
+ 5 files changed, 444 insertions(+), 29 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_tier_keys.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_keys.py b/tests/v1/simple_kv_offload/test_ds41_tier_keys.py
+new file mode 100644
+index 000000000..0a5c04da4
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_keys.py
+@@ -0,0 +1,311 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Each disk slot names the block it holds (CPU-only).
++
++Every store writes the block key (disk_backend.slot_key of the block hash)
++into the slot header, and every load sends the key that the scheduler took at
++its lookup. A slot rewritten for another block between the lookup and the load
++passes the generation check (the rank's latest store to the slot) but fails
++the key check: the load is a fault, a miss on all ranks, and the tier degrades.
++"""
++
++from __future__ import annotations
++
++import errno
++import time
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from tests.v1.simple_kv_offload import ds41_layout
++from tests.v1.simple_kv_offload.test_ds41_offload import _odirect_dir
++from tests.v1.simple_kv_offload.test_ds41_tier_faults import (  # noqa: F401
++    _HostStream,
++    _load,
++    _poll,
++    _rank_output,
++    host_cuda,
++    sealed,
++)
++from tests.v1.simple_kv_offload.test_scheduler import (
++    _BYTES_PER_BLOCK,
++    SchedulerFixture,
++    _alloc_and_register,
++    _make_kv_cache_config,
++    _make_vllm_config,
++    BLOCK_SIZE,
++    make_request,
++    make_scheduler_output,
++)
++from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
++from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++from vllm.v1.outputs import KVConnectorOutput
++from vllm.v1.request import Request
++from vllm.v1.simple_kv_offload.disk_backend import DiskBackend, slot_key
++from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
++from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
++from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++BLOCK = ds41_layout.LIVE_BLOCK_BYTES
++SLOT = 229376
++SLOTS = 16
++GPU_BLOCKS = 16
++
++
++def _wait_store(worker, event) -> None:
++    deadline = time.monotonic() + 5
++    while event in worker._pending_store_event_indices:
++        worker.get_transfer_results(set())
++        assert time.monotonic() < deadline
++        time.sleep(0.01)
++
++
++def test_slot_key_separates_groups_and_blocks() -> None:
++    # A 256-token block's hash starts with the 128-token hash at the same
++    # position; the group id is the last 4 bytes. An 8-byte prefix would match.
++    h0 = bytes(range(32))
++    h1 = bytes(range(32, 64))
++    big = h0 + h1 + (7).to_bytes(4, "big")
++    small = h0 + (0).to_bytes(4, "big")
++    other_group = h0 + h1 + (6).to_bytes(4, "big")
++    assert big[:8] == small[:8]
++    keys = {slot_key(big), slot_key(small), slot_key(other_group)}
++    assert len(keys) == 3 and 0 not in keys
++    assert slot_key(None) == 0
++    assert slot_key(big) == slot_key(bytes(big))  # stable for equal hashes
++
++
++def test_slot_rewritten_for_another_block_is_a_fault(sealed) -> None:
++    """Block A stored, then block B into the same slot (the rank's latest
++    store, so the generation matches); a load that expects A fails before any
++    copy to the GPU."""
++    worker, gpu, path = sealed()
++    key_a, key_b = 0x1111, 0x2222
++    worker._backend.launch_copy([0], [8], True, 0, worker._store_events, keys=[key_a])
++    worker._pending_store_event_indices.add(0)
++    _wait_store(worker, 0)
++    worker._backend.launch_copy([1], [8], True, 1, worker._store_events, keys=[key_b])
++    worker._pending_store_event_indices.add(1)
++    _wait_store(worker, 1)
++    gpu[4].zero_()
++    worker.bind_connector_metadata(_load_meta(slots=[8], gpu_ids=[4], keys=[key_a]))
++    worker.start_load_kv()
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.finished_recving == {"r1"} and res.failed_recving == {"r1"}
++    fault = worker._backend.fault
++    assert (fault.op, fault.slot, fault.errno) == ("load", 8, errno.EBADMSG)
++    assert f"block key {key_b:016x}, expected {key_a:016x}" in fault.message
++    assert torch.count_nonzero(gpu[4]) == 0  # checked before any DMA
++
++
++def test_matching_key_loads(sealed) -> None:
++    worker, gpu, path = sealed()
++    want = gpu[2].clone()
++    worker._backend.launch_copy([2], [11], True, 0, worker._store_events, keys=[77])
++    worker._pending_store_event_indices.add(0)
++    _wait_store(worker, 0)
++    gpu[2].zero_()
++    worker.bind_connector_metadata(_load_meta(slots=[11], gpu_ids=[2], keys=[77]))
++    worker.start_load_kv()
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.finished_recving == {"r1"} and not res.failed_recving
++    assert torch.equal(gpu[2], want)
++
++
++def _load_meta(slots, gpu_ids, keys, event=0, req="r1"):
++    from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
++
++    return SimpleCPUOffloadMetadata(
++        load_event=event,
++        load_gpu_blocks=gpu_ids,
++        load_cpu_blocks=slots,
++        load_keys=keys,
++        load_event_to_reqs={event: [req]},
++    )
++
++
++# ---------------------------------------------------------------------------
++# The scheduler sends the keys: a disk-mode scheduler, one real worker as
++# rank 1, two simulated ranks, the fork's aggregator
++# ---------------------------------------------------------------------------
++
++
++def _disk_scheduler(num_cpu_blocks=8, num_gpu_blocks=GPU_BLOCKS) -> SchedulerFixture:
++    kv_cache_config = _make_kv_cache_config(num_gpu_blocks, 1)
++    vllm_config = _make_vllm_config()
++    sched = SimpleCPUOffloadScheduler(
++        vllm_config=vllm_config,
++        kv_cache_config=kv_cache_config,
++        cpu_capacity_bytes=0,
++        scheduler_block_size=BLOCK_SIZE,
++        hash_block_size=BLOCK_SIZE,
++        lazy_offload=False,
++        disk_capacity_bytes=_BYTES_PER_BLOCK * num_cpu_blocks,
++        disk_use_page_cache=True,  # the scheduler's slot count, unpadded
++    )
++    gpu_block_pool = BlockPool(
++        num_gpu_blocks=num_gpu_blocks, enable_caching=True, hash_block_size=BLOCK_SIZE
++    )
++    sched.bind_gpu_block_pool(gpu_block_pool)
++    return SchedulerFixture(
++        scheduler=sched,
++        gpu_block_pool=gpu_block_pool,
++        vllm_config=vllm_config,
++        kv_cache_config=kv_cache_config,
++        num_groups=1,
++    )
++
++
++@pytest.fixture
++def rank1(tmp_path, host_cuda):  # noqa: F811
++    """A worker on a sealed host-copy DiskBackend with 16 GPU blocks."""
++    gen = torch.Generator().manual_seed(11)
++    gpu = torch.randint(-128, 127, (GPU_BLOCKS, BLOCK), dtype=torch.int8, generator=gen)
++    worker = SimpleCPUOffloadWorker(
++        vllm_config=MagicMock(),
++        kv_cache_config=None,
++        cpu_capacity_bytes=0,
++        kv_offload_backend="disk",
++        disk_path=str(tmp_path / "unused"),
++        disk_capacity_bytes=SLOTS * SLOT,
++    )
++    stream = _HostStream()
++    backend = DiskBackend()
++    backend.init(
++        {"packed": gpu},
++        torch.device("cpu"),
++        stream,
++        stream,
++        str(_odirect_dir(tmp_path) / "keys.rank_1"),
++        SLOTS,
++        BLOCK,
++        checksum="crc32",
++    )
++    worker._backend = backend
++    worker.load_stream = worker.store_stream = stream
++    worker._rank = 1
++    yield worker, gpu
++    backend.shutdown()
++
++
++def _run_store(worker, meta) -> None:
++    worker.bind_connector_metadata(meta)
++    worker.wait_for_save()
++    worker._connector_metadata = None
++    _wait_store(worker, meta.store_event)
++    done = worker.build_connector_worker_meta()
++    assert done.completed_store_events == {meta.store_event: 1}
++    assert not done.failed_store_events
++
++
++def test_rewrite_between_lookup_and_load_is_a_miss_on_all_ranks(rank1) -> None:
++    worker, gpu = rank1
++    fix = _disk_scheduler()
++    sched = fix.scheduler
++    sched._expected_worker_count = 3
++
++    # Request A computes 2 blocks; the scheduler stores them with their keys.
++    req = make_request(num_blocks=2)
++    kv_blocks = _alloc_and_register(fix, req, 2)
++    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
++    meta = sched.build_connector_meta(
++        make_scheduler_output(
++            {req.request_id: 32}, new_reqs={req.request_id: kv_blocks.get_block_ids()}
++        )
++    )
++    hashes = [fix.gpu_block_pool.blocks[b].block_hash for b in meta.store_gpu_blocks]
++    assert meta.store_keys == [slot_key(h) for h in hashes]
++    assert len(set(meta.store_keys)) == 2 and 0 not in meta.store_keys
++    _run_store(worker, meta)
++    sched.update_connector_output(
++        KVConnectorOutput(
++            kv_connector_worker_meta=SimpleCPUOffloadWorkerMetadata(
++                completed_store_events={meta.store_event: 3}
++            )
++        )
++    )
++    slots = list(meta.store_cpu_blocks)
++
++    # Request B, same prompt: the lookup hits both slots and takes their keys.
++    req2 = Request(
++        request_id="r2",
++        prompt_token_ids=req.prompt_token_ids,
++        sampling_params=req.sampling_params,
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=req._block_hasher,
++    )
++    hit, is_async = sched.get_num_new_matched_tokens(req2, 0)
++    assert (hit, is_async) == (32, True)
++
++    # Between the lookup and the load the second slot is rewritten for
++    # another block (as a pin bug would let a store take it): a different
++    # GPU block, the key of another request's block hash, on rank 1.
++    other = make_request(num_blocks=1)
++    other_gpu = _alloc_and_register(fix, other, 1).get_block_ids()[0][0]
++    other_key = slot_key(fix.gpu_block_pool.blocks[other_gpu].block_hash)
++    assert other_key not in meta.store_keys
++    worker._backend.launch_copy(
++        [15], [slots[1]], True, 100, worker._store_events, keys=[other_key]
++    )
++    worker._pending_store_event_indices.add(100)
++    _wait_store(worker, 100)
++    worker._completed_store_events.clear()
++
++    blocks2 = KVCacheBlocks(blocks=(fix.gpu_block_pool.get_new_blocks(2),))
++    sched.update_state_after_alloc(req2, blocks2, num_external_tokens=hit)
++    load_meta = sched.build_connector_meta(
++        make_scheduler_output({"r2": 1}, new_reqs={"r2": blocks2.get_block_ids()})
++    )
++    assert load_meta.load_cpu_blocks == slots
++    assert load_meta.load_keys == meta.store_keys  # the keys of the lookup
++    dst = load_meta.load_gpu_blocks
++    for b in dst:
++        gpu[b].zero_()
++    worker.bind_connector_metadata(load_meta)
++    worker.start_load_kv()
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.finished_recving == {"r2"} and res.failed_recving == {"r2"}
++    fault = worker._backend.fault
++    assert (fault.op, fault.slot, fault.errno) == ("load", slots[1], errno.EBADMSG)
++    assert "block key" in fault.message
++    assert torch.equal(gpu[dst[0]], gpu[meta.store_gpu_blocks[0]])  # slot 1 of 2
++    assert torch.count_nonzero(gpu[dst[1]]) == 0  # the rewritten slot: no DMA
++
++    # Ranks 0 and 2 loaded fine; rank 1 failed: a miss for the request.
++    agg = KVOutputAggregator(expected_finished_count=3)
++    out = agg.aggregate(
++        [
++            _rank_output(["r2"]),
++            _rank_output(["r2"], ["r2"], worker.build_connector_worker_meta()),
++            _rank_output(["r2"]),
++        ]
++    ).kv_connector_output
++    assert out.finished_recving == {"r2"} and out.failed_recving == {"r2"}
++    sched.update_connector_output(out)
++    assert sched.degraded
++    assert "r2" not in sched._reqs_to_load
++    assert sched.get_num_new_matched_tokens(req2, 0) == (0, False)
++    stats = sched.get_stats()
++    assert stats["load_failures"] == 1 and stats["io_errors"] == 1
++    assert stats["degraded"] == 1
++
++
++def test_cpu_mode_sends_no_keys() -> None:
++    from tests.v1.simple_kv_offload.test_scheduler import make_scheduler
++
++    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16)
++    sched = fix.scheduler
++    req = make_request(num_blocks=2)
++    kv_blocks = _alloc_and_register(fix, req, 2)
++    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
++    meta = sched.build_connector_meta(
++        make_scheduler_output(
++            {req.request_id: 32}, new_reqs={req.request_id: kv_blocks.get_block_ids()}
++        )
++    )
++    assert meta.store_gpu_blocks and meta.store_keys == []
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 4f5d1c495..464516bbe 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import errno
++import hashlib
+ import os
+ import queue
+ import struct
+@@ -38,15 +39,33 @@ O_DIRECT = getattr(os, "O_DIRECT", 0)
+ _ALIGNMENT = 4096
+ 
+ # Slot header, written into the slot's padding after the block bytes:
+-# magic, version, checksum kind, slot id, generation, checksum. The slot id
+-# catches a misdirected read, the generation (the slot's store count in this
+-# process) a lost or stale write, the checksum corrupted or torn bytes.
+-_HEADER = struct.Struct("<4sHHQQQ")
++# magic, version, checksum kind, slot id, generation, block key, checksum.
++# The slot id catches a misdirected read, the generation (the slot's store
++# count on this rank) a lost or stale write, the block key (slot_key of the
++# block hash that the scheduler stored or expects, sent with every store and
++# load) a slot rewritten for another block between the scheduler's lookup and
++# the load, and the checksum corrupted or torn bytes.
++_HEADER = struct.Struct("<4sHHQQQQ")
+ _HEADER_MAGIC = b"KVT1"
+-_HEADER_VERSION = 1
++_HEADER_VERSION = 2
+ CHECKSUMS = {"none": 0, "crc32": 1, "sum64": 2}
+ 
+ 
++def slot_key(block_hash: bytes | None) -> int:
++    """The 8-byte identity of a block in its disk slot header.
++
++    A BLAKE2b digest of the whole BlockHashWithGroupId, not a prefix of it:
++    a group whose block spans two hash blocks has a hash that starts with the
++    hash of a smaller group's block at the same position, and the group id
++    sits in the last 4 bytes. 0 means no block (never a real digest in
++    practice: one chance in 2**64).
++    """
++    if block_hash is None:
++        return 0
++    digest = hashlib.blake2b(block_hash, digest_size=8).digest()
++    return int.from_bytes(digest, "little")
++
++
+ class DiskTierError(OSError):
+     """An I/O fault on one tier slot: the errno, the message and the slot."""
+ 
+@@ -148,7 +167,7 @@ class DiskBackend:
+         self._abandon_lock = threading.Lock()
+         # Slot under I/O in each thread, for the fault report of a timeout.
+         self._current_slot: dict[bool, int] = {True: -1, False: -1}
+-        # Slot integrity (see _HEADER): kind 0 is off.
++        # Slot integrity (see _HEADER): kind 0 is off, the header with it.
+         self._checksum_kind = 0
+         self._generation: np.ndarray | None = None
+         self._store_rows: list[np.ndarray] = []
+@@ -209,6 +228,7 @@ class DiskBackend:
+         dst_blocks: list[int],
+         stream: torch.cuda.Stream,
+         event_idx: int,
++        keys: list[int] | None = None,
+     ) -> None:
+         """One queued transfer. Never raises: a fault marks the event failed."""
+         if self._fault is not None:
+@@ -217,9 +237,9 @@ class DiskBackend:
+             return
+         try:
+             if is_store:
+-                self._do_store(src_blocks, dst_blocks, stream, event_idx)
++                self._do_store(src_blocks, dst_blocks, stream, event_idx, keys)
+             else:
+-                self._do_load(src_blocks, dst_blocks, stream, event_idx)
++                self._do_load(src_blocks, dst_blocks, stream, event_idx, keys)
+         except _Abandoned:
+             self._failed_events[is_store].add(event_idx)
+         except Exception as e:  # OSError, a CUDA RuntimeError, a bad header
+@@ -407,9 +427,17 @@ class DiskBackend:
+         event_idx: int,
+         events_list: list[tuple[int, torch.Event]],
+         wait_event: torch.Event | None = None,
++        keys: list[int] | None = None,
+     ) -> None:
++        """Queue a transfer. ``keys`` holds the block key (slot_key) of each
++        disk slot of the transfer, in order: written into the header by a
++        store, compared with the header by a load. None means key 0."""
+         q = self._store_queue if is_store else self._load_queue
+-        q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
++        slots = dst_blocks if is_store else src_blocks
++        if keys is None:
++            keys = [0] * len(slots)
++        assert len(keys) == len(slots), (len(keys), len(slots))
++        q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event, keys))
+ 
+     def shutdown(self) -> None:
+         if self._shutdown:
+@@ -456,10 +484,10 @@ class DiskBackend:
+             item = self._store_queue.get()
+             if item is None:
+                 return
+-            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
++            (src_blocks, dst_blocks, event_idx, events_list, wait_event, keys) = item
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+-            self._run_transfer(True, src_blocks, dst_blocks, stream, event_idx)
++            self._run_transfer(True, src_blocks, dst_blocks, stream, event_idx, keys)
+             event = torch.Event()
+             event.record(stream)
+             events_list.append((event_idx, event))
+@@ -469,7 +497,7 @@ class DiskBackend:
+             return zlib.crc32(memoryview(data))
+         return int(data.view(np.uint64).sum(dtype=np.uint64))
+ 
+-    def _seal_slot(self, buf_slot: int, slot: int) -> int:
++    def _seal_slot(self, buf_slot: int, slot: int, key: int) -> int:
+         """Write the header of a staged block; returns its generation."""
+         assert self._generation is not None
+         row = self._store_rows[buf_slot]
+@@ -483,17 +511,18 @@ class DiskBackend:
+             self._checksum_kind,
+             slot,
+             generation,
++            key,
+             self._checksum(row[:n]),
+         )
+         return generation
+ 
+-    def _verify_slot(self, buf_slot: int, slot: int) -> None:
++    def _verify_slot(self, buf_slot: int, slot: int, expected_key: int) -> None:
+         """Check a read slot's header and checksum before any DMA."""
+         assert self._generation is not None
+         row = self._load_rows[buf_slot]
+         n = self._total_block_bytes
+-        magic, version, kind, got_slot, generation, checksum = _HEADER.unpack_from(
+-            row, n
++        magic, version, kind, got_slot, generation, key, checksum = (
++            _HEADER.unpack_from(row, n)
+         )
+         expected_generation = int(self._generation[slot])
+         problem = None
+@@ -505,6 +534,8 @@ class DiskBackend:
+             problem = f"header of slot {got_slot}"
+         elif generation != expected_generation:
+             problem = f"generation {generation}, expected {expected_generation}"
++        elif key != expected_key:
++            problem = f"block key {key:016x}, expected {expected_key:016x}"
+         elif checksum != self._checksum(row[:n]):
+             problem = "checksum mismatch"
+         if problem is not None:
+@@ -514,9 +545,11 @@ class DiskBackend:
+                 slot,
+             )
+ 
+-    def _writev_slot(self, buf_slot: int, file_offset: int, slot: int = -1) -> None:
++    def _writev_slot(
++        self, buf_slot: int, file_offset: int, slot: int = -1, key: int = 0
++    ) -> None:
+         self._current_slot[True] = slot
+-        generation = self._seal_slot(buf_slot, slot) if self._checksum_kind else 0
++        generation = self._seal_slot(buf_slot, slot, key) if self._checksum_kind else 0
+         try:
+             written = os.pwritev(
+                 self._fd, self._store_slot_views[buf_slot], file_offset
+@@ -534,7 +567,9 @@ class DiskBackend:
+         if self._generation is not None:
+             self._generation[slot] = generation
+ 
+-    def _readv_slot(self, buf_slot: int, file_offset: int, slot: int = -1) -> None:
++    def _readv_slot(
++        self, buf_slot: int, file_offset: int, slot: int = -1, key: int = 0
++    ) -> None:
+         self._current_slot[False] = slot
+         try:
+             bytes_read = os.preadv(
+@@ -551,7 +586,7 @@ class DiskBackend:
+                 slot,
+             )
+         if self._checksum_kind:
+-            self._verify_slot(buf_slot, slot)
++            self._verify_slot(buf_slot, slot, key)
+ 
+     def _load_loop(
+         self,
+@@ -563,10 +598,10 @@ class DiskBackend:
+             item = self._load_queue.get()
+             if item is None:
+                 return
+-            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
++            (src_blocks, dst_blocks, event_idx, events_list, wait_event, keys) = item
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+-            self._run_transfer(False, src_blocks, dst_blocks, stream, event_idx)
++            self._run_transfer(False, src_blocks, dst_blocks, stream, event_idx, keys)
+             event = torch.Event()
+             event.record(stream)
+             events_list.append((event_idx, event))
+@@ -577,19 +612,24 @@ class DiskBackend:
+         disk_slots: list[int],
+         stream: torch.cuda.Stream,
+         event_idx: int = -1,
++        keys: list[int] | None = None,
+     ) -> None:
+         """GPU -> buffer (DMA) -> disk (pwritev), interleaved double-buffer."""
+         assert self._store_slot_params
+         n = self._num_buffer_slots
+-        # (DMA event, disk slot) of the block already staged in each slot.
+-        pending: list[tuple[torch.Event, int] | None] = [None] * n
++        if keys is None:
++            keys = [0] * len(disk_slots)
++        # (DMA event, disk slot, block key) of the block staged in each slot.
++        pending: list[tuple[torch.Event, int, int] | None] = [None] * n
+ 
+         for i, (gpu_blk, disk_slot) in enumerate(zip(gpu_blocks, disk_slots)):
+             buf_slot = i % n
+             prev = pending[buf_slot]
+             if prev is not None:
+                 prev[0].synchronize()
+-                self._writev_slot(buf_slot, prev[1] * self._slot_bytes, prev[1])
++                self._writev_slot(
++                    buf_slot, prev[1] * self._slot_bytes, prev[1], prev[2]
++                )
+ 
+             ev = self._copy_unless_abandoned(
+                 True,
+@@ -599,12 +639,12 @@ class DiskBackend:
+                 self._store_slot_params[buf_slot],
+                 stream,
+             )
+-            pending[buf_slot] = (ev, disk_slot)
++            pending[buf_slot] = (ev, disk_slot, keys[i])
+ 
+         for slot, last in enumerate(pending):
+             if last is not None:
+                 last[0].synchronize()
+-                self._writev_slot(slot, last[1] * self._slot_bytes, last[1])
++                self._writev_slot(slot, last[1] * self._slot_bytes, last[1], last[2])
+ 
+     def _do_load(
+         self,
+@@ -612,10 +652,13 @@ class DiskBackend:
+         gpu_blocks: list[int],
+         stream: torch.cuda.Stream,
+         event_idx: int = -1,
++        keys: list[int] | None = None,
+     ) -> None:
+         """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
+         assert self._load_slot_params
+         n = self._num_buffer_slots
++        if keys is None:
++            keys = [0] * len(disk_slots)
+         prev_dma_events: list[torch.Event | None] = [None] * n
+ 
+         for i, (disk_slot, gpu_blk) in enumerate(zip(disk_slots, gpu_blocks)):
+@@ -624,7 +667,9 @@ class DiskBackend:
+             if prev is not None:
+                 prev.synchronize()
+ 
+-            self._readv_slot(buf_slot, disk_slot * self._slot_bytes, disk_slot)
++            self._readv_slot(
++                buf_slot, disk_slot * self._slot_bytes, disk_slot, keys[i]
++            )
+ 
+             prev_dma_events[buf_slot] = self._copy_unless_abandoned(
+                 False,
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 327d30adc..5fd8b3778 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -45,7 +45,7 @@ from vllm.v1.kv_cache_interface import (
+     get_kv_cache_spec_sliding_window,
+ )
+ from vllm.v1.outputs import KVConnectorOutput
+-from vllm.v1.simple_kv_offload.disk_backend import disk_slot_bytes
++from vllm.v1.simple_kv_offload.disk_backend import disk_slot_bytes, slot_key
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+@@ -84,6 +84,9 @@ class TransferMeta:
+     # Eager finish-time store only: the request it belongs to, so that the
+     # request's chain refresh waits for this store too.
+     req_id: str | None = None
++    # Disk tier, loads only: the block key (slot_key) that each slot of
++    # cpu_block_ids must hold, taken at the lookup.
++    keys: list[int] | None = None
+ 
+ 
+ @dataclass
+@@ -241,6 +244,13 @@ class SimpleCPUOffloadScheduler:
+         self._pending_cpu_hits: dict[
+             str, tuple[tuple[list[KVCacheBlock], ...], int, int]
+         ] = {}
++        # Disk tier: every store and load names the block it expects in each
++        # slot (disk_backend.slot_key of the block hash), and the slot header
++        # check compares it before any copy to the GPU. A load's keys are
++        # taken at the lookup, here per pending hit, so a slot rewritten for
++        # another block between the lookup and the load fails its check.
++        self._slot_keys = disk_capacity_bytes > 0
++        self._pending_cpu_hit_keys: dict[str, tuple[list[int], ...]] = {}
+ 
+         # Store metadata
+         self._lazy_mode = lazy_offload
+@@ -368,6 +378,7 @@ class SimpleCPUOffloadScheduler:
+         # is dropped first.
+         if stale := self._pending_cpu_hits.pop(request.request_id, None):
+             self._free_pending_cpu_hit(stale)
++        self._pending_cpu_hit_keys.pop(request.request_id, None)
+ 
+         if request.skip_reading_prefix_cache or self.degraded:
+             return 0, False
+@@ -424,6 +435,11 @@ class SimpleCPUOffloadScheduler:
+                 hit_length,
+                 num_computed_tokens,
+             )
++            if self._slot_keys:
++                self._pending_cpu_hit_keys[request.request_id] = tuple(
++                    [0 if blk.is_null else slot_key(blk.block_hash) for blk in grp]
++                    for grp in cpu_hit_blocks
++                )
+             return hit_length, True
+         return 0, False
+ 
+@@ -453,6 +469,7 @@ class SimpleCPUOffloadScheduler:
+         # found blocks were pinned there to survive LRU eviction in the window
+         # between get_num_new_matched_tokens() and this matching call.
+         pending = self._pending_cpu_hits.pop(req_id, None)
++        pending_keys = self._pending_cpu_hit_keys.pop(req_id, None)
+ 
+         if num_external_tokens == 0:
+             if pending is not None:
+@@ -506,6 +523,7 @@ class SimpleCPUOffloadScheduler:
+ 
+         gpu_block_ids: list[int] = []
+         cpu_block_ids: list[int] = []
++        cpu_keys: list[int] | None = [] if pending_keys is not None else None
+         cpu_blocks_to_touch: list[KVCacheBlock] = []
+ 
+         for g in range(num_groups):
+@@ -524,6 +542,9 @@ class SimpleCPUOffloadScheduler:
+                     continue
+                 gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
+                 cpu_block_ids.append(cpu_blk.block_id)
++                if cpu_keys is not None:
++                    assert pending_keys is not None
++                    cpu_keys.append(pending_keys[g][i])
+                 cpu_blocks_to_touch.append(cpu_blk)
+ 
+         # Touch CPU blocks to prevent eviction during async load.
+@@ -539,7 +560,8 @@ class SimpleCPUOffloadScheduler:
+ 
+         assert self._reqs_to_load.get(req_id) is None
+         self._reqs_to_load[req_id] = LoadRequestState(
+-            request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
++            request=request,
++            transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids, keys=cpu_keys),
+         )
+ 
+     def build_connector_meta(
+@@ -576,6 +598,13 @@ class SimpleCPUOffloadScheduler:
+                 store_req_ids.append(transfer.req_id)
+         store_req_ids = list(dict.fromkeys(store_req_ids))
+         self._pending_finished_stores.clear()
++        store_keys: list[int] = []
++        if self._slot_keys and store_gpu:
++            # Every stored GPU block holds a reference until its store
++            # completes, so its hash here is the one published then.
++            assert self._gpu_block_pool is not None
++            gpu_blocks = self._gpu_block_pool.blocks
++            store_keys = [slot_key(gpu_blocks[b].block_hash) for b in store_gpu]
+ 
+         if store_gpu:
+             store_event = self._store_event_counter
+@@ -594,6 +623,7 @@ class SimpleCPUOffloadScheduler:
+         load_event = -1
+         load_gpu: list[int] = []
+         load_cpu: list[int] = []
++        load_keys: list[int] = []
+         load_req_ids: list[str] = []
+         for req_id, load_state in self._reqs_to_load.items():
+             if load_state.load_event is not None:
+@@ -601,6 +631,13 @@ class SimpleCPUOffloadScheduler:
+             assert load_state.transfer_meta is not None
+             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
+             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
++            if self._slot_keys:
++                keys = load_state.transfer_meta.keys
++                load_keys.extend(
++                    keys
++                    if keys is not None
++                    else [0] * len(load_state.transfer_meta.cpu_block_ids)
++                )
+             load_req_ids.append(req_id)
+         if load_req_ids:
+             load_event = self._load_event_counter
+@@ -613,6 +650,7 @@ class SimpleCPUOffloadScheduler:
+             load_event=load_event,
+             load_gpu_blocks=load_gpu,
+             load_cpu_blocks=load_cpu,
++            load_keys=load_keys,
+             load_event_to_reqs={
+                 event_idx: list(req_ids)
+                 for event_idx, req_ids in self._load_event_to_reqs.items()
+@@ -620,6 +658,7 @@ class SimpleCPUOffloadScheduler:
+             store_event=store_event,
+             store_gpu_blocks=store_gpu,
+             store_cpu_blocks=store_cpu,
++            store_keys=store_keys,
+             need_flush=bool(scheduler_output.preempted_req_ids),
+         )
+         return result
+@@ -1283,6 +1322,7 @@ class SimpleCPUOffloadScheduler:
+         pending = self._pending_cpu_hits.pop(req_id, None)
+         if pending is not None:
+             self._free_pending_cpu_hit(pending)
++        self._pending_cpu_hit_keys.pop(req_id, None)
+ 
+         # Handle load: defer cleanup if load is in-flight
+         load_state = self._reqs_to_load.get(req_id)
+diff --git a/vllm/v1/simple_kv_offload/metadata.py b/vllm/v1/simple_kv_offload/metadata.py
+index 1b53149c8..aed43cdb7 100644
+--- a/vllm/v1/simple_kv_offload/metadata.py
++++ b/vllm/v1/simple_kv_offload/metadata.py
+@@ -26,6 +26,10 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
+     load_event: int = INVALID_JOB_ID
+     load_gpu_blocks: list[int] = field(default_factory=list)
+     load_cpu_blocks: list[int] = field(default_factory=list)
++    # Disk tier only: the block key (disk_backend.slot_key) that the scheduler
++    # expects in each slot of load_cpu_blocks, taken at its lookup. Empty means
++    # key 0 for every slot.
++    load_keys: list[int] = field(default_factory=list)
+     # Reverse map: load_event->req_ids, for tracking requests with finished load events
+     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
+ 
+@@ -33,6 +37,9 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
+     store_event: int = INVALID_JOB_ID
+     store_gpu_blocks: list[int] = field(default_factory=list)
+     store_cpu_blocks: list[int] = field(default_factory=list)
++    # Disk tier only: the block key of each block in store_cpu_blocks, written
++    # into its slot header.
++    store_keys: list[int] = field(default_factory=list)
+ 
+     # Whether any requests were preempted this step and need flush pending transfers.
+     need_flush: bool = False
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index 1eb5229f9..c99d97c82 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -312,12 +312,18 @@ class SimpleCPUOffloadWorker:
+             backend = self._backend
+             assert backend is not None
+             self._load_submit_time[metadata.load_event] = time.monotonic()
++            keys = (
++                {"keys": metadata.load_keys or None}
++                if isinstance(backend, DiskBackend)
++                else {}
++            )
+             backend.launch_copy(
+                 metadata.load_cpu_blocks,
+                 metadata.load_gpu_blocks,
+                 is_store=False,
+                 event_idx=metadata.load_event,
+                 events_list=self._load_events,
++                **keys,
+             )
+ 
+     def wait_for_save(self) -> None:
+@@ -340,6 +346,11 @@ class SimpleCPUOffloadWorker:
+                 self._store_compute_done = torch.Event()
+             self._store_compute_done.record(torch.cuda.current_stream())
+             self._store_submit_time[metadata.store_event] = time.monotonic()
++            keys = (
++                {"keys": metadata.store_keys or None}
++                if isinstance(backend, DiskBackend)
++                else {}
++            )
+             backend.launch_copy(
+                 metadata.store_gpu_blocks,
+                 metadata.store_cpu_blocks,
+@@ -347,6 +358,7 @@ class SimpleCPUOffloadWorker:
+                 event_idx=metadata.store_event,
+                 events_list=self._store_events,
+                 wait_event=self._store_compute_done,
++                **keys,
+             )
+             self._store_submitted = True
+ 
+-- 
+2.56.1
+

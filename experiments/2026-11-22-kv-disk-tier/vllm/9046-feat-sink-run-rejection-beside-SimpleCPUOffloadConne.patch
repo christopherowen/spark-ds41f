@@ -1,0 +1,1202 @@
+From 9c55f200624575939c19e598304b789f3fc2403c Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:06:01 +0000
+Subject: [PATCH] feat(sink): run rejection beside SimpleCPUOffloadConnector
+ with kv_both
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9045
+of this series.
+
+Rationale: sink rejection is on by default for DeepSeek V4.1 Flash, and
+the sink check of the V2 runner refused every KV connector while
+rejection was on, so a start with the disk tier failed at model load on
+every rank with "The sink detector and rejection (vllm.v1.sample.sink)
+do not support KV transfer." No text gives a reason for that entry; the
+message of patch 0221 calls the list "the features it does not handle".
+A reading of the scheduler side of the connector found no path on which
+the connector changes a request that holds a provisional token. Loads
+are asynchronous only, and they reach requests in WAITING_FOR_REMOTE_KVS,
+which hold no draft zero. A failed or overrun load comes back as
+failed_recving for those requests only, and the connector reports no
+invalid blocks, so the path that cuts the computed tokens of a running
+request without clearing draft zero never runs. A hit leaves at least
+the last prompt token to compute, and 128 tokens with the replay suffix
+of the V4.1 layout. Stores copy hashed blocks only, which hold committed
+tokens, and the eager store also stops at the computed tokens. The
+connector does not ask for dropped stale outputs at a preemption. This
+patch therefore adds a pure function, kv_transfer_refusal in
+vllm/v1/sample/sink.py, that allows SimpleCPUOffloadConnector with
+kv_role kv_both when it is set as kv_connector and taken from the vLLM
+registry. Every other connector or role, a MultiConnector, and a
+kv_connector_module_path are still refused, and the refusal names the
+connector and the role, or a config with no kv_connector set, together
+with the one allowed configuration. The detector without rejection runs
+beside any connector, as before, and no other product code changes. The
+reading may have missed a case for which the entry was written.
+
+Quality implications: where the reading holds, outputs do not change. A
+case that the reading missed would most likely show as an assertion in
+the worker or the scheduler, because the scheduler checks that draft
+zero leads every step of a decoding request. Every other entry of the
+refusal list stays in force.
+
+Tests: the patch adds 58 tests on the CPU path. 48 of them run sink
+rejection through the core scheduler, in sync and async mode, with no
+drafter and with 2 drafts, beside the scheduler side of the connector
+with the disk backend, the policy "recompute", and one rank. A scripted
+worker keeps the KV cache as (position, token) slots, checks the slots
+that each step reads, checks each store slot by slot against the
+committed tokens of the block, and copies tier slots back on each load.
+After each output, the computed tokens past the committed ones and the
+output placeholders must stay within the tokens in flight. At the end of
+each run, the key of every hashed block on the GPU and on the tier is
+recomputed from the block's slots, and the block hashes of every
+request from its committed tokens. The cases are a tier hit followed by
+a draft-zero rejection; a failed load; an overrun load and its cold
+retry; a preemption while draft zero is held and a resume with a tier
+hit, with no replay suffix or a suffix of 16 tokens, in one step or in
+chunks of 16 tokens; an abort in WAITING_FOR_REMOTE_KVS beside a request
+that holds a draft zero; and a rejection at the last slot of a block in
+eager and lazy mode, with the replacement computed there or committed
+unverified as EOS. In every case each reply and each sink counter equal
+those of the run with no connector. Each case also fails under a
+mutation of the code it depends on: the load mapping, the hit cap, the
+reset of a failed load, the overrun mark, the end of the replay after a
+preemption, the clear of draft zero at a preemption (in the chunked
+resume only), both pins of an aborted load (one pin alone keeps the case
+passing), a block hashed with a held token that is then rejected, the
+hash of a block completed by an unverified token, and a rollback missing
+for a rejected draft zero or for every rejection. The other 10 tests
+cover the allow rule. No connector, and the connector with the CPU or
+the disk backend, pass, while the roles kv_producer and kv_consumer,
+NixlConnector, LMCacheConnectorV1, a MultiConnector around the allowed
+connector, a kv_connector_module_path, and a config with no
+kv_connector are refused by name. The offload suite with the connector
+unit test passed 278 tests, the 58 new ones included, with 2 skipped
+because they need CUDA, and the sink scheduler suite passed 65.
+
+On three DGX Spark nodes, with spark-ds41f-1120 at tp3-triangle-4k and
+the whole series mounted over the release image, each rank started
+with rejection on beside the tier. The engine counted 38 draft-zero
+rejections during the checks, every compared disk hit returned the
+tokens of a hit in the GPU pool, and no rank logged an assertion. No
+check forced a rejection right after a tier hit. The check in the V2
+runner was not tested on the CPU test setup, where the module does not
+import, and neither were the drafter state after a tier hit under a
+forced rejection and a preemption on hardware.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../simple_kv_offload/test_ds41_tier_sink.py  | 994 ++++++++++++++++++
+ vllm/v1/sample/sink.py                        |  46 +-
+ vllm/v1/worker/gpu/model_runner.py            |   7 +-
+ 3 files changed, 1044 insertions(+), 3 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_tier_sink.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_sink.py b/tests/v1/simple_kv_offload/test_ds41_tier_sink.py
+new file mode 100644
+index 000000000..5c2520cd2
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_sink.py
+@@ -0,0 +1,994 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Sink rejection beside the disk tier, through the core scheduler (CPU-only).
++
++The real v1 scheduler runs sink rejection (vllm.v1.sample.sink) and the
++scheduler side of SimpleCPUOffloadConnector: disk backend, kv_role kv_both,
++kv_load_failure_policy "recompute", one rank. The scripted worker of
++tests/v1/core/test_sink_draft_zero.py plays the runner's side of draft zero.
++TierWorker extends that worker with a KV cache of one (position, token) entry
++a slot. Each step checks that the slots before the step's first input hold the
++request's committed tokens, then writes the KV of the step's inputs into the
++slots of the request's block table. The connector's transfers run on that
++model: a store copies GPU slots into the tier and checks the slots against the
++tokens of the block's hash, and a load copies tier slots back. The worker
++reports each transfer as the worker side of the connector does. Each case
++compares the reply and the sink counters with the same script run without a
++connector.
++"""
++
++from __future__ import annotations
++
++import errno
++from collections import deque
++from collections.abc import Callable
++
++import pytest
++
++from tests.v1.core.test_sink_draft_zero import (
++    CAN,
++    HELP,
++    HOW,
++    I_,
++    QM,
++    TODAY,
++    YOU,
++    Run,
++    ScriptedWorker,
++    _model_dir,
++    _script,
++    expected_reply,
++)
++from tests.v1.core.utils import EOS_TOKEN_ID
++from tests.v1.simple_kv_offload.test_scheduler import (
++    _BYTES_PER_BLOCK,
++    BLOCK_SIZE,
++    _make_kv_cache_config,
++)
++from vllm.config import (
++    CacheConfig,
++    DeviceConfig,
++    KVTransferConfig,
++    ModelConfig,
++    SchedulerConfig,
++    SpeculativeConfig,
++    VllmConfig,
++)
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_utils import (
++    get_block_hash,
++    get_request_block_hasher,
++    hash_block_tokens,
++    init_none_hash,
++    make_block_hash_with_group_id,
++)
++from vllm.v1.core.sched.async_scheduler import AsyncScheduler
++from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.metrics.stats import RequestSinkMetrics
++from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
++from vllm.v1.request import Request, RequestStatus
++from vllm.v1.sample.sink import SinkOutcome, kv_transfer_refusal
++from vllm.v1.simple_kv_offload.metadata import (
++    SimpleCPUOffloadMetadata,
++    SimpleCPUOffloadWorkerMetadata,
++)
++from vllm.v1.structured_output import StructuredOutputManager
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++B = BLOCK_SIZE
++NUM_GPU_BLOCKS = 64
++# Four blocks: with no replay suffix, a hit takes the first three blocks and
++# leaves the fourth to compute.
++PROMPT = list(range(1000, 1064))
++SAY_HI = _script(HOW, CAN, I_, HELP, YOU, TODAY, QM)
++ONE_REJECTION = RequestSinkMetrics(
++    num_flagged_draft_zero=1, num_draft_zero_rejections=1
++)
++
++# (position, token) whose KV a slot holds.
++Slot = tuple[int, int]
++
++
++@pytest.fixture(autouse=True)
++def sink_rejection_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    # The test model has no entry in SINK_CHANNELS: name the model's column
++    # and threshold, and switch rejection on.
++    monkeypatch.setenv("VLLM_SINK_DETECTOR_COLUMN", "2455")
++    monkeypatch.setenv("VLLM_SINK_DETECTOR_THRESHOLD", "85000")
++    monkeypatch.setenv("VLLM_SINK_REJECTION", "1")
++    monkeypatch.setenv("VLLM_SINK_REJECTION_MAX_RETRIES", "3")
++
++
++def _scheduler(
++    tmp_path,
++    *,
++    tier: bool,
++    async_scheduling: bool,
++    num_drafts: int | None,
++    lazy: bool = False,
++    budget: int | None = None,
++) -> Scheduler:
++    model_config = ModelConfig(
++        model=_model_dir(),
++        trust_remote_code=True,
++        dtype="float16",
++        seed=42,
++        skip_tokenizer_init=True,
++    )
++    scheduler_config = SchedulerConfig(
++        max_num_seqs=16,
++        max_num_batched_tokens=1024,
++        max_model_len=model_config.max_model_len,
++        enable_chunked_prefill=True,
++        async_scheduling=async_scheduling,
++        is_encoder_decoder=False,
++        watermark=0.0,
++    )
++    cache_config = CacheConfig(
++        block_size=B,
++        gpu_memory_utilization=0.9,
++        cache_dtype="auto",
++        enable_prefix_caching=True,
++    )
++    speculative_config = None
++    if num_drafts is not None:
++        speculative_config = SpeculativeConfig(
++            model="ngram",
++            method="ngram_gpu",
++            num_speculative_tokens=num_drafts,
++            prompt_lookup_max=num_drafts,
++            prompt_lookup_min=1,
++        )
++    kv_transfer_config = None
++    if tier:
++        kv_transfer_config = KVTransferConfig(
++            kv_connector="SimpleCPUOffloadConnector",
++            kv_role="kv_both",
++            kv_connector_extra_config={
++                "cpu_bytes_to_use": _BYTES_PER_BLOCK * 64,
++                "kv_offload_backend": "disk",
++                "disk_path": str(tmp_path / "tier"),
++                "disk_capacity_bytes": 256 * 4096,
++                "lazy_offload": lazy,
++            },
++            kv_load_failure_policy="recompute",
++        )
++    vllm_config = VllmConfig(
++        device_config=DeviceConfig(device="cpu"),
++        scheduler_config=scheduler_config,
++        model_config=model_config,
++        cache_config=cache_config,
++        kv_transfer_config=kv_transfer_config,
++        speculative_config=speculative_config,
++    )
++    cache_config.num_gpu_blocks = NUM_GPU_BLOCKS
++    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
++    scheduler = scheduler_cls(
++        vllm_config=vllm_config,
++        kv_cache_config=_make_kv_cache_config(NUM_GPU_BLOCKS),
++        block_size=B,
++        log_stats=True,
++        structured_output_manager=StructuredOutputManager(vllm_config),
++    )
++    scheduler.use_v2_model_runner = True
++    if budget is not None:
++        # The step's token budget: a prompt longer than the budget is computed
++        # in chunks.
++        scheduler.max_num_scheduled_tokens = budget
++    assert scheduler.sink_rejection
++    assert (scheduler.connector is not None) == tier
++    return scheduler
++
++
++def _request(
++    req_id: str,
++    prompt: list[int],
++    max_tokens: int,
++    stop_token_ids: list[int] | None = None,
++) -> Request:
++    init_none_hash(sha256)
++    params = SamplingParams(
++        max_tokens=max_tokens, temperature=0.0, stop_token_ids=stop_token_ids
++    )
++    params.update_from_generation_config({}, EOS_TOKEN_ID)
++    return Request(
++        request_id=req_id,
++        prompt_token_ids=list(prompt),
++        sampling_params=params,
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(B, sha256),
++    )
++
++
++def _check_keys(pool, contents: dict[int, list[Slot | None]], where: str) -> None:
++    """Every block of ``pool`` with a key holds full slots whose hash, chained
++    on a keyed block of the position before, is the key."""
++    by_index: dict[int, list[tuple[bytes, list[int]]]] = {}
++    for block_id, content in contents.items():
++        key = pool.blocks[block_id].block_hash
++        if key is None:
++            continue
++        assert all(slot is not None for slot in content), (where, block_id)
++        index = content[0][0] // B
++        assert [q for q, _ in content] == list(range(index * B, (index + 1) * B))
++        tokens = [t for _, t in content]
++        by_index.setdefault(index, []).append((get_block_hash(key), tokens))
++    parents: list[bytes | None] = [None]
++    for index in range(max(by_index, default=-1) + 1):
++        chained = []
++        for key, tokens in by_index.get(index, []):
++            assert any(
++                hash_block_tokens(sha256, parent, tokens) == key for parent in parents
++            ), f"{where} block {index}: the key is not the hash of the slots {tokens}"
++            chained.append(key)
++        parents = chained
++
++
++class TierWorker(ScriptedWorker):
++    """The scripted worker with a KV cache of (position, token) slots and the
++    worker side of SimpleCPUOffloadConnector on one rank."""
++
++    def __init__(self, scheduler, scripts, num_drafts, **kwargs):
++        super().__init__(scheduler, scripts, num_drafts, **kwargs)
++        self.gpu: dict[int, list[Slot | None]] = {}
++        self.tier: dict[int, list[Slot]] = {}
++        # Requests whose next load fails (a read fault), overruns the total
++        # bound, or stays in flight until the test releases the load.
++        self.fail_loads: set[str] = set()
++        self.overrun_loads: set[str] = set()
++        self.held_loads: set[str] = set()
++        # Loads sent and not reported: (event, GPU blocks, tier blocks, reqs).
++        self.pending: list[tuple[int, list[int], list[int], list[str]]] = []
++        # Per load event sent: (event, the event's requests, the block count).
++        self.loads: list[tuple[int, list[str], int]] = []
++        # Per stored block: (request whose hash the block carries, block index).
++        self.stored: list[tuple[str, int]] = []
++        # (position, token) of each rejected draft zero.
++        self.rejected: list[Slot] = []
++        # Every request seen, kept after the finish for the finish-time store.
++        self.seen: dict[str, Request] = {}
++        self.tables: dict[str, list[int]] = {}
++        # Per request: the slots read by the request's first computing step.
++        self.first_reads: dict[str, int] = {}
++        self._draft_zero_at: dict[str, Slot] = {}
++
++    def execute(self, so: SchedulerOutput) -> ModelRunnerOutput:
++        self.seen.update(self.scheduler.requests)
++        self._compute(so)
++        # Stores are ordered after the step's forward (wait_for_save).
++        kv_output = self._transfer(so)
++        mro = super().execute(so)
++        for req_id, event in (mro.sink_events or {}).items():
++            if event.outcome == SinkOutcome.REJECTED:
++                self.rejected.append(self._draft_zero_at[req_id])
++        mro.kv_connector_output = kv_output
++        return mro
++
++    def _slot(self, table: list[int], q: int) -> Slot | None:
++        return self.gpu.get(table[q // B], [None] * B)[q % B]
++
++    def _compute(self, so: SchedulerOutput) -> None:
++        """Check the KV each scheduled request reads, then write the step's inputs."""
++        draft_zero = so.sink_draft_zero_req_ids or set()
++        for req_id, n in so.num_scheduled_tokens.items():
++            request = self.scheduler.requests[req_id]
++            table = list(self.scheduler.kv_cache_manager.get_block_ids(req_id)[0])
++            self.tables[req_id] = table
++            if req_id in draft_zero:
++                st = self.requests[req_id]
++                spec = so.scheduled_spec_decode_tokens[req_id]
++                assert request.prompt_token_ids is not None
++                committed = [*request.prompt_token_ids, *st.committed]
++                start = len(committed)
++                assert st.provisional is not None
++                inputs = [st.provisional, *st.drafts[: len(spec) - 1]]
++                self._draft_zero_at[req_id] = (start, st.provisional)
++            else:
++                start = request.num_computed_tokens - n
++                committed = list(request.all_token_ids)
++                # A request with one token left after the hits gets spec
++                # placeholders (pad_spec_decode): the placeholders roll back
++                # like rejected drafts, and hold no committed token.
++                num_pads = len(so.scheduled_spec_decode_tokens.get(req_id, ()))
++                assert start + n - num_pads <= len(committed), (req_id, start, n)
++                inputs = committed[start : start + n - num_pads] + [-1] * num_pads
++            for q in range(start):
++                assert self._slot(table, q) == (q, committed[q]), (
++                    f"{req_id} reads slot {q}: {self._slot(table, q)}, "
++                    f"committed {committed[q]}"
++                )
++            self.first_reads.setdefault(req_id, start)
++            for j, token in enumerate(inputs):
++                q = start + j
++                block = self.gpu.setdefault(table[q // B], [None] * B)
++                block[q % B] = (q, token)
++
++    def _block_of(self, block_hash) -> tuple[str, int]:
++        for req_id, request in self.seen.items():
++            for i, h in enumerate(request.block_hashes):
++                if make_block_hash_with_group_id(h, 0) == block_hash:
++                    return req_id, i
++        raise AssertionError(f"no request has the block hash {block_hash!r}")
++
++    def check_keys(self) -> None:
++        """The key of each hashed block, on the GPU and on the tier, is the hash
++        of the block's own slots, chained on a hashed block at the position
++        before; the block hashes of each request are the hashes of the request's
++        committed tokens. No key names a token that the slots or the request do
++        not hold."""
++        _check_keys(self.scheduler.kv_cache_manager.block_pool, self.gpu, "GPU")
++        if self.scheduler.connector is not None:
++            pool = self.scheduler.connector.scheduler_manager.cpu_block_pool
++            _check_keys(pool, self.tier, "tier")
++        for req_id, request in self.seen.items():
++            committed = _request("committed", request.all_token_ids, max_tokens=1)
++            assert request.block_hashes == committed.block_hashes, req_id
++
++    def _transfer(self, so: SchedulerOutput) -> KVConnectorOutput | None:
++        meta = so.kv_connector_metadata
++        if not isinstance(meta, SimpleCPUOffloadMetadata):
++            return None
++        worker_meta = SimpleCPUOffloadWorkerMetadata(completed_store_events={})
++        if meta.store_event >= 0:
++            pool = self.scheduler.kv_cache_manager.block_pool
++            for gpu_id, cpu_id in zip(meta.store_gpu_blocks, meta.store_cpu_blocks):
++                req_id, index = self._block_of(pool.blocks[gpu_id].block_hash)
++                tokens = self.seen[req_id].all_token_ids[index * B : (index + 1) * B]
++                content = list(self.gpu.get(gpu_id, [None] * B))
++                # A stored block holds the KV of the committed tokens of the
++                # block's hash, and of no other token.
++                assert content == [(index * B + j, t) for j, t in enumerate(tokens)], (
++                    f"stored block {index} of {req_id}: {content}"
++                )
++                self.tier[cpu_id] = content
++                self.stored.append((req_id, index))
++            worker_meta.completed_store_events[meta.store_event] = 1
++        if meta.load_event >= 0:
++            req_ids = list(meta.load_event_to_reqs[meta.load_event])
++            self.pending.append(
++                (
++                    meta.load_event,
++                    list(meta.load_gpu_blocks),
++                    list(meta.load_cpu_blocks),
++                    req_ids,
++                )
++            )
++            self.loads.append((meta.load_event, req_ids, len(meta.load_gpu_blocks)))
++        finished: set[str] = set()
++        failed: set[str] = set()
++        still: list[tuple[int, list[int], list[int], list[str]]] = []
++        for event, gpu_ids, cpu_ids, req_ids in self.pending:
++            reqs = set(req_ids)
++            if reqs & self.held_loads:
++                still.append((event, gpu_ids, cpu_ids, req_ids))
++                continue
++            if reqs & self.fail_loads:
++                self.fail_loads -= reqs
++                failed |= reqs
++                worker_meta.faults.append(
++                    (0, "read", cpu_ids[0], errno.EIO, "scripted read fault")
++                )
++            elif reqs & self.overrun_loads:
++                self.overrun_loads -= reqs
++                failed |= reqs
++                worker_meta.overrun_load_events.add(event)
++            else:
++                # The copy lands when the load is reported, at the latest.
++                for gpu_id, cpu_id in zip(gpu_ids, cpu_ids):
++                    self.gpu[gpu_id] = list(self.tier[cpu_id])
++            finished |= reqs
++        self.pending = still
++        return KVConnectorOutput(
++            finished_recving=finished,
++            failed_recving=failed,
++            kv_connector_worker_meta=worker_meta,
++        )
++
++
++def drive(
++    scheduler,
++    worker: TierWorker,
++    *,
++    async_scheduling: bool,
++    run: Run | None = None,
++    max_steps: int = 600,
++    before_schedule: Callable[[], None] | None = None,
++    on_schedule: Callable[[SchedulerOutput], None] | None = None,
++    on_output: Callable[[SchedulerOutput, ModelRunnerOutput], None] | None = None,
++) -> Run:
++    """The engine core loop, as test_sink_draft_zero.drive, except that every
++    step runs on the worker, one with no tokens too (EngineCore.step): the
++    connector's transfers report in such steps.
++
++    After each output, the computed tokens past the committed ones and the
++    output placeholders of a running request stay within the tokens in flight.
++    The store bounds read num_computed_tokens - num_output_placeholders, so an
++    asynchronous step whose rejections roll back neither counter leaves the
++    stores unchanged; this check is what sees such a step. At the end, the
++    keys of the hashed blocks and of the requests are checked against the slots
++    and the committed tokens (TierWorker.check_keys)."""
++    run = run if run is not None else Run()
++    queue: deque[tuple[SchedulerOutput, ModelRunnerOutput]] = deque()
++
++    def process(so: SchedulerOutput, mro: ModelRunnerOutput) -> None:
++        engine_outputs = scheduler.update_from_output(so, mro)
++        for eco in engine_outputs.values():
++            for out in eco.outputs:
++                run.emitted.setdefault(out.request_id, []).extend(out.new_token_ids)
++                run.outputs.setdefault(out.request_id, []).append(out)
++                if out.finish_reason is not None:
++                    run.finished[out.request_id] = out
++        if not async_scheduling and so.total_num_scheduled_tokens > 0:
++            req_ids = [r for r in mro.req_ids if r in worker.requests]
++            scheduler.update_draft_token_ids(
++                DraftTokenIds(
++                    req_ids, [list(worker.requests[r].drafts) for r in req_ids]
++                )
++            )
++        for request in scheduler.running:
++            assert request.num_output_placeholders >= 0
++            in_flight = request.num_in_flight_tokens
++            assert request.num_computed_tokens <= request.num_tokens + in_flight, (
++                request.request_id
++            )
++            assert request.num_output_placeholders <= in_flight, request.request_id
++            if not async_scheduling and not request.is_prefill_chunk:
++                # Every committed token is computed; the held one is not.
++                assert request.num_computed_tokens == request.num_tokens, (
++                    request.request_id
++                )
++        if on_output is not None:
++            on_output(so, mro)
++
++    steps = 0
++    while steps < max_steps:
++        if not scheduler.has_requests():
++            if not queue:
++                break
++            process(*queue.popleft())
++            continue
++        steps += 1
++        if before_schedule is not None:
++            before_schedule()
++        so = scheduler.schedule()
++        if on_schedule is not None:
++            on_schedule(so)
++        queue.append((so, worker.execute(so)))
++        if async_scheduling and len(queue) < 2:
++            continue
++        process(*queue.popleft())
++    assert not queue and not scheduler.has_requests(), "the run did not finish"
++    worker.check_keys()
++    run.steps += steps
++    return run
++
++
++def _seed(scheduler, worker: TierWorker, prompt: list[int], *, async_scheduling):
++    """A request computes ``prompt`` and finishes; with the tier, the request's
++    blocks are stored. The GPU prefix cache is then dropped: a later request
++    with the same prompt finds the prompt on the tier only."""
++    worker.scripts["seed"] = _script(HOW)
++    scheduler.add_request(_request("seed", prompt, max_tokens=1))
++    drive(scheduler, worker, async_scheduling=async_scheduling)
++    if scheduler.connector is not None:
++        assert len(prompt) // B >= 3
++        assert {i for r, i in worker.stored if r == "seed"} >= {0, 1, 2}
++    assert scheduler.kv_cache_manager.reset_prefix_cache()
++
++
++def _manager(scheduler):
++    return scheduler.connector.scheduler_manager
++
++
++def _prefills(request: Request, prefills: list[tuple[int, int]]):
++    """An on_schedule hook: (first position, committed tokens) of each step
++    of ``request`` that computes committed positions, spec placeholders of a
++    padded step (pad_spec_decode) left out."""
++
++    def record(so: SchedulerOutput) -> None:
++        req_id = request.request_id
++        n = so.num_scheduled_tokens.get(req_id)
++        if n and req_id not in (so.sink_draft_zero_req_ids or ()):
++            num_pads = len(so.scheduled_spec_decode_tokens.get(req_id, ()))
++            prefills.append((request.num_computed_tokens - n, n - num_pads))
++
++    return record
++
++
++def _tier_hit_run(tmp_path, *, tier, async_scheduling, num_drafts, load=None):
++    """Request "a" with PROMPT after the seed: a tier hit with the tier (the
++    load as ``load`` says), then the collapse sequence of SAY_HI, `` can``
++    held as draft zero and rejected."""
++    scheduler = _scheduler(
++        tmp_path, tier=tier, async_scheduling=async_scheduling, num_drafts=num_drafts
++    )
++    worker = TierWorker(scheduler, {}, num_drafts or 0, draft_errors={("a", 1): 999})
++    _seed(scheduler, worker, PROMPT, async_scheduling=async_scheduling)
++    worker.scripts["a"] = SAY_HI
++    if load == "fail":
++        worker.fail_loads.add("a")
++    elif load == "overrun":
++        worker.overrun_loads.add("a")
++    request = _request("a", PROMPT, max_tokens=12)
++    scheduler.add_request(request)
++    statuses: list[RequestStatus] = []
++    prefills: list[tuple[int, int]] = []
++    overrun_marks: list[bool] = []
++    record_prefill = _prefills(request, prefills)
++
++    def on_schedule(so: SchedulerOutput) -> None:
++        statuses.append(request.status)
++        record_prefill(so)
++        if tier and "a" in so.num_scheduled_tokens:
++            overrun_marks.append("a" in _manager(scheduler)._overrun_reqs)
++
++    run = drive(
++        scheduler, worker, async_scheduling=async_scheduling, on_schedule=on_schedule
++    )
++    return run, scheduler, worker, statuses, prefills, overrun_marks
++
++
++def _assert_same_reply(run: Run, ref: Run, req_id: str, script, length: int):
++    assert run.emitted[req_id] == expected_reply(script, length)
++    assert run.emitted[req_id] == ref.emitted[req_id]
++    assert run.finished[req_id].sink_metrics == ref.finished[req_id].sink_metrics
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("num_drafts", [None, 2])
++def test_tier_hit_then_draft_zero_rejection(tmp_path, async_scheduling, num_drafts):
++    """The prompt loads from the tier through WAITING_FOR_REMOTE_KVS (three
++    blocks; the fourth block is computed, with the last prompt row), then
++    `` can`` is held as draft zero and rejected. The reply and the counters
++    are those of the run with no connector, which computes the whole prompt."""
++    run, scheduler, worker, statuses, prefills, _ = _tier_hit_run(
++        tmp_path, tier=True, async_scheduling=async_scheduling, num_drafts=num_drafts
++    )
++    ref, *_, ref_prefills, _ = _tier_hit_run(
++        tmp_path / "ref",
++        tier=False,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++    )
++    _assert_same_reply(run, ref, "a", SAY_HI, 12)
++    assert run.finished["a"].sink_metrics == ONE_REJECTION
++    assert RequestStatus.WAITING_FOR_REMOTE_KVS in statuses
++    assert [(reqs, n) for _, reqs, n in worker.loads] == [(["a"], 3)]
++    assert prefills == [(48, 16)] and ref_prefills == [(0, 64)]
++    # The step after the load read the 48 loaded slots, and found the prompt.
++    assert worker.first_reads["a"] == 48
++    mgr = _manager(scheduler)
++    assert not mgr.degraded and not mgr._reqs_to_load
++    assert worker.rejected == [(len(PROMPT) + 1, CAN)]
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("num_drafts", [None, 2])
++def test_failed_tier_load_then_draft_zero_rejection(
++    tmp_path, async_scheduling, num_drafts
++):
++    """The load fails (failed_recving with a read fault, policy "recompute"):
++    the request recomputes the prompt from 0 with no second load, the tier
++    degrades, and the rejection that follows gives the reply and the counters
++    of the run with no connector."""
++    run, scheduler, worker, statuses, prefills, _ = _tier_hit_run(
++        tmp_path,
++        tier=True,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++        load="fail",
++    )
++    ref, *_ = _tier_hit_run(
++        tmp_path / "ref",
++        tier=False,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++    )
++    _assert_same_reply(run, ref, "a", SAY_HI, 12)
++    assert run.finished["a"].sink_metrics == ONE_REJECTION
++    assert RequestStatus.WAITING_FOR_REMOTE_KVS in statuses
++    assert [(reqs, n) for _, reqs, n in worker.loads] == [(["a"], 3)]
++    assert prefills == [(0, 64)]
++    mgr = _manager(scheduler)
++    assert mgr.degraded and not mgr._reqs_to_load
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("num_drafts", [None, 2])
++def test_overrun_tier_load_then_draft_zero_rejection(
++    tmp_path, async_scheduling, num_drafts
++):
++    """The load overruns the total bound (patches 9042 to 9044): the cold
++    retry computes the prompt from 0 with no second load, the overrun mark
++    ends at the retry's admission, the tier stays up, and the rejection that follows
++    gives the reply and the counters of the run with no connector."""
++    run, scheduler, worker, statuses, prefills, marks = _tier_hit_run(
++        tmp_path,
++        tier=True,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++        load="overrun",
++    )
++    ref, *_ = _tier_hit_run(
++        tmp_path / "ref",
++        tier=False,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++    )
++    _assert_same_reply(run, ref, "a", SAY_HI, 12)
++    assert run.finished["a"].sink_metrics == ONE_REJECTION
++    assert RequestStatus.WAITING_FOR_REMOTE_KVS in statuses
++    assert [(reqs, n) for _, reqs, n in worker.loads] == [(["a"], 3)]
++    assert prefills == [(0, 64)]
++    # The mark ends at the admission of the cold retry, before the first step.
++    assert marks and not any(marks)
++    mgr = _manager(scheduler)
++    assert not mgr.degraded and not mgr._reqs_to_load and not mgr._overrun_reqs
++
++
++# Request "p": 58 prompt tokens; output position 7 (position 65) is `` can``.
++PREEMPT_PROMPT = list(range(2000, 2058))
++PREEMPT_SCRIPT = _script(11, 12, 13, 14, 15, 16, 17, CAN, I_, HELP)
++
++
++def _preempt_run(tmp_path, *, tier, async_scheduling, num_drafts, replay, budget):
++    """Request "p" is preempted while the request holds `` can`` as draft
++    zero. The GPU prefix cache is dropped before the resume, so the resume
++    loads from the tier (with the tier) or computes everything (without)."""
++    scheduler = _scheduler(
++        tmp_path,
++        tier=tier,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++        budget=budget,
++    )
++    if tier:
++        # The replay suffix of the DeepSeek-V4.1 layout, on the tier's
++        # lookup only: a hit stops ``replay`` tokens before the prompt's end.
++        _manager(scheduler).cpu_coordinator.prefill_replay_tokens = replay
++    worker = TierWorker(
++        scheduler, {"p": PREEMPT_SCRIPT}, num_drafts or 0, draft_errors={("p", 7): 999}
++    )
++    request = _request("p", PREEMPT_PROMPT, max_tokens=12)
++    scheduler.add_request(request)
++    state = {"preempted_at": None, "reset": False, "num_prefills": 0}
++    prefills: list[tuple[int, int]] = []
++    record_prefill = _prefills(request, prefills)
++
++    def on_output(so: SchedulerOutput, mro: ModelRunnerOutput) -> None:
++        if (
++            state["preempted_at"] is None
++            and request.sink_provisional == CAN
++            and request.sink_draft_zero
++            and request.status == RequestStatus.RUNNING
++        ):
++            state["preempted_at"] = len(worker.loads)
++            state["num_prefills"] = len(prefills)
++            scheduler.running.remove(request)
++            scheduler._preempt_request(request, 0.0)
++
++    def before_schedule() -> None:
++        if (
++            state["preempted_at"] is not None
++            and not state["reset"]
++            and scheduler.kv_cache_manager.reset_prefix_cache()
++        ):
++            state["reset"] = True
++
++    def on_schedule(so: SchedulerOutput) -> None:
++        if "p" in so.num_scheduled_tokens or request.status == (
++            RequestStatus.WAITING_FOR_REMOTE_KVS
++        ):
++            assert state["preempted_at"] is None or state["reset"], (
++                "resumed before the GPU prefix cache was dropped"
++            )
++        record_prefill(so)
++
++    run = drive(
++        scheduler,
++        worker,
++        async_scheduling=async_scheduling,
++        before_schedule=before_schedule,
++        on_schedule=on_schedule,
++        on_output=on_output,
++    )
++    assert state["preempted_at"] is not None and request.num_preemptions == 1
++    k = state["num_prefills"]
++    return run, scheduler, worker, prefills[:k], prefills[k:], state["preempted_at"]
++
++
++def _assert_chunks(chunks: list[tuple[int, int]], start: int, end: int) -> None:
++    """The steps cover positions start to end, one after the other."""
++    assert chunks and chunks[0][0] == start, chunks
++    for (first, n), (following, _) in zip(chunks, chunks[1:]):
++        assert first + n == following, chunks
++    assert chunks[-1][0] + chunks[-1][1] == end, chunks
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("num_drafts", [None, 2])
++@pytest.mark.parametrize("replay", [0, 16])
++@pytest.mark.parametrize("budget", [None, 16])
++def test_preempted_with_draft_zero_resumes_with_a_tier_hit(
++    tmp_path, async_scheduling, num_drafts, replay, budget
++):
++    """Preempted while `` can`` is held as draft zero, the request resumes
++    with a tier hit. With no replay suffix the hit reaches into the committed
++    output and stops one token short of the end; with a suffix of 16 the hit
++    stops 16 tokens before the prompt's end (manager.py,
++    get_num_new_matched_tokens). The resumed request draws position 7 again,
++    holds `` can`` again, and rejects `` can``. Reply and counters equal the
++    run with no connector, whose resume computes everything. With a step
++    budget of 16 the prompt and the resume run in chunks: the request is a
++    running request again from the resume's second chunk on, and holds no
++    draft zero until the resume's last chunk samples."""
++    run, scheduler, worker, before, after, preempted_at = _preempt_run(
++        tmp_path,
++        tier=True,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++        replay=replay,
++        budget=budget,
++    )
++    ref, _, _, _, ref_after, _ = _preempt_run(
++        tmp_path / "ref",
++        tier=False,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++        replay=0,
++        budget=budget,
++    )
++    _assert_same_reply(run, ref, "p", PREEMPT_SCRIPT, 12)
++    assert run.finished["p"].sink_metrics == ONE_REJECTION
++    # The first admission found an empty tier.
++    assert preempted_at == 0
++    resume_loads = worker.loads[preempted_at:]
++    assert len(resume_loads) == 1 and resume_loads[0][1] == ["p"]
++    hit = resume_loads[0][2] * B
++    if replay:
++        assert hit == (len(PREEMPT_PROMPT) - replay) // B * B
++    else:
++        # Every committed token but the last of the request at preemption.
++        assert hit > len(PREEMPT_PROMPT) - B and hit % B == 0
++    # Seven output tokens were committed at the preemption.
++    num_tokens = len(PREEMPT_PROMPT) + 7
++    _assert_chunks(before, 0, len(PREEMPT_PROMPT))
++    _assert_chunks(after, hit, num_tokens)
++    _assert_chunks(ref_after, 0, num_tokens)
++    if budget:
++        assert len(before) > 1 and len(ref_after) > 1
++        assert len(after) == (1 if num_tokens - hit <= budget else 3)
++    # Every rejected draft zero was `` can`` at position 65.
++    assert set(worker.rejected) == {(len(PREEMPT_PROMPT) + 7, CAN)}
++
++
++def _abort_run(tmp_path, *, tier, async_scheduling, num_drafts):
++    """Request "a" (SAY_HI, a separate prompt) holds `` can``; then request "b"
++    with the seeded PROMPT arrives and, with the tier, waits for a load that
++    the worker holds back. "b" is aborted while waiting, beside "a", which then
++    holds a draft zero; the load is reported afterwards."""
++    scheduler = _scheduler(
++        tmp_path, tier=tier, async_scheduling=async_scheduling, num_drafts=num_drafts
++    )
++    worker = TierWorker(scheduler, {}, num_drafts or 0, draft_errors={("a", 1): 999})
++    _seed(scheduler, worker, PROMPT, async_scheduling=async_scheduling)
++    worker.scripts.update(a=SAY_HI, b=_script(21, 22, 23))
++    a = _request("a", list(range(3000, 3030)), max_tokens=12)
++    b = _request("b", PROMPT, max_tokens=8)
++    scheduler.add_request(a)
++    state: dict = {"phase": "before", "targets": [], "refs": []}
++
++    def on_output(so: SchedulerOutput, mro: ModelRunnerOutput) -> None:
++        phase = state["phase"]
++        if phase == "before" and a.sink_provisional == CAN:
++            worker.held_loads.add("b")
++            scheduler.add_request(b)
++            state["phase"] = "added"
++        elif phase == "added" and b.status != RequestStatus.WAITING:
++            assert b.status == (
++                RequestStatus.WAITING_FOR_REMOTE_KVS if tier else RequestStatus.RUNNING
++            )
++            assert a.sink_draft_zero and a.sink_provisional is not None
++            if tier:
++                state["targets"] = [
++                    g
++                    for _, gpu_ids, _, reqs in worker.pending
++                    if "b" in reqs
++                    for g in gpu_ids
++                ]
++                assert state["targets"]
++            scheduler.finish_requests("b", RequestStatus.FINISHED_ABORTED)
++            pool = scheduler.kv_cache_manager.block_pool
++            # The load is still in flight: the load's GPU blocks stay pinned.
++            state["refs"] = [pool.blocks[g].ref_cnt for g in state["targets"]]
++            state["phase"] = "aborted"
++        elif phase == "aborted":
++            worker.held_loads.discard("b")
++            state["phase"] = "released"
++
++    run = drive(
++        scheduler, worker, async_scheduling=async_scheduling, on_output=on_output
++    )
++    assert state["phase"] == "released"
++    return run, scheduler, worker, state, b
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("num_drafts", [None, 2])
++def test_abort_while_waiting_beside_a_draft_zero(
++    tmp_path, async_scheduling, num_drafts
++):
++    """An abort of a request in WAITING_FOR_REMOTE_KVS, beside a request that
++    holds a draft zero, changes nothing of the latter: the reply and counters
++    of "a" equal the run with no connector. The aborted load keeps the load's
++    GPU blocks pinned until the worker reports the load, and nothing of the
++    load stays afterwards."""
++    run, scheduler, worker, state, b = _abort_run(
++        tmp_path, tier=True, async_scheduling=async_scheduling, num_drafts=num_drafts
++    )
++    ref, *_ = _abort_run(
++        tmp_path / "ref",
++        tier=False,
++        async_scheduling=async_scheduling,
++        num_drafts=num_drafts,
++    )
++    _assert_same_reply(run, ref, "a", SAY_HI, 12)
++    assert run.finished["a"].sink_metrics == ONE_REJECTION
++    assert b.status == RequestStatus.FINISHED_ABORTED and "b" not in scheduler.requests
++    assert not run.emitted.get("b")
++    assert [(reqs, n) for _, reqs, n in worker.loads] == [(["b"], 3)]
++    assert state["refs"] and all(ref_cnt > 0 for ref_cnt in state["refs"])
++    mgr = _manager(scheduler)
++    assert not mgr._reqs_to_load and not mgr._load_event_to_reqs
++    assert not mgr.degraded and not worker.pending
++    pool = scheduler.kv_cache_manager.block_pool
++    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
++    cpu_pool = mgr.cpu_block_pool
++    assert cpu_pool.get_num_free_blocks() == cpu_pool.num_gpu_blocks - 1
++
++
++# Request "s": 20 prompt tokens, so output position 11 is position 31, the last
++# slot of block 1. `` can`` is drawn there and rejected.
++STORE_PROMPT = list(range(4000, 4020))
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("num_drafts", [None, 2])
++@pytest.mark.parametrize("lazy", [False, True])
++@pytest.mark.parametrize("ending", ["stop", "continue"])
++def test_stored_blocks_hold_committed_tokens_only(
++    tmp_path, async_scheduling, num_drafts, lazy, ending
++):
++    """Every block the tier stores holds the KV of the committed tokens of the
++    block's hash (checked slot by slot when the store runs), so no held or
++    rejected token. `` can`` is rejected at position 31, the last slot of
++    block 1, so the KV of `` can`` sits in that slot. "continue": the
++    replacement is computed there in the next step, and block 1 is stored with
++    the replacement. "stop": the replacement is EOS, committed unverified when
++    drawn, which completes block 1 after the block's last allocation: the block
++    has no hash and is not stored."""
++    script = _script(*range(30, 41), CAN)
++    script[11] = [CAN, EOS_TOKEN_ID if ending == "stop" else I_, 311]
++    length = 12 if ending == "stop" else 30
++    runs = {}
++    for tier in (True, False):
++        scheduler = _scheduler(
++            tmp_path / str(tier),
++            tier=tier,
++            async_scheduling=async_scheduling,
++            num_drafts=num_drafts,
++            lazy=lazy,
++        )
++        worker = TierWorker(
++            scheduler, {"s": script}, num_drafts or 0, draft_errors={("s", 11): 999}
++        )
++        scheduler.add_request(_request("s", STORE_PROMPT, max_tokens=30))
++        runs[tier] = (
++            drive(scheduler, worker, async_scheduling=async_scheduling),
++            worker,
++        )
++    (run, worker), (ref, _) = runs[True], runs[False]
++    _assert_same_reply(run, ref, "s", script, length)
++    assert run.finished["s"].sink_metrics == ONE_REJECTION
++    assert worker.rejected == [(31, CAN)]
++    block1 = worker.tables["s"][1]
++    stored = sorted(i for r, i in worker.stored if r == "s")
++    if ending == "stop":
++        assert run.emitted["s"][-1] == EOS_TOKEN_ID
++        # Synchronous: no step follows, so the slot keeps the KV of `` can``.
++        # Asynchronous: the step in flight computed EOS there; the output of
++        # dropped with the finished request. Either way the block's last token
++        # was committed after the last allocation, so the block has no hash.
++        assert worker.gpu[block1][15] == (31, EOS_TOKEN_ID if async_scheduling else CAN)
++        assert stored == [0]
++    else:
++        # Block 2 too, if a step ran after the block's last token was committed.
++        assert stored[:2] == [0, 1] and stored == sorted(set(stored))
++        assert worker.gpu[block1][15] == (31, I_)
++    for content in worker.tier.values():
++        for slot in content:
++            assert slot not in worker.rejected
++
++
++def _kv(connector: str | None, role: str = "kv_both", **kwargs) -> KVTransferConfig:
++    return KVTransferConfig(kv_connector=connector, kv_role=role, **kwargs)
++
++
++ALLOWED = "SimpleCPUOffloadConnector with kv_role kv_both"
++
++
++@pytest.mark.parametrize(
++    "config",
++    [
++        None,
++        _kv("SimpleCPUOffloadConnector"),
++        _kv(
++            "SimpleCPUOffloadConnector",
++            kv_connector_extra_config={"kv_offload_backend": "disk"},
++            kv_load_failure_policy="recompute",
++        ),
++    ],
++    ids=["no-connector", "simple-cpu", "simple-cpu-disk"],
++)
++def test_kv_transfer_allowed(config):
++    """Rejection runs with no connector and beside SimpleCPUOffloadConnector
++    with kv_role kv_both, either backend."""
++    assert kv_transfer_refusal(config, rejection=True) is None
++    assert kv_transfer_refusal(config, rejection=False) is None
++
++
++@pytest.mark.parametrize(
++    ("config", "named"),
++    [
++        (
++            _kv("SimpleCPUOffloadConnector", "kv_producer"),
++            "SimpleCPUOffloadConnector with kv_role kv_producer",
++        ),
++        (
++            _kv("SimpleCPUOffloadConnector", "kv_consumer"),
++            "SimpleCPUOffloadConnector with kv_role kv_consumer",
++        ),
++        (_kv("NixlConnector"), "NixlConnector with kv_role kv_both"),
++        (_kv("LMCacheConnectorV1"), "LMCacheConnectorV1 with kv_role kv_both"),
++        (
++            _kv(
++                "MultiConnector",
++                kv_connector_extra_config={
++                    "connectors": [
++                        {
++                            "kv_connector": "SimpleCPUOffloadConnector",
++                            "kv_role": "kv_both",
++                        }
++                    ]
++                },
++            ),
++            "MultiConnector with kv_role kv_both",
++        ),
++        (
++            _kv(
++                "SimpleCPUOffloadConnector",
++                kv_connector_module_path="custom.connectors",
++            ),
++            "SimpleCPUOffloadConnector from custom.connectors with kv_role kv_both",
++        ),
++        (KVTransferConfig(), None),
++    ],
++    ids=["producer", "consumer", "nixl", "lmcache", "multi", "module-path", "unset"],
++)
++def test_kv_transfer_refused(config, named):
++    """Every other connector, role or source is refused, by name, with the one
++    configuration that is allowed."""
++    refusal = kv_transfer_refusal(config, rejection=True)
++    assert refusal is not None
++    given = (
++        "a KV transfer config with no kv_connector set"
++        if named is None
++        else f"KV transfer through {named}"
++    )
++    assert refusal.startswith(f"{given} (only ")
++    assert f"only {ALLOWED}" in refusal and "not inside MultiConnector" in refusal
++    # The detector alone holds nothing back: any connector.
++    assert kv_transfer_refusal(config, rejection=False) is None
+diff --git a/vllm/v1/sample/sink.py b/vllm/v1/sample/sink.py
+index 99bf5f8d1..fa25e1675 100644
+--- a/vllm/v1/sample/sink.py
++++ b/vllm/v1/sample/sink.py
+@@ -31,11 +31,21 @@ from typing import TYPE_CHECKING
+ import vllm.envs as envs
+ 
+ if TYPE_CHECKING:
+-    from vllm.config import VllmConfig
++    from vllm.config import KVTransferConfig, VllmConfig
+ 
+ # Fields of a request's per-step sink event, as the worker encodes them.
+ NUM_SINK_EVENT_FIELDS = 6
+ 
++# The only KV transfer that rejection runs beside. The scheduler side of this
++# connector changes a request only while the request holds no provisional
++# token: the connector's loads are asynchronous and reach requests in
++# WAITING_FOR_REMOTE_KVS, a failed or overrun load is a miss for those
++# requests only, a hit leaves at least the last prompt token to compute, and
++# the connector's stores copy hashed blocks, which hold committed tokens only.
++# The test is tests/v1/simple_kv_offload/test_ds41_tier_sink.py.
++SINK_REJECTION_KV_CONNECTOR = "SimpleCPUOffloadConnector"
++SINK_REJECTION_KV_ROLE = "kv_both"
++
+ 
+ class SinkOutcome(IntEnum):
+     """What happened at a request's row 0 (the row whose input is the step's
+@@ -163,6 +173,40 @@ class SinkConfig:
+         return self.max_retries if self.rejection else 0
+ 
+ 
++def kv_transfer_refusal(
++    kv_transfer_config: KVTransferConfig | None, rejection: bool
++) -> str | None:
++    """Why rejection does not run beside this KV transfer, or None.
++
++    Rejection runs beside SimpleCPUOffloadConnector with kv_role kv_both, set
++    as kv_connector (not inside MultiConnector) and taken from the vLLM
++    registry (no kv_connector_module_path). Every other connector, role or
++    source is refused. The detector alone (rejection off) holds no token back
++    and runs beside any connector.
++    """
++    if not rejection or kv_transfer_config is None:
++        return None
++    connector = kv_transfer_config.kv_connector
++    role = kv_transfer_config.kv_role
++    module_path = kv_transfer_config.kv_connector_module_path
++    if (
++        connector == SINK_REJECTION_KV_CONNECTOR
++        and role == SINK_REJECTION_KV_ROLE
++        and not module_path
++    ):
++        return None
++    if connector is None:
++        given = "a KV transfer config with no kv_connector set"
++    else:
++        source = f" from {module_path}" if module_path else ""
++        given = f"KV transfer through {connector}{source} with kv_role {role}"
++    return (
++        f"{given} (only {SINK_REJECTION_KV_CONNECTOR} with kv_role "
++        f"{SINK_REJECTION_KV_ROLE}, set as kv_connector and not inside "
++        "MultiConnector, is supported)"
++    )
++
++
+ @dataclass(frozen=True)
+ class SinkEvent:
+     """One request's sink event of one step (host form of the worker's
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 71c54bfcb..7b0d0c7f8 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -99,7 +99,7 @@ from vllm.v1.outputs import (
+     ModelRunnerOutput,
+     RoutedExpertsTensors,
+ )
+-from vllm.v1.sample.sink import SinkConfig, SinkOutcome
++from vllm.v1.sample.sink import SinkConfig, SinkOutcome, kv_transfer_refusal
+ from vllm.v1.watermarking import create_watermarker
+ from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
+ from vllm.v1.watermarking.spec_decode import (
+@@ -3290,6 +3290,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         ]
+         if config.rejection:
+             spec = self.speculative_config
++            kv_refusal = kv_transfer_refusal(
++                self.vllm_config.kv_transfer_config, config.rejection
++            )
+             unsupported += [
+                 ("a model-specific sampler", custom_sampler),
+                 (
+@@ -3304,7 +3307,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 ("sampling masks", self.model_config.return_sampling_mask),
+                 ("trace replay", self.model_config.enable_trace_replay),
+                 ("routed experts", self.model_config.enable_return_routed_experts),
+-                ("KV transfer", self.vllm_config.kv_transfer_config is not None),
++                (kv_refusal or "", kv_refusal is not None),
+                 (
+                     "request boundary checkpoints",
+                     self.vllm_config.use_request_boundary_checkpoints,
+-- 
+2.56.1
+

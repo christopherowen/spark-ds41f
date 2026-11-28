@@ -1,0 +1,60 @@
+{
+ "notes": "The arm tp3-4k-b6144-m1m-kv35 with an NVMe KV tier of 200 GiB a rank (SimpleCPUOffloadConnector, disk backend, O_DIRECT, file /cache/kvtier/ds41f.rank_0 on each node), on the spark-ds41f:1120 image with the eight files of vLLM 9030 to 9046 in overlay/ over the image's copies, tree 47e196a2.",
+ "extends": {
+  "config": "experiments/2026-11-22-kv-disk-tier/tp3-4k-b6144-m1m-kv35.json"
+ },
+ "set": {
+  "container": {
+   "mounts": [
+    [
+     "{checkout}/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/v1/simple_kv_offload/disk_backend.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/simple_kv_offload/disk_backend.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/v1/simple_kv_offload/worker.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/simple_kv_offload/worker.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/v1/simple_kv_offload/manager.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/simple_kv_offload/manager.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/v1/simple_kv_offload/metadata.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/simple_kv_offload/metadata.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/v1/simple_kv_offload/metrics.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/simple_kv_offload/metrics.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/v1/sample/sink.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/sample/sink.py",
+     "ro"
+    ],
+    [
+     "{checkout}/experiments/2026-11-22-kv-disk-tier/overlay/vllm/v1/worker/gpu/model_runner.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py",
+     "ro"
+    ]
+   ]
+  }
+ },
+ "add_serve_options": {
+  "--kv-transfer-config": "{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_connector_extra_config\":{\"disk_buffer_slots\":4,\"disk_capacity_bytes\":214748364800,\"disk_checksum\":\"crc32\",\"disk_io_slot_budget_s\":0.02,\"disk_io_timeout_s\":15,\"disk_path\":\"/cache/kvtier/ds41f\",\"disk_preallocate\":true,\"kv_offload_backend\":\"disk\",\"lazy_offload\":false,\"use_page_cache\":false},\"kv_load_failure_policy\":\"recompute\",\"kv_role\":\"kv_both\"}"
+ }
+}

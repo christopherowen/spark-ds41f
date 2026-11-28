@@ -1,0 +1,451 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
+
+import math
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from vllm.config import VllmConfig
+from vllm.distributed.kv_events import KVCacheEvent
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRole,
+    KVConnectorTransferResults,
+    SupportsHMA,
+    SupportsVmmSafeTransfers,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
+from vllm.logger import init_logger
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload.manager import (
+    BoundaryStoreStats,
+    SimpleCPUOffloadScheduler,
+)
+from vllm.v1.simple_kv_offload.metadata import (
+    SimpleCPUOffloadMetadata,
+)
+from vllm.v1.simple_kv_offload.metrics import (
+    SimpleCPUOffloadPromMetrics,
+    SimpleCPUOffloadStats,
+)
+from vllm.v1.simple_kv_offload.worker import (
+    SimpleCPUOffloadWorker,
+)
+
+if TYPE_CHECKING:
+    from vllm.config import KVTransferConfig
+    from vllm.forward_context import ForwardContext
+    from vllm.v1.attention.backend import AttentionMetadata
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+# Default CPU capacity: 8 GB
+DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
+
+VALID_KV_OFFLOAD_BACKENDS = ("cpu", "disk")
+# Keys that only apply to the disk backend, warned about under "cpu".
+_DISK_ONLY_KEYS = (
+    "disk_path",
+    "disk_capacity_bytes",
+    "disk_buffer_slots",
+    "use_page_cache",
+    "disk_io_timeout_s",
+    "disk_io_slot_budget_s",
+    "disk_checksum",
+    "disk_preallocate",
+)
+# Seconds a disk transfer under I/O may go without completing a slot, counted
+# from the moment its IO thread takes it from the queue or from its last
+# completed slot, before it is abandoned and its requests fall back to a cache
+# miss (kv_connector_extra_config "disk_io_timeout_s"). Queue time does not
+# count.
+DEFAULT_DISK_IO_TIMEOUT_S = 15.0
+# Seconds a slot adds to the total bound of a disk transfer: a transfer that
+# runs longer than disk_io_timeout_s plus this for each of its slots, counted
+# from its dequeue, is abandoned even while it makes progress, as a cache miss
+# for its requests and not as a fault: the tier stays up
+# (kv_connector_extra_config "disk_io_slot_budget_s"). The per-slot time
+# includes the IO thread's Python work, which waits for the GIL behind the
+# worker's other threads, not only the device time. 0.02 s is below the
+# estimated cost of recomputing a 256-token block on DS41 at 500K context
+# (about 70 s for 1,960 blocks): a load slower than that costs more than the
+# recompute that replaces it.
+DEFAULT_DISK_IO_SLOT_BUDGET_S = 0.02
+
+
+class SimpleCPUOffloadConnector(
+    KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers
+):
+    """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
+
+    @classmethod
+    def supports_aligned_hybrid_transfer(cls, config: "VllmConfig") -> bool:
+        # Aligned Qwen QSA restores are validated with this connector.
+        return True
+
+    @classmethod
+    def supports_vmm_safe_transfer_config(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        # Both backends reach the GPU KV cache only through virtual addresses
+        # resolved at copy time: cuMemcpyBatchAsync / hipMemcpyBatchAsync on
+        # data_ptr() bases (cuda_mem_ops.build_params, copy_blocks). The only
+        # registered memory is host memory, the CPU pool or the disk staging
+        # slots, pinned with cudaHostRegister. No RDMA, GPUDirect or GDS
+        # registration of GPU pages exists, so an expandable_segments remap
+        # cannot leave a stale registration behind. The disk backend reaches
+        # the file with pwritev/preadv on those host slots only.
+        extra = kv_transfer_config.kv_connector_extra_config or {}
+        backend = str(extra.get("kv_offload_backend", "cpu"))
+        return backend in VALID_KV_OFFLOAD_BACKENDS
+
+    @property
+    def requires_kv_delivery(self) -> bool:
+        # Runs as kv_both, but is a best-effort cache: a dropped save is just a
+        # future cache miss, so opt out of the producer-role default.
+        return False
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+
+        enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
+        extra_config = self._kv_transfer_config.kv_connector_extra_config or {}
+
+        cpu_capacity_bytes = int(
+            extra_config.get("cpu_bytes_to_use", DEFAULT_CPU_CAPACITY_BYTES)
+        )
+        # cpu_bytes_to_use is server-wide for compatibility;
+        # cpu_bytes_to_use_per_rank overrides for per-rank capacity.
+        world_size = vllm_config.parallel_config.world_size
+        cpu_capacity_per_rank = cpu_capacity_bytes // world_size
+        if "cpu_bytes_to_use_per_rank" in extra_config:
+            explicit = int(extra_config["cpu_bytes_to_use_per_rank"])
+            if explicit != cpu_capacity_per_rank:
+                logger.warning(
+                    "cpu_bytes_to_use_per_rank (%.2f GB) != "
+                    "cpu_bytes_to_use/world_size (%.2f GB). Using per-rank value.",
+                    explicit / (1024**3),
+                    cpu_capacity_per_rank / (1024**3),
+                )
+            cpu_capacity_per_rank = explicit
+
+        lazy_offload = bool(extra_config.get("lazy_offload", False))
+
+        kv_offload_backend = str(extra_config.get("kv_offload_backend", "cpu"))
+        if kv_offload_backend not in VALID_KV_OFFLOAD_BACKENDS:
+            raise ValueError(
+                f"Unknown kv_offload_backend {kv_offload_backend!r}; "
+                f"expected one of {VALID_KV_OFFLOAD_BACKENDS}"
+            )
+        disk_mode = kv_offload_backend == "disk"
+
+        disk_path = extra_config.get("disk_path", None) or None
+        disk_capacity_bytes = int(
+            extra_config.get("disk_capacity_bytes", 100 * (1024**3))
+        )
+        disk_buffer_slots = max(1, int(extra_config.get("disk_buffer_slots", 2)))
+        use_page_cache = bool(extra_config.get("use_page_cache", False))
+        disk_io_timeout_s = float(
+            extra_config.get("disk_io_timeout_s", DEFAULT_DISK_IO_TIMEOUT_S)
+        )
+        disk_io_slot_budget_s = float(
+            extra_config.get("disk_io_slot_budget_s", DEFAULT_DISK_IO_SLOT_BUDGET_S)
+        )
+        # Slot integrity check in the slot padding: "crc32", "sum64" or "none".
+        disk_checksum = str(extra_config.get("disk_checksum", "crc32"))
+        # Reserve the whole tier file at start (posix_fallocate); a start on a
+        # filesystem without the space fails at once instead of hours later.
+        disk_preallocate = bool(extra_config.get("disk_preallocate", True))
+
+        if disk_mode:
+            if disk_path is None:
+                raise ValueError(
+                    'kv_offload_backend="disk" requires disk_path to be set.'
+                )
+            if disk_capacity_bytes <= 0:
+                raise ValueError(
+                    'kv_offload_backend="disk" requires disk_capacity_bytes > 0.'
+                )
+            # NaN and infinity would turn a bound off without a word: NaN <= 0
+            # is False, and so is any comparison against NaN.
+            if not (math.isfinite(disk_io_timeout_s) and disk_io_timeout_s > 0):
+                raise ValueError(
+                    'kv_offload_backend="disk" requires disk_io_timeout_s > 0.'
+                )
+            if not (
+                math.isfinite(disk_io_slot_budget_s) and disk_io_slot_budget_s > 0
+            ):
+                raise ValueError(
+                    'kv_offload_backend="disk" requires disk_io_slot_budget_s > 0.'
+                )
+            if self._kv_transfer_config.kv_load_failure_policy != "recompute":
+                logger.warning_once(
+                    'kv_offload_backend="disk" with kv_load_failure_policy=%r: '
+                    "a disk fault fails the requests whose load it hits. Set "
+                    'kv_load_failure_policy="recompute" to turn them into '
+                    "cache misses.",
+                    self._kv_transfer_config.kv_load_failure_policy,
+                )
+        else:
+            ignored = [k for k in _DISK_ONLY_KEYS if k in extra_config]
+            if ignored:
+                logger.warning(
+                    'kv_offload_backend is "cpu", ignoring disk-only config: %s. '
+                    'Set kv_offload_backend="disk" to enable the disk backend.',
+                    ", ".join(ignored),
+                )
+            disk_path = None
+
+        self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
+        self.worker_handler: SimpleCPUOffloadWorker | None = None
+
+        if not enable_prefix_caching:
+            logger.warning(
+                "Detected prefix caching disabled, disabling CPU offload "
+                "since it requires prefix caching."
+            )
+            return
+
+        logger.info(
+            "SimpleCPUOffloadConnector: role=%s, "
+            "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s",
+            role.name,
+            cpu_capacity_per_rank / (1024**3),
+            world_size,
+            "lazy" if lazy_offload else "eager",
+            kv_offload_backend,
+            disk_path or "none",
+        )
+
+        if role == KVConnectorRole.SCHEDULER:
+            from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+            assert kv_cache_config is not None
+            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+                kv_cache_config, vllm_config
+            )
+            self.scheduler_manager = SimpleCPUOffloadScheduler(
+                vllm_config,
+                kv_cache_config,
+                cpu_capacity_per_rank,
+                scheduler_block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+                lazy_offload=lazy_offload,
+                disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
+                disk_use_page_cache=use_page_cache,
+            )
+        elif role == KVConnectorRole.WORKER:
+            self.worker_handler = SimpleCPUOffloadWorker(
+                vllm_config,
+                kv_cache_config,
+                cpu_capacity_per_rank,
+                kv_offload_backend=kv_offload_backend,
+                disk_path=disk_path,
+                disk_capacity_bytes=disk_capacity_bytes,
+                disk_buffer_slots=disk_buffer_slots,
+                use_page_cache=use_page_cache,
+                disk_io_timeout_s=disk_io_timeout_s,
+                disk_io_slot_budget_s=disk_io_slot_budget_s,
+                disk_checksum=disk_checksum,
+                disk_preallocate=disk_preallocate,
+            )
+
+    # --- Worker-side methods ---
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        if self.worker_handler is not None:
+            self.worker_handler.register_kv_caches(kv_caches)
+
+    def bind_connector_metadata(
+        self,
+        connector_metadata: KVConnectorMetadata,
+    ) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        if self.worker_handler is not None:
+            assert isinstance(connector_metadata, SimpleCPUOffloadMetadata)
+            self.worker_handler.bind_connector_metadata(connector_metadata)
+
+    def clear_connector_metadata(self) -> None:
+        super().clear_connector_metadata()
+        if self.worker_handler is not None:
+            self.worker_handler.clear_connector_metadata()
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        if self.worker_handler is not None:
+            assert isinstance(kv_connector_metadata, SimpleCPUOffloadMetadata)
+            self.worker_handler.handle_preemptions(kv_connector_metadata)
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+        if self.worker_handler is not None:
+            self.worker_handler.start_load_kv()
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        pass  # Always load asynchronously, issued in start_load_kv()
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        pass  # Always save asynchronously, issued in wait_for_save()
+
+    def wait_for_save(self) -> None:
+        if self.worker_handler is not None:
+            self.worker_handler.wait_for_save()
+
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+    ) -> tuple[set[str] | None, set[str] | None]:
+        if self.worker_handler is not None:
+            return self.worker_handler.get_finished(finished_req_ids)
+        return None, None
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        # Failed loads also appear in finished_recving, so every rank releases
+        # the request; failed_recving turns it into a cache miss.
+        if self.worker_handler is not None:
+            return self.worker_handler.get_transfer_results(finished_req_ids)
+        return KVConnectorTransferResults()
+
+    def build_connector_worker_meta(self):
+        if self.worker_handler is not None:
+            return self.worker_handler.build_connector_worker_meta()
+        return None
+
+    # --- Scheduler-side methods ---
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        if self.scheduler_manager is not None:
+            self.scheduler_manager.bind_gpu_block_pool(gpu_block_pool)
+
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_new_matched_tokens(
+                request, num_computed_tokens
+            )
+        return 0, False
+
+    def update_state_after_alloc(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+    ) -> None:
+        if self.scheduler_manager is not None:
+            self.scheduler_manager.update_state_after_alloc(
+                request, blocks, num_external_tokens
+            )
+
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> KVConnectorMetadata:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.build_connector_meta(scheduler_output)
+        return SimpleCPUOffloadMetadata()
+
+    def update_connector_output(
+        self,
+        connector_output: KVConnectorOutput,
+    ) -> None:
+        if self.scheduler_manager is not None:
+            self.scheduler_manager.update_connector_output(connector_output)
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.request_finished(request, block_ids)
+        return False, None
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.request_finished_all_groups(
+                request, block_ids
+            )
+        return False, None
+
+    def has_pending_push_work(self) -> bool:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.has_pending_stores()
+        return False
+
+    def get_boundary_store_stats(self) -> BoundaryStoreStats | None:
+        """Return cumulative boundary-handoff store diagnostics."""
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_boundary_store_stats()
+        return None
+
+    # --- Stats ---
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.scheduler_manager is not None:
+            data = self.scheduler_manager.get_stats()
+            if data:
+                return SimpleCPUOffloadStats(data=data)
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        return SimpleCPUOffloadStats(data=dict(data or {}))
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return SimpleCPUOffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
+
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.take_events()
+        return []
+
+    # NOTE: Workers are not contacted. In-flight transfers drain naturally,
+    # and stale completions are ignored by the guarded
+    # SimpleCPUOffloadScheduler._process_store_event().
+    def reset_cache(self) -> bool | None:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.reset()
+        return None

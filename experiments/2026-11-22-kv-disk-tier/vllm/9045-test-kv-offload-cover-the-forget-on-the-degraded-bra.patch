@@ -1,0 +1,171 @@
+From 478ac0c87a4815c590340323327a0f7d2fafe341 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 04:14:19 +0000
+Subject: [PATCH] test(kv-offload): cover the forget on the degraded branch
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9044
+of this series.
+
+Rationale: the disk backend drops the abandon mark and the failure mark
+of an abandoned event on two branches of _run_transfer, the finally
+block of a transfer under I/O and the early return of a degraded rank.
+Only the first branch had a test, and the whole offload suite still
+passed with the forget call of the degraded branch removed. The existing
+test of the forget waited until running() returned None and then read
+the two sets, but the IO thread sets the running transfer to None before
+it calls forget, so a thread switch between those two lines fails the
+test while the code is correct; a 50 ms sleep between the two lines
+makes the failure repeat. The module docstring also said that each
+request overruns at most once, although the mark ends when the cold
+retry is admitted, so a later preemption may hit the tier and, on a path
+that stays slow, overrun again. This patch adds a test of the forget
+call on the degraded branch, makes the waits of both tests independent
+of a thread switch, and corrects the docstring. The product code does
+not change.
+
+Quality implications: the patch changes tests and a docstring only.
+
+Tests: on the CPU path the offload suite passed 220 tests, with 2
+CUDA-only modules skipped, and 1 of them is new. That test,
+test_degraded_backend_forgets_the_abandoned_queue, hangs the first read
+of the first load past the timeout, so the rank degrades and abandons
+that load and the two loads queued behind it. Once the read returns,
+the IO thread takes both queued loads through the degraded branch with
+no I/O, and no mark of the three events stays. The test fails with
+either forget call removed, and with a forget that keeps the failure
+mark. Both tests now wait, with a deadline, until the two sets are
+empty, reading them under the abandon lock, and both pass with the
+50 ms sleep in either branch.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_overrun.py                 | 82 +++++++++++++++----
+ 1 file changed, 68 insertions(+), 14 deletions(-)
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py b/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py
+index 403ec0faf..c500b4db1 100644
+--- a/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_overrun.py
+@@ -9,23 +9,26 @@ external lookup at the next admission). With the tier up, that lookup finds
+ the same hit and starts the same load on the same slow path, so a path that
+ stays slow would overrun every attempt and the request would never prefill.
+ The scheduler remembers a request whose load overran and answers its later
+-lookups with a miss: each request overruns at most once, and other requests
+-still get their hits. An overrun store is dropped: reported complete and
+-failed, with no fault, and its blocks are never published.
++lookups with a miss: each request overruns at most once before the admission
++of its cold retry, and other requests still get their hits. An overrun store
++is dropped: reported complete and failed, with no fault, and its blocks are
++never published.
+ 
+ The mark lasts from the overrun to the admission of the cold retry, so a
+-later preemption of the request may hit the tier again. A request that
+-finished while the load was in flight (an abort, an error, a reset) gets no
+-mark, since no request_finished call comes after the failed load. Each rank
+-reports an overrun load once, in the same step as the overrun event, and the
+-disk backend keeps no mark of an abandoned event after the IO thread is done
+-with the event.
++later preemption of the request may hit the tier again, and on a path that
++stays slow, overrun again. A request that finished while the load was in
++flight (an abort, an error, a reset) gets no mark, since no request_finished
++call comes after the failed load. Each rank reports an overrun load once, in
++the same step as the overrun event, and the disk backend keeps no mark of an
++abandoned event after the IO thread is done with the event, on a healthy
++rank and on a degraded one.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+ import os
++import threading
+ import time
+ 
+ import pytest
+@@ -42,6 +45,7 @@ from tests.v1.simple_kv_offload.test_ds41_tier_faults import (  # noqa: F401
+     tier,
+ )
+ from tests.v1.simple_kv_offload.test_ds41_tier_timeouts import (
++    _poll_all,
+     _slow_reads,
+     _submit_loads,
+ )
+@@ -409,6 +413,25 @@ def test_overrun_reaches_the_scheduler_in_the_step_of_the_failure(
+         time.sleep(0.01)
+ 
+ 
++def _wait_until_no_marks(backend, is_store: bool, timeout_s: float = 5.0) -> None:
++    """Wait until the backend holds no abandon mark and no failure mark of
++    the load (or store) thread. Both sets are read under the abandon lock,
++    which _forget_if_abandoned holds while the two marks of an event are
++    dropped. running() is no sign of the forget: the IO thread sets the
++    running transfer to None before the forget call."""
++    deadline = time.monotonic() + timeout_s
++    while True:
++        with backend._abandon_lock:
++            abandoned = set(backend._abandoned[is_store])
++            failed = set(backend._failed_events[is_store])
++        if not abandoned and not failed:
++            return
++        assert time.monotonic() < deadline, (
++            f"marks left: abandoned {abandoned}, failed {failed}"
++        )
++        time.sleep(0.01)
++
++
+ def test_backend_forgets_an_abandoned_event(tier, monkeypatch) -> None:
+     """Two loads overrun one after the other (12 slots at 0.1 s a read, a
+     0.54 s bound each). The worker reports each one at the abandon; once the
+@@ -426,9 +449,40 @@ def test_backend_forgets_an_abandoned_event(tier, monkeypatch) -> None:
+         failed |= worker.get_transfer_results(set()).failed_recving
+         time.sleep(0.01)
+     backend = worker._backend
+-    while backend.running(False) is not None:
+-        assert time.monotonic() < deadline
+-        time.sleep(0.01)
++    _wait_until_no_marks(backend, is_store=False)
+     assert backend.fault is None
+-    assert backend._abandoned[False] == set()
+-    assert backend._failed_events[False] == set()
++    assert backend.running(False) is None
++
++
++def test_degraded_backend_forgets_the_abandoned_queue(tier, monkeypatch) -> None:
++    """The first read of the first load hangs past the 0.3 s timeout: the
++    rank degrades and abandons that load and the two loads queued behind
++    that load. Once the read returns, the IO thread takes the two queued
++    loads through the degraded branch of _run_transfer with no I/O, and the
++    backend holds no abandon mark and no failure mark of any of the three."""
++    worker, gpu = tier(timeout_s=0.3)
++    _stored(worker, [0, 1, 2], [3, 4, 5])
++    real = os.preadv
++    calls = {"n": 0}
++    release = threading.Event()
++
++    def hang_first(fd, bufs, offset):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            release.wait(10)
++        return real(fd, bufs, offset)
++
++    monkeypatch.setattr(os, "preadv", hang_first)
++    backend = worker._backend
++    try:
++        reqs = _submit_loads(worker, [([3], [0]), ([4], [1]), ([5], [2])])
++        assert _poll_all(worker, reqs) == reqs
++        assert backend.fault is not None
++        assert backend._abandoned[False] == {0, 1, 2}
++        assert not backend.started(False, 1)  # both queued loads still queued
++    finally:
++        release.set()
++    _wait_until_no_marks(backend, is_store=False)
++    assert backend.started(False, 2)
++    assert backend.running(False) is None
++    assert calls["n"] == 1  # the queued loads did no I/O
+-- 
+2.56.1
+

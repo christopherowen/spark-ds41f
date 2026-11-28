@@ -1,0 +1,1543 @@
+From 4f5b3c59f1dfff709934af4ba4c07dcb6216d150 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:09:51 +0000
+Subject: [PATCH] feat(kv-offload): turn disk faults into misses and degrade
+ the tier
+
+Upstream base: the patch applies to local-inference-lab/vllm at
+19f2c20ed4d64ae22bd009ceacadd85e2a81e354 after the 702 patches of
+spark-ds41f-1120 (candidate-62, 0001 to 0829) and patches 9030 to 9032
+of this series.
+
+Rationale: an exception in an IO thread of the disk backend ended the
+thread. The failed load and every later load on that rank were then
+never reported, so each request with a disk hit waited forever while
+/health stayed up, and failed stores kept their GPU blocks pinned; a
+CPU-only probe on the tree of 9030 to 9032 showed both. This patch makes
+every disk transfer end within a bound and keeps a fault from serving
+any state:
+- DiskBackend runs each queued transfer under one handler. A failed or
+  short preadv or pwritev raises DiskTierError with the errno and the
+  slot, and that or any other exception marks the event failed and
+  records the first fault of the rank, while the IO thread stays alive.
+  After the first fault, every queued transfer fails at once with no
+  I/O. abandon() stops the copies of an event before its next DMA, and
+  the check runs under a lock.
+- SimpleCPUOffloadWorker abandons a transfer that is still pending
+  disk_io_timeout_s after submission (a new kv_connector_extra_config
+  key, 15 s by default), and every pending transfer of an IO thread that
+  is no longer running. It drains the load stream before it releases a
+  load. A failed load is reported in finished_recving and in
+  failed_recving (get_transfer_results), and a failed store is reported
+  complete and in failed_store_events. The worker metadata carries the
+  first fault of the rank once, as (rank, op, slot, errno, message).
+- SimpleCPUOffloadScheduler marks the tier degraded at the first fault
+  record or failed load from any rank. From then on every lookup misses,
+  no store is selected, and the queued finish-time stores are released.
+  A store that failed on any rank is dropped once all ranks have
+  reported it, so its slots are never published and its GPU references
+  are released. The scheduler logs one error line at the change, with
+  the rank, the operation, the slot, and the errno, and none afterwards.
+- The scheduler side exports the stats as Prometheus series: the gauge
+  vllm:kv_offload_disk_degraded and the counters
+  vllm:kv_offload_disk_loads_total, _load_failures_total,
+  _stored_blocks_total, _store_failed_blocks_total, and _io_errors_total.
+- The connector warns when the disk backend runs with a
+  kv_load_failure_policy other than "recompute", because the default
+  "fail" ends the request where "recompute" computes it again.
+A request that waits on a load is released as a miss at the first engine
+step after the fault is caught, or, when the I/O hangs, at the first
+step after disk_io_timeout_s from submission on the slowest rank. The
+fork's KVOutputAggregator releases the request only when all ranks have
+reported, and _handle_failed_recving (with kv_load_failure_policy
+"recompute") frees the loaded blocks uncached and computes the request
+again.
+
+Quality implications: a disk fault costs one prefill of the affected
+request and turns the tier off until the next engine start, and no state
+from a failed transfer reaches the model.
+
+Tests: tests/v1/simple_kv_offload/test_ds41_tier_faults.py runs a real
+O_DIRECT file with host copies and injects EIO on a read and on a write,
+a short read, a load thread that ends in the middle of a load, and a
+read that hangs. The hung read is released at 0.3 to 0.5 s with a 0.3 s
+timeout, and the late read copies nothing. Further tests check that the
+fault reaches the scheduler from rank 1 of three through
+KVOutputAggregator, that a store failed on one rank is dropped from the
+index, and that the metric names are right. On the CPU path the offload
+suite passed 139 tests, with 2 CUDA-only modules skipped. These tests
+run the stream drain and the abandoned DMA of the CUDA side with host
+copies only. On DGX Spark hardware the patch ran as part of the whole
+series, and its fault path ran once there: when the tier file of one
+rank was truncated to 0 bytes, the request was computed again and the
+tier marked itself degraded.
+
+Upstream status: the patch is proposed to spark-ds41f in
+experiments/2026-11-22-kv-disk-tier and has not been submitted to
+local-inference-lab/vllm.
+---
+ .../test_ds41_tier_faults.py                  | 445 ++++++++++++++++++
+ .../v1/simple_cpu_offload_connector.py        |  68 +++
+ vllm/v1/simple_kv_offload/disk_backend.py     | 192 +++++++-
+ vllm/v1/simple_kv_offload/manager.py          | 107 ++++-
+ vllm/v1/simple_kv_offload/metadata.py         |  17 +-
+ vllm/v1/simple_kv_offload/metrics.py          | 121 +++++
+ vllm/v1/simple_kv_offload/worker.py           | 152 +++++-
+ 7 files changed, 1057 insertions(+), 45 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+ create mode 100644 vllm/v1/simple_kv_offload/metrics.py
+
+diff --git a/tests/v1/simple_kv_offload/test_ds41_tier_faults.py b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+new file mode 100644
+index 000000000..dc5bc95af
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_ds41_tier_faults.py
+@@ -0,0 +1,445 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Disk faults of the SimpleCPUOffloadConnector tier never hang a request and
++never serve wrong state (CPU-only).
++
++The worker runs on a real DiskBackend with a real O_DIRECT file; only the CUDA
++batch copy is replaced by a host memmove (test_ds41_offload's harness). Faults
++are injected into preadv/pwritev. The scheduler side runs the fork's
++KVOutputAggregator over three simulated ranks.
++"""
++
++from __future__ import annotations
++
++import copy
++import errno
++import logging
++import os
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from tests.v1.simple_kv_offload import ds41_layout
++from tests.v1.simple_kv_offload.test_ds41_offload import (
++    _host_build_params,
++    _host_copy_blocks,
++    _HostEvent,
++    _odirect_dir,
++)
++from tests.v1.simple_kv_offload.test_scheduler import (
++    _alloc_and_register,
++    make_request,
++    make_scheduler,
++    make_scheduler_output,
++)
++from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
++from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, KVConnectorOutput
++from vllm.v1.request import Request
++from vllm.v1.simple_kv_offload import disk_backend as disk_backend_mod
++from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
++from vllm.v1.simple_kv_offload.metadata import (
++    SimpleCPUOffloadMetadata,
++    SimpleCPUOffloadWorkerMetadata,
++)
++from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++BLOCK = ds41_layout.LIVE_BLOCK_BYTES
++SLOTS = 16
++
++
++class _HostStream:
++    cuda_stream = 0
++
++    def wait_event(self, event) -> None:
++        pass
++
++    def synchronize(self) -> None:
++        pass
++
++
++@pytest.fixture
++def host_cuda(monkeypatch):
++    monkeypatch.setattr(disk_backend_mod, "pin_tensor", lambda t: None)
++    monkeypatch.setattr(disk_backend_mod, "build_params", _host_build_params)
++    monkeypatch.setattr(disk_backend_mod, "copy_blocks", _host_copy_blocks)
++    monkeypatch.setattr(
++        disk_backend_mod,
++        "current_platform",
++        SimpleNamespace(set_device=lambda device: None),
++    )
++    monkeypatch.setattr(torch, "Event", _HostEvent)
++    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _HostStream())
++
++
++@pytest.fixture
++def tier(tmp_path, host_cuda):
++    """A worker in disk mode on a host-copy DiskBackend; 6 GPU blocks."""
++    made = []
++
++    def make(timeout_s: float = 15.0):
++        gen = torch.Generator().manual_seed(42)
++        gpu = torch.randint(-128, 127, (6, BLOCK), dtype=torch.int8, generator=gen)
++        worker = SimpleCPUOffloadWorker(
++            vllm_config=MagicMock(),
++            kv_cache_config=None,
++            cpu_capacity_bytes=0,
++            kv_offload_backend="disk",
++            disk_path=str(_odirect_dir(tmp_path) / "tier"),
++            disk_capacity_bytes=SLOTS * 229376,
++            disk_io_timeout_s=timeout_s,
++        )
++        stream = _HostStream()
++        backend = DiskBackend()
++        backend.init(
++            {"packed": gpu},
++            torch.device("cpu"),
++            stream,
++            stream,
++            str(_odirect_dir(tmp_path) / f"tier.rank_{len(made)}"),
++            SLOTS,
++            BLOCK,
++        )
++        worker._backend = backend
++        worker.load_stream = stream
++        worker.store_stream = stream
++        worker._rank = 1
++        made.append(worker)
++        return worker, gpu
++
++    yield make
++    for worker in made:
++        worker._backend.shutdown()
++
++
++def _store(worker, gpu_ids, slots, event=0):
++    worker.bind_connector_metadata(
++        SimpleCPUOffloadMetadata(
++            store_event=event, store_gpu_blocks=gpu_ids, store_cpu_blocks=slots
++        )
++    )
++    worker.wait_for_save()
++    worker._connector_metadata = None
++
++
++def _load(worker, slots, gpu_ids, event, req="r1"):
++    worker.bind_connector_metadata(
++        SimpleCPUOffloadMetadata(
++            load_event=event,
++            load_gpu_blocks=gpu_ids,
++            load_cpu_blocks=slots,
++            load_event_to_reqs={event: [req]},
++        )
++    )
++    worker.start_load_kv()
++
++
++def _poll(worker, until, timeout_s=10.0):
++    """get_transfer_results every 10 ms (an engine step), with the metadata
++    of the in-flight load bound, until ``until(results)``; returns results."""
++    deadline = time.monotonic() + timeout_s
++    while time.monotonic() < deadline:
++        results = worker.get_transfer_results(set())
++        if until(results):
++            return results
++        time.sleep(0.01)
++    raise AssertionError("no result before the deadline")
++
++
++def _stored(worker, gpu_ids, slots):
++    _store(worker, gpu_ids, slots)
++    deadline = time.monotonic() + 5
++    while 0 in worker._pending_store_event_indices:
++        worker.get_transfer_results(set())
++        assert time.monotonic() < deadline
++        time.sleep(0.01)
++    meta = worker.build_connector_worker_meta()
++    assert meta.completed_store_events == {0: 1} and not meta.failed_store_events
++
++
++def _inject(monkeypatch, name, fault):
++    """Replace os.preadv or os.pwritev for the next call only."""
++    real = getattr(os, name)
++    calls = {"n": 0}
++
++    def wrapped(fd, bufs, offset):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            return fault(real, fd, bufs, offset)
++        return real(fd, bufs, offset)
++
++    monkeypatch.setattr(os, name, wrapped)
++    return calls
++
++
++def _eio(real, fd, bufs, offset):
++    raise OSError(errno.EIO, "Input/output error (injected)")
++
++
++# ---------------------------------------------------------------------------
++# Worker: each fault fails the load or store, never hangs, degrades the rank
++# ---------------------------------------------------------------------------
++
++
++def test_read_eio_fails_load_as_miss_and_degrades(tier, monkeypatch) -> None:
++    worker, gpu = tier()
++    _stored(worker, [0, 1, 2], [3, 4, 5])
++    calls = _inject(monkeypatch, "preadv", _eio)
++    _load(worker, [3, 4, 5], [3, 4, 5], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.finished_recving == {"r1"} and res.failed_recving == {"r1"}
++    fault = worker._backend.fault
++    assert (fault.op, fault.slot, fault.errno) == ("load", 3, errno.EIO)
++    meta = worker.build_connector_worker_meta()
++    assert meta.faults == [(1, "load", 3, errno.EIO, fault.message)]
++    # reported once
++    assert worker.build_connector_worker_meta() is None
++    # degraded: the next load fails at once, with no I/O, on a live thread
++    _load(worker, [4], [4], event=1, req="r2")
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.failed_recving == {"r2"}
++    assert calls["n"] == 1
++    assert worker._backend.thread_alive(False)
++
++
++def test_short_read_fails_load(tier, monkeypatch) -> None:
++    worker, gpu = tier()
++    _stored(worker, [0], [7])
++
++    def short(real, fd, bufs, offset):
++        return real(fd, bufs, offset) - 4096
++
++    _inject(monkeypatch, "preadv", short)
++    _load(worker, [7], [5], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert res.failed_recving == {"r1"}
++    fault = worker._backend.fault
++    assert fault.errno == errno.EIO and "short read of slot 7" in fault.message
++
++
++def test_write_eio_fails_store_and_drops_it(tier, monkeypatch) -> None:
++    worker, gpu = tier()
++    _inject(monkeypatch, "pwritev", _eio)
++    _store(worker, [0, 1], [2, 9])
++    deadline = time.monotonic() + 5
++    while 0 in worker._pending_store_event_indices:
++        worker.get_transfer_results(set())
++        assert time.monotonic() < deadline
++    meta = worker.build_connector_worker_meta()
++    assert meta.completed_store_events == {0: 1}
++    assert meta.failed_store_events == {0}
++    assert meta.faults[0][1:4] == ("store", 2, errno.EIO)
++
++
++def test_load_thread_killed_mid_load(tier, monkeypatch) -> None:
++    worker, gpu = tier()
++    _stored(worker, [0, 1], [0, 1])
++
++    def die(real, fd, bufs, offset):
++        raise SystemExit  # not an Exception: the load thread ends here
++
++    _inject(monkeypatch, "preadv", die)
++    _load(worker, [0, 1], [4, 5], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    assert not worker._backend.thread_alive(False)
++    assert res.failed_recving == {"r1"}
++    fault = worker._backend.fault
++    assert (fault.op, fault.errno) == ("load", errno.EPIPE)
++
++
++def test_hung_read_is_released_as_miss_within_the_bound(tier, monkeypatch) -> None:
++    """A read that never returns: the request is reported finished and failed
++    at the first poll after disk_io_timeout_s, and the late read copies
++    nothing into the GPU block it was loading."""
++    timeout_s = 0.3
++    worker, gpu = tier(timeout_s=timeout_s)
++    _stored(worker, [0], [6])
++    gpu[5].zero_()
++    release = threading.Event()
++
++    def hang(real, fd, bufs, offset):
++        release.wait(10)
++        return real(fd, bufs, offset)
++
++    _inject(monkeypatch, "preadv", hang)
++    start = time.monotonic()
++    _load(worker, [6], [5], event=0)
++    res = _poll(worker, lambda r: r.finished_recving)
++    waited = time.monotonic() - start
++    assert res.failed_recving == {"r1"}
++    assert timeout_s <= waited < timeout_s + 0.2
++    fault = worker._backend.fault
++    assert (fault.op, fault.slot, fault.errno) == ("load", 6, errno.ETIMEDOUT)
++    release.set()
++    time.sleep(0.2)
++    assert torch.count_nonzero(gpu[5]) == 0  # abandoned: no late copy
++    assert worker._backend.thread_alive(False)
++
++
++# ---------------------------------------------------------------------------
++# Scheduler: three ranks, the fork's aggregator, the degraded state
++# ---------------------------------------------------------------------------
++
++
++def _rank_output(finished=(), failed=(), meta=None):
++    out = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
++    out.kv_connector_output = KVConnectorOutput(
++        finished_recving=set(finished) or None,
++        failed_recving=set(failed),
++        kv_connector_worker_meta=meta,
++    )
++    return out
++
++
++def _scheduler_with_pending_load():
++    """A cached request, then a second request whose CPU hit is loading."""
++    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16)
++    sched = fix.scheduler
++    sched._expected_worker_count = 3
++    req = make_request(num_blocks=2)
++    kv_blocks = _alloc_and_register(fix, req, 2)
++    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
++    meta = sched.build_connector_meta(
++        make_scheduler_output(
++            {req.request_id: 32}, new_reqs={req.request_id: kv_blocks.get_block_ids()}
++        )
++    )
++    done = SimpleCPUOffloadWorkerMetadata(completed_store_events={meta.store_event: 3})
++    sched.update_connector_output(KVConnectorOutput(kv_connector_worker_meta=done))
++    req2 = Request(
++        request_id="r2",
++        prompt_token_ids=req.prompt_token_ids,
++        sampling_params=req.sampling_params,
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=req._block_hasher,
++    )
++    hit, _ = sched.get_num_new_matched_tokens(req2, 0)
++    assert hit == 32
++    blocks2 = KVCacheBlocks(blocks=(fix.gpu_block_pool.get_new_blocks(2),))
++    sched.update_state_after_alloc(req2, blocks2, num_external_tokens=hit)
++    load_meta = sched.build_connector_meta(
++        make_scheduler_output({"r2": 1}, new_reqs={"r2": blocks2.get_block_ids()})
++    )
++    assert load_meta.load_event >= 0
++    return fix, req, req2
++
++
++def test_degraded_reaches_scheduler_from_one_of_three_ranks(caplog) -> None:
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    agg = KVOutputAggregator(expected_finished_count=3)
++    fault = (1, "load", 4, errno.EIO, "OSError: read of slot 4")
++    meta1 = SimpleCPUOffloadWorkerMetadata(completed_store_events={}, faults=[fault])
++    # step 1: ranks 0 and 1 finish r2 (rank 1 failed it); rank 2 still loading
++    step1 = agg.aggregate(
++        [_rank_output(["r2"]), _rank_output(["r2"], ["r2"], meta1), _rank_output()]
++    )
++    out1 = step1.kv_connector_output
++    assert not out1.finished_recving and not out1.failed_recving
++    with caplog.at_level(logging.ERROR):
++        sched.update_connector_output(out1)
++    assert sched.degraded  # the fault record arrives before the request
++    # step 2: rank 2 finishes r2 (fine on that rank): released as failed
++    out2 = agg.aggregate([_rank_output(), _rank_output(), _rank_output(["r2"])])
++    out2 = out2.kv_connector_output
++    assert out2.finished_recving == {"r2"} and out2.failed_recving == {"r2"}
++    sched.update_connector_output(out2)
++    assert "r2" not in sched._reqs_to_load
++    lines = [r for r in caplog.records if "degraded" in r.getMessage()]
++    assert len(lines) == 1
++    assert "rank 1 load fault on slot 4, errno 5 (EIO)" in lines[0].getMessage()
++    # every lookup now misses, nothing is stored, and no more log lines
++    req3 = Request(
++        request_id="r3",
++        prompt_token_ids=req.prompt_token_ids,
++        sampling_params=req.sampling_params,
++        pooling_params=None,
++        mm_features=None,
++        block_hasher=req._block_hasher,
++    )
++    with caplog.at_level(logging.DEBUG):
++        caplog.clear()
++        assert sched.get_num_new_matched_tokens(req3, 0) == (0, False)
++        assert sched.prepare_store_specs(make_scheduler_output({}))[0] == []
++    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
++    stats = sched.get_stats()
++    # the setup's store of 2 blocks, then the fault
++    assert stats == {
++        "stored_blocks": 2,
++        "io_errors": 1,
++        "load_failures": 1,
++        "degraded": 1,
++    }
++    assert sched.get_stats() is None
++
++
++def test_failed_load_without_fault_record_still_degrades() -> None:
++    fix, req, req2 = _scheduler_with_pending_load()
++    sched = fix.scheduler
++    sched.update_connector_output(
++        KVConnectorOutput(finished_recving={"r2"}, failed_recving={"r2"})
++    )
++    assert sched.degraded
++
++
++def test_store_failed_on_one_rank_is_dropped_from_index() -> None:
++    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16)
++    sched = fix.scheduler
++    sched._expected_worker_count = 3
++    req = make_request(num_blocks=2)
++    kv_blocks = _alloc_and_register(fix, req, 2)
++    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
++    meta = sched.build_connector_meta(
++        make_scheduler_output(
++            {req.request_id: 32}, new_reqs={req.request_id: kv_blocks.get_block_ids()}
++        )
++    )
++    j = meta.store_event
++    gpu_refs = [fix.gpu_block_pool.blocks[b].ref_cnt for b in meta.store_gpu_blocks]
++    agg = KVOutputAggregator(expected_finished_count=3)
++    ok = SimpleCPUOffloadWorkerMetadata(completed_store_events={j: 1})
++    bad = SimpleCPUOffloadWorkerMetadata(
++        completed_store_events={j: 1},
++        failed_store_events={j},
++        faults=[(2, "store", meta.store_cpu_blocks[0], errno.ENOSPC, "no space")],
++    )
++    out = agg.aggregate(
++        [_rank_output(meta=ok), _rank_output(meta=ok), _rank_output(meta=bad)]
++    )
++    sched.update_connector_output(out.kv_connector_output)
++    assert sched.degraded
++    pool = sched.cpu_block_pool
++    assert all(
++        pool.blocks[b].block_hash is None for b in meta.store_cpu_blocks
++    )  # nothing published
++    assert [fix.gpu_block_pool.blocks[b].ref_cnt for b in meta.store_gpu_blocks] == [
++        r - 1 for r in gpu_refs
++    ]  # the store's GPU refs are released
++    req2 = make_request(num_blocks=2)
++    req2.prompt_token_ids[:] = req.prompt_token_ids
++    assert sched.get_num_new_matched_tokens(req, 0) == (0, False)
++    assert sched.get_stats()["store_failed_blocks"] == 2
++
++
++def test_prometheus_series_names() -> None:
++    from vllm.v1.simple_kv_offload import metrics
++
++    names = sorted(n for n, _ in metrics.COUNTERS.values()) + [metrics.DEGRADED[0]]
++    assert names == [
++        "vllm:kv_offload_disk_io_errors",
++        "vllm:kv_offload_disk_load_failures",
++        "vllm:kv_offload_disk_loads",
++        "vllm:kv_offload_disk_store_failed_blocks",
++        "vllm:kv_offload_disk_stored_blocks",
++        "vllm:kv_offload_disk_degraded",
++    ]
++    a = metrics.SimpleCPUOffloadStats(data={"loads": 2, "degraded": 0})
++    b = metrics.SimpleCPUOffloadStats(data={"loads": 1, "io_errors": 1, "degraded": 1})
++    assert a.aggregate(b).data == {"loads": 3, "io_errors": 1, "degraded": 1}
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 03d239dcd..01c419835 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -13,9 +13,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorBase_V1,
+     KVConnectorMetadata,
+     KVConnectorRole,
++    KVConnectorTransferResults,
+     SupportsHMA,
+     SupportsVmmSafeTransfers,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++    KVConnectorPromMetrics,
++    KVConnectorStats,
++    PromMetric,
++    PromMetricT,
++)
+ from vllm.logger import init_logger
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.outputs import KVConnectorOutput
+@@ -26,6 +33,10 @@ from vllm.v1.simple_kv_offload.manager import (
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+ )
++from vllm.v1.simple_kv_offload.metrics import (
++    SimpleCPUOffloadPromMetrics,
++    SimpleCPUOffloadStats,
++)
+ from vllm.v1.simple_kv_offload.worker import (
+     SimpleCPUOffloadWorker,
+ )
+@@ -51,7 +62,12 @@ _DISK_ONLY_KEYS = (
+     "disk_capacity_bytes",
+     "disk_buffer_slots",
+     "use_page_cache",
++    "disk_io_timeout_s",
+ )
++# Seconds a disk transfer may take, from submission, before it is abandoned
++# and its requests fall back to a cache miss (kv_connector_extra_config
++# "disk_io_timeout_s").
++DEFAULT_DISK_IO_TIMEOUT_S = 15.0
+ 
+ 
+ class SimpleCPUOffloadConnector(
+@@ -131,6 +147,9 @@ class SimpleCPUOffloadConnector(
+         )
+         disk_buffer_slots = max(1, int(extra_config.get("disk_buffer_slots", 2)))
+         use_page_cache = bool(extra_config.get("use_page_cache", False))
++        disk_io_timeout_s = float(
++            extra_config.get("disk_io_timeout_s", DEFAULT_DISK_IO_TIMEOUT_S)
++        )
+ 
+         if disk_mode:
+             if disk_path is None:
+@@ -141,6 +160,18 @@ class SimpleCPUOffloadConnector(
+                 raise ValueError(
+                     'kv_offload_backend="disk" requires disk_capacity_bytes > 0.'
+                 )
++            if disk_io_timeout_s <= 0:
++                raise ValueError(
++                    'kv_offload_backend="disk" requires disk_io_timeout_s > 0.'
++                )
++            if self._kv_transfer_config.kv_load_failure_policy != "recompute":
++                logger.warning_once(
++                    'kv_offload_backend="disk" with kv_load_failure_policy=%r: '
++                    "a disk fault fails the requests whose load it hits. Set "
++                    'kv_load_failure_policy="recompute" to turn them into '
++                    "cache misses.",
++                    self._kv_transfer_config.kv_load_failure_policy,
++                )
+         else:
+             ignored = [k for k in _DISK_ONLY_KEYS if k in extra_config]
+             if ignored:
+@@ -199,6 +230,7 @@ class SimpleCPUOffloadConnector(
+                 disk_capacity_bytes=disk_capacity_bytes,
+                 disk_buffer_slots=disk_buffer_slots,
+                 use_page_cache=use_page_cache,
++                disk_io_timeout_s=disk_io_timeout_s,
+             )
+ 
+     # --- Worker-side methods ---
+@@ -254,6 +286,15 @@ class SimpleCPUOffloadConnector(
+             return self.worker_handler.get_finished(finished_req_ids)
+         return None, None
+ 
++    def get_transfer_results(
++        self, finished_req_ids: set[str]
++    ) -> KVConnectorTransferResults:
++        # Failed loads also appear in finished_recving, so every rank releases
++        # the request; failed_recving turns it into a cache miss.
++        if self.worker_handler is not None:
++            return self.worker_handler.get_transfer_results(finished_req_ids)
++        return KVConnectorTransferResults()
++
+     def build_connector_worker_meta(self):
+         if self.worker_handler is not None:
+             return self.worker_handler.build_connector_worker_meta()
+@@ -333,6 +374,33 @@ class SimpleCPUOffloadConnector(
+             return self.scheduler_manager.get_boundary_store_stats()
+         return None
+ 
++    # --- Stats ---
++
++    def get_kv_connector_stats(self) -> KVConnectorStats | None:
++        if self.scheduler_manager is not None:
++            data = self.scheduler_manager.get_stats()
++            if data:
++                return SimpleCPUOffloadStats(data=data)
++        return None
++
++    @classmethod
++    def build_kv_connector_stats(
++        cls, data: dict[str, Any] | None = None
++    ) -> KVConnectorStats | None:
++        return SimpleCPUOffloadStats(data=dict(data or {}))
++
++    @classmethod
++    def build_prom_metrics(
++        cls,
++        vllm_config: VllmConfig,
++        metric_types: dict[type[PromMetric], type[PromMetricT]],
++        labelnames: list[str],
++        per_engine_labelvalues: dict[int, list[object]],
++    ) -> KVConnectorPromMetrics:
++        return SimpleCPUOffloadPromMetrics(
++            vllm_config, metric_types, labelnames, per_engine_labelvalues
++        )
++
+     def take_events(self) -> Iterable[KVCacheEvent]:
+         if self.scheduler_manager is not None:
+             return self.scheduler_manager.take_events()
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 1e27b034b..ee884e5e5 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -10,9 +10,11 @@ staging buffers to avoid contention.
+ from __future__ import annotations
+ 
+ import contextlib
++import errno
+ import os
+ import queue
+ import threading
++from typing import NamedTuple
+ 
+ import torch
+ 
+@@ -33,6 +35,27 @@ O_DIRECT = getattr(os, "O_DIRECT", 0)
+ _ALIGNMENT = 4096
+ 
+ 
++class DiskTierError(OSError):
++    """An I/O fault on one tier slot: the errno, the message and the slot."""
++
++    def __init__(self, err: int, message: str, slot: int = -1) -> None:
++        super().__init__(err, message)
++        self.slot = slot
++
++
++class _Abandoned(Exception):
++    """The worker gave up on this transfer (I/O timeout); skip its copies."""
++
++
++class DiskFault(NamedTuple):
++    """The first fault of a backend: once set, the tier on this rank is degraded."""
++
++    op: str  # "load" or "store"
++    slot: int  # disk slot of the failed I/O, -1 when unknown
++    errno: int
++    message: str
++
++
+ def disk_slot_bytes(block_bytes: int, use_page_cache: bool = False) -> int:
+     """Bytes one offload block occupies in the disk file and in a staging slot.
+ 
+@@ -100,6 +123,98 @@ class DiskBackend:
+         self._load_slot_params: list[BatchMemcpyParams] = []
+         self._per_tensor_bpb: list[int] = []
+         self._tensor_names: list[str] = []
++        # Fault state. The first fault degrades the tier on this rank: every
++        # transfer queued after it fails at once without I/O. Failed event ids
++        # are recorded before the event is published, so the worker sees the
++        # failure no later than the completion. Keyed by is_store.
++        self._fault: DiskFault | None = None
++        self._failed_events: dict[bool, set[int]] = {True: set(), False: set()}
++        # Events the worker abandoned after its I/O timeout. The IO threads
++        # check this under the lock before every DMA, so no copy of an
++        # abandoned event starts after abandon() returns.
++        self._abandoned: dict[bool, set[int]] = {True: set(), False: set()}
++        self._abandon_lock = threading.Lock()
++        # Slot under I/O in each thread, for the fault report of a timeout.
++        self._current_slot: dict[bool, int] = {True: -1, False: -1}
++
++    # --- fault state (thread-safe) ---
++
++    @property
++    def fault(self) -> DiskFault | None:
++        return self._fault
++
++    def record_fault(self, op: str, slot: int, err: int, message: str) -> None:
++        with self._abandon_lock:
++            if self._fault is None:
++                self._fault = DiskFault(op, slot, err, message)
++
++    def take_failed(self, is_store: bool, event_idx: int) -> bool:
++        """Whether a completed event failed; forgets it."""
++        failed = self._failed_events[is_store]
++        if event_idx in failed:
++            failed.discard(event_idx)
++            return True
++        return False
++
++    def abandon(self, is_store: bool, event_idx: int) -> None:
++        """Stop all further copies of an event (the worker's I/O timeout)."""
++        with self._abandon_lock:
++            self._abandoned[is_store].add(event_idx)
++
++    def current_slot(self, is_store: bool) -> int:
++        return self._current_slot[is_store]
++
++    def thread_alive(self, is_store: bool) -> bool:
++        thread = self._store_thread if is_store else self._load_thread
++        return thread is not None and thread.is_alive()
++
++    def _copy_unless_abandoned(
++        self,
++        is_store: bool,
++        event_idx: int,
++        src_blocks: list[int],
++        dst_blocks: list[int],
++        params: BatchMemcpyParams,
++        stream: torch.cuda.Stream,
++    ) -> torch.Event:
++        with self._abandon_lock:
++            if event_idx in self._abandoned[is_store]:
++                raise _Abandoned()
++            copy_blocks(src_blocks, dst_blocks, params)
++            ev = torch.Event()
++            ev.record(stream)
++        return ev
++
++    def _run_transfer(
++        self,
++        is_store: bool,
++        src_blocks: list[int],
++        dst_blocks: list[int],
++        stream: torch.cuda.Stream,
++        event_idx: int,
++    ) -> None:
++        """One queued transfer. Never raises: a fault marks the event failed."""
++        if self._fault is not None:
++            # Degraded: no I/O. The event still completes, as a failure.
++            self._failed_events[is_store].add(event_idx)
++            return
++        try:
++            if is_store:
++                self._do_store(src_blocks, dst_blocks, stream, event_idx)
++            else:
++                self._do_load(src_blocks, dst_blocks, stream, event_idx)
++        except _Abandoned:
++            self._failed_events[is_store].add(event_idx)
++        except Exception as e:  # OSError, a CUDA RuntimeError, a bad header
++            self._failed_events[is_store].add(event_idx)
++            self.record_fault(
++                "store" if is_store else "load",
++                getattr(e, "slot", self._current_slot[is_store]),
++                getattr(e, "errno", None) or errno.EIO,
++                f"{type(e).__name__}: {e}",
++            )
++        finally:
++            self._current_slot[is_store] = -1
+ 
+     def _slot_tensor_views(
+         self, buffer: torch.Tensor, slot: int
+@@ -279,23 +394,43 @@ class DiskBackend:
+             (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+-            self._do_store(src_blocks, dst_blocks, stream)
++            self._run_transfer(True, src_blocks, dst_blocks, stream, event_idx)
+             event = torch.Event()
+             event.record(stream)
+             events_list.append((event_idx, event))
+ 
+-    def _writev_slot(self, buf_slot: int, file_offset: int) -> None:
+-        written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
++    def _writev_slot(self, buf_slot: int, file_offset: int, slot: int = -1) -> None:
++        self._current_slot[True] = slot
++        try:
++            written = os.pwritev(
++                self._fd, self._store_slot_views[buf_slot], file_offset
++            )
++        except OSError as e:
++            raise DiskTierError(
++                e.errno or errno.EIO, f"write of slot {slot}: {e.strerror}", slot
++            ) from e
+         if written < self._slot_bytes:
+-            raise OSError(
+-                f"Short write: expected {self._slot_bytes} bytes, wrote {written}"
++            raise DiskTierError(
++                errno.EIO,
++                f"short write of slot {slot}: {written} of {self._slot_bytes} bytes",
++                slot,
+             )
+ 
+-    def _readv_slot(self, buf_slot: int, file_offset: int) -> None:
+-        bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
++    def _readv_slot(self, buf_slot: int, file_offset: int, slot: int = -1) -> None:
++        self._current_slot[False] = slot
++        try:
++            bytes_read = os.preadv(
++                self._fd, self._load_slot_views[buf_slot], file_offset
++            )
++        except OSError as e:
++            raise DiskTierError(
++                e.errno or errno.EIO, f"read of slot {slot}: {e.strerror}", slot
++            ) from e
+         if bytes_read < self._slot_bytes:
+-            raise OSError(
+-                f"Short read: expected {self._slot_bytes} bytes, read {bytes_read}"
++            raise DiskTierError(
++                errno.EIO,
++                f"short read of slot {slot}: {bytes_read} of {self._slot_bytes} bytes",
++                slot,
+             )
+ 
+     def _load_loop(
+@@ -311,7 +446,7 @@ class DiskBackend:
+             (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
+             if wait_event is not None:
+                 stream.wait_event(wait_event)
+-            self._do_load(src_blocks, dst_blocks, stream)
++            self._run_transfer(False, src_blocks, dst_blocks, stream, event_idx)
+             event = torch.Event()
+             event.record(stream)
+             events_list.append((event_idx, event))
+@@ -321,11 +456,12 @@ class DiskBackend:
+         gpu_blocks: list[int],
+         disk_slots: list[int],
+         stream: torch.cuda.Stream,
++        event_idx: int = -1,
+     ) -> None:
+         """GPU -> buffer (DMA) -> disk (pwritev), interleaved double-buffer."""
+         assert self._store_slot_params
+         n = self._num_buffer_slots
+-        # (DMA event, file offset) of the block already staged in each slot.
++        # (DMA event, disk slot) of the block already staged in each slot.
+         pending: list[tuple[torch.Event, int] | None] = [None] * n
+ 
+         for i, (gpu_blk, disk_slot) in enumerate(zip(gpu_blocks, disk_slots)):
+@@ -333,23 +469,29 @@ class DiskBackend:
+             prev = pending[buf_slot]
+             if prev is not None:
+                 prev[0].synchronize()
+-                self._writev_slot(buf_slot, prev[1])
+-
+-            copy_blocks([gpu_blk], [0], self._store_slot_params[buf_slot])
+-            ev = torch.Event()
+-            ev.record(stream)
+-            pending[buf_slot] = (ev, disk_slot * self._slot_bytes)
++                self._writev_slot(buf_slot, prev[1] * self._slot_bytes, prev[1])
++
++            ev = self._copy_unless_abandoned(
++                True,
++                event_idx,
++                [gpu_blk],
++                [0],
++                self._store_slot_params[buf_slot],
++                stream,
++            )
++            pending[buf_slot] = (ev, disk_slot)
+ 
+         for slot, last in enumerate(pending):
+             if last is not None:
+                 last[0].synchronize()
+-                self._writev_slot(slot, last[1])
++                self._writev_slot(slot, last[1] * self._slot_bytes, last[1])
+ 
+     def _do_load(
+         self,
+         disk_slots: list[int],
+         gpu_blocks: list[int],
+         stream: torch.cuda.Stream,
++        event_idx: int = -1,
+     ) -> None:
+         """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
+         assert self._load_slot_params
+@@ -362,12 +504,16 @@ class DiskBackend:
+             if prev is not None:
+                 prev.synchronize()
+ 
+-            self._readv_slot(buf_slot, disk_slot * self._slot_bytes)
++            self._readv_slot(buf_slot, disk_slot * self._slot_bytes, disk_slot)
+ 
+-            copy_blocks([0], [gpu_blk], self._load_slot_params[buf_slot])
+-            ev = torch.Event()
+-            ev.record(stream)
+-            prev_dma_events[buf_slot] = ev
++            prev_dma_events[buf_slot] = self._copy_unless_abandoned(
++                False,
++                event_idx,
++                [0],
++                [gpu_blk],
++                self._load_slot_params[buf_slot],
++                stream,
++            )
+ 
+         for ev in prev_dma_events:
+             if ev is not None:
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 8dc1aff2f..d1dd43e9a 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -3,6 +3,7 @@
+ """Scheduler-side manager for SimpleCPUOffloadConnector."""
+ 
+ import contextlib
++import errno
+ from collections.abc import Iterable
+ from dataclasses import dataclass, field, replace
+ from enum import Enum, auto
+@@ -269,6 +270,17 @@ class SimpleCPUOffloadScheduler:
+         self._expected_worker_count = vllm_config.parallel_config.world_size
+         self._store_event_pending_counts: dict[int, int] = {}
+ 
++        # Disk fault state. A fault on any rank (a failed or short read or
++        # write, an I/O timeout, a stopped IO thread, a bad slot header)
++        # degrades the tier until the engine restarts: every lookup misses
++        # and nothing new is stored. Store events that failed on any rank are
++        # dropped when all ranks have reported them. Counters since the last
++        # get_stats() call feed the connector's Prometheus metrics.
++        self.degraded = False
++        self._failed_store_events: set[int] = set()
++        self._stats: dict[str, int] = {}
++        self._degraded_reported: bool | None = None
++
+     @staticmethod
+     def _derive_cpu_config(
+         gpu_config: "KVCacheConfig",
+@@ -354,7 +366,7 @@ class SimpleCPUOffloadScheduler:
+         if stale := self._pending_cpu_hits.pop(request.request_id, None):
+             self._free_pending_cpu_hit(stale)
+ 
+-        if request.skip_reading_prefix_cache:
++        if request.skip_reading_prefix_cache or self.degraded:
+             return 0, False
+ 
+         if num_computed_tokens % self.block_size != 0:
+@@ -536,6 +548,15 @@ class SimpleCPUOffloadScheduler:
+         store_gpu, store_cpu, store_req_ids, store_meta = self.prepare_store_specs(
+             scheduler_output
+         )
++        if self.degraded:
++            # Nothing new reaches a degraded tier: release the queued
++            # finish-time stores instead of submitting them.
++            for transfer in self._pending_finished_stores:
++                self._in_flight_store_gpu_blocks.difference_update(
++                    transfer.gpu_block_ids
++                )
++                self._release_transfer_refs(transfer)
++            self._pending_finished_stores.clear()
+         for transfer in self._pending_finished_stores:
+             store_gpu.extend(transfer.gpu_block_ids)
+             store_cpu.extend(transfer.cpu_block_ids)
+@@ -600,6 +621,8 @@ class SimpleCPUOffloadScheduler:
+         list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None,
+     ]:
+         """Prepare store specs for the store event."""
++        if self.degraded:
++            return [], [], [], ([] if self.enable_kv_cache_events else None)
+         if self._lazy_mode:
+             return self._prepare_lazy_store_specs()
+         else:
+@@ -1000,12 +1023,27 @@ class SimpleCPUOffloadScheduler:
+         per-event worker counts. We accumulate across steps and process
+         a store event only when all workers have reported completion.
+         """
++        meta = connector_output.kv_connector_worker_meta
++        if isinstance(meta, SimpleCPUOffloadWorkerMetadata):
++            if meta.faults:
++                self._count("io_errors", len(meta.faults))
++                self._mark_degraded(meta.faults[0])
++            self._failed_store_events.update(meta.failed_store_events)
++
+         # --- Load completions ---
++        failed_recving = connector_output.failed_recving or set()
+         for req_id in list(connector_output.finished_recving or []):
++            if req_id in self._reqs_to_load:
++                if req_id in failed_recving:
++                    self._count("load_failures")
++                else:
++                    self._count("loads")
+             self._cleanup_load_request(req_id)
++        if failed_recving and not self.degraded:
++            # A rank failed a load without a fault record reaching here yet.
++            self._mark_degraded(None)
+ 
+         # --- Store completions ---
+-        meta = connector_output.kv_connector_worker_meta
+         if not isinstance(meta, SimpleCPUOffloadWorkerMetadata):
+             return
+         for event_idx, count in meta.completed_store_events.items():
+@@ -1018,6 +1056,8 @@ class SimpleCPUOffloadScheduler:
+ 
+     def _process_store_event(self, event_idx: int) -> None:
+         """Process a fully-completed store event."""
++        failed = event_idx in self._failed_store_events
++        self._failed_store_events.discard(event_idx)
+         transfer = self._store_event_to_blocks.pop(event_idx, None)
+         if transfer is None:
+             transfer = self._abandoned_store_event_to_blocks.pop(event_idx, None)
+@@ -1029,14 +1069,22 @@ class SimpleCPUOffloadScheduler:
+         if not self._lazy_mode:
+             self._in_flight_store_gpu_blocks.difference_update(transfer.gpu_block_ids)
+ 
+-        self._process_store_completion(
+-            transfer.gpu_block_ids,
+-            transfer.cpu_block_ids,
+-            transfer.block_meta,
+-        )
++        if failed:
++            # The write failed on at least one rank: publish nothing, so no
++            # lookup can find these slots; their blocks return unhashed.
++            self._release_transfer_refs(transfer)
++            self._count("store_failed_blocks", len(transfer.cpu_block_ids))
++        else:
++            self._process_store_completion(
++                transfer.gpu_block_ids,
++                transfer.cpu_block_ids,
++                transfer.block_meta,
++            )
++            self._count("stored_blocks", len(transfer.cpu_block_ids))
+         logger.debug(
+-            "Store event %d completed: cached %d blocks to CPU",
++            "Store event %d completed: %s %d blocks",
+             event_idx,
++            "dropped" if failed else "cached",
+             len(transfer.cpu_block_ids),
+         )
+ 
+@@ -1160,6 +1208,47 @@ class SimpleCPUOffloadScheduler:
+             self._gpu_block_pool.blocks[bid] for bid in transfer.gpu_block_ids
+         )
+ 
++    def _count(self, key: str, n: int = 1) -> None:
++        self._stats[key] = self._stats.get(key, 0) + n
++
++    def _mark_degraded(self, fault: tuple[int, str, int, int, str] | None) -> None:
++        """Degrade the tier until the engine restarts; one log line."""
++        if self.degraded:
++            return
++        self.degraded = True
++        if fault is None:
++            logger.error(
++                "SimpleCPUOffload disk tier degraded: a rank failed a load; "
++                "no external hits and no stores until the engine restarts"
++            )
++            return
++        rank, op, slot, err, message = fault
++        logger.error(
++            "SimpleCPUOffload disk tier degraded: rank %d %s fault on slot %d, "
++            "errno %d (%s): %s; no external hits and no stores until the "
++            "engine restarts",
++            rank,
++            op,
++            slot,
++            err,
++            errno.errorcode.get(err, "?"),
++            message,
++        )
++
++    def get_stats(self) -> dict[str, int] | None:
++        """Counters since the last call and the degraded flag (0 or 1).
++
++        None when nothing changed, so idle steps send nothing.
++        """
++        degraded_changed = self._degraded_reported != self.degraded
++        if not self._stats and not degraded_changed:
++            return None
++        data = dict(self._stats)
++        data["degraded"] = int(self.degraded)
++        self._stats = {}
++        self._degraded_reported = self.degraded
++        return data
++
+     def has_pending_stores(self) -> bool:
+         """Return True if a store transfer is queued or in flight."""
+         return bool(
+@@ -1216,7 +1305,7 @@ class SimpleCPUOffloadScheduler:
+         """Queue confirmed eager blocks omitted after a request enters decode."""
+         state = self._reqs_to_store.get(request.request_id)
+         gpu_pool = self._gpu_block_pool
+-        if state is None or gpu_pool is None:
++        if state is None or gpu_pool is None or self.degraded:
+             return
+         gpu_ids, _, block_meta = self._select_eager_blocks_to_store(state, block_ids)
+         partial_tail = self._find_fa_partial_tail_source(request, block_ids)
+diff --git a/vllm/v1/simple_kv_offload/metadata.py b/vllm/v1/simple_kv_offload/metadata.py
+index 8c8d4511e..1b53149c8 100644
+--- a/vllm/v1/simple_kv_offload/metadata.py
++++ b/vllm/v1/simple_kv_offload/metadata.py
+@@ -42,13 +42,18 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
+ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
+     """Worker -> Scheduler metadata for completed store events.
+ 
+-    Each worker reports {event_idx: 1} for newly completed stores.
+-    ``aggregate()`` sums counts across workers within a step.
++    Each worker reports {event_idx: 1} for newly completed stores, failed
++    ones included. ``aggregate()`` sums counts across workers within a step.
+     The scheduler-side manager accumulates across steps and processes
+-    a store completion only when count reaches ``world_size``.
++    a store completion only when count reaches ``world_size``; a store that
++    failed on any rank is dropped instead of published.
++    ``faults`` carries each rank's first disk fault once, as
++    (rank, op, slot, errno, message).
+     """
+ 
+     completed_store_events: dict[int, int]
++    failed_store_events: set[int] = field(default_factory=set)
++    faults: list[tuple[int, str, int, int, str]] = field(default_factory=list)
+ 
+     def aggregate(
+         self, other: "KVConnectorWorkerMetadata"
+@@ -57,4 +62,8 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
+         merged = dict(self.completed_store_events)
+         for k, v in other.completed_store_events.items():
+             merged[k] = merged.get(k, 0) + v
+-        return SimpleCPUOffloadWorkerMetadata(completed_store_events=merged)
++        return SimpleCPUOffloadWorkerMetadata(
++            completed_store_events=merged,
++            failed_store_events=self.failed_store_events | other.failed_store_events,
++            faults=self.faults + other.faults,
++        )
+diff --git a/vllm/v1/simple_kv_offload/metrics.py b/vllm/v1/simple_kv_offload/metrics.py
+new file mode 100644
+index 000000000..3db388458
+--- /dev/null
++++ b/vllm/v1/simple_kv_offload/metrics.py
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Stats and Prometheus metrics of SimpleCPUOffloadConnector's offload tier.
++
++The scheduler-side manager counts events and reports them through
++``get_kv_connector_stats``; workers report nothing here. Series (one child per
++engine label set):
++
++- ``vllm:kv_offload_disk_degraded`` gauge: 1 once a disk fault on any rank
++  degraded the tier (no external hits, no stores until the engine restarts).
++- ``vllm:kv_offload_disk_loads_total``: loads finished on every rank.
++- ``vllm:kv_offload_disk_load_failures_total``: loads that failed on a rank and
++  fell back to a cache miss.
++- ``vllm:kv_offload_disk_stored_blocks_total``: blocks stored on every rank and
++  published in the tier's index.
++- ``vllm:kv_offload_disk_store_failed_blocks_total``: blocks whose store failed
++  on a rank and were dropped from the index.
++- ``vllm:kv_offload_disk_io_errors_total``: disk faults reported by ranks
++  (each rank reports its first fault).
++
++External prefix-cache hits keep their generic series,
++``vllm:external_prefix_cache_hits_total`` and
++``vllm:external_prefix_cache_queries_total`` (tokens, counted at lookup).
++"""
++
++from dataclasses import dataclass
++from typing import Any
++
++from vllm.config import VllmConfig
++from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++    KVConnectorPromMetrics,
++    KVConnectorStats,
++    PromMetric,
++    PromMetricT,
++)
++from vllm.v1.metrics.utils import create_metric_per_engine
++
++COUNTERS = {
++    "loads": (
++        "vllm:kv_offload_disk_loads",
++        "Offload-tier loads that finished on every rank.",
++    ),
++    "load_failures": (
++        "vllm:kv_offload_disk_load_failures",
++        "Offload-tier loads that failed on a rank and fell back to a cache miss.",
++    ),
++    "stored_blocks": (
++        "vllm:kv_offload_disk_stored_blocks",
++        "Blocks stored on every rank and published in the offload tier's index.",
++    ),
++    "store_failed_blocks": (
++        "vllm:kv_offload_disk_store_failed_blocks",
++        "Blocks whose store failed on a rank and were dropped from the index.",
++    ),
++    "io_errors": (
++        "vllm:kv_offload_disk_io_errors",
++        "Disk faults reported by ranks (each rank reports its first fault).",
++    ),
++}
++DEGRADED = (
++    "vllm:kv_offload_disk_degraded",
++    "1 when a disk fault degraded the offload tier until the engine restarts.",
++)
++
++
++@dataclass
++class SimpleCPUOffloadStats(KVConnectorStats):
++    """Counters since the last report, plus ``degraded`` (0 or 1)."""
++
++    def reset(self) -> None:
++        self.data = {}
++
++    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
++        merged = dict(self.data)
++        for key, value in other.data.items():
++            if key == "degraded":
++                merged[key] = max(merged.get(key, 0), value)
++            else:
++                merged[key] = merged.get(key, 0) + value
++        return SimpleCPUOffloadStats(data=merged)
++
++    def reduce(self) -> dict[str, int | float]:
++        return {f"disk_{key}": value for key, value in sorted(self.data.items())}
++
++    def is_empty(self) -> bool:
++        return not self.data
++
++
++class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        metric_types: dict[type[PromMetric], type[PromMetricT]],
++        labelnames: list[str],
++        per_engine_labelvalues: dict[int, list[object]],
++    ):
++        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
++        self.counters = {
++            key: create_metric_per_engine(
++                self._counter_cls(name=name, documentation=doc, labelnames=labelnames),
++                per_engine_labelvalues,
++            )
++            for key, (name, doc) in COUNTERS.items()
++        }
++        name, doc = DEGRADED
++        self.degraded = create_metric_per_engine(
++            self._gauge_cls(
++                name=name,
++                documentation=doc,
++                multiprocess_mode="mostrecent",
++                labelnames=labelnames,
++            ),
++            per_engine_labelvalues,
++        )
++
++    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
++        for key, value in transfer_stats_data.items():
++            if key == "degraded":
++                self.degraded[engine_idx].set(value)
++            elif key in self.counters and value:
++                self.counters[key][engine_idx].inc(value)
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index b8fee5775..af567720e 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -2,11 +2,16 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Worker-side handler for SimpleCPUOffloadConnector."""
+ 
++import errno
++import time
+ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+ from vllm.config import VllmConfig
++from vllm.distributed.kv_transfer.kv_connector.v1.base import (
++    KVConnectorTransferResults,
++)
+ from vllm.logger import init_logger
+ from vllm.utils.torch_utils import PIN_MEMORY
+ from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+@@ -36,6 +41,7 @@ class SimpleCPUOffloadWorker:
+         disk_capacity_bytes: int = 0,
+         disk_buffer_slots: int = 2,
+         use_page_cache: bool = False,
++        disk_io_timeout_s: float = 15.0,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -79,6 +85,22 @@ class SimpleCPUOffloadWorker:
+         # Completed store events to report via build_connector_worker_meta
+         self._completed_store_events: dict[int, int] = {}
+ 
++        # Disk fault handling (disk mode). A transfer that has not completed
++        # disk_io_timeout_s after submission is abandoned and reported failed;
++        # so is every pending transfer of an IO thread that is not running. A
++        # failed load is still reported finished, so all ranks release the
++        # request together, and it is also reported in failed_recving, which
++        # the scheduler turns into a cache miss (kv_load_failure_policy
++        # "recompute"). A failed store is reported complete and failed, so
++        # the scheduler drops its blocks instead of publishing them.
++        self.disk_io_timeout_s = disk_io_timeout_s
++        self._load_submit_time: dict[int, float] = {}
++        self._store_submit_time: dict[int, float] = {}
++        self._forced_failed_loads: set[int] = set()
++        self._failed_store_events: set[int] = set()
++        self._fault_reported = False
++        self._rank = 0
++
+     def register_kv_caches(
+         self,
+         kv_caches: dict[str, torch.Tensor],
+@@ -97,6 +119,7 @@ class SimpleCPUOffloadWorker:
+             return
+ 
+         self.device = next(iter(kv_caches.values())).device
++        self._rank = self._global_rank()
+ 
+         assert self.kv_cache_config is not None
+         num_blocks = self.kv_cache_config.num_blocks
+@@ -173,6 +196,17 @@ class SimpleCPUOffloadWorker:
+         else:
+             self._init_cpu_mode(unique_gpu_caches, total_bytes_per_block, self.device)
+ 
++    @staticmethod
++    def _global_rank() -> int:
++        try:
++            from vllm.distributed.parallel_state import get_world_group
++
++            return get_world_group().rank
++        except Exception:
++            if torch.distributed.is_available() and torch.distributed.is_initialized():
++                return torch.distributed.get_rank()
++            return 0
++
+     def _init_disk_mode(
+         self,
+         unique_gpu_caches: dict[str, torch.Tensor],
+@@ -271,6 +305,7 @@ class SimpleCPUOffloadWorker:
+         if metadata is not None and metadata.load_cpu_blocks:
+             backend = self._backend
+             assert backend is not None
++            self._load_submit_time[metadata.load_event] = time.monotonic()
+             backend.launch_copy(
+                 metadata.load_cpu_blocks,
+                 metadata.load_gpu_blocks,
+@@ -298,6 +333,7 @@ class SimpleCPUOffloadWorker:
+             if self._store_compute_done is None:
+                 self._store_compute_done = torch.Event()
+             self._store_compute_done.record(torch.cuda.current_stream())
++            self._store_submit_time[metadata.store_event] = time.monotonic()
+             backend.launch_copy(
+                 metadata.store_gpu_blocks,
+                 metadata.store_cpu_blocks,
+@@ -318,37 +354,135 @@ class SimpleCPUOffloadWorker:
+         Returns:
+             tuple of (finished_sending, finished_recving).
+             - finished_sending: always None (stores use worker metadata).
+-            - finished_recving: req_ids whose loads have completed.
++            - finished_recving: req_ids whose loads have completed, failed
++              loads included (see get_transfer_results).
+         """
++        results = self.get_transfer_results(finished_req_ids)
++        return None, results.finished_recving or None
++
++    def get_transfer_results(
++        self, finished_req_ids: set[str]
++    ) -> KVConnectorTransferResults:
++        """Completed loads, with the failed ones also in failed_recving."""
+         metadata = self._connector_metadata
+         finished_recving: set[str] = set()
++        failed_recving: set[str] = set()
++        self._check_overdue_transfers()
++
++        def reqs_of(j: int) -> list[str]:
++            return (
++                (metadata.load_event_to_reqs.get(j) or [])
++                if metadata is not None
++                else []
++            )
+ 
+         if self._pending_load_event_indices:
+             load_wm = self._poll_stream_events(is_store=False)
+             for j in [j for j in self._pending_load_event_indices if j <= load_wm]:
+                 self._pending_load_event_indices.discard(j)
+-                req_ids = (
+-                    metadata.load_event_to_reqs.get(j) if metadata is not None else None
+-                )
+-                if req_ids:
+-                    finished_recving.update(req_ids)
++                self._load_submit_time.pop(j, None)
++                req_ids = reqs_of(j)
++                finished_recving.update(req_ids)
++                backend = self._backend
++                if isinstance(backend, DiskBackend) and backend.take_failed(False, j):
++                    failed_recving.update(req_ids)
++        for j in self._forced_failed_loads:
++            req_ids = reqs_of(j)
++            finished_recving.update(req_ids)
++            failed_recving.update(req_ids)
++        self._forced_failed_loads.clear()
+ 
+         if self._pending_store_event_indices:
+             store_wm = self._poll_stream_events(is_store=True)
+             for j in [j for j in self._pending_store_event_indices if j <= store_wm]:
+                 self._pending_store_event_indices.discard(j)
++                self._store_submit_time.pop(j, None)
+                 self._completed_store_events[j] = 1
++                backend = self._backend
++                if isinstance(backend, DiskBackend) and backend.take_failed(True, j):
++                    self._failed_store_events.add(j)
+ 
+-        return None, finished_recving or None
++        return KVConnectorTransferResults(
++            finished_recving=finished_recving, failed_recving=failed_recving
++        )
++
++    def _check_overdue_transfers(self) -> None:
++        """Abandon disk transfers past the I/O timeout or on a dead IO thread.
++
++        Bound: a transfer is reported failed at the first get_finished call
++        after disk_io_timeout_s from its submission, or at once when its IO
++        thread is not running. Abandoned copies stop before their next DMA
++        (DiskBackend.abandon); copies already queued on the load stream are
++        drained before the request's blocks are released.
++        """
++        backend = self._backend
++        if not isinstance(backend, DiskBackend):
++            return
++        now = time.monotonic()
++        for is_store, pending, submitted in (
++            (False, self._pending_load_event_indices, self._load_submit_time),
++            (True, self._pending_store_event_indices, self._store_submit_time),
++        ):
++            if not pending:
++                continue
++            op = "store" if is_store else "load"
++            dead = not backend.thread_alive(is_store)
++            overdue = [
++                j
++                for j in pending
++                if dead or now - submitted.get(j, now) > self.disk_io_timeout_s
++            ]
++            if not overdue:
++                continue
++            if dead:
++                backend.record_fault(op, -1, errno.EPIPE, f"the {op} thread stopped")
++            else:
++                backend.record_fault(
++                    op,
++                    backend.current_slot(is_store),
++                    errno.ETIMEDOUT,
++                    f"{op} event {min(overdue)} exceeded the "
++                    f"{self.disk_io_timeout_s:g} s I/O timeout",
++                )
++            for j in overdue:
++                backend.abandon(is_store, j)
++            if not is_store and self.load_stream is not None:
++                # No DMA of an abandoned load starts after abandon(); finish
++                # the ones already queued before the blocks are released.
++                self.load_stream.synchronize()
++            for j in overdue:
++                pending.discard(j)
++                submitted.pop(j, None)
++                if is_store:
++                    self._completed_store_events[j] = 1
++                    self._failed_store_events.add(j)
++                else:
++                    self._forced_failed_loads.add(j)
+ 
+     def build_connector_worker_meta(self) -> SimpleCPUOffloadWorkerMetadata | None:
+-        """Return completed store events since the last call."""
+-        if not self._completed_store_events:
++        """Return completed store events since the last call, the failed ones
++        among them, and this rank's first disk fault once."""
++        faults: list[tuple[int, str, int, int, str]] = []
++        backend = self._backend
++        if (
++            isinstance(backend, DiskBackend)
++            and backend.fault is not None
++            and not self._fault_reported
++        ):
++            fault = backend.fault
++            faults.append(
++                (self._rank, fault.op, fault.slot, fault.errno, fault.message)
++            )
++            self._fault_reported = True
++        if not self._completed_store_events and not faults:
+             return None
+         meta = SimpleCPUOffloadWorkerMetadata(
+             completed_store_events=self._completed_store_events,
++            failed_store_events=self._failed_store_events,
++            faults=faults,
+         )
+         self._completed_store_events = {}
++        self._failed_store_events = set()
+         return meta
+ 
+     def handle_preemptions(
+-- 
+2.56.1
+
