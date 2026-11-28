@@ -174,6 +174,32 @@ then alone again. Two `tp4-switched` pods ran at once on 1122, one as shipped an
 The first C1 pass repeats the warm-up prompt and is not comparable with the other two. This is three passes per level
 on one night, enough to see that nothing large moved and no more.
 
+### 7. Speculative decoding off
+
+Profile `speculative: false`, so each stream is one row per decode step. The first such boot (`tp8-1122-nospec`, not
+traced) was identical to idle at K=2..24 and broke at K=32
+(11/32 token-identical). Two more boots on the 1122 image repeat it with the step trace, as shipped and fixed.
+[`probes/nospec_align.py`](probes/nospec_align.py) matches each API response to its rows in the trace and compares the
+request's first token or logprob difference from idle with the token produced by its first decode step on a captured
+graph of an empty-slice size.
+
+| K=32 pass | As shipped: tokens identical | first difference is the token made by the request's first 28-row step | finished before the step reached 28 rows, identical | decode steps on the 28-row graph | Fixed: tokens and logprobs identical | requests that ran 28-row steps, identical | decode steps on the 28-row graph |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 11/32 | 28/32 | 4/32 | 33 | 32/32 | 28/32 | 34 |
+| 2 | 13/32 | 28/32 | 4/32 | 29 | 32/32 | 28/32 | 27 |
+| 3 | 11/32 | 28/32 | 4/32 | 33 | 32/32 | 28/32 | 33 |
+| 4 | 13/32 | 28/32 | 4/32 | 32 | 32/32 | 28/32 | 33 |
+
+- With 32 streams started together the step stays above 28 rows until streams finish. It then runs on the 28-row graph
+  (25..28 rows), where rank 7 is dealt no index rows. As shipped, every request still running first differs at exactly
+  the token that step produces; the requests that had already finished are identical.
+- With the fix, 112 requests across the 4 passes went through the same 28-row steps and none differs from idle
+  at any token or logprob.
+- K=24, 16, 8 on both boots: no decode step on an empty-slice size, every prompt identical to idle. One row per stream
+  never reaches 25 rows at 24 streams or fewer.
+- Idle is bit-identical between the untraced and traced boots and between the as-shipped and fixed boots
+  (4,590 logprob positions each).
+
 ## Every boot
 
 | # | Arm | Build | Shape | Change from the shape as shipped | Started (CST) | Ready s | Min MemAvailable serving | Result |
@@ -213,6 +239,8 @@ on one night, enough to see that nothing large moved and no more.
 | 33 | `tp4A-1120-trace` | 1120 | `tp4-switched` | as shipped + step trace (Sparks 5-8) | 2026-11-24 03:12:49 | 136 | 18.6 GiB | K sweep 5:40/40; long-context concurrent vs solo 3/3/3/3 of 3 |
 | 34 | `tp4B-1120-fix1-trace` | 1120 + fix | `tp4-switched` | the fix + step trace (Sparks 1-4) | 2026-11-24 03:12:49 | 150 | 18.6 GiB | K sweep 5:40/40; long-context concurrent vs solo 3/3/3/3 of 3 |
 | 35 | `tp4A-1120-ctl` | 1120 | `tp4-switched` | as shipped (control, Sparks 5-8) | 2026-11-24 03:18:47 | 136 | 18.6 GiB | K sweep 2:40/40, 3:39/39, 4:40/40, 5:40/40, 6:36/36, 8:40/40, 12:36/36, 16:32/32, 24:24/24, 32:32/32; his gate identical=true |
+| 36 | `tp8-1122-nospec-tr` | 1122 | `tp8-switched` | speculative decoding off + step trace | 2026-11-24 10:03:10 | 118 | 17.1 GiB | K=32 reproduces on every pass; each first difference is at the request's first 28-row step (section 7) |
+| 37 | `tp8-1122-nospec-fix-tr` | 1122 + fix | `tp8-switched` | speculative decoding off + step trace + the fix | 2026-11-24 10:08:48 | 103 | 18.5 GiB | every K=32 pass identical to idle through the same 28-row steps (section 7) |
 
 `MemAvailable` is the minimum across the arm's nodes once serving. Every arm that started booted first time. A site
 network drop at 03:11 (the driving host lost its route to the Sparks for about a minute) cut the `tp7-1120-fix1-trace`
@@ -224,8 +252,8 @@ discarded.
 - A change in 1122 (0830..0857): 1120 fails identically, and the 1122 Python tree minus those 28 patches equals 1120's.
 - The 32K scheduling settings, device-resident Engram tables, the sparse-MLA kernel route by row count, and workspace
   sharing between kernels: one boot each, all still failing.
-- Speculative decoding as a cause: with it off, K=2..24 is clean and K=32 breaks once streams finish, which is
-  consistent with one row per stream passing through 28..25 rows. Graph sizes were not traced on that boot.
+- Speculative decoding as a cause: with it off, K=2..24 is clean and K=32 breaks once streams finish and the step
+  passes through 28..25 rows. Traced, and repeated with the fix, in section 7.
 - Our own first reading was wrong twice and is recorded in the run log: "needs sampled neighbours" (fifteen steady
   greedy neighbours sit above the affected sizes) and "0835's TP8 tile branch" (1120 has no 0835).
 
@@ -255,6 +283,8 @@ rendered `docker run` line with the extra `--volume`, started rank by rank from 
   and head-layout argument says none of them has an affected size.
 - The overlay file on boots `tp8-1122-fix1` and `tp8-1122-fix1-b2` carried an earlier wording of one comment. Its AST
   equals the final file's (`ast.dump` compared). Every later fixed boot ran the final file.
+- The fix measured throughout is this record's `overlay/attention.py`. The same change as reworked into the
+  candidate-72 series (0868) was not booted on this site.
 - Raw probe outputs (about 150 MB of JSON with logprobs) and the step traces are not in this folder;
   [`results/facts.json`](results/facts.json) is computed from them and they are available on request.
 
