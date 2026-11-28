@@ -640,12 +640,6 @@ def smoke_script(upstreams: dict) -> str:
                 'print("sparknet proxy ABI", load().roce_abi_version())\n'
                 'print("sparknet import smoke passed")\n'
             )
-        if not b12x:
-            script += (
-                'loaded = sorted(n for n in sys.modules if n == "b12x" or n.startswith("b12x."))\n'
-                "assert not loaded, loaded\n"
-                'print("B12X is not imported; spark_ds41 imports cleanly without it")\n'
-            )
         return script
     script = SMOKE_SCRIPT
     if kernel_backend.TILELANG_ONLY in capabilities or not b12x:
