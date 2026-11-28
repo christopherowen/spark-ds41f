@@ -75,7 +75,7 @@ class _PaddedSplitColumnParallelLinear(MergedColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | None = None,
     ) -> None:
-        from vllm.model_executor.model_loader.weight_utils import copy_weight
+        from spark_ds41.direct_io.weight_transfer import copy_weight
 
         if loaded_shard_id is None:
             if (
@@ -150,7 +150,7 @@ class CompressorBackend(DeepseekV41Backend):
         return "DSV41_COMPRESSOR"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [MultipleOf(1)]
 
 
@@ -184,6 +184,10 @@ class CompressorStateCache(nn.Module, AttentionLayerBase):
             dtype=torch.float32,
             uses_only_written_slots=True,
         )
+
+    def get_kv_cache_config(self, config):
+        from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+        return CircularBufferManager.layer_config(self.get_kv_cache_spec(config))
 
     def get_attn_backend(self):
         return CompressorBackend

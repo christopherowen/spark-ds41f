@@ -2024,6 +2024,13 @@ def _split_workspace(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return workspace["stats"].view(-1), workspace["parts"].view(-1)
 
 
+
+def _spark_topp_split_count(batch_size: int, vocab_size: int, num_sm: int) -> int:
+    try:
+        return reference._topp_split_count(batch_size, vocab_size, num_sm)
+    except TypeError:
+        return _spark_topp_split_count(batch_size, vocab_size, num_sm)
+
 def _launches(
     rows: int, vocab: int, has_k: bool, has_p: bool, aligned: bool, num_sm: int
 ) -> list[tuple]:
@@ -2036,7 +2043,7 @@ def _launches(
     if not use_split or has_k:
         launches.append((topk_topp_kernel, (vocab, has_k, has_p, use_split, aligned)))
     if use_split:
-        splits = reference._topp_split_count(rows, num_sm)
+        splits = _spark_topp_split_count(rows, vocab, num_sm)
         launches += [
             (factory, (vocab, splits, has_k, aligned))
             for factory in (topp_stats_kernel, topp_step_kernel, topp_mask_kernel)

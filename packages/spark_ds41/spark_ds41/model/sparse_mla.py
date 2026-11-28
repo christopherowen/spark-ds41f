@@ -206,7 +206,7 @@ class DeepseekV41Backend(AttentionBackend):
         return DeepseekV41MetadataBuilder
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [MultipleOf(32)]
 
     @classmethod

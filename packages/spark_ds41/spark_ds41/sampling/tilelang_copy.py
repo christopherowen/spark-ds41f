@@ -744,6 +744,12 @@ def copy_alloc(
     if not num_reqs:
         return
     key = copy_alloc_key(min_match, lookahead, block, initial, idx_mapping.dtype)
+    if num_sampled.dtype != torch.int32:
+        num_sampled = num_sampled.to(torch.int32)
+    if verified.dtype != torch.int32:
+        verified = verified.to(torch.int32)
+    if cut.dtype != torch.int32:
+        cut = cut.to(torch.int32)
     _kernel(copy_alloc_kernel, *key)(
         idx_mapping,
         total_len,

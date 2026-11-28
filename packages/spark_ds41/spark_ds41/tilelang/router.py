@@ -308,7 +308,7 @@ def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
     """
     if not envs.VLLM_MOE_SKIP_PADDING:
         return (False,)
-    if vllm_config is not None and vllm_config.use_v2_model_runner:
+    if vllm_config is not None and getattr(vllm_config, "use_v2_model_runner", True):
         return (True,)
     return (False, True)
 
@@ -860,6 +860,7 @@ class TileKernelsRouter(FusedTopKBiasRouter):
     indices_dtype = torch.int64
 
     def __init__(self, *args, **kwargs):
+        self.image_sentinel_count = kwargs.pop("image_sentinel_count", 5)
         super().__init__(*args, **kwargs)
         if self._hash_indices_table is not None:
             raise ValueError("DeepSeek V4.1 routing has no hash-routed layers")
@@ -1133,7 +1134,7 @@ class TileLangGateRouter(TileKernelsRouter):
 
     def __init__(self, *args, gate: torch.nn.Module, **kwargs):
         super().__init__(*args, **kwargs)
-        self.gate = gate
+        object.__setattr__(self, "gate", gate)
         self._kernels: dict[tuple, object] = {}
         # Text-only layers pass no image tokens; one all-false mask serves them.
         self._no_image = None
@@ -1145,7 +1146,7 @@ class TileLangGateRouter(TileKernelsRouter):
             if vllm_config is None
             else vllm_config.scheduler_config.max_num_batched_tokens
         )
-        gate.tilelang_router = self
+        object.__setattr__(gate, "tilelang_router", self)
         self._mask_variants = _routing_mask_variants(vllm_config)
 
     def _partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:

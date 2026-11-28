@@ -98,3 +98,58 @@ def materialize_weight(source: torch.Tensor) -> torch.Tensor:
     writer = _writer.get()
     materialize = getattr(writer, "materialize", None)
     return materialize(source) if materialize is not None else source.clone()
+
+
+_SAFETENSORS_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
+    "I16": torch.int16,
+    "U16": torch.uint16,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I32": torch.int32,
+    "U32": torch.uint32,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I64": torch.int64,
+    "U64": torch.uint64,
+}
+
+
+def safetensors_file_sources(path: str) -> dict[str, FileTensorSource]:
+    import json
+    import os
+    from safetensors import safe_open
+
+    path = os.path.abspath(path)
+    with open(path, "rb", buffering=0) as f:
+        size = os.fstat(f.fileno()).st_size
+        length_bytes = f.read(8)
+        if len(length_bytes) != 8:
+            raise ValueError(f"Missing safetensors header in {path}")
+        length = int.from_bytes(length_bytes, "little")
+        if length > 100 << 20 or length > size - 8:
+            raise ValueError(f"Invalid safetensors header length in {path}")
+        header = json.loads(f.read(length))
+    with safe_open(path, framework="pt"):
+        pass
+    return {
+        name: FileTensorSource(
+            path=path,
+            offset=8 + length + entry["data_offsets"][0],
+            shape=tuple(entry["shape"]),
+            dtype=_SAFETENSORS_TO_TORCH_DTYPE[entry["dtype"]],
+        )
+        for name, entry in header.items()
+        if name != "__metadata__"
+    }
+
+
+def file_source_tensor(source: FileTensorSource) -> torch.Tensor:
+    tensor = torch.empty(source.shape, dtype=source.dtype, device="meta")
+    tensor._vllm_file_tensor_source = source
+    return tensor

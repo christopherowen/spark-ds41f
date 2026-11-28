@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 3/9] Add DirectModelLoader, buddy sponge, layerwise direct
+ load, and mlock hooks
+
+---
+ vllm/model_executor/model_loader/__init__.py  |  4 ++
+ .../model_loader/base_loader.py               | 12 ++++++
+ .../model_loader/reload/layerwise.py          | 41 +++++++++++++++++--
+ vllm/model_executor/model_loader/utils.py     | 28 ++++++++++++-
+ vllm/model_executor/utils.py                  |  5 +++
+ vllm/v1/utils.py                              | 23 +++++++++++
+ 6 files changed, 108 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
+index ef97147..c7d54d4 100644
+--- a/vllm/model_executor/model_loader/__init__.py
++++ b/vllm/model_executor/model_loader/__init__.py
+@@ -131,6 +131,10 @@ def register_model_loader(load_format: str):
+ def get_model_loader_cls(load_config: LoadConfig) -> type[BaseModelLoader]:
+     """Get the model loader class for the load format."""
+     load_format = load_config.load_format
++    if load_format == "direct" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
++        from spark_ds41.direct_io.direct_loader import DirectModelLoader
++
++        _LOAD_FORMAT_TO_MODEL_LOADER["direct"] = DirectModelLoader
+     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+         raise ValueError(f"Load format `{load_format}` is not supported")
+     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format]
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 17ed747..2f9e5a6 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -182,7 +182,19 @@ class BaseModelLoader(ABC):
+                 # The model runner logs the backends of a loaded model. A
+                 # failed load never reaches it, but its selections were made.
+                 log_layer_backends(model, model_config, load_failed=True)
++                if model is not None and hasattr(model, "_direct_buddy_sponge"):
++                    from spark_ds41.direct_io.direct_loader import (
++                        release_weight_arena_sponge,
++                    )
++                    release_weight_arena_sponge(model, target_device)
+                 raise
++            if model is not None and hasattr(model, "_direct_buddy_sponge"):
++                from spark_ds41.direct_io.direct_loader import (
++                    defer_weight_arena_sponge_release,
++                    release_weight_arena_sponge,
++                )
++                if not defer_weight_arena_sponge_release(model):
++                    release_weight_arena_sponge(model, target_device)
+ 
+             gc.collect()
+             torch.accelerator.empty_cache()
+diff --git a/vllm/model_executor/model_loader/reload/layerwise.py b/vllm/model_executor/model_loader/reload/layerwise.py
+index 2f55589..46501de 100644
+--- a/vllm/model_executor/model_loader/reload/layerwise.py
++++ b/vllm/model_executor/model_loader/reload/layerwise.py
+@@ -12,6 +12,17 @@ from vllm.config import ModelConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import is_deferred_attention_layer
+ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
++
++try:
++    from spark_ds41.direct_io.weight_transfer import (
++        flush_weight_transfers,
++        is_weight_transfer_active,
++    )
++except ImportError:
++    def flush_weight_transfers() -> None:
++        return None
++    def is_weight_transfer_active() -> bool:
++        return False
+ from vllm.model_executor.model_loader.weight_utils import (
+     default_weight_loader,
+     finalize_model_weights,
+@@ -200,9 +211,26 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
+         bound_args = loader_signature.bind(*args, **kwargs)
+         bound_args.apply_defaults()
+ 
+-        # Buffer loaded weights, track loading progress
+-        info.loaded_weights.append((param_name, bound_args))
+-        num_loaded, ret = get_numel_loaded(original_loader, bound_args)
++        direct_load = (
++            info.kernel_tensors is None
++            and not info.defer_processing
++            and not is_deferred_attention_layer(layer)
++            and not is_weight_transfer_active()
++        )
++        if direct_load:
++            materialize_layer(layer, info)
++            bound_args.arguments["param"] = getattr(layer, param_name)
++            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
++        else:
++            for _arg_name, _arg_val in tuple(bound_args.arguments.items()):
++                if (
++                    _arg_name != "param"
++                    and isinstance(_arg_val, torch.Tensor)
++                    and _arg_val.device.type not in ("meta", "cpu")
++                ):
++                    bound_args.arguments[_arg_name] = _arg_val.clone()
++            info.loaded_weights.append((param_name, bound_args))
++            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+         info.load_numel += num_loaded
+ 
+         logger.debug(
+@@ -236,6 +264,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
+ 
+         # Process and copy when all weights are loaded
+         if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
++            del bound_args
+             _layerwise_process(layer, info)
+             LOADING_LAYERS.discard(layer)
+ 
+@@ -403,10 +432,16 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
+         param.weight_loader = _get_original_loader(param)
+ 
+     # Load all buffered weights into materialized layer (using original loaders)
++    args = None
+     for name, args in info.loaded_weights:
+         param = getattr(layer, name)
+         args.arguments["param"] = param
+         param.weight_loader(*args.args, **args.kwargs)
++    flush_weight_transfers()
++    if info.kernel_tensors is None:
++        info.loaded_weights.clear()
++        args = None
++    param = None
+ 
+     _process_loaded_layer(layer, info)
+     logger.debug("%s: Processed", layer.__class__.__name__)
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 07999c4..be99d4e 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -198,6 +198,14 @@ def process_weights_after_loading(
+                 if isinstance(quant_method, (OnlineLinearBase, OnlineMoEMethodBase))
+                 else nullcontext()
+             )
++            track_cuda_reserved = (
++                target_device.type == "cuda" and torch.cuda.is_available()
++            )
++            reserved_before = (
++                torch.cuda.memory_reserved(target_device)
++                if track_cuda_reserved
++                else 0
++            )
+             with loading_context, timing_context:
+                 # Quantize the staged fused shared experts into their slots.
+                 shared_expert_loader = getattr(
+@@ -215,8 +223,24 @@ def process_weights_after_loading(
+                 module.update_param_tp_status()
+             # Repacking transients above can leave large amounts of memory in
+             # the caching allocator, which starves the OS on UMA devices.
+-            release_device_memory_under_pressure(target_device)
+-
++            if not track_cuda_reserved:
++                release_device_memory_under_pressure(target_device)
++            else:
++                reserved_after = torch.cuda.memory_reserved(target_device)
++                if reserved_after > reserved_before:
++                    releasable = reserved_after - torch.cuda.memory_allocated(
++                        target_device
++                    )
++                    if releasable >= (4 << 30):
++                        release_device_memory_under_pressure(target_device)
++                    elif releasable >= (512 << 20):
++                        import psutil
++
++                        if psutil.virtual_memory().available < (8 << 30):
++                            release_device_memory_under_pressure(target_device)
++
++    if target_device.type == "cuda" and torch.cuda.is_available():
++        release_device_memory_under_pressure(target_device)
+     finalize_model_weights(model, target_device)
+ 
+ 
+diff --git a/vllm/model_executor/utils.py b/vllm/model_executor/utils.py
+index 0a4a060..0dda33e 100644
+--- a/vllm/model_executor/utils.py
++++ b/vllm/model_executor/utils.py
+@@ -98,6 +98,11 @@ def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+     a CPU temporary. Sources with at most one element are skipped: they count
+     as contiguous with any stride, which `view(torch.uint8)` rejects.
+     """
++    from spark_ds41.direct_io.weight_transfer import _writer
++
++    writer = _writer.get()
++    if writer is not None and not dst.is_meta and writer(dst, src):
++        return dst
+     if (
+         src.dtype != dst.dtype
+         and src.dtype in _BYTE_CONTAINERS
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+index b28681a..4cda291 100644
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -108,6 +108,27 @@ class ConstantList(Generic[T], Sequence):
+         return self._x.copy()
+ 
+ 
++
++_LIBC_MLOCK = None
++
++
++def mlock_memory(addr: int, nbytes: int) -> bool:
++    global _LIBC_MLOCK
++    if _LIBC_MLOCK is False:
++        return False
++    if _LIBC_MLOCK is None:
++        try:
++            import ctypes
++            libc = ctypes.CDLL(None, use_errno=True)
++            libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
++            libc.mlock.restype = ctypes.c_int
++            _LIBC_MLOCK = libc.mlock
++        except Exception:
++            _LIBC_MLOCK = False
++            return False
++    return _LIBC_MLOCK(addr, nbytes) == 0
++
++
+ class CpuGpuBuffer:
+     """Buffer to easily copy tensors between CPU and GPU."""
+ 
+@@ -124,6 +145,8 @@ class CpuGpuBuffer:
+             self.cpu = torch.zeros(
+                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
+             )
++            if pin_memory and self.cpu.nbytes > 0:
++                mlock_memory(self.cpu.data_ptr(), self.cpu.nbytes)
+             self.gpu = torch.zeros_like(self.cpu, device=device)
+         self.np: np.ndarray
+         # To keep type hints simple (avoiding generics and subclasses), we

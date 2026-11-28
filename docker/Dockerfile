@@ -212,6 +212,14 @@ COPY --from=sparknet-source . /workspace/sparknet/
 RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /workspace/sparknet && \
     ls /opt/sparknet/dgx_spark_networking-*.whl
 
+# spark_ds41: standalone Spark DS4.1 runtime package (TileLang kernels, DSpark,
+# direct io_uring loader, O13 pool, display carve-out, sampler/spec-decode).
+FROM ${CUDA_STAGE} AS spark-ds41-builder
+
+COPY --from=spark_ds41-source . /workspace/spark_ds41/
+RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/spark_ds41 /workspace/spark_ds41 && \
+    ls /opt/spark_ds41/spark_ds41-*.whl
+
 # Everything the image holds but B12X: the candidate vLLM tree with its two
 # rebuilt native extensions, the patched NCCL and the hash-locked CuTe DSL wheels.
 # While the lock lists B12X (spark-ds41f-1025 and earlier), `runtime` adds it on
@@ -431,6 +439,147 @@ assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0 and version.
 boxes = torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]])
 assert torchvision.ops.nms(boxes, torch.tensor([1.0, 0.5]), 0.5).tolist() == [0]
 print("torch build checks passed")
+PY
+
+# Canonical vLLM nightly base (native CUDA 13.5, PyTorch 2.16, CuTe DSL 4.8,
+# matching prebuilt vLLM C++ extensions) plus thin vLLM seam patches, rebased
+# NCCL and the standalone spark_ds41 wheel. Selected when the lock lists
+# spark_ds41 and uses the base image's prebuilt vLLM native extensions.
+FROM ${CUDA_STAGE} AS runtime-core-canonical
+
+ENV VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+
+ARG BASE_IMAGE_NAME=unrecorded
+ARG BASE_IMAGE_DIGEST=unrecorded
+ARG VLLM_UPSTREAM=unrecorded
+ARG VLLM_REF=unrecorded
+ARG VLLM_REVISION=unrecorded
+ARG VLLM_PATCH_HEAD=unrecorded
+ARG VLLM_TREE=unrecorded
+ARG NCCL_UPSTREAM=unrecorded
+ARG NCCL_REF=unrecorded
+ARG NCCL_REVISION=unrecorded
+ARG NCCL_PATCH_HEAD=unrecorded
+ARG NCCL_TREE=unrecorded
+ARG SPARK_DS41_TREE=unrecorded
+ARG SPARK_DS41_VERSION=unrecorded
+ARG DEPLOYMENT_COMMIT=uncommitted
+ARG NCCL_VERSION_CODE=23203
+
+LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-ds41f" \
+      org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}" \
+      local.spark-ds41f.vllm.upstream="${VLLM_UPSTREAM}" \
+      local.spark-ds41f.vllm.ref="${VLLM_REF}" \
+      local.spark-ds41f.vllm.revision="${VLLM_REVISION}" \
+      local.spark-ds41f.vllm.patch-head="${VLLM_PATCH_HEAD}" \
+      local.spark-ds41f.vllm.tree="${VLLM_TREE}" \
+      local.spark-ds41f.nccl.upstream="${NCCL_UPSTREAM}" \
+      local.spark-ds41f.nccl.ref="${NCCL_REF}" \
+      local.spark-ds41f.nccl.revision="${NCCL_REVISION}" \
+      local.spark-ds41f.nccl.patch-head="${NCCL_PATCH_HEAD}" \
+      local.spark-ds41f.nccl.tree="${NCCL_TREE}" \
+      local.spark-ds41f.spark_ds41.tree="${SPARK_DS41_TREE}" \
+      local.spark-ds41f.spark_ds41.version="${SPARK_DS41_VERSION}"
+
+USER root
+
+COPY --from=vllm-source . /opt/spark-ds41f/candidate/vllm/
+COPY --from=nccl-builder /opt/nccl/ /opt/spark-ds41f/nccl/
+RUN set -eux; \
+    target=$(python3 -c 'from pathlib import Path; import nvidia.nccl; print(Path(nvidia.nccl.__path__[0]) / "lib/libnccl.so.2")'); \
+    test -f "$target"; \
+    install -m 0755 /opt/spark-ds41f/nccl/libnccl.so.2 "$target"; \
+    rm /opt/spark-ds41f/nccl/libnccl.so.2
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      liburing-dev liburing2 pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=vllm-deletions deleted.txt /tmp/vllm-deleted.txt
+RUN set -eux; \
+    installed=$(python3 -c \
+      'from pathlib import Path; import vllm; print(Path(vllm.__file__).parent)'); \
+    cp -a --no-clobber "$installed"/. /opt/spark-ds41f/candidate/vllm/vllm/; \
+    while read -r relative; do \
+      [ -n "$relative" ] || continue; \
+      rm -f "/opt/spark-ds41f/candidate/vllm/vllm/$relative"; \
+      echo "kept deletion: $relative"; \
+    done < /tmp/vllm-deleted.txt; \
+    rm -f /tmp/vllm-deleted.txt
+
+RUN --mount=type=bind,from=spark-ds41-builder,source=/opt/spark_ds41,target=/tmp/spark-ds41-wheels \
+    python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+      /tmp/spark-ds41-wheels/spark_ds41-*.whl
+
+ENV PYTHONPATH=/opt/spark-ds41f/candidate/vllm
+ENV VLLM_NATIVE_CACHE_DIR=/opt/spark-ds41f/native
+
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+    NCCL_VERSION_CODE=${NCCL_VERSION_CODE} \
+    SPARK_DS41_VERSION=${SPARK_DS41_VERSION} \
+    python3 - <<'PY'
+import ctypes
+import hashlib
+import importlib.metadata as metadata
+import os
+import subprocess
+from pathlib import Path
+
+import nvidia.nccl
+import torch
+from packaging.requirements import Requirement
+
+SHARED = ("nvidia-cutlass-dsl", "quack-kernels")
+for consumer in ("vllm", "quack-kernels", "flashinfer-python", "nvidia-cudnn-frontend", "tokenspeed-mla"):
+    try:
+        requirements = metadata.requires(consumer) or ()
+    except metadata.PackageNotFoundError:
+        continue
+    for raw_requirement in requirements:
+        requirement = Requirement(raw_requirement)
+        if not requirement.name.startswith(SHARED):
+            continue
+        if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+            continue
+        installed = metadata.version(requirement.name)
+        if requirement.specifier and installed not in requirement.specifier:
+            raise RuntimeError(f"{consumer} requires {requirement}, but {installed} is installed")
+
+import cutlass.base_dsl.enums  # noqa: F401
+import quack.compile_utils  # noqa: F401
+
+assert metadata.version("spark-ds41") == os.environ["SPARK_DS41_VERSION"]
+nccl = str(Path(nvidia.nccl.__path__[0]) / "lib/libnccl.so.2")
+code = int(os.environ["NCCL_VERSION_CODE"])
+compiled = torch.cuda.nccl.version()
+assert tuple(compiled[:3]) == (code // 10000, code // 100 % 100, code % 100), (compiled, code)
+version = ctypes.c_int()
+assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0
+assert version.value == code, version.value
+with open(nccl, "rb") as handle:
+    built = open("/opt/spark-ds41f/nccl/libnccl.so.2.sha256").read().strip()
+    assert hashlib.sha256(handle.read()).hexdigest() == built, "NCCL is not the patched build"
+for name in ("_C_stable_libtorch", "_moe_C_stable_libtorch"):
+    with open(f"/opt/spark-ds41f/candidate/vllm/vllm/{name}.abi3.so", "rb") as handle:
+        assert handle.read(4) == b"\x7fELF"
+
+from spark_ds41.direct_io import _native as direct_native
+from spark_ds41.engram_rows import _native as engram_native
+from spark_ds41.expert_slots import _native as expert_slots_native
+
+for label, mod in (
+    ("direct_io", direct_native),
+    ("engram_rows", engram_native),
+    ("expert_slots", expert_slots_native),
+):
+    builder = getattr(mod, "prebuild", mod._build)
+    native_path = builder()
+    linked = subprocess.check_output(["ldd", str(native_path)], text=True)
+    assert "liburing.so" in linked, f"{label} was built without io_uring"
+print("canonical runtime build checks passed")
 PY
 
 # B12X, while the lock lists it (spark-ds41f-1025 and earlier): its tree on

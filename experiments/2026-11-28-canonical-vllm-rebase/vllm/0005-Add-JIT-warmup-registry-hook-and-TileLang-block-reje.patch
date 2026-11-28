@@ -1,17 +1,21 @@
-From 74e9b2e79d736be53f0aff190c2d8555d44f269f Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 08:41:28 +0100
-Subject: [PATCH] spec-decode: wire jit_warmup active registry and TileLang
- block rejection
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 5/9] Add JIT warmup registry hook and TileLang block rejection
+ and acceptance estimator hooks
 
 ---
- vllm/model_executor/warmup/jit_warmup.py      | 54 ++++++++++-
- .../gpu/spec_decode/rejection_sampler.py      | 21 ++++
- .../spec_decode/rejection_sampler_utils.py    | 96 +++++++++++++++++--
- 3 files changed, 156 insertions(+), 15 deletions(-)
+ vllm/model_executor/warmup/jit_warmup.py      | 54 +++++++++-
+ vllm/utils/jit_monitor.py                     |  2 +
+ vllm/v1/worker/gpu/sample/output.py           |  4 +-
+ vllm/v1/worker/gpu/spec_decode/__init__.py    |  6 ++
+ .../gpu/spec_decode/rejection_sampler.py      | 35 +++++--
+ .../spec_decode/rejection_sampler_utils.py    | 98 +++++++++++++++++--
+ vllm/v1/worker/gpu/spec_decode/speculator.py  | 32 +++++-
+ 7 files changed, 203 insertions(+), 28 deletions(-)
 
 diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
-index a048fbc55d73b39768bd4191b48afd74e19f2918..ded96ba6dc33eef27f085c0fcbeb0fe9aa97e6bb 100644
+index a048fbc..ded96ba 100644
 --- a/vllm/model_executor/warmup/jit_warmup.py
 +++ b/vllm/model_executor/warmup/jit_warmup.py
 @@ -1009,6 +1009,24 @@ def _same_registration(
@@ -101,8 +105,60 @@ index a048fbc55d73b39768bd4191b48afd74e19f2918..ded96ba6dc33eef27f085c0fcbeb0fe9
      def warmup(self) -> None:
          """Expand registrations and compile each wrapper/key pair once."""
          from tqdm import tqdm
+diff --git a/vllm/utils/jit_monitor.py b/vllm/utils/jit_monitor.py
+index be753f1..c527787 100644
+--- a/vllm/utils/jit_monitor.py
++++ b/vllm/utils/jit_monitor.py
+@@ -67,6 +67,8 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
+     global _active, _mode, _verbose
+     if _active:
+         return
++    if mode == "off":
++        return
+     if mode not in ("warn", "error"):
+         raise ValueError(f"Unsupported JIT monitor mode: {mode!r}")
+     _active = True
+diff --git a/vllm/v1/worker/gpu/sample/output.py b/vllm/v1/worker/gpu/sample/output.py
+index 028eed6..20a46de 100644
+--- a/vllm/v1/worker/gpu/sample/output.py
++++ b/vllm/v1/worker/gpu/sample/output.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ 
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+-from typing import NamedTuple
++from typing import Any, NamedTuple
+ 
+ import numpy as np
+ import torch
+@@ -22,6 +22,8 @@ class SamplerOutput:
+     num_sampled: torch.Tensor
+     num_rejected: torch.Tensor
+     sampling_mask_tensors: SamplingMaskTensors | None = None
++    sink_alternates: Any = None
++    sink: Any = None
+ 
+ 
+ @triton.jit
+diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
+index 6ec9afd..6a8a6f9 100644
+--- a/vllm/v1/worker/gpu/spec_decode/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
+@@ -31,6 +31,12 @@ def init_speculator(
+     assert speculative_config is not None
+     speculator_config = speculative_config.speculator_config
+     qualname = speculator_config.speculator_class
++    if (
++        speculative_config.method == "dspark"
++        and getattr(vllm_config.model_config, "architecture", None)
++        == "DeepseekV41ForCausalLM"
++    ):
++        qualname = "spark_ds41.spec_decode.dspark.DSparkSpeculator"
+     if qualname is None:
+         raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
+     speculator_cls = resolve_obj_by_qualname(qualname)
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
-index c1844c2013b4b0fcfbf9c7814f60a6784edb6e76..8645917221440d80d499ea4376e41abf592b0822 100644
+index c1844c2..df86a84 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 +++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 @@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
@@ -113,7 +169,27 @@ index c1844c2013b4b0fcfbf9c7814f60a6784edb6e76..8645917221440d80d499ea4376e41abf
      rejection_sample,
  )
  
-@@ -260,6 +261,26 @@ class RejectionSampler:
+@@ -204,16 +205,12 @@ class RejectionSampler:
+ 
+         num_reqs = cu_num_logits.shape[0] - 1
+         num_logits = logits.shape[0]
+-        flat_sampled = torch.zeros(
+-            num_logits, dtype=sampled.dtype, device=sampled.device
+-        )
+-        _flatten_sampled_kernel[(num_reqs,)](
+-            flat_sampled,
++        from spark_ds41.sampling import tilelang_inputs
++        flat_sampled = tilelang_inputs.flatten_sampled(
+             sampled,
+-            sampled.stride(0),
+             num_sampled,
+             cu_num_logits,
+-            num_warps=1,
++            num_logits,
+         )
+         expanded_logits = num_logits != num_reqs
+         cu_num_generated_tokens: list[int] | torch.Tensor | None = None
+@@ -260,6 +257,30 @@ class RejectionSampler:
              "watermark_key": self.watermark_key,
          }
  
@@ -125,23 +201,27 @@ index c1844c2013b4b0fcfbf9c7814f60a6784edb6e76..8645917221440d80d499ea4376e41abf
 +        *,
 +        dead_rows: bool = False,
 +    ) -> None:
-+        if self.watermarking is not None:
++        if getattr(self, "watermark_key", None) is not None:
 +            return
 +        register_rejection_sample_warmups(
 +            logits=logits,
 +            vocab_size=vocab_size,
 +            num_speculative_steps=num_speculative_steps,
-+            synthetic_mode=self.synthetic_conditional_rates is not None,
-+            use_block_verification=self.use_block_verification,
-+            use_fp64=self.use_fp64,
++            synthetic_mode=getattr(self, "synthetic_conditional_rates", None) is not None,
++            use_block_verification=getattr(self, "use_block_verification", False),
++            use_fp64=getattr(self.sampler, "use_fp64_gumbel", False),
 +            dead_rows=dead_rows,
 +        )
++        from spark_ds41.sampling import tilelang_inputs
++        tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
++        if dead_rows and self.use_block_verification:
++            tilelang_inputs.declare(tilelang_inputs.mask_dead_rows_calls)
 +
      def _verify(
          self,
          logits: torch.Tensor,
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
-index 4350c2cd22c54c1d908301fc1fc46418d055f3d4..3c75b96ece7f6db4bb71ba4e5635f4f328b80a22 100644
+index 4350c2c..32ef430 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
 @@ -1,7 +1,18 @@
@@ -228,7 +308,7 @@ index 4350c2cd22c54c1d908301fc1fc46418d055f3d4..3c75b96ece7f6db4bb71ba4e5635f4f3
      assert watermarking_skip_mask is None or watermark, (
          "watermarking_skip_mask requires watermarking."
      )
-@@ -1448,21 +1504,41 @@ def rejection_sample(
+@@ -1448,21 +1504,43 @@ def rejection_sample(
      )
  
      # Insert the resampled tokens into the output sampled.
@@ -277,5 +357,74 @@ index 4350c2cd22c54c1d908301fc1fc46418d055f3d4..3c75b96ece7f6db4bb71ba4e5635f4f3
 +        )
 +    register_insert(
 +        triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
-+        dead_rows=dead_rows and not (use_block_verification and not synthetic_mode and not use_fp64),
++        use_fp64,
++        num_speculative_steps + 1,
++        limits=(False, True) if dead_rows else (False,),
 +    )
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 8ce2229..7631592 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -41,9 +41,14 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
+ from vllm.v1.worker.gpu.sample.batch_shard import batch_sharded_sampling_enabled
+ from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+-from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+-    OnlineAcceptanceEstimator,
+-)
++try:
++    from spark_ds41.spec_decode.acceptance_estimator import (
++        OnlineAcceptanceEstimator,
++    )
++except ImportError:
++    from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
++        OnlineAcceptanceEstimator,
++    )
+ from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
+ from vllm.v1.worker.utils import (
+     AttentionGroup,
+@@ -673,6 +678,8 @@ class DraftModelSpeculator(BaseSpeculator):
+         idx_mapping: torch.Tensor,
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
++        dead_row_cut: torch.Tensor | None = None,
++        copy_int_state: torch.Tensor | None = None,
+     ) -> None:
+         """Fold the target's verdict on the last drafts into the estimator.
+ 
+@@ -680,7 +687,13 @@ class DraftModelSpeculator(BaseSpeculator):
+         features the verdict grades.
+         """
+         if self.acceptance_estimator is not None:
+-            self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
++            self.acceptance_estimator.step(
++                idx_mapping,
++                num_sampled,
++                num_rejected,
++                dead_row_cut=dead_row_cut,
++                copy_int_state=copy_int_state,
++            )
+ 
+     def prepare_watermarking(
+         self,
+@@ -703,10 +716,19 @@ class DraftModelSpeculator(BaseSpeculator):
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
+         sampler: "Sampler",
++        *,
++        dead_row_cut: torch.Tensor | None = None,
++        copy_int_state: torch.Tensor | None = None,
+     ) -> None:
+         """Per-step work between verifying the last drafts and the next
+         `propose`."""
+-        self.observe_verification(input_batch.idx_mapping, num_sampled, num_rejected)
++        self.observe_verification(
++            input_batch.idx_mapping,
++            num_sampled,
++            num_rejected,
++            dead_row_cut=dead_row_cut,
++            copy_int_state=copy_int_state,
++        )
+         if isinstance(sampler, GPUWatermarkSampler):
+             self.prepare_watermarking(sampler, input_batch.idx_mapping)
+         if self.draft_logits is not None:

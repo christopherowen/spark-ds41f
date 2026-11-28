@@ -1,18 +1,18 @@
-From 722c448976e89fdf9d133946211c369c94e82393 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 08:28:49 +0100
-Subject: [PATCH] distributed: add ring4_relay, all_to_all_rows, and SparkNet
- collective hooks
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 2/9] Add sparknet one-shot RoCE collectives and ring relay
+ hooks
 
 ---
- vllm/distributed/communication_op.py          |   7 ++
- .../device_communicators/cuda_communicator.py |  39 +++++++
- .../device_communicators/pynccl.py            | 107 ++++++++++++++++++
- vllm/distributed/parallel_state.py            |  44 +++++++
- 4 files changed, 197 insertions(+)
+ vllm/distributed/communication_op.py          |   7 +
+ .../device_communicators/cuda_communicator.py | 147 ++++++++++++++++++
+ .../device_communicators/pynccl.py            | 107 +++++++++++++
+ vllm/distributed/parallel_state.py            |  44 ++++++
+ 4 files changed, 305 insertions(+)
 
 diff --git a/vllm/distributed/communication_op.py b/vllm/distributed/communication_op.py
-index 5ad99e4e1592d321fdc67e177664dd92981c4dcd..ef9e6334bad6063fd12e34968529badf9940e684 100644
+index 5ad99e4..ef9e633 100644
 --- a/vllm/distributed/communication_op.py
 +++ b/vllm/distributed/communication_op.py
 @@ -41,3 +41,10 @@ def broadcast_tensor_dict(
@@ -27,10 +27,156 @@ index 5ad99e4e1592d321fdc67e177664dd92981c4dcd..ef9e6334bad6063fd12e34968529badf
 +    """All-to-all variable row counts across the tensor model parallel group."""
 +    return get_tp_group().all_to_all_rows(input_, send_counts, recv_counts)
 diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
-index 11c8de67d9476120f218fea1b0bd66719d6e7c4a..0e1fa3e4c9588db1ace99d1ccfcf8111651abefb 100644
+index 11c8de6..9a0a3aa 100644
 --- a/vllm/distributed/device_communicators/cuda_communicator.py
 +++ b/vllm/distributed/device_communicators/cuda_communicator.py
-@@ -1144,3 +1144,42 @@ class CudaCommunicator(DeviceCommunicatorBase):
+@@ -120,6 +120,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+         self.use_aiter_ag_rs: bool = False
+         self.use_aiter_tp_all_gather: bool = False
++        self.roce_ar_comm = None
++        self._roce_policy = False
++        if (
++            self.world_size > 1
++            and use_custom_allreduce
++            and current_platform.is_cuda()
++            and not current_platform.is_rocm()
++        ):
++            try:
++                from sparknet.integration.vllm import SparknetOneShotAllReduce
++                from vllm.distributed.parallel_state import in_the_same_node_as
++
++                roce_comm = SparknetOneShotAllReduce(
++                    group=self.cpu_group,
++                    device_group=self.device_group,
++                    device=self.device,
++                    global_ranks=self.ranks,
++                    nccl_available=(
++                        self.pynccl_comm is not None and not self.pynccl_comm.disabled
++                    ),
++                    in_the_same_node=in_the_same_node_as(self.cpu_group, source_rank=0),
++                )
++                if not roce_comm.disabled:
++                    self.roce_ar_comm = roce_comm
++                    self._roce_policy = True
++                    use_torch_symm_mem = self.use_torch_symm_mem = False
++                    self.use_flashinfer_allreduce = False
++                    self.use_flashinfer_pcie_ipc_allreduce = False
++                    self.use_aiter_allreduce = False
++            except ImportError:
++                pass
+ 
+         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
+         config = get_current_vllm_config_or_none()
+@@ -386,7 +417,65 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             scope="global",
+         )
+ 
++    @property
++    def all_reduce_capacity_bytes(self) -> int:
++        comm = getattr(self, "roce_ar_comm", None)
++        return int(getattr(comm, "all_reduce_capacity_bytes", 0)) if comm is not None else 0
++
++    @property
++    def rank_order_reduce_scatter(self) -> bool:
++        return self._roce_policy
++
++    @property
++    def owns_broadcast(self) -> bool:
++        return self._roce_policy
++
++    def roce_failure(self) -> str | None:
++        if self._roce_policy and self.roce_ar_comm is not None:
++            return self.roce_ar_comm.failure()
++        return None
++
++    def _require_roce_policy(self) -> None:
++        if not self._roce_policy:
++            return
++        if self.roce_ar_comm is None or self.roce_ar_comm.disabled:
++            raise RuntimeError("SparkNet RoCE policy lost its RoCE communicator")
++        if self.pynccl_comm is None or self.pynccl_comm.disabled:
++            raise RuntimeError("SparkNet RoCE policy lost its PyNCCL communicator")
++
++    def _broadcast_one_shot(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
++        flat = tensor.view(-1)
++        if not self.roce_ar_comm.should_all_gather(flat, 0):
++            raise RuntimeError(
++                f"SparkNet RoCE one-shot broadcast cannot take {tuple(tensor.shape)} {tensor.dtype}"
++            )
++        gathered = self.roce_ar_comm.all_gather(flat, 0)
++        if self.rank_in_group != src:
++            flat.copy_(gathered.view(self.world_size, -1)[src])
++        return tensor
++
+     def all_reduce(self, input_):
++        self._require_roce_policy()
++        roce_comm = self.roce_ar_comm
++        if (
++            roce_comm is not None
++            and not roce_comm.disabled
++            and roce_comm.should_custom_ar(input_)
++        ):
++            out = roce_comm.custom_all_reduce(input_)
++            if out is None:
++                raise RuntimeError("SparkNet RoCE all-reduce returned None")
++            return out
++        if self._roce_policy:
++            from spark_ds41.tilelang.collectives import all_reduce_rank_order
++
++            return all_reduce_rank_order(
++                self.pynccl_comm,
++                input_,
++                self.rank_in_group,
++                self.world_size,
++                roce_comm=roce_comm,
++            )
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+@@ -485,6 +574,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         return ca_comm.custom_reduce_scatter(input_.contiguous())
+ 
+     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
++        self._require_roce_policy()
++        roce_comm = self.roce_ar_comm
++        if (
++            roce_comm is not None
++            and not roce_comm.disabled
++            and roce_comm.should_all_gather(input_, dim)
++        ):
++            return roce_comm.all_gather(input_, dim)
+         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
+         # enabled (mirrors reduce_scatter); otherwise fall back to the
+         # PyNccl/base-class all-gather. Sequence parallelism's
+@@ -515,6 +612,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             output_size, dtype=input_.dtype, device=input_.device
+         )
+         pynccl_comm.all_gather(output_tensor, input_.contiguous())
++        if dim > 0 and dim == input_.dim() - 1:
++            from spark_ds41.tilelang.collectives import concat_rank_shards
++
++            concatenated = concat_rank_shards(
++                output_tensor, self.world_size, tuple(input_size)
++            )
++            if concatenated is not None:
++                return concatenated
+         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
+         output_tensor = output_tensor.movedim(0, dim)
+         return output_tensor.reshape(
+@@ -851,8 +956,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+         """Broadcast a tensor from source rank to all ranks."""
++        self._require_roce_policy()
+         if self.world_size == 1:
+             return tensor
++        if self._roce_policy:
++            return self._broadcast_one_shot(tensor, src)
+ 
+         pynccl_comm = self.pynccl_comm
+         if pynccl_comm is not None and not pynccl_comm.disabled:
+@@ -1144,3 +1252,42 @@ class CudaCommunicator(DeviceCommunicatorBase):
              pynccl_comm.batch_isend_irecv(p2p_ops)
          else:
              raise ValueError("No PyNCCL communicator found")
@@ -74,7 +220,7 @@ index 11c8de67d9476120f218fea1b0bd66719d6e7c4a..0e1fa3e4c9588db1ace99d1ccfcf8111
 +        pynccl_comm.all_to_all_rows(output, input_, rows)
 +        return output
 diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
-index 8361b9c9cda457970cdc26e58269523b675ebe74..1b2af1bdc44fd226df4c68f430455b58c886a92b 100644
+index 8361b9c..1b2af1b 100644
 --- a/vllm/distributed/device_communicators/pynccl.py
 +++ b/vllm/distributed/device_communicators/pynccl.py
 @@ -4,6 +4,8 @@
@@ -206,7 +352,7 @@ index 8361b9c9cda457970cdc26e58269523b675ebe74..1b2af1bdc44fd226df4c68f430455b58
          self.nccl.ncclGroupStart()
  
 diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
-index a5edf716a4cd4e8fb5addb20e28836b88e876d66..ea426471d09857e05d7f0f3a7f5e306e6b75695d 100644
+index a5edf71..ea42647 100644
 --- a/vllm/distributed/parallel_state.py
 +++ b/vllm/distributed/parallel_state.py
 @@ -244,6 +244,22 @@ def all_gather_fake(

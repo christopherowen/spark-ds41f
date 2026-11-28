@@ -189,7 +189,12 @@ def tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
-        if ".git" in relative.parts or "__pycache__" in relative.parts:
+        if (
+            ".git" in relative.parts
+            or "__pycache__" in relative.parts
+            or "build" in relative.parts
+            or any(part.endswith(".egg-info") for part in relative.parts)
+        ):
             continue
         digest.update(str(relative).encode())
         if path.is_symlink():
@@ -382,7 +387,11 @@ def build_projects(sources: dict) -> tuple[str, ...]:
 
 
 def build_contexts(inputs: dict) -> tuple[str, ...]:
-    contexts = BUILD_CONTEXTS + tuple(f"{name}-source" for name in LISTED_BUILD_PROJECTS if name in inputs)
+    if "spark_ds41" in inputs and inputs.get("vllm", {}).get("prebuilt_native"):
+        base: tuple[str, ...] = ("vllm-source", "nccl-source", "vllm-deletions", "spark_ds41-source")
+    else:
+        base = BUILD_CONTEXTS + (("spark_ds41-source",) if "spark_ds41" in inputs else ())
+    contexts = base + tuple(f"{name}-source" for name in LISTED_BUILD_PROJECTS if name in inputs)
     contexts += (CUDA_TOOLKIT_CONTEXT,) if "cuda_toolkit" in inputs else ()
     return contexts + ((TORCH_CONTEXT,) if "torch" in inputs else ())
 
@@ -555,9 +564,12 @@ def final_stage(cluster: dict, stage: str | None) -> str | None:
 
 def tilelang_base_stage(inputs: dict) -> str:
     """The Dockerfile stage the TileLang runtime builds on: B12X's while the lock lists it,
+    runtime-core-canonical when the lock uses spark_ds41 on a native CUDA/prebuilt vLLM base,
     else runtime-core (re-wired for the lock's CUDA toolkit when it lists one)."""
     if "b12x" in inputs:
         return "runtime"
+    if "spark_ds41" in inputs and inputs.get("vllm", {}).get("prebuilt_native"):
+        return "runtime-core-canonical"
     stages = cuda_stages(inputs)
     return "runtime-core" if stages is None else stages[1]
 
@@ -586,6 +598,51 @@ def smoke_script(upstreams: dict) -> str:
     manifest = read_json(upstreams["source_manifest"])
     capabilities = manifest["vllm"].get("capabilities", [])
     b12x = "b12x" in upstreams["sources"]
+    has_spark_ds41 = "spark_ds41" in upstreams["sources"]
+    if has_spark_ds41:
+        spark_ver = upstreams["sources"]["spark_ds41"]["version"]
+        script = (
+            "import importlib\n"
+            "import importlib.metadata\n"
+            "import importlib.util\n"
+            "import pkgutil\n"
+            "import sys\n"
+            "import torch\n\n"
+            "assert torch.cuda.is_available()\n"
+            'print("device", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))\n'
+            f'assert importlib.metadata.version("spark-ds41") == {spark_ver!r}\n'
+            "import spark_ds41\n"
+            "import spark_ds41.model.dspark  # noqa: F401\n"
+            "import spark_ds41.model.model  # noqa: F401\n"
+            "import spark_ds41.model.vl_model  # noqa: F401\n"
+            "import spark_ds41.tilelang  # noqa: F401\n"
+            "from vllm.models.deepseek_v41 import DeepseekV41ForCausalLM\n\n"
+            'print("DS4.1 SM12x class:", DeepseekV41ForCausalLM.__module__)\n'
+            'assert DeepseekV41ForCausalLM.__module__.startswith("spark_ds41.")\n'
+            'print("GPU import smoke passed")\n'
+            "import tilelang\n"
+            "import tile_kernels  # noqa: F401\n\n"
+            f'assert importlib.metadata.version("tilelang") == {version!r}, tilelang.__version__\n'
+            'print("TileLang", tilelang.__version__)\n'
+            'print("TileLang import smoke passed")\n'
+        )
+        if "sparknet" in upstreams["sources"]:
+            snet_ver = upstreams["sources"]["sparknet"]["version"]
+            script += (
+                "from sparknet.integration.vllm import SparknetOneShotAllReduce  # noqa: F401\n"
+                "from sparknet.oneshot._proxy import load\n\n"
+                f'assert importlib.metadata.version("dgx-spark-networking") == {snet_ver!r}\n'
+                'print("sparknet proxy ABI", load().roce_abi_version())\n'
+                'print("sparknet import smoke passed")\n'
+            )
+        if not b12x:
+            script += (
+                'assert importlib.util.find_spec("b12x") is None, "B12X is installed"\n'
+                'loaded = sorted(n for n in sys.modules if n == "b12x" or n.startswith("b12x."))\n'
+                "assert not loaded, loaded\n"
+                'print("B12X is not installed; spark_ds41 imports cleanly without it")\n'
+            )
+        return script
     script = SMOKE_SCRIPT
     if kernel_backend.TILELANG_ONLY in capabilities or not b12x:
         script = script.replace(B12X_ROCE_IMPORT, "")
@@ -939,12 +996,26 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
     if listed and len(listed) != len(OPTIONAL_BUILD_PROJECTS):
         raise SystemExit(f"{' and '.join(OPTIONAL_BUILD_PROJECTS)} are built together; the lock lists only {listed[0]}")
     base = sources["vllm_base_image"]
-    inputs = {
+    prebuilt_native = bool(sources["vllm"].get("prebuilt_native"))
+    inputs: dict = {
         "base_image": f"{base['upstream']}@{base['recorded_base_digest']}",
         "base_source_revision": base["source_revision"],
-        "cutlass": {key: sources["cutlass"][key] for key in ("upstream", "revision", "release_tag")},
-        "cutlass_dsl_wheels": expected_wheel_hashes(),
     }
+    if not prebuilt_native:
+        inputs["cutlass"] = {
+            key: sources["cutlass"][key] for key in ("upstream", "revision", "release_tag")
+        }
+        inputs["cutlass_dsl_wheels"] = expected_wheel_hashes()
+    if "spark_ds41" in sources:
+        pkg = sources["spark_ds41"]
+        pkg_path = ROOT / pkg["path"]
+        if not pkg_path.is_dir():
+            raise SystemExit(f"spark_ds41: missing local package directory {pkg['path']}")
+        inputs["spark_ds41"] = {
+            "path": pkg["path"],
+            "version": pkg["version"],
+            "expected_tree": tree_digest(pkg_path),
+        }
     for name in build_projects(sources):
         source = sources[name]
         missing = missing_patches(source)
@@ -993,6 +1064,8 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
             inputs[name]["submodules"] = record["submodules"]
     if sources["vllm"].get("canonical_base"):
         inputs["vllm"]["canonical_upstream"] = sources["vllm"]["canonical_base"]["upstream"]
+    if prebuilt_native:
+        inputs["vllm"]["prebuilt_native"] = True
     # Only a lock that lists a CUDA toolkit records one, so every other lock keeps its
     # inputs and its build directory.
     toolkit_problems = cuda_toolkit_problems(sources)
@@ -1296,7 +1369,10 @@ def export_source(source: Path, destination: Path) -> None:
     temporary = destination.with_name(f".{destination.name}.export")
     shutil.rmtree(temporary, ignore_errors=True)
     shutil.copytree(
-        source, temporary, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        source,
+        temporary,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", "build", "*.egg-info"),
     )
     replace_directory(temporary, destination)
 
@@ -1349,12 +1425,13 @@ def build_problems(directory: Path, inputs: dict) -> list[str]:
             problems.append(f"{name}: context changed since it was prepared")
     if sorted(record.get("contexts", {})) != sorted(build_contexts(inputs)):
         problems.append("inputs.json does not record every build context")
-    problems.extend(wheel_problems(directory / "context/cutlass-dsl-wheels"))
+    if "cutlass_dsl_wheels" in inputs:
+        problems.extend(wheel_problems(directory / "context/cutlass-dsl-wheels"))
     if "cuda_toolkit" in inputs:
         problems.extend(cuda_deb_problems(directory / "context" / CUDA_TOOLKIT_CONTEXT, inputs))
     if "torch" in inputs:
         problems.extend(torch_wheel_problems(directory / "context" / TORCH_CONTEXT, inputs))
-    if not (directory / "context/cutlass-source/include/cutlass/cutlass.h").is_file():
+    if "cutlass" in inputs and not (directory / "context/cutlass-source/include/cutlass/cutlass.h").is_file():
         problems.append("cutlass-source: include/cutlass/cutlass.h is missing")
     return problems
 
@@ -1383,7 +1460,12 @@ def command_build_prepare(args: argparse.Namespace) -> int:
             return 1
     directory = build_directory(inputs)
     toolkit_part = tuple(part for part in ("cuda_toolkit", "torch") if part in inputs)
-    parts = parts or [*BUILD_PARTS, *build_projects(inputs), *toolkit_part]
+    default_parts = tuple(
+        part for part in BUILD_PARTS
+        if (part != "cutlass" or "cutlass" in inputs)
+        and (part != "wheels" or "cutlass_dsl_wheels" in inputs)
+    )
+    parts = parts or [*default_parts, *build_projects(inputs), *toolkit_part]
     if not args.only and not build_problems(directory, inputs):
         print(f"build inputs ready: {directory.relative_to(ROOT)}")
         return 0
@@ -1393,9 +1475,9 @@ def command_build_prepare(args: argparse.Namespace) -> int:
     for name in build_projects(inputs):
         if name in parts:
             prepare_project(directory, name, inputs[name])
-    if "cutlass" in parts:
+    if "cutlass" in parts and "cutlass" in inputs:
         prepare_cutlass(directory, inputs["cutlass"])
-    if "wheels" in parts:
+    if "wheels" in parts and "cutlass_dsl_wheels" in inputs:
         prepare_wheels(directory, upstreams)
     if "cuda_toolkit" in parts:
         prepare_cuda_toolkit(directory, inputs)
@@ -1405,8 +1487,11 @@ def command_build_prepare(args: argparse.Namespace) -> int:
         print("partial preparation; run bin/spark build prepare for the complete inputs")
         return 0
     context = directory / "context"
-    for name in (*build_projects(inputs), "cutlass"):
+    export_names = (*build_projects(inputs), *(("cutlass",) if "cutlass" in inputs else ()))
+    for name in export_names:
         export_source(directory / "src" / name, context / f"{name}-source")
+    if "spark_ds41" in inputs:
+        export_source(ROOT / inputs["spark_ds41"]["path"], context / "spark_ds41-source")
     deleted = vllm_deletions(directory, inputs)
     deletions = context / "vllm-deletions"
     deletions.mkdir(exist_ok=True)
@@ -1625,6 +1710,9 @@ def command_build_image(args: argparse.Namespace) -> int:
             })
             if "version" in record:
                 build_args[f"{prefix}_VERSION"] = record["version"]
+        if "spark_ds41" in inputs:
+            build_args["SPARK_DS41_TREE"] = inputs["spark_ds41"]["expected_tree"]
+            build_args["SPARK_DS41_VERSION"] = inputs["spark_ds41"]["version"]
         toolkit_stages = cuda_stages(inputs)
         if toolkit_stages is not None:
             build_args.update(CUDA_STAGE=toolkit_stages[0], RUNTIME_CORE_STAGE=toolkit_stages[1])
@@ -1671,6 +1759,10 @@ def command_build_image(args: argparse.Namespace) -> int:
         label = source_labels.get(image["labels"], f"{name}.tree")
         if label != inputs[name]["expected_tree"]:
             raise SystemExit(f"{tag}: label {source_labels.key(image['labels'], f'{name}.tree')} is {label!r}")
+    if "spark_ds41" in inputs:
+        label = source_labels.get(image["labels"], "spark_ds41.tree")
+        if label != inputs["spark_ds41"]["expected_tree"]:
+            raise SystemExit(f"{tag}: label {source_labels.key(image['labels'], 'spark_ds41.tree')} is {label!r}")
     toolkit_label = source_labels.get(image["labels"], "cuda.version")
     if toolkit_label != inputs.get("cuda_toolkit", {}).get("version"):
         raise SystemExit(f"{tag}: label {source_labels.PREFIX}cuda.version is {toolkit_label!r}")

@@ -86,8 +86,8 @@ class _Cache(nn.Module, AttentionLayerBase):
         self.prefix, self.kind, self.ratio, self.window = prefix, kind, ratio, window
         self.draft = draft
         self.block_size = (
-            config.cache_config.swa_block_size
-            or CacheConfig.DEFAULT_DS41_SWA_BLOCK_SIZE
+            getattr(config.cache_config, "swa_block_size", None)
+            or getattr(CacheConfig, "DEFAULT_DS41_SWA_BLOCK_SIZE", 128)
             if kind == "swa"
             else config.cache_config.block_size
         )
@@ -123,20 +123,41 @@ class _Cache(nn.Module, AttentionLayerBase):
             alignment=None,
             uses_only_written_slots=True,
         )
+        return MLAAttentionSpec(**common)
+
+    def get_kv_cache_config(self, config):
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            FullAttentionManager,
+            SlidingWindowManager,
+        )
+        common = dict(
+            block_size=self.block_size,
+            num_kv_heads=1,
+            head_size=512 if self.kind == "swa" else 68,
+            state_content_bytes=(
+                528
+                if self.kind == "swa"
+                else (84 if os.environ.get("VLLM_DS41_LSA") == "1" else 68)
+            ),
+            dtype=torch.uint8,
+            tokens_per_state=self.ratio,
+            cache_dtype_str="dsv41",
+            alignment=None,
+            uses_only_written_slots=True,
+        )
         if self.kind == "swa":
             boundary = ced_decoder_start(config.model_config.hf_config)
             layer_id = int(re.search(r"layers\.(\d+)", self.prefix).group(1))
             bounded_replay = self.draft or (
                 boundary is not None and layer_id >= boundary
             )
-            return SlidingWindowMLASpec(
-                **common,
+            return SlidingWindowManager.layer_config(
+                MLAAttentionSpec(**common),
                 sliding_window=self.window,
                 extra_retained_tokens=int(self.draft),
-                prefix_cache_enabled=not bounded_replay,
-                prefill_replay_window=128 if bounded_replay else 0,
+                bounded_replay=bounded_replay,
             )
-        return MLAAttentionSpec(**common)
+        return FullAttentionManager.layer_config(MLAAttentionSpec(**common))
 
     def get_attn_backend(self):
         return DeepseekV41Backend
@@ -642,6 +663,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self):
         return self.backend_cls
+
+    def get_kv_cache_config(self, config):
+        spec = self.get_kv_cache_spec(config)
+        if spec is None:
+            return None
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+        return FullAttentionManager.layer_config(spec)
 
     def get_kv_cache_spec(self, config):
         if not self.is_kv_source:

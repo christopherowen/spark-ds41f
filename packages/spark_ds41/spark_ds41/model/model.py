@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -27,6 +29,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -42,7 +45,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from spark_ds41.direct_io.weight_transfer import copy_weight
-from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
+from spark_ds41.model.moe import DeepseekV4MoE
 from vllm.models.deepseek_v41.nvidia.model import (
     DeepseekV4MixtureOfExperts as DeepseekV4MixtureOfExperts,
 )
@@ -607,8 +610,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         if vllm_config.lora_config is not None:
             raise ValueError("V4.1 native kernels do not support LoRA adapters")
+        if quant_config is not None and quant_config.get_name() == "deepseek_v4_fp8":
+            from spark_ds41.model.quant_config import DeepseekV41FP8Config
+            hf_qcfg = getattr(config, "quantization_config", None) or {}
+            quant_config = DeepseekV41FP8Config.from_config(hf_qcfg)
+            self.quant_config = quant_config
+            vllm_config.quant_config = quant_config
         if quant_config is None or quant_config.get_name() not in (
             "deepseek_v41_fp8",
+            "deepseek_v4_fp8",
             "mxfp4_csf",
         ):
             raise ValueError("V4.1 requires its native block32 quantization config")
@@ -671,6 +681,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if getattr(layer, "engram", None) is not None:
                 layer.engram.prefill_sp_min_rows = self.prefill_sp_min_rows
         self._expert_disk_cache = self._configure_expert_slot_cache(vllm_config)
+        self.column_gathers = None
 
         # Hashing reads the runner's accepted-only lookback, never KV slot state.
         self.engram_hash: NgramHashState | None = None
@@ -1784,6 +1795,15 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        if envs.VLLM_DS41_PACKED_BF16_LM_HEAD and isinstance(
+            self.lm_head, ParallelLMHead
+        ):
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+                lm_head_quantization="packed_bf16",
+            )
         self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
         )

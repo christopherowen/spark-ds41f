@@ -1,0 +1,702 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:14:13 +0100
+Subject: [PATCH 1/9] Add Spark runtime configuration, environment flags, and
+ CLI arguments
+
+---
+ requirements/cuda.txt        |   2 +-
+ vllm/config/engram.py        |  11 ++
+ vllm/config/kernel.py        |   2 +
+ vllm/config/model.py         |   1 +
+ vllm/config/observability.py |   2 +-
+ vllm/config/scheduler.py     |   7 ++
+ vllm/config/speculative.py   | 108 +++++++++++++++++++
+ vllm/config/vllm.py          | 106 +++++++++++++++++--
+ vllm/engine/arg_utils.py     |  29 ++++++
+ vllm/envs.py                 | 195 +++++++++++++++++++++++++++++++++++
+ 10 files changed, 453 insertions(+), 10 deletions(-)
+
+diff --git a/requirements/cuda.txt b/requirements/cuda.txt
+index 4a8d286..86a3943 100644
+--- a/requirements/cuda.txt
++++ b/requirements/cuda.txt
+@@ -12,7 +12,7 @@ torchcodec >= 0.16
+ PyNvVideoCodec>=2.2.4
+ flashinfer-python==0.7.4
+ apache-tvm-ffi==0.1.11
+-tilelang==0.1.12
++tilelang==0.1.16
+ # >=1.31.0 keeps execution plans alive for the CUDA graphs recorded from them
+ # (NVIDIA/cudnn-frontend#1195); older versions can replay an unloaded kernel.
+ # <1.33 because FlashInfer 0.7.4's cuDNN linear attention unpacks three results
+diff --git a/vllm/config/engram.py b/vllm/config/engram.py
+index 93507db..441c387 100644
+--- a/vllm/config/engram.py
++++ b/vllm/config/engram.py
+@@ -48,6 +48,13 @@ class EngramConfig:
+     Grace host memory when enabled and HBM when disabled."""
+ 
+     disk_offload: bool = False
++    table_memory: Literal["device", "ram", "disk"] = "device"
++    """Native V4.1 table storage: resident CUDA rows, mapped pinned host RAM,
++    or SSD io_uring staging."""
++    projection_tp: bool = False
++    """Shard Engram WKV output columns over TP and gather the BF16 result."""
++    disk_resident_scales: bool = False
++    """Compatibility knob (must be False; disk reader reads scales from disk)."""
+     """Keep Qwen4Exp PLE tables in the checkpoint files and read each step's
+     rows on the host instead of allocating the table. Takes precedence over
+     cpu_offload."""
+@@ -113,6 +120,10 @@ class EngramConfig:
+ 
+     @model_validator(mode="after")
+     def _validate_shared_memory(self) -> Self:
++        if self.disk_resident_scales:
++            raise ValueError(
++                "disk_resident_scales was removed: the disk reader reads scales from disk"
++            )
+         if self.dp_shared_memory and not self.cpu_offload:
+             raise ValueError("dp_shared_memory requires cpu_offload=True")
+         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index 60cc7a0..b656d7a 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -138,6 +138,7 @@ MoEBackend = Literal[
+     "flashinfer_moe_ep_cutedsl",
+     "flashinfer_b12x",
+     "b12x",
++    "tilelang",
+     "flashinfer_moe_ep_mega_deep_gemm",
+     "marlin",
+     "humming",
+@@ -262,6 +263,7 @@ LinearBackend = Literal[
+     "flashinfer_cudnn",
+     "flashinfer_b12x",
+     "b12x",
++    "tilelang",
+     "marlin",
+     "humming",
+     "triton",
+diff --git a/vllm/config/model.py b/vllm/config/model.py
+index 0ad8103..2e90ceb 100644
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -104,6 +104,7 @@ TokenizerMode = Literal[
+     "mistral",
+     "deepseek_v32",
+     "deepseek_v4",
++    "deepseek_v41",
+     "inkling",
+     "kimi_k3",
+     "cohere",
+diff --git a/vllm/config/observability.py b/vllm/config/observability.py
+index 248fef0..eb21d19 100644
+--- a/vllm/config/observability.py
++++ b/vllm/config/observability.py
+@@ -115,7 +115,7 @@ class ObservabilityConfig:
+     step to only one of the API servers, so the stat loggers of any one
+     server receive only part of the iterations."""
+ 
+-    jit_monitor_mode: Literal["warn", "error"] = "warn"
++    jit_monitor_mode: Literal["off", "warn", "error"] = "warn"
+     """How to handle post-warmup JIT compilation events."""
+ 
+     jit_monitor_verbose: bool = False
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 8b744b8..1b3fc0a 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -20,6 +20,9 @@ RunnerType = Literal["generate", "pooling", "draft"]
+ SchedulerPolicy = Literal["fcfs", "priority"]
+ 
+ 
++PrefillYield = Literal["off", "short"]
++
++
+ @config
+ class SchedulerConfig:
+     """Scheduler configuration."""
+@@ -102,6 +105,8 @@ class SchedulerConfig:
+     """
+ 
+     long_prefill_token_threshold: int = Field(default=0, ge=0)
++    max_parallel_prefills: int | Literal["auto"] | None = None
++    align_prefill_chunks: bool = False
+     """For chunked prefill, a request is considered long if the prompt is
+     longer than this number of tokens. 0 disables the cap (default).
+     Ignored when chunked prefill is disabled.
+@@ -272,6 +277,8 @@ class SchedulerConfig:
+     no benefit. It also means the per-request cache probe is skipped entirely
+     while the cache is roomy. Set to 0.0 to reorder on every step."""
+ 
++    prefill_yield: PrefillYield = "off"
++    prefill_yield_limit_s: float = Field(default=10.0, gt=0)
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+     avoid gaps in GPU utilization, leading to better latency and throughput.
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index aa40e10..ab08e42 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -437,6 +437,56 @@ _DRAFT_VLLM_CONFIG_OVERRIDES = (
+ )
+ 
+ 
++@config
++class CopyDraftsConfig:
++    """Copy drafts beside DSpark: a request's own earlier text proposes the tokens
++    that follow the longest suffix match of its context.
++
++    Each step, a request whose context ends with the same ``min_match`` tokens
++    (or 2, 4, ... times as many, up to ``MAX_LEVEL``) as an earlier position of
++    its own prompt and output is offered a continuation in place of DSpark's
++    drafts. Among equally strong matches prefer a full lookahead, then recency;
++    if only short continuations exist, take the longest available. DSpark drafts
++    everywhere else.
++    The search reads only the request's own history: nothing is shared between
++    requests. Drafts never change what is committed, only how many tokens a
++    step verifies.
++
++    Not an option: DSpark with greedy drafts and adaptive verification always
++    copies, at these defaults (``SpeculativeConfig.copy_drafts``). The fields
++    parametrize the kernels and their tests."""
++
++    MAX_LEVEL = 256
++    """The longest suffix compared: a match of 256 tokens ranks above every
++    shorter one, and longer matches rank as 256."""
++
++    min_match: int = Field(default=16, ge=1)
++    """The shortest suffix that proposes a copy."""
++
++    max_drafts: int = Field(default=16, ge=1)
++    """The most copy drafts a step verifies for one request: the verification
++    lookahead, which every buffer a verified row touches is sized for."""
++
++    initial_drafts: int = Field(default=8, ge=1)
++    """A copy's first proposal offers at most this many drafts; each step whose
++    copy drafts were all accepted doubles it, up to ``max_drafts``, and a
++    rejected copy draft returns it here."""
++
++    def levels(self) -> tuple[int, ...]:
++        """The suffix lengths compared, shortest first: ``min_match`` doubling
++        up to ``MAX_LEVEL``."""
++        out = []
++        level = self.min_match
++        while level <= self.MAX_LEVEL:
++            out.append(level)
++            level *= 2
++        return tuple(out)
++
++    def compute_hash(self) -> str:
++        factors = [self.min_match, self.max_drafts, self.initial_drafts]
++        return safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
++
++
+ @config
+ class SpeculativeConfig:
+     """Configuration for speculative decoding."""
+@@ -625,10 +675,30 @@ class SpeculativeConfig:
+     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
+     Mutually exclusive with synthetic_acceptance_rates."""
+ 
++    copy_drafts: CopyDraftsConfig | None = field(default=None, init=False)
++    """Copy drafts from the request's own history beside DSpark."""
++
+     enable_adaptive_verification: bool = False
+     """Whether to adaptively size the draft-verification budget from per-request
+     confidence. Currently only supported for method="dspark"."""
+ 
++    adaptive_verification_row_cost: float = Field(default=0.02, gt=0.0, lt=1.0)
++    """One verification row's cost as a fraction of a step's fixed cost."""
++
++    adaptive_verification_single_req_row_cost_scale: float = Field(
++        default=2.5, gt=0.0
++    )
++    """Scale applied to adaptive_verification_row_cost for single-request DSpark."""
++
++    adaptive_verification_high_row_cost_scale: float = Field(default=0.65, gt=0.0)
++    """Marginal row-cost multiplier above HIGH_ROW_COST_KNEE (16 rows)."""
++
++    adaptive_verification_wide_row_cost_knee: int = Field(default=32, ge=16)
++    """Row threshold separating the high-row band from the wide-row band."""
++
++    adaptive_verification_wide_row_cost_scale: float = Field(default=0.50, gt=0.0)
++    """Marginal row-cost multiplier above adaptive_verification_wide_row_cost_knee."""
++
+     prefill_context_kv_only: bool = False
+     """Set on a P/D prefill instance (Model Runner V2, DFlash-based speculators)
+     to only store the drafter's context K/V, which the decode instance reads:
+@@ -754,6 +824,11 @@ class SpeculativeConfig:
+             "synthetic_acceptance_rates",
+             "synthetic_acceptance_length",
+             "enable_adaptive_verification",
++            "adaptive_verification_row_cost",
++            "adaptive_verification_single_req_row_cost_scale",
++            "adaptive_verification_high_row_cost_scale",
++            "adaptive_verification_wide_row_cost_knee",
++            "adaptive_verification_wide_row_cost_scale",
+             "draft_sample_method",
+             "dspark_draft_topk",
+             "xpress_topc",
+@@ -1552,6 +1627,32 @@ class SpeculativeConfig:
+                 self.enable_adaptive_verification = False
+                 self.num_speculative_tokens_per_batch_size = None
+ 
++        for field_name, default_value in (
++            ("adaptive_verification_row_cost", 0.02),
++            ("adaptive_verification_single_req_row_cost_scale", 2.5),
++            ("adaptive_verification_high_row_cost_scale", 0.65),
++            ("adaptive_verification_wide_row_cost_knee", 32),
++            ("adaptive_verification_wide_row_cost_scale", 0.50),
++        ):
++            if getattr(self, field_name) != default_value and (
++                self.method != "dspark" or not self.enable_adaptive_verification
++            ):
++                raise ValueError(
++                    f"{field_name} requires DSpark adaptive verification"
++                )
++
++        if (
++            self.method == "dspark"
++            and self.enable_adaptive_verification
++            and self.draft_sample_method == "greedy"
++        ):
++            self.copy_drafts = CopyDraftsConfig(
++                max_drafts=max(
++                    CopyDraftsConfig().max_drafts,
++                    int(self.num_speculative_tokens or 0),
++                )
++            )
++
+         if (
+             config_cls.adaptive_verification_uses_draft_logits
+             and self.enable_adaptive_verification
+@@ -2070,6 +2171,13 @@ class SpeculativeConfig:
+                     f"errors during speculative decoding."
+                 )
+ 
++    @property
++    def num_verification_tokens(self) -> int:
++        n = int(self.num_speculative_tokens or 0)
++        if self.copy_drafts is None:
++            return n
++        return max(n, self.copy_drafts.max_drafts)
++
+     @property
+     def max_num_new_slots_for_drafting(self) -> int:
+         """Return the maximum additional drafting slots per request.
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index edd16ce..fd83de2 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -708,6 +708,27 @@ class VllmConfig:
+             return self.num_speculative_tokens
+         return speculative_config.speculator_config.num_scheduled_spec_tokens
+ 
++    @property
++    def num_verification_tokens(self) -> int:
++        if (
++            self.speculative_config is not None
++            and self.speculative_config.num_speculative_tokens is not None
++        ):
++            return getattr(
++                self.speculative_config,
++                "num_verification_tokens",
++                self.speculative_config.num_speculative_tokens,
++            )
++        return self.num_speculative_tokens
++
++    @property
++    def max_decode_rows(self) -> int:
++        return (
++            self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
++            + self.num_verification_tokens
++            - self.num_speculative_tokens
++        )
++
+     @property
+     def num_lookahead_tokens(self) -> int:
+         """KV slots to reserve past the tokens the target model is scheduled for.
+@@ -2117,6 +2138,22 @@ class VllmConfig:
+             else:
+                 self.compilation_config.cudagraph_num_of_warmups = 1
+ 
++            if (
++                self.speculative_config is not None
++                and self.speculative_config.copy_drafts is not None
++                and not (
++                    self.scheduler_config.async_scheduling
++
++                )
++            ):
++                logger.info_once(
++                    "Copy drafts are off: they need async scheduling on the V2 "
++                    "model runner; DSpark drafts alone."
++                )
++                self.speculative_config.copy_drafts = None
++            if self.speculative_config is not None:
++                self._fit_copy_decode_rows()
++                self._fit_copy_capture_sizes()
+             self._set_cudagraph_sizes()
+ 
+         else:
+@@ -2519,6 +2556,57 @@ class VllmConfig:
+                     )
+                     self.scheduler_config.max_num_active_seqs = max_draft_seqs
+ 
++    def _fit_copy_decode_rows(self) -> None:
++        scheduler = self.scheduler_config
++        uniform_rows = scheduler.max_num_seqs * self.uniform_decode_query_len
++        threshold = scheduler.long_prefill_token_threshold
++        budget = scheduler.max_num_batched_tokens
++        if not (
++            scheduler.align_prefill_chunks
++            and threshold > 0
++            and threshold + uniform_rows <= budget < threshold + self.max_decode_rows
++        ):
++            return
++        widened = threshold + self.max_decode_rows
++        scheduler.max_num_batched_tokens = widened
++        if scheduler.max_num_encoder_input_tokens == budget:
++            scheduler.max_num_encoder_input_tokens = widened
++        if scheduler.encoder_cache_size == budget:
++            scheduler.encoder_cache_size = widened
++        logger.info_once(
++            "Copy drafts widen max_num_batched_tokens from %d to %d: an aligned "
++            "%d-token prefill chunk beside %d decode rows.",
++            budget,
++            widened,
++            threshold,
++            self.max_decode_rows,
++        )
++
++    def _fit_copy_capture_sizes(self) -> None:
++        compilation = self.compilation_config
++        uniform_rows = (
++            self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
++        )
++        rows = self.max_decode_rows
++        sizes = compilation.cudagraph_capture_sizes
++        largest = compilation.max_cudagraph_capture_size
++        if largest is None and sizes:
++            largest = max(sizes)
++        if rows <= uniform_rows or largest != uniform_rows:
++            return
++        compilation.max_cudagraph_capture_size = rows
++        if sizes:
++            compilation.cudagraph_capture_sizes = [
++                *sizes,
++                *range(uniform_rows // 8 * 8 + 8, rows, 8),
++                rows,
++            ]
++        logger.info_once(
++            "Copy drafts widen the CUDA-graph capture range from %d to %d rows.",
++            uniform_rows,
++            rows,
++        )
++
+     def _set_cudagraph_sizes(self):
+         """VLLM defines the default candidate list of batch sizes for CUDA graph
+         capture as:
+@@ -3501,7 +3589,10 @@ class VllmConfig:
+                 "Adaptive verification is not currently compatible with LoRA"
+             )
+ 
+-        if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
++        if (
++            not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
++            and getattr(spec_config, "adaptive_verification_row_cost", None) is None
++        ):
+             raise ValueError(
+                 "Adaptive verification requires full CUDA graphs. Use cudagraph "
+                 "mode FULL, FULL_DECODE_ONLY, or FULL_AND_PIECEWISE, or disable "
+@@ -3524,14 +3615,13 @@ class VllmConfig:
+                 "kv_producer instance, which never verifies drafts)."
+             )
+ 
+-        if self.parallel_config.pipeline_parallel_size > 1:
+-            # Cost curves and confidences currently only exist on the last PP rank;
+-            # earlier ranks would diverge on the trimmed batch shape.
+-            # TODO: we should be able to support adaptive verification with PP by
+-            # broadcasting the cost curves and confidences to all ranks.
++        if (
++            self.parallel_config.pipeline_parallel_size > 1
++            and getattr(spec_config, "adaptive_verification_row_cost", None) is None
++        ):
+             raise ValueError(
+-                "Adaptive verification is not currently compatible "
+-                "with pipeline parallelism"
++                "Adaptive verification with pipeline parallelism requires a "
++                "pinned adaptive_verification_row_cost"
+             )
+ 
+     def _validate_batch_sharded_sampling(self) -> None:
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index e39bed0..cc136d6 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -593,6 +593,10 @@ class EngineArgs:
+     max_num_batched_tokens: int | None = None
+     max_num_scheduled_tokens: int | None = None
+     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
++    align_prefill_chunks: bool = SchedulerConfig.align_prefill_chunks
++    max_parallel_prefills: int | str | None = SchedulerConfig.max_parallel_prefills
++    prefill_yield: str = SchedulerConfig.prefill_yield
++    prefill_yield_limit_s: float = SchedulerConfig.prefill_yield_limit_s
+     long_prefill_token_threshold_adaptive: bool = (
+         SchedulerConfig.long_prefill_token_threshold_adaptive
+     )
+@@ -1782,6 +1786,27 @@ class EngineArgs:
+             "--long-prefill-token-threshold",
+             **scheduler_kwargs["long_prefill_token_threshold"],
+         )
++        scheduler_group.add_argument(
++            "--align-prefill-chunks",
++            **scheduler_kwargs["align_prefill_chunks"],
++        )
++        max_parallel_prefills_kwargs = scheduler_kwargs["max_parallel_prefills"]
++        max_parallel_prefills_kwargs.pop("choices", None)
++        max_parallel_prefills_kwargs["type"] = (
++            lambda v: v if v == "auto" else int(v)
++        )
++        scheduler_group.add_argument(
++            "--max-parallel-prefills",
++            **max_parallel_prefills_kwargs,
++        )
++        scheduler_group.add_argument(
++            "--prefill-yield",
++            **scheduler_kwargs["prefill_yield"],
++        )
++        scheduler_group.add_argument(
++            "--prefill-yield-limit-s",
++            **scheduler_kwargs["prefill_yield_limit_s"],
++        )
+         scheduler_group.add_argument(
+             "--long-prefill-token-threshold-adaptive",
+             **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
+@@ -2709,6 +2734,10 @@ class EngineArgs:
+             policy=self.scheduling_policy,
+             scheduler_cls=self.scheduler_cls,
+             long_prefill_token_threshold=self.long_prefill_token_threshold,
++            align_prefill_chunks=self.align_prefill_chunks,
++            max_parallel_prefills=self.max_parallel_prefills,
++            prefill_yield=self.prefill_yield,
++            prefill_yield_limit_s=self.prefill_yield_limit_s,
+             long_prefill_token_threshold_adaptive=(
+                 self.long_prefill_token_threshold_adaptive
+             ),
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b5a83e5..09498ca 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -364,6 +364,62 @@ if TYPE_CHECKING:
+     VLLM_USE_SIMPLE_KV_OFFLOAD: bool = False
+     VLLM_USE_SPINLOOP_EXT: bool = False
+     VLLM_SKIP_VERSION_SUFFIX: bool = False
++    # Spark DS4.1 / RoCE / direct-loader / GLP environment knobs
++    VLLM_DFLASH_AUX_BF16_STAGING: bool = False
++    VLLM_DFLASH_AUX_MXFP8_STREAMING: bool = False
++    VLLM_DFLASH_COMPACT_ROPE: bool = False
++    VLLM_DFLASH_SHARD_AUX_PROJECTION: bool = False
++    VLLM_DFLASH_VOCAB_PARALLEL_DRAFT: bool = False
++    VLLM_DS41_EXPERT_CACHE_DIR: str | None = None
++    VLLM_DS41_EXPERT_DYNAMIC_SLOTS: int = 48
++    VLLM_DS41_EXPERT_FAST_LOOKAHEAD: bool = False
++    VLLM_DS41_EXPERT_HALF_LIFE: float = 64.0
++    VLLM_DS41_EXPERT_HOTLIST: str | None = None
++    VLLM_DS41_EXPERT_HOTLIST_MODE: str = "pure"
++    VLLM_DS41_EXPERT_PREFILL_MODE: str = "expert"
++    VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS: int = 24
++    VLLM_DS41_EXPERT_SLOTS: int = 0
++    VLLM_DS41_EXPERT_STATIC_SLOTS: int = -1
++    VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
++    VLLM_DS41_IKET: str | None = None
++    VLLM_DS41_IKET_CACHE_DIR: str | None = None
++    VLLM_DS41_IKET_CTAS: int = 0
++    VLLM_DS41_IKET_GRANULARITY: Literal["fine", "phase"] = "fine"
++    VLLM_DS41_IKET_ITERS: int = 0
++    VLLM_DS41_IKET_PAYLOADS: bool = False
++    VLLM_DS41_IKET_SKIP: str = ""
++    VLLM_DS41_IKET_WARPS: int = 0
++    VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
++    VLLM_DSPARK_COMPACT_ROPE: bool = False
++    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
++    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
++    VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
++    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
++    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
++    VLLM_KV_CACHE_POISON: bool = False
++    VLLM_LATE_ADMISSION_LAYER: int = -1
++    VLLM_LM_HEAD_A16: bool = True
++    VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
++    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
++    VLLM_PCIE_DMA_FP8: str | None = None
++    VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
++    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
++    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
++    VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
++    VLLM_PP_SPARKNET_P2P: bool = False
++    VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
++    VLLM_SHARE_PYNCCL_COMMS: bool = False
++    VLLM_SINK_DETECTOR_CHECK_RANKS: bool = False
++    VLLM_SINK_DETECTOR_COLUMN: int | None = None
++    VLLM_SINK_DETECTOR_THRESHOLD: float | None = None
++    VLLM_SINK_REJECTION: bool | None = None
++    VLLM_SINK_REJECTION_MAX_RETRIES: int = 3
++    VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
++    VLLM_USE_V2_MODEL_RUNNER: bool | None = None
++    WEIGHTLESS_STEER_ALPHA: str | None = None
++    WEIGHTLESS_STEER_GENERATION_DEFAULTS: str | None = None
++    WEIGHTLESS_STEER_MODEL: str | None = None
++    WEIGHTLESS_STEER_PATH: str | None = None
+ 
+ 
+ def get_default_cache_root():
+@@ -2459,6 +2515,145 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_REQUEST_BODY_LOG_LEVEL": lambda: os.getenv(
+         "VLLM_REQUEST_BODY_LOG_LEVEL", "DEBUG"
+     ).upper(),
++    # Spark DS4.1 / RoCE / direct-loader / GLP environment knobs
++    "VLLM_DFLASH_AUX_BF16_STAGING": lambda: bool(
++        int(os.getenv("VLLM_DFLASH_AUX_BF16_STAGING", "0"))
++    ),
++    "VLLM_DFLASH_AUX_MXFP8_STREAMING": lambda: bool(
++        int(os.getenv("VLLM_DFLASH_AUX_MXFP8_STREAMING", "0"))
++    ),
++    "VLLM_DFLASH_COMPACT_ROPE": lambda: bool(
++        int(os.getenv("VLLM_DFLASH_COMPACT_ROPE", "0"))
++    ),
++    "VLLM_DFLASH_SHARD_AUX_PROJECTION": lambda: bool(
++        int(os.getenv("VLLM_DFLASH_SHARD_AUX_PROJECTION", "0"))
++    ),
++    "VLLM_DFLASH_VOCAB_PARALLEL_DRAFT": lambda: (
++        os.getenv("VLLM_DFLASH_VOCAB_PARALLEL_DRAFT", "0") == "1"
++    ),
++    "VLLM_DS41_EXPERT_CACHE_DIR": lambda: os.getenv("VLLM_DS41_EXPERT_CACHE_DIR")
++    or None,
++    "VLLM_DS41_EXPERT_DYNAMIC_SLOTS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_DYNAMIC_SLOTS", "48")
++    ),
++    "VLLM_DS41_EXPERT_FAST_LOOKAHEAD": lambda: bool(
++        int(os.getenv("VLLM_DS41_EXPERT_FAST_LOOKAHEAD", "0"))
++    ),
++    "VLLM_DS41_EXPERT_HALF_LIFE": lambda: float(
++        os.getenv("VLLM_DS41_EXPERT_HALF_LIFE", "64.0")
++    ),
++    "VLLM_DS41_EXPERT_HOTLIST": lambda: os.getenv("VLLM_DS41_EXPERT_HOTLIST") or None,
++    "VLLM_DS41_EXPERT_HOTLIST_MODE": lambda: os.getenv(
++        "VLLM_DS41_EXPERT_HOTLIST_MODE", "pure"
++    ),
++    "VLLM_DS41_EXPERT_PREFILL_MODE": lambda: os.getenv(
++        "VLLM_DS41_EXPERT_PREFILL_MODE", "expert"
++    ),
++    "VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_PREFILL_PROTECT_ROWS", "24")
++    ),
++    "VLLM_DS41_EXPERT_SLOTS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_SLOTS", "0")
++    ),
++    "VLLM_DS41_EXPERT_STATIC_SLOTS": lambda: int(
++        os.getenv("VLLM_DS41_EXPERT_STATIC_SLOTS", "-1")
++    ),
++    "VLLM_DS41_HEAD_DTYPE": env_with_choices(
++        "VLLM_DS41_HEAD_DTYPE",
++        "float32",
++        ["float32", "model"],
++    ),
++    "VLLM_DS41_IKET": lambda: os.getenv("VLLM_DS41_IKET") or None,
++    "VLLM_DS41_IKET_CACHE_DIR": lambda: os.getenv("VLLM_DS41_IKET_CACHE_DIR") or None,
++    "VLLM_DS41_IKET_CTAS": lambda: int(os.getenv("VLLM_DS41_IKET_CTAS", "0")),
++    "VLLM_DS41_IKET_GRANULARITY": lambda: os.getenv(
++        "VLLM_DS41_IKET_GRANULARITY", "fine"
++    ),
++    "VLLM_DS41_IKET_ITERS": lambda: int(os.getenv("VLLM_DS41_IKET_ITERS", "0")),
++    "VLLM_DS41_IKET_PAYLOADS": lambda: bool(
++        int(os.getenv("VLLM_DS41_IKET_PAYLOADS", "0"))
++    ),
++    "VLLM_DS41_IKET_SKIP": lambda: os.getenv("VLLM_DS41_IKET_SKIP", ""),
++    "VLLM_DS41_IKET_WARPS": lambda: int(os.getenv("VLLM_DS41_IKET_WARPS", "0")),
++    "VLLM_DS41_PACKED_BF16_LM_HEAD": lambda: bool(
++        int(os.getenv("VLLM_DS41_PACKED_BF16_LM_HEAD", "0"))
++    ),
++    "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
++        int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
++    ),
++    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
++        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
++    ),
++    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
++        int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
++    ),
++    "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
++        int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
++    ),
++    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
++        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
++    ),
++    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
++        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
++    ),
++    "VLLM_KV_CACHE_POISON": lambda: bool(int(os.getenv("VLLM_KV_CACHE_POISON", "0"))),
++    "VLLM_LATE_ADMISSION_LAYER": lambda: int(
++        os.getenv("VLLM_LATE_ADMISSION_LAYER", "-1")
++    ),
++    "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
++    "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
++        os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
++    ),
++    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
++        "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
++    ),
++    "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
++    "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
++    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
++        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
++    ),
++    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
++        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
++    ),
++    "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
++        "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "off"
++    ),
++    "VLLM_PP_SPARKNET_P2P": lambda: bool(int(os.getenv("VLLM_PP_SPARKNET_P2P", "0"))),
++    "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
++        os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
++    ),
++    "VLLM_SHARE_PYNCCL_COMMS": lambda: bool(
++        int(os.getenv("VLLM_SHARE_PYNCCL_COMMS", "0"))
++    ),
++    "VLLM_SINK_DETECTOR_CHECK_RANKS": lambda: bool(
++        int(os.getenv("VLLM_SINK_DETECTOR_CHECK_RANKS", "0"))
++    ),
++    "VLLM_SINK_DETECTOR_COLUMN": lambda: maybe_convert_int(
++        os.getenv("VLLM_SINK_DETECTOR_COLUMN", None)
++    ),
++    "VLLM_SINK_DETECTOR_THRESHOLD": lambda: (
++        float(os.environ["VLLM_SINK_DETECTOR_THRESHOLD"])
++        if "VLLM_SINK_DETECTOR_THRESHOLD" in os.environ
++        else None
++    ),
++    "VLLM_SINK_REJECTION": lambda: maybe_convert_bool(
++        os.getenv("VLLM_SINK_REJECTION", None)
++    ),
++    "VLLM_SINK_REJECTION_MAX_RETRIES": lambda: int(
++        os.getenv("VLLM_SINK_REJECTION_MAX_RETRIES", "3")
++    ),
++    "VLLM_STARTUP_HEARTBEAT_TIMEOUT_S": lambda: float(
++        os.getenv("VLLM_STARTUP_HEARTBEAT_TIMEOUT_S", "120")
++    ),
++    "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
++        os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
++    ),
++    "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
++    "WEIGHTLESS_STEER_GENERATION_DEFAULTS": lambda: (
++        os.getenv("WEIGHTLESS_STEER_GENERATION_DEFAULTS") or None
++    ),
++    "WEIGHTLESS_STEER_MODEL": lambda: os.getenv("WEIGHTLESS_STEER_MODEL") or None,
++    "WEIGHTLESS_STEER_PATH": lambda: os.getenv("WEIGHTLESS_STEER_PATH") or None,
+ }
+ 
+ 

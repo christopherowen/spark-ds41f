@@ -1,0 +1,606 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 6/9] Add worker mixin, KV cache spec, workspace, and dense
+ varlen CUDA graph hooks
+
+---
+ vllm/v1/executor/multiproc_executor.py |  40 +++++++
+ vllm/v1/kv_cache_interface.py          | 140 +++++++++++++++++++++++++
+ vllm/v1/worker/gpu/cudagraph_utils.py  | 102 ++++++++++++++++--
+ vllm/v1/worker/gpu_worker.py           |  77 ++++++++++++--
+ vllm/v1/worker/utils.py                |  10 ++
+ vllm/v1/worker/workspace.py            |  46 +++++++-
+ 6 files changed, 395 insertions(+), 20 deletions(-)
+
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index d9582fb..1f2721b 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -211,6 +211,37 @@ class MultiprocExecutor(Executor):
+         # Create workers
+         context = get_mp_context()
+         shared_worker_lock = context.Lock()
++        self._inline_worker_kwargs: dict[str, Any] | None = None
++        if (
++            not self.monitor_workers
++            and self.parallel_config.node_rank_within_dp > 0
++            and self.local_world_size == 1
++            and not getattr(self.parallel_config, "numa_bind", False)
++            and not current_platform.is_cpu()
++        ):
++            global_rank = (
++                self.local_world_size * self.parallel_config.node_rank_within_dp
++            )
++            self._inline_worker_kwargs = {
++                "vllm_config": self.vllm_config,
++                "local_rank": 0,
++                "rank": global_rank,
++                "distributed_init_method": distributed_init_method,
++                "input_shm_handle": scheduler_output_handle,
++                "ready_pipe": None,
++                "death_pipe": None,
++                "shared_worker_lock": shared_worker_lock,
++                "is_driver_worker": self._is_driver_worker(global_rank),
++                "inherited_fds": [],
++            }
++            self.workers = []
++            self.response_mqs = []
++            self.futures_queue = deque[FutureWrapper]()
++            self.held_replies: dict[int, deque[tuple[Any, Any]]] = {}
++            self._post_init_executor()
++            self.output_rank = self._get_output_rank()
++            return
++
+         unready_workers: list[UnreadyWorkerProcHandle] = []
+         success = False
+         try:
+@@ -300,6 +331,10 @@ class MultiprocExecutor(Executor):
+             self.futures_queue = deque[FutureWrapper]()
+ 
+             self._post_init_executor()
++            from spark_ds41.worker.mem_utils import trim_host_heap
++            import gc as _gc
++            _gc.collect()
++            trim_host_heap()
+ 
+             success = True
+         finally:
+@@ -387,6 +422,11 @@ class MultiprocExecutor(Executor):
+             future.result()
+ 
+     def start_worker_monitor(self, inline=False) -> None:
++        if inline and getattr(self, "_inline_worker_kwargs", None) is not None:
++            inline_kwargs = self._inline_worker_kwargs
++            self._inline_worker_kwargs = None
++            WorkerProc.worker_main(**inline_kwargs)
++            return
+         workers = self.workers
+         self_ref = weakref.ref(self)
+ 
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 743274f..7df733e 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -193,6 +193,7 @@ class KVCacheSpec:
+     # number of tokens in a block
+     block_size: int
+     dcp_sharded: bool = field(default=False, kw_only=True)
++    uses_only_written_slots: bool = field(default=False, kw_only=True)
+     """Whether DCP shards this cache's token positions across ranks."""
+ 
+     block_stride_alignment: int | MultipleOf | None = field(default=None, kw_only=True)
+@@ -972,3 +973,142 @@ class KVCacheConfig:
+                 if isinstance(spec, AttentionSpec)
+             )
+         return len(kv_cache_precisions) > 1
++
++
++@dataclass(frozen=True, kw_only=True)
++class CircularBufferSpec(AttentionSpec):
++    """One block per request holding the raw keys of the token group that
++    is still being compressed.
++
++    ``block_size`` is the ring capacity. It must exceed the compression ratio
++    by the speculative lookahead: a speculative step stores all of its rows,
++    drafts included, before acceptance is known, while the next step still
++    reads the open group's committed keys from the ring.
++
++    The worker maps every real row into that block at its position modulo
++    ``block_size`` and padding rows to the pad slot; owners write only rows
++    with a valid slot.
++    """
++
++    @property
++    def block_table_token_alignment(self) -> int | None:
++        return None
++
++    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
++        # The ring occupies one block per request for its whole lifetime.
++        del vllm_config
++        return self.page_size_bytes
++
++    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
++        del vllm_config, max_len
++        return 1
++
++    def is_uniform_with_collection(
++        self, kv_cache_specs: dict[str, KVCacheSpec]
++    ) -> bool:
++        return all(
++            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
++        )
++
++    @property
++    def prefix_cacheable(self) -> bool:
++        return False
++
++
++@dataclass(frozen=True, kw_only=True)
++class SlidingWindowMLASpec(MLAAttentionSpec):
++    """Sliding window attention with MLA cache format."""
++
++    cache_dtype_str: str | None = None
++    non_causal_multi_token_decode: bool = False
++    # DeepseekV4-only: see MLAAttentionSpec.model_version.
++    alignment: int | None = None  # Default to None for no padding.
++    model_version: str | None = None
++    # CED decoder/draft rows may be skipped; their SWA is request-private.
++    prefix_cache_enabled: bool = True
++    prefill_replay_window: int = 0
++
++    @property
++    def prefix_cacheable(self) -> bool:
++        return self.prefix_cache_enabled
++
++    @property
++    def prefill_replay_tokens(self) -> int:
++        return self.prefill_replay_window
++
++    # MLA stores a single latent vector per state; there is no separate V.
++    head_size_v: int = 0
++
++    def __post_init__(self):
++        assert self.prefill_replay_window >= 0
++        assert self.model_version in (None, "deepseek_v4", "deepseek_v41"), (
++            f"Unsupported model version: {self.model_version}"
++        )
++        super().__post_init__()
++        _apply_alignment_padding(self)
++
++    @classmethod
++    def merge(cls, specs: list[Self]) -> Self:
++        assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
++            "All attention layers in the same KV cache group must be "
++            "SlidingWindowMLASpec."
++        )
++        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
++        tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
++        model_version_set = set(spec.model_version for spec in specs)
++        sliding_window_set = set(spec.sliding_window for spec in specs)
++        extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
++        dcp_replicated_set = {spec.dcp_replicated for spec in specs}
++        non_causal_set = {spec.non_causal_multi_token_decode for spec in specs}
++        prefix_policy_set = {
++            (spec.prefix_cache_enabled, spec.prefill_replay_window) for spec in specs
++        }
++        bounded_reads_set = {spec.uses_only_written_slots for spec in specs}
++        assert (
++            len(cache_dtype_str_set) == 1
++            and len(tokens_per_state_set) == 1
++            and len(model_version_set) == 1
++            and len(sliding_window_set) == 1
++            and len(extra_retained_set) == 1
++            and len(dcp_replicated_set) == 1
++            and len(non_causal_set) == 1
++            and len(prefix_policy_set) == 1
++            and len(bounded_reads_set) == 1
++        ), (
++            "All attention layers in the same KV cache group must use the same "
++            "quantization method, tokens per state, model version, sliding "
++            "window size, retained token count, DCP replication mode, "
++            "non-causal mode, prefix policy and written-slot use."
++        )
++        return cls(
++            block_size=specs[0].block_size,
++            num_kv_heads=specs[0].num_kv_heads,
++            head_size=specs[0].head_size,
++            dtype=specs[0].dtype,
++            page_size_padded=specs[0].page_size_padded,
++            num_head_slots=specs[0].num_head_slots,
++            state_content_bytes=specs[0].state_content_bytes,
++            sliding_window=sliding_window_set.pop(),
++            extra_retained_tokens=extra_retained_set.pop(),
++            cache_dtype_str=cache_dtype_str_set.pop(),
++            tokens_per_state=tokens_per_state_set.pop(),
++            model_version=model_version_set.pop(),
++            dcp_replicated=dcp_replicated_set.pop(),
++            non_causal_multi_token_decode=non_causal_set.pop(),
++            prefix_cache_enabled=specs[0].prefix_cache_enabled,
++            prefill_replay_window=specs[0].prefill_replay_window,
++            uses_only_written_slots=bounded_reads_set.pop(),
++        )
++
++    def is_uniform_with_collection(
++        self, kv_cache_specs: dict[str, KVCacheSpec]
++    ) -> bool:
++        return all(
++            isinstance(spec, SlidingWindowMLASpec)
++            and spec.sliding_window == self.sliding_window
++            and spec.dcp_replicated == self.dcp_replicated
++            and spec.non_causal_multi_token_decode == self.non_causal_multi_token_decode
++            and spec.prefix_cacheable == self.prefix_cacheable
++            and spec.prefill_replay_tokens == self.prefill_replay_tokens
++            for spec in kv_cache_specs.values()
++        )
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index fe2fbfd..dc37390 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -318,23 +318,40 @@ class CudaGraphManager:
+         # With one routine for every batch, decode batches take token-keyed graphs.
+         capture_decode = separate_decode_routine and decode_mode != CUDAGraphMode.NONE
+         if capture_decode and self.varlen_decode:
+-            # Varlen decode graphs take any mix of 1..decode_query_len tokens per
+-            # request, worst case 1 token per request (or max_num_reqs).
++            max_cg_capture_size = compilation_config.max_cudagraph_capture_size or 0
++            for num_active_loras, (dense_num_reqs, num_tokens) in product(
++                self.lora_capture_cases,
++                dense_varlen_decode_shapes(
++                    self.max_num_reqs,
++                    self.decode_query_len,
++                    max_cg_capture_size,
++                    getattr(self.vllm_config, "uniform_decode_query_len", None),
++                ),
++            ):
++                desc = BatchExecutionDescriptor(
++                    cg_mode=decode_mode,
++                    num_tokens=num_tokens,
++                    num_reqs=dense_num_reqs,
++                    max_query_len=self.decode_query_len,
++                    num_active_loras=num_active_loras,
++                )
++                if desc not in token_keyed_descs:
++                    token_keyed_descs.append(desc)
+             varlen_sizes = self.vllm_config.get_varlen_decode_cudagraph_token_sizes(
+                 self.decode_query_len
+             )
+             for num_tokens, num_active_loras in product(
+                 varlen_sizes, self.lora_capture_cases
+             ):
+-                token_keyed_descs.append(
+-                    BatchExecutionDescriptor(
+-                        cg_mode=decode_mode,
+-                        num_tokens=num_tokens,
+-                        num_reqs=min(num_tokens, self.max_num_reqs),
+-                        max_query_len=self.decode_query_len,
+-                        num_active_loras=num_active_loras,
+-                    )
++                desc = BatchExecutionDescriptor(
++                    cg_mode=decode_mode,
++                    num_tokens=num_tokens,
++                    num_reqs=min(num_tokens, self.max_num_reqs),
++                    max_query_len=self.decode_query_len,
++                    num_active_loras=num_active_loras,
+                 )
++                if desc not in token_keyed_descs:
++                    token_keyed_descs.append(desc)
+         elif capture_decode:
+             # Attention backends size CUDA graph buffers and pick graph-compatible
+             # paths by the recorded max (e.g. FA3 max_num_splits, FlashInfer's
+@@ -547,10 +564,13 @@ class CudaGraphManager:
+                             torch.accelerator.synchronize()
+                             free_after = torch.accelerator.get_memory_info()[0]
+                             self._capture_mem_samples.append(free_before - free_after)
+-                        self.graphs[desc] = graph
++                        from spark_ds41.runner.cudagraph import instantiate_priority_graph
++                        self.graphs[desc] = instantiate_priority_graph(graph)
+                         compilation_counter.num_cudagraph_captured += 1
+ 
+         self._graphs_captured = True
++        from spark_ds41.worker.mem_utils import trim_host_heap
++        trim_host_heap()
+ 
+     def captured_token_counts(self) -> list[int]:
+         """Sorted token counts with a captured graph, ignoring LoRA variants."""
+@@ -1181,3 +1201,63 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     runner.maybe_remove_all_loras(runner.lora_config)
+     gc.collect()
+     torch.accelerator.empty_cache()
++
++
++_DENSE_VARLEN_DECODE_MAX_REQS = 2
++_FULL_DEPTH_VARLEN_DECODE_MAX_REQS = 16
++
++
++def dense_varlen_decode_shapes(
++    max_num_reqs: int,
++    decode_query_len: int,
++    max_capture_tokens: int,
++    uniform_query_len: int | None = None,
++) -> tuple[tuple[int, int], ...]:
++    """Return request and token counts of exact variable-length decode graphs.
++
++    Covers every valid token total for low-concurrency batches (``1`` to
++    ``_DENSE_VARLEN_DECODE_MAX_REQS`` requests, including odd heterogeneous and
++    adaptively trimmed totals) and the full-depth speculative batch for each
++    higher request count up to ``_FULL_DEPTH_VARLEN_DECODE_MAX_REQS`` (above
++    which the 8-row/16-row padded ladder already covers ``104+`` rows). When
++    copy drafts widen the verification limit, retain ordinary full-depth row
++    totals with room for any valid request count, using ``uniform_query_len``.
++    """
++    dense_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs)
++    full_depth_reqs = min(_FULL_DEPTH_VARLEN_DECODE_MAX_REQS, max_num_reqs)
++    has_copy_width = (
++        uniform_query_len is not None and 1 < uniform_query_len < decode_query_len
++    )
++    full_depth_tokens = min(
++        max_capture_tokens,
++        (
++            full_depth_reqs * uniform_query_len + (decode_query_len - uniform_query_len)
++            if has_copy_width
++            else full_depth_reqs * decode_query_len
++        ),
++    )
++    dense = (
++        (num_reqs, num_tokens)
++        for num_reqs in range(1, dense_reqs + 1)
++        for num_tokens in range(num_reqs, num_reqs * decode_query_len + 1)
++        if num_tokens <= max_capture_tokens
++    )
++    widths = {decode_query_len}
++    uniform = (
++        (num_reqs, num_reqs * width)
++        for num_reqs in range(dense_reqs + 1, full_depth_reqs + 1)
++        for width in sorted(widths)
++        if width > 1 and num_reqs * width <= full_depth_tokens
++    )
++    native_rows = ()
++    if has_copy_width:
++        native_rows = (
++            (min(rows, max_num_reqs), rows)
++            for rows in range(
++                uniform_query_len,
++                full_depth_reqs * uniform_query_len + 1,
++                uniform_query_len,
++            )
++            if rows <= full_depth_tokens
++        )
++    return tuple(dict.fromkeys((*dense, *uniform, *native_rows)))
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index fb7d00e..8fbf170 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -240,7 +240,10 @@ class AsyncIntermediateTensors(IntermediateTensors):
+ _MAX_SPLIT_SIZE_MB = 21
+ 
+ 
+-class Worker(WorkerBase):
++from spark_ds41.worker.mixin import SparkWorkerMixin, log_startup_memory_breakdown
++
++
++class Worker(SparkWorkerMixin, WorkerBase):
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -260,6 +263,11 @@ class Worker(WorkerBase):
+             is_driver_worker=is_driver_worker,
+         )
+         self._external_weight_charges = ExternalWeightCharges()
++        self._startup_heartbeat = None
++        self._contiguous_cuda_pool: torch.Tensor | None = None
++        self._contiguous_cuda_pool_bytes: int = 0
++        self._pp_p2p = None
++        self._lazy_dev_profiler: bool = False
+ 
+         # configure float32 matmul precision according to vLLM env.
+         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
+@@ -550,6 +558,8 @@ class Worker(WorkerBase):
+             # memory snapshot
+             # This ensures NCCL buffers are allocated before we measure
+             # available memory
++            from spark_ds41.worker.cpu_affinity import configure_worker_cpu_affinity
++            self._cpu_affinity_plan = configure_worker_cpu_affinity(self.local_rank)
+             init_worker_distributed_environment(
+                 self.vllm_config,
+                 self.rank,
+@@ -557,6 +567,8 @@ class Worker(WorkerBase):
+                 self.local_rank,
+                 current_platform.dist_backend,
+             )
++            self._start_startup_heartbeat()
++            self._startup_rendezvous("distributed_init")
+ 
+             warn_if_flashinfer_kernels_missing()
+ 
+@@ -651,13 +663,33 @@ class Worker(WorkerBase):
+     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
+     # to hijack tensor allocation.
+     def load_model(self, *, load_dummy_weights: bool = False) -> None:
++        self._preallocate_contiguous_cuda_pool()
+         with (
+             self._maybe_get_memory_pool_context(tag="weights"),
+             set_current_vllm_config(self.vllm_config),
+-            self._scoped_allocator_max_split(max_split_size_mb=_MAX_SPLIT_SIZE_MB),
++            (
++                nullcontext()
++                if getattr(self, "_contiguous_pool_anchor", None) is not None
++                else self._scoped_allocator_max_split(max_split_size_mb=_MAX_SPLIT_SIZE_MB)
++            ),
+             self._external_weight_charges.track(),
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
++        if (
++            getattr(self, "_contiguous_pool_bytes", 0) > 0
++            and not getattr(self, "_contiguous_pool_finalized", True)
++        ):
++            self._contiguous_pool_finalized = True
++            from spark_ds41.direct_io.direct_loader import (
++                set_preallocated_cuda_pool_bytes,
++            )
++            set_preallocated_cuda_pool_bytes(
++                self._contiguous_pool_bytes,
++                front_clean=getattr(self, "_contiguous_pool_front_clean", True),
++                resize_cb=None,
++            )
++        from spark_ds41.worker.cpu_affinity import apply_worker_thread_affinity
++        apply_worker_thread_affinity(getattr(self, "_cpu_affinity_plan", None))
+ 
+         if self._external_weight_charges.fallback_bytes:
+             self.requested_memory = self._resolve_requested_memory()
+@@ -752,13 +784,27 @@ class Worker(WorkerBase):
+         """
+         maybe_apply_startup_plan(self)
+ 
++        self._prepare_kernels()
++        self._startup_rendezvous("memory profiling")
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+-            # still need a profile run which compiles the model for
+-            # max_num_batched_tokens
+-            with set_current_vllm_config(self.vllm_config):
+-                self.model_runner.profile_run(
+-                    randomize_inputs=self.randomize_dummy_inputs
++            from vllm.config.compilation import CompilationMode
++            has_compiled = any(
++                hasattr(m, "do_not_compile") and not m.do_not_compile
++                for model in (
++                    self.model_runner.get_model(),
++                    getattr(self.model_runner, "get_draft_model", lambda: None)(),
+                 )
++                if model is not None
++                for m in model.modules()
++            )
++            if not (
++                self.vllm_config.compilation_config.mode == CompilationMode.NONE
++                and not has_compiled
++            ):
++                with set_current_vllm_config(self.vllm_config):
++                    self.model_runner.profile_run(
++                        randomize_inputs=self.randomize_dummy_inputs
++                    )
+ 
+             msg = (
+                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
+@@ -1072,7 +1118,18 @@ class Worker(WorkerBase):
+     def compile_or_warm_up_model(self) -> CompilationTimes:
+         # Warmup forwards record expert load like real ones.
+         with self.model_runner.eplb.suppress():
+-            return self._compile_or_warm_up_model()
++            self._startup_rendezvous("warm-up")
++            times = self._compile_or_warm_up_model()
++            if self._startup_heartbeat is not None:
++                self._startup_heartbeat.stop()
++                self._startup_heartbeat = None
++            import sys as _sys
++            if "sparknet.oneshot" in _sys.modules:
++                _sys.modules["sparknet.oneshot"].freeze_kernel_resolution(
++                    "sparknet one-shot kernel resolution frozen after warm-up"
++                )
++            log_startup_memory_breakdown(self)
++            return times
+ 
+     def _compile_or_warm_up_model(self) -> CompilationTimes:
+         if self.cache_config.enable_extensible_kv_cache:
+@@ -1895,6 +1952,10 @@ class Worker(WorkerBase):
+             self.model_runner.on_target_weights_replaced()
+ 
+     def shutdown(self) -> None:
++        if pp_p2p := getattr(self, "_pp_p2p", None):
++            pp_p2p.close()
++            self._pp_p2p = None
++        self._release_contiguous_cuda_pool()
+         model_runner = getattr(self, "model_runner", None)
+         if model_runner is not None and model_runner.eplb_state is not None:
+             model_runner.eplb_state.stop_async_loop()
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 0f4718d..675ff68 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -243,6 +243,16 @@ class KVBlockZeroer:
+         ) = self._meta
+         n_blocks = len(block_ids)
+         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
++        if self.device.type == "cuda":
++            from spark_ds41.sampling import tilelang_inputs
++            tilelang_inputs.zero_kv_blocks(
++                seg_addrs.view(torch.int64),
++                seg_block_strides,
++                seg_page_sizes,
++                idx,
++                int(max_chunks * blk_size),
++            )
++            return
+         grid = (n_blocks, n_segs, max_chunks)
+         _zero_kv_blocks_kernel[grid](
+             seg_addrs,
+diff --git a/vllm/v1/worker/workspace.py b/vllm/v1/worker/workspace.py
+index 5abbcf5..ec51876 100644
+--- a/vllm/v1/worker/workspace.py
++++ b/vllm/v1/worker/workspace.py
+@@ -3,7 +3,8 @@
+ 
+ import inspect
+ import os
+-from collections.abc import Callable, Generator, Hashable
++from typing import Any
++from collections.abc import Iterator, Callable, Generator, Hashable
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from contextvars import ContextVar
+ from itertools import accumulate
+@@ -50,6 +51,46 @@ def use_workspace_lane(lane: int) -> Generator[None]:
+         _workspace_lane.reset(token)
+ 
+ 
++
++_preallocated_workspace: ContextVar[torch.Tensor | None] = ContextVar(
++    "_preallocated_workspace", default=None
++)
++_cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
++    "_cuda_graph_capture_resources", default=None
++)
++
++
++@contextmanager
++def use_preallocated_workspace(workspace: torch.Tensor | None) -> Iterator[None]:
++    token = _preallocated_workspace.set(workspace)
++    try:
++        yield
++    finally:
++        _preallocated_workspace.reset(token)
++
++
++def current_preallocated_workspace() -> torch.Tensor | None:
++    return _preallocated_workspace.get()
++
++
++@contextmanager
++def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
++    resources: list[Any] = []
++    token = _cuda_graph_capture_resources.set(resources)
++    try:
++        yield resources
++    finally:
++        _cuda_graph_capture_resources.reset(token)
++
++
++def retain_cuda_graph_capture_resource(resource: Any) -> bool:
++    resources = _cuda_graph_capture_resources.get()
++    if resources is None:
++        return False
++    resources.append(resource)
++    return True
++
++
+ class WorkspaceManager:
+     """Manager for workspace allocation.
+ 
+@@ -82,6 +123,9 @@ class WorkspaceManager:
+         self._retained: list[tuple[Hashable, int] | None] = [
+             None for _ in self._current_workspaces
+         ]
++        self._moe_output_buffers: list[torch.Tensor | None] = [None] * (
++            self._num_ubatches * self._num_lanes
++        )
+         self._locked: bool = False
+ 
+     @staticmethod

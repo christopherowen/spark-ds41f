@@ -101,5 +101,119 @@ class DeepseekV41FP8Config(Fp8Config):
         if isinstance(layer, VocabParallelEmbedding):
             return kernels.embedding_method()
         if isinstance(layer, RoutedExperts):
-            return Mxfp4MoEMethod(layer.moe_config)
+            return SparkMxfp4MoEMethod.create(layer.moe_config)
         return None
+
+
+class SparkMxfp4MoEMethod:
+    @staticmethod
+    def create(moe_config):
+        from vllm import envs
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        from vllm.model_executor.utils import set_weight_attrs
+
+        class _SparkMxfp4MoEMethod(Mxfp4MoEMethod):
+            def create_weights(
+                self,
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                **extra_weight_attrs,
+            ):
+                slot_target = envs.VLLM_DS41_EXPERT_SLOTS
+                prefix = getattr(layer, "prefix", None) or getattr(layer, "layer_name", "") or ""
+                is_draft_layer = "dspark" in prefix or "mtp" in prefix
+                if not is_draft_layer and "layers." in prefix:
+                    from vllm.model_executor.models.utils import extract_layer_index
+                    try:
+                        is_draft_layer = extract_layer_index(prefix) >= 40
+                    except ValueError:
+                        pass
+                use_slot_meta = (
+                    slot_target != 0
+                    and not is_draft_layer
+                    and (slot_target < 0 or slot_target < num_experts)
+                )
+                from spark_ds41.direct_io.direct_loader import (
+                    is_deferring_arena_weight_alloc,
+                )
+                defer_arena_meta = (not use_slot_meta) and is_deferring_arena_weight_alloc()
+                if not use_slot_meta and not defer_arena_meta:
+                    return super().create_weights(
+                        layer,
+                        num_experts,
+                        hidden_size,
+                        intermediate_size_per_partition,
+                        params_dtype,
+                        **extra_weight_attrs,
+                    )
+                self.num_experts = num_experts
+                self.hidden_size = hidden_size
+                self.intermediate_size = self.moe.intermediate_size_per_partition
+                self.intermediate_size_per_partition = self.moe.intermediate_size_per_partition
+                weight_dtype = torch.uint8
+                scale_dtype = torch.uint8
+                mxfp4_block = 32
+                intermediate_size_per_partition = self.moe.intermediate_size_per_partition
+                weight_loader = extra_weight_attrs.pop("weight_loader")
+                scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
+                if use_slot_meta:
+                    self.uses_meta_device = True
+                    alloc_fn = lambda shape, dt: torch.empty(shape, dtype=dt, device=torch.device("meta"))
+                else:
+                    alloc_fn = lambda shape, dt: torch.empty((1,), dtype=dt).expand(shape)
+
+                def _mark(p):
+                    if defer_arena_meta:
+                        p._direct_deferred_alloc = True
+                    return p
+
+                w13_weight = _mark(torch.nn.Parameter(alloc_fn((num_experts, self.moe.w13_num_shards * intermediate_size_per_partition, hidden_size // 2), weight_dtype), requires_grad=False))
+                layer.register_parameter("w13_weight", w13_weight)
+                set_weight_attrs(w13_weight, extra_weight_attrs)
+                set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
+
+                w13_weight_scale = _mark(torch.nn.Parameter(alloc_fn((num_experts, self.moe.w13_num_shards * intermediate_size_per_partition, hidden_size // mxfp4_block), scale_dtype), requires_grad=False))
+                layer.register_parameter("w13_weight_scale", w13_weight_scale)
+                set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+                set_weight_attrs(w13_weight_scale, {"weight_loader": scale_weight_loader})
+                w13_weight_scale.quant_method = "block"
+
+                w2_weight = _mark(torch.nn.Parameter(alloc_fn((num_experts, hidden_size, intermediate_size_per_partition // 2), weight_dtype), requires_grad=False))
+                layer.register_parameter("w2_weight", w2_weight)
+                set_weight_attrs(w2_weight, extra_weight_attrs)
+                set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
+
+                w2_weight_scale = _mark(torch.nn.Parameter(alloc_fn((num_experts, hidden_size, intermediate_size_per_partition // mxfp4_block), scale_dtype), requires_grad=False))
+                layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+                set_weight_attrs(w2_weight_scale, {"weight_loader": scale_weight_loader})
+                w2_weight_scale.quant_method = "block"
+
+                if self.moe.has_bias:
+                    w13_bias = torch.nn.Parameter(alloc_fn((num_experts, self.moe.w13_num_shards * intermediate_size_per_partition), torch.bfloat16), requires_grad=False)
+                    layer.register_parameter("w13_bias", w13_bias)
+                    set_weight_attrs(w13_bias, extra_weight_attrs)
+                    set_weight_attrs(w13_bias, {"weight_loader": weight_loader})
+                    w2_bias = torch.nn.Parameter(alloc_fn((num_experts, hidden_size), torch.bfloat16), requires_grad=False)
+                    layer.register_parameter("w2_bias", w2_bias)
+                    set_weight_attrs(w2_bias, extra_weight_attrs)
+                    set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
+
+                if use_slot_meta:
+                    from vllm.model_executor.model_loader.reload.layerwise import (
+                        initialize_online_processing,
+                    )
+                    initialize_online_processing(layer)
+
+            def process_weights_after_loading(self, layer):
+                if getattr(layer, "_already_called_process_weights_after_loading", False):
+                    return
+                layer._already_called_process_weights_after_loading = True
+                super().process_weights_after_loading(layer)
+                if getattr(layer, "slot_cache_config", None) is not None:
+                    torch.cuda.empty_cache()
+
+        return _SparkMxfp4MoEMethod(moe_config)

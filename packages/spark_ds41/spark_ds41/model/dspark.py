@@ -39,7 +39,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.qwen3_dspark import (
+from spark_ds41.model.dspark_markov import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
 )
@@ -174,7 +174,10 @@ class DSparkContextCudaGraphs:
         config.compilation_config.cudagraph_capture_sizes = capacities
         config.compilation_config.max_cudagraph_capture_size = limit
         self.manager = CudaGraphManager(
-            config, hidden_states.device, CUDAGraphMode.FULL, decode_query_len=1
+            config,
+            hidden_states.device,
+            CUDAGraphMode.FULL,
+            decode_query_lens={1: config.scheduler_config.max_num_seqs},
         )
 
     def _forward(self, capacity: int) -> None:
@@ -301,6 +304,13 @@ class DSparkDeepseekV4Model(nn.Module):
             or getattr(config, "num_nextn_predict_layers", None)
             or 3
         )
+
+        from spark_ds41.model.quant_config import DeepseekV41FP8Config
+        for _cfg in (vllm_config, get_current_vllm_config()):
+            _qc = getattr(_cfg, "quant_config", None)
+            if _qc is not None and not isinstance(_qc, DeepseekV41FP8Config) and _qc.get_name() in ("deepseek_v4_fp8", "deepseek_v41_fp8"):
+                _raw_qc = getattr(getattr(_cfg.model_config, "hf_config", None), "quantization_config", None) or {}
+                _cfg.quant_config = DeepseekV41FP8Config.from_config(_raw_qc)
 
         # Bound from the loaded target, as in K3DSparkModel. When the target's
         # embed_tokens lives on an earlier PP stage, own and load it here.
@@ -1052,7 +1062,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             )
         probs = self.compute_confidence(head_hidden, markov_embed, out=out)
         if margins is not None:
-            from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+            from spark_ds41.spec_decode.acceptance_estimator import (
                 add_margin_to_confidence_probs,
             )
 

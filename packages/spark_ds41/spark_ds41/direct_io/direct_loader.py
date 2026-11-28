@@ -1078,9 +1078,9 @@ class DirectModelLoader(DefaultModelLoader):
                     resolved_indexed = (index_path.parent / indexed_file).resolve()
                     indexed_paths[indexed_file] = resolved_indexed
                 names_by_path.setdefault(resolved_indexed, []).append(name)
-        prefixes = source.weight_name_prefixes
+        prefixes = getattr(source, "weight_name_prefixes", None)
         local_expert_ids = self.local_expert_ids
-        file_filter = source.file_weight_filter
+        file_filter = getattr(source, "file_weight_filter", None) or getattr(self, "_active_file_weight_filter", None)
         for path in files:
             resolved_path = Path(path).resolve()
             if names_by_path is not None:
@@ -1105,7 +1105,8 @@ class DirectModelLoader(DefaultModelLoader):
                 allowed_indexed = set(candidate_names)
             else:
                 allowed_indexed = None
-            sources = weight_utils.safetensors_file_sources(path)
+            from spark_ds41.direct_io.weight_transfer import safetensors_file_sources, file_source_tensor
+            sources = safetensors_file_sources(path)
             if allowed_indexed is not None:
                 selected = [name for name in sorted(sources) if name in allowed_indexed]
             else:
@@ -1118,7 +1119,7 @@ class DirectModelLoader(DefaultModelLoader):
             file_names = {name for name in selected if file_filter(name)}
             ordinary_names = {name for name in selected if name not in file_names}
             file_backed = (
-                (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
+                (source.prefix + name, file_source_tensor(sources[name]))
                 for name in selected
                 if name in file_names
             )
@@ -1138,27 +1139,35 @@ class DirectModelLoader(DefaultModelLoader):
             )
             yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
 
+    def load_weights(self, model, model_config):
+        self._active_file_weight_filter = getattr(model, "checkpoint_file_weight_filter", None)
+        try:
+            super().load_weights(model, model_config)
+            from spark_ds41.direct_io.weight_transfer import finish_weight_transfers
+            finish_weight_transfers()
+        finally:
+            self._active_file_weight_filter = None
+
     def _get_weights_iterator(self, source):
         session = self._session
         if session is None:
             raise RuntimeError("the direct loader reads weights only in load_model")
-        folder, files, _ = self._prepare_weights(
+        folder, files, *_ = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
             source.revision,
             False,
             source.allow_patterns_overrides,
-            source.weight_name_prefixes,
         )
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         index_path = Path(folder) / SAFE_WEIGHTS_INDEX_NAME
-        if source.file_weight_filter is not None:
+        if (getattr(source, "file_weight_filter", None) or getattr(self, "_active_file_weight_filter", None)) is not None:
             yield from self._file_backed_weights_iterator(files, source, index_path)
             return
         yield from session.weights(
             files,
-            prefixes=source.weight_name_prefixes,
+            prefixes=getattr(source, "weight_name_prefixes", None),
             prefix=source.prefix,
             index_path=index_path,
             needs_values=self._needs_values,

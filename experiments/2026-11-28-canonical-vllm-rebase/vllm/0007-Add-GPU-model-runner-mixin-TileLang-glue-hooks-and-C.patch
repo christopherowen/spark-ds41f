@@ -1,0 +1,1061 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 7/9] Add GPU model runner mixin, TileLang glue hooks, and
+ CopyDrafter integration
+
+---
+ vllm/v1/outputs.py                       |   4 +
+ vllm/v1/request.py                       |   2 +
+ vllm/v1/worker/gpu/async_utils.py        |  36 ++++
+ vllm/v1/worker/gpu/block_table.py        |  78 +++++++
+ vllm/v1/worker/gpu/buffer_utils.py       |  85 ++++++--
+ vllm/v1/worker/gpu/input_batch.py        |  93 ++++++++-
+ vllm/v1/worker/gpu/model_runner.py       | 252 +++++++++++++++++++----
+ vllm/v1/worker/gpu/states.py             |  27 ++-
+ vllm/v1/worker/gpu/structured_outputs.py |  67 ++++--
+ 9 files changed, 566 insertions(+), 78 deletions(-)
+
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 4b8ccd5..f2e6b2d 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -318,6 +318,10 @@ class ModelRunnerOutput:
+     # req_ids order.
+     num_verified_tokens_per_req: list[int] | None = None
+ 
++    # Copy drafts: per request, the drafts its copy state asks the scheduler
++    # to lay out for the step after the next one. None without copy drafts.
++    copy_draft_alloc: list[int] | None = None
++
+     aux_output_connector_output: dict[str, AuxRequestOutput] | None = None
+ 
+     # ``None`` when ``return_sampling_mask`` is off.
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index bbda79a..54b3c23 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -236,6 +236,8 @@ class Request:
+         # the scheduler when --per-request-spec-decode-metrics is set (eagerly on
+         # add_request, then observed each verify step); stays None otherwise.
+         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
++        # Copy drafts: drafts requested by the worker copy state for next steps.
++        self.copy_draft_alloc = 0
+ 
+         # Prompt block hashes precomputed by the frontend; the hasher continues
+         # from the first block they don't cover. Hidden from the cyclic GC: it
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index 21c5a8c..fe9019a 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -139,6 +139,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
+         # Blocking (sleep) event to avoid busy-polling the accelerator driver lock.
+         self.copy_event = torch.Event(blocking=True)
+         self._has_fault: torch.Tensor | None = None
++        self.copy_draft_alloc: torch.Tensor | None = None
++        self.copy_draft_alloc_np: np.ndarray | None = None
++        self.copy_draft_alloc_event: torch.Event | None = None
+         self._has_fault_gpu: torch.Tensor | None = None
+         if check_ep_fault:
+             # Computed on the main stream: the copy stream only carries copies.
+@@ -189,6 +192,33 @@ class AsyncOutput(AsyncModelRunnerOutput):
+                 self._has_fault = self._has_fault_gpu.to("cpu", non_blocking=True)
+             self.copy_event.record(copy_stream)
+ 
++    def attach_copy_draft_alloc(
++        self,
++        copy_draft_alloc: Any,
++        copy_stream: torch.Stream,
++        main_stream: torch.Stream,
++        *,
++        num_reqs: int | None = None,
++        alloc_event: torch.Event | None = None,
++    ) -> None:
++        self.copy_draft_alloc_event = (
++            alloc_event if alloc_event is not None else torch.Event(blocking=True)
++        )
++        if hasattr(copy_draft_alloc, "copy_to_cpu"):
++            n = copy_draft_alloc.gpu.shape[0] if num_reqs is None else num_reqs
++            self.copy_draft_alloc = copy_draft_alloc.gpu[:n]
++            with stream(copy_stream, main_stream):
++                copy_stream.wait_stream(main_stream)
++                copy_draft_alloc.copy_to_cpu(n)
++                self.copy_draft_alloc_np = copy_draft_alloc.np[:n]
++                self.copy_draft_alloc_event.record(copy_stream)
++            return
++        self.copy_draft_alloc = copy_draft_alloc.clone()
++        with stream(copy_stream, main_stream):
++            copy_stream.wait_stream(main_stream)
++            self.copy_draft_alloc_np = async_copy_to_np(self.copy_draft_alloc)
++            self.copy_draft_alloc_event.record(copy_stream)
++
+     def get_output(self) -> ModelRunnerOutput:
+         self.copy_event.synchronize()
+ 
+@@ -207,6 +237,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
+             num_verified = self.num_verified_tokens_per_req_np.tolist()
+             self.model_runner_output.num_drafted_tokens_per_req = num_drafted
+             self.model_runner_output.num_verified_tokens_per_req = num_verified
++        if self.copy_draft_alloc_np is not None:
++            assert self.copy_draft_alloc_event is not None
++            self.copy_draft_alloc_event.synchronize()
++            self.model_runner_output.copy_draft_alloc = (
++                self.copy_draft_alloc_np.tolist()
++            )
+ 
+         if self.sampling_mask_tensors is not None:
+             self.model_runner_output.sampling_masks = (
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index 9d93f10..6fee048 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -7,6 +7,11 @@ import torch
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.math_utils import round_up
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
++
++
++def slot_mapping_mode(layer_spec: KVCacheSpec) -> tuple[bool, bool]:
++    return layer_spec.uses_slot_mapping, isinstance(layer_spec, CircularBufferSpec)
+ from vllm.v1.worker.gpu.buffer_utils import (
+     FusedStagedWriter,
+     StagedWriteTensor,
+@@ -48,6 +53,8 @@ class BlockTables:
+         slot_mapping_enabled: list[bool] | None = None,
+         dcp_sharded: list[bool] | None = None,
+         sliding_window_reach: list[int] | None = None,
++        slot_mapping_circular: list[bool] | None = None,
++        kernel_block_sizes: list[int] | None = None,
+     ):
+         self.block_sizes = block_sizes
+         self.max_num_reqs = max_num_reqs
+@@ -64,6 +71,12 @@ class BlockTables:
+             slot_mapping_enabled = [True] * self.num_kv_cache_groups
+         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
+         self._slot_mapping_enabled = slot_mapping_enabled
++        if slot_mapping_circular is None:
++            slot_mapping_circular = [False] * self.num_kv_cache_groups
++        assert len(slot_mapping_circular) == self.num_kv_cache_groups
++        self._slot_mapping_circular = slot_mapping_circular
++        self.kernel_block_sizes = list(kernel_block_sizes) if kernel_block_sizes is not None else list(block_sizes)
++        self.group_cp_sizes_list = [cp_size if sharded else 1 for sharded in (dcp_sharded or [True] * self.num_kv_cache_groups)]
+         if dcp_sharded is None:
+             dcp_sharded = [True] * self.num_kv_cache_groups
+         assert len(dcp_sharded) == self.num_kv_cache_groups
+@@ -134,6 +147,30 @@ class BlockTables:
+             self._sliding_window_reach, dtype=torch.int32, device=self.device
+         )
+         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
++        self._block_table_ptrs_i64 = self.block_table_ptrs.view(torch.int64)
++        self._input_block_table_ptrs_i64 = self.input_block_table_ptrs.view(torch.int64)
++        self.kernel_block_sizes_tensor = torch.tensor(
++            self.kernel_block_sizes, dtype=torch.int32, device=self.device
++        )
++        self.slot_mapping_circular = torch.tensor(
++            self._slot_mapping_circular, dtype=torch.bool, device=self.device
++        )
++        self.group_cp_sizes = torch.tensor(
++            self.group_cp_sizes_list, dtype=torch.int32, device=self.device
++        )
++        try:
++            from spark_ds41.sampling import tilelang_inputs
++            self._gather_chunks = tilelang_inputs.gather_chunks(
++                [b.gpu.stride(0) for b in self.block_tables], self.device
++            )
++        except Exception:
++            self._gather_chunks = None
++
++    def get_group_cp_parameters(self, group_id: int) -> tuple[int, int, int]:
++        group_cp_size = self.group_cp_sizes_list[group_id]
++        if group_cp_size == 1:
++            return 0, 1, 1
++        return self.cp_rank, group_cp_size, self.cp_interleave
+ 
+     def append_block_ids(
+         self,
+@@ -206,6 +243,19 @@ class BlockTables:
+         else:
+             assert out_ptrs is not None
+             assert len(out) == self.num_kv_cache_groups
++        if not mask_sliding_window and self._gather_chunks is not None:
++            from spark_ds41.sampling import tilelang_inputs
++            dst_ptrs = self._input_block_table_ptrs_i64 if out_ptrs is self.input_block_table_ptrs else out_ptrs.view(torch.int64)
++            tilelang_inputs.gather_block_tables(
++                idx_mapping,
++                self._block_table_ptrs_i64,
++                dst_ptrs,
++                self.block_table_strides,
++                self.num_blocks.gpu,
++                self._gather_chunks,
++                num_rows,
++            )
++            return tuple(t[:num_reqs_padded] for t in out)
+         # Also clear rows left by a larger batch in the shared buffer.
+         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
+             idx_mapping,
+@@ -257,6 +307,26 @@ class BlockTables:
+         num_reqs = idx_mapping.shape[0]
+         num_groups = self.num_kv_cache_groups
+         slot_mappings = self.slot_mappings if out is None else out
++        if self._gather_chunks is not None:
++            from spark_ds41.sampling import tilelang_inputs
++            tilelang_inputs.compute_slot_mappings(
++                idx_mapping,
++                query_start_loc,
++                positions,
++                self._block_table_ptrs_i64,
++                self.block_table_strides,
++                self.num_blocks.gpu,
++                self.block_sizes_tensor,
++                self.kernel_block_sizes_tensor,
++                self.slot_mapping_enabled,
++                self.slot_mapping_circular,
++                self.group_cp_sizes,
++                slot_mappings[:, :num_tokens_padded],
++                self.cp_rank,
++                self.cp_size,
++                self.cp_interleave,
++            )
++            return slot_mappings[:, :num_tokens_padded]
+         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
+             slot_mappings.shape[1],
+             idx_mapping,
+@@ -430,3 +500,11 @@ def _compute_slot_mappings_kernel(
+ 
+         slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
+         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
++
++
++def declare_block_table_kernels(*, cp_size: int, cp_interleave: int) -> None:
++    from spark_ds41.sampling import tilelang_inputs
++
++    tilelang_inputs.declare(
++        lambda: tilelang_inputs.block_table_calls(cp_size, cp_interleave)
++    )
+diff --git a/vllm/v1/worker/gpu/buffer_utils.py b/vllm/v1/worker/gpu/buffer_utils.py
+index 8ebbc8b..4982f17 100644
+--- a/vllm/v1/worker/gpu/buffer_utils.py
++++ b/vllm/v1/worker/gpu/buffer_utils.py
+@@ -268,20 +268,40 @@ class StagedWriteTensor:
+         )
+ 
+         # Write diffs to the GPU buffer
+-        _apply_write_kernel[(n, _num_write_chunks(self._staged_write_max_len))](
+-            self.gpu,
+-            self.gpu.stride(0),
+-            indices_uva,
+-            starts_uva,
+-            write_contents,
+-            cu_lens_uva,
+-            None,
+-            BLOCK_SIZE=_WRITE_BLOCK_SIZE,
+-            MULTI_GROUP=False,
+-        )
++        if self.device.type == "cuda":
++            from spark_ds41.sampling import tilelang_inputs
++            tilelang_inputs.apply_staged_writes(
++                self.gpu.view(-1),
++                self.gpu.stride(0),
++                indices_uva,
++                starts_uva,
++                write_contents,
++                cu_lens_uva,
++                self._staged_write_cu_lens,
++            )
++        else:
++            _apply_write_kernel[(n, _num_write_chunks(self._staged_write_max_len))](
++                self.gpu,
++                self.gpu.stride(0),
++                indices_uva,
++                starts_uva,
++                write_contents,
++                cu_lens_uva,
++                None,
++                BLOCK_SIZE=_WRITE_BLOCK_SIZE,
++                MULTI_GROUP=False,
++            )
+         # Clear the staged writes
+         self.clear_staged_writes()
+ 
++    def register_warmup(self) -> None:
++        from spark_ds41.sampling import tilelang_inputs
++
++        dtype = self.dtype
++        tilelang_inputs.declare(
++            lambda: tilelang_inputs.staged_write_calls(dtypes=(dtype,), fused=False)
++        )
++
+     def clear_staged_writes(self) -> None:
+         self._staged_write_indices.clear()
+         self._staged_write_starts.clear()
+@@ -299,6 +319,14 @@ class StagedWriteTensor:
+ 
+ 
+ class FusedStagedWriter:
++    @staticmethod
++    def register_warmup() -> None:
++        from spark_ds41.sampling import tilelang_inputs
++
++        tilelang_inputs.declare(
++            lambda: tilelang_inputs.staged_write_calls(dtypes=(), fused=True)
++        )
++
+     """Applies the staged writes of several `StagedWriteTensor`s at once."""
+ 
+     def __init__(
+@@ -351,17 +379,30 @@ class FusedStagedWriter:
+         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
+         contents_uva = self.contents.copy_chunks_to_uva(contents, content_base)
+ 
+-        _apply_write_kernel[(len(group_ids), _num_write_chunks(max_len))](
+-            output_ptrs,
+-            output_strides,
+-            indices_uva,
+-            starts_uva,
+-            contents_uva,
+-            cu_lens_uva,
+-            group_ids_uva,
+-            BLOCK_SIZE=_WRITE_BLOCK_SIZE,
+-            MULTI_GROUP=True,
+-        )
++        if self.device.type == "cuda" and contents_uva.dtype == torch.int32:
++            from spark_ds41.sampling import tilelang_inputs
++            tilelang_inputs.apply_fused_staged_writes(
++                output_ptrs.view(torch.int64),
++                output_strides,
++                indices_uva,
++                starts_uva,
++                contents_uva,
++                cu_lens_uva,
++                group_ids_uva,
++                cu_lens,
++            )
++        else:
++            _apply_write_kernel[(len(group_ids), _num_write_chunks(max_len))](
++                output_ptrs,
++                output_strides,
++                indices_uva,
++                starts_uva,
++                contents_uva,
++                cu_lens_uva,
++                group_ids_uva,
++                BLOCK_SIZE=_WRITE_BLOCK_SIZE,
++                MULTI_GROUP=True,
++            )
+         for t in tensors:
+             t.clear_staged_writes()
+ 
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index f5ca37a..385642c 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -326,6 +326,9 @@ def _prepare_prefill_inputs_kernel(
+     )
+ 
+ 
++from spark_ds41.sampling.tilelang_inputs import DeadRows
++
++
+ def prepare_prefill_inputs(
+     input_ids: torch.Tensor,
+     next_prefill_tokens: torch.Tensor,
+@@ -335,6 +338,18 @@ def prepare_prefill_inputs(
+     prefill_len: torch.Tensor,
+     num_computed_tokens: torch.Tensor,
+ ) -> None:
++    if input_ids.is_cuda:
++        from spark_ds41.sampling import tilelang_inputs
++        tilelang_inputs.prepare_prefill_inputs(
++            input_ids,
++            next_prefill_tokens,
++            idx_mapping,
++            query_start_loc,
++            all_token_ids,
++            prefill_len,
++            num_computed_tokens,
++        )
++        return
+     num_reqs = idx_mapping.shape[0]
+     num_lookahead = next_prefill_tokens.shape[0]
+     _prepare_prefill_inputs_kernel[(num_reqs,)](
+@@ -397,6 +412,16 @@ def prepare_pos_seq_lens(
+     pos: torch.Tensor,
+     seq_lens: torch.Tensor,
+ ) -> None:
++    if pos.is_cuda:
++        from spark_ds41.sampling import tilelang_inputs
++        tilelang_inputs.prepare_pos_seq_lens(
++            idx_mapping,
++            query_start_loc,
++            num_computed_tokens,
++            pos,
++            seq_lens,
++        )
++        return
+     num_reqs = idx_mapping.shape[0]
+     # NOTE(woosuk): We do +1 because the last thread block is used
+     # to pad unused seq_lens as 0 for full CUDA graphs.
+@@ -492,6 +517,21 @@ def combine_sampled_and_draft_tokens(
+     num_speculative_steps = draft_tokens.shape[-1]
+ 
+     logits_indices = torch.empty(num_logits, dtype=torch.int64, device=input_ids.device)
++    if input_ids.is_cuda:
++        from spark_ds41.sampling import tilelang_inputs
++        tilelang_inputs.combine_sampled_and_draft_tokens(
++            input_ids,
++            idx_mapping,
++            last_sampled_tokens,
++            query_start_loc,
++            seq_lens,
++            prefill_len,
++            draft_tokens,
++            cu_num_logits,
++            logits_indices,
++            num_new_sampled_tokens,
++        )
++        return logits_indices
+     _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
+         input_ids,
+         idx_mapping,
+@@ -543,12 +583,30 @@ def _get_num_sampled_and_rejected_kernel(
+ 
+ 
+ def get_num_sampled_and_rejected(
+-    num_sampled: torch.Tensor,
++    num_sampled: torch.Tensor | None,
+     seq_lens: torch.Tensor,
+     cu_num_logits: torch.Tensor,
+     idx_mapping: torch.Tensor,
+     prefill_len: torch.Tensor,
++    dead_row_cut: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
++    one = num_sampled is None
++    if one:
++        num_sampled = torch.empty_like(seq_lens)
++    if seq_lens.is_cuda:
++        from spark_ds41.sampling.tilelang_token_counts import count_tokens
++        num_rejected = torch.empty_like(num_sampled)
++        count_tokens(
++            num_sampled,
++            num_rejected,
++            seq_lens,
++            cu_num_logits,
++            idx_mapping,
++            prefill_len,
++            dead_row_cut,
++            one=one,
++        )
++        return num_sampled, num_rejected
+     num_reqs = idx_mapping.shape[0]
+     num_rejected = torch.empty_like(num_sampled)
+     _get_num_sampled_and_rejected_kernel[(num_reqs,)](
+@@ -665,6 +723,21 @@ def post_update(
+         assert draft_tokens_out is not None
+         assert draft_tokens.shape[1] == draft_tokens_out.shape[1]
+         assert draft_tokens.is_contiguous() and draft_tokens_out.is_contiguous()
++    elif idx_mapping.is_cuda:
++        from spark_ds41.sampling import tilelang_inputs
++        tilelang_inputs.post_update(
++            idx_mapping,
++            num_computed_tokens,
++            last_sampled_tokens,
++            output_bin_counts,
++            sampled_tokens,
++            num_sampled,
++            num_rejected,
++            query_start_loc,
++            all_token_ids,
++            total_len,
++        )
++        return
+     _post_update_kernel[(num_reqs,)](
+         idx_mapping,
+         num_computed_tokens,
+@@ -710,6 +783,14 @@ def post_update_num_computed_tokens(
+     # [num_reqs + 1]
+     query_start_loc: torch.Tensor,
+ ) -> None:
++    if num_computed_tokens.is_cuda:
++        from spark_ds41.sampling import tilelang_inputs
++        tilelang_inputs.post_update_num_computed_tokens(
++            idx_mapping,
++            num_computed_tokens,
++            query_start_loc,
++        )
++        return
+     num_reqs = idx_mapping.shape[0]
+     _post_update_num_computed_tokens_kernel[(num_reqs,)](
+         idx_mapping,
+@@ -749,6 +830,16 @@ def expand_idx_mapping(
+     expanded_local_pos = torch.empty(
+         total_num_logits, dtype=torch.int32, device=idx_mapping.device
+     )
++    if idx_mapping.is_cuda:
++        from spark_ds41.sampling import tilelang_inputs
++        tilelang_inputs.expand_idx_mapping(
++            idx_mapping,
++            expanded_idx_mapping,
++            expanded_local_pos,
++            cu_num_logits,
++            max_expand_len,
++        )
++        return expanded_idx_mapping, expanded_local_pos
+     _expand_idx_mapping_kernel[(num_reqs,)](
+         idx_mapping,
+         expanded_idx_mapping,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 46c3643..dbf61f7 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -169,11 +169,18 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+ from vllm.v1.worker.gpu.spec_decode import init_speculator
+-from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+-    AdaptiveVerificationManager,
+-    maybe_create_adaptive_verification_manager,
+-    resolve_adaptive_cudagraph_mode,
+-)
++try:
++    from spark_ds41.spec_decode.adaptive_verification import (
++        AdaptiveVerificationManager,
++        maybe_create_adaptive_verification_manager,
++        resolve_adaptive_cudagraph_mode,
++    )
++except ImportError:
++    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++        AdaptiveVerificationManager,
++        maybe_create_adaptive_verification_manager,
++        resolve_adaptive_cudagraph_mode,
++    )
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
+ )
+@@ -206,7 +213,10 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ logger = init_logger(__name__)
+ 
+ 
+-class GPUModelRunner(LoRAModelRunnerMixin):
++from spark_ds41.runner.mixin import SparkModelRunnerMixin
++
++
++class GPUModelRunner(SparkModelRunnerMixin, LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+@@ -295,7 +305,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.encoder_cache = EncoderCache()
+         self.ec_connector = get_ec_connector(vllm_config, self.encoder_cache)
+ 
+-        self.num_speculative_steps = vllm_config.num_speculative_tokens
++        self.num_speculative_steps = getattr(
++            vllm_config, "num_verification_tokens", vllm_config.num_speculative_tokens
++        )
++        self.num_draft_steps = vllm_config.num_speculative_tokens
++        self.copy_drafter: Any = None
+         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
+         use_dense_all_token_ids = (
+             self.speculative_config is not None
+@@ -327,6 +341,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.speculative_config.uses_aux_hidden_states
+             )
+ 
++        copy_drafts_cfg = (
++            getattr(self.speculative_config, "copy_drafts", None)
++            if self.speculative_config is not None
++            else None
++        )
++        if copy_drafts_cfg is not None and self.speculator is not None:
++            from spark_ds41.sampling.copy_drafts import CopyDrafter
++            self.copy_drafter = CopyDrafter(
++                copy_drafts_cfg,
++                self.req_states,
++                num_draft_steps=self.num_draft_steps,
++                device=self.device,
++            )
++
+         # Draft tokens propagation - for spec-dec + struct outputs.
+         self.draft_tokens_handler = DraftTokensHandler(self.device)
+ 
+@@ -379,6 +407,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # For transferring state from execute_model to subsequent sample_tokens call.
+         self.execute_model_state: ExecuteModelState | None = None
++        self._pending_post_prefill_cache_flush: bool = False
++        self.layer_progress = None
+ 
+         # Expert parallelism load balancer.
+         self.eplb = EPLBController(self.parallel_config, self.device)
+@@ -455,9 +485,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                             load_dummy_weights,
+                         )
+                     self.speculator.free_unused_weights(self.model)
++        from spark_ds41.worker import display_carveout
++        if display_carveout.required():
++            display_carveout.confirm_streamed_weights(
++                self.model,
++                self.device,
++                getattr(self.speculator, "model", None),
++            )
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory
++        if envs.VLLM_LATE_ADMISSION_LAYER >= 0 and not self.use_pp:
++            from spark_ds41.worker.late_admission import LayerProgress
++            self.layer_progress = LayerProgress(
++                self.model, envs.VLLM_LATE_ADMISSION_LAYER
++            )
+         logger.info(
+             "Model loading took %s GiB memory and %.6f seconds",
+             format_gib(m.consumed_memory),
+@@ -520,8 +562,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     register_top_k_top_p_warmups,
+                 )
+ 
+-                with self.jit_warmup_registry.activate():
+-                    register_top_k_top_p_warmups()
++                if not self._use_spark_tilelang:
++                    with self.jit_warmup_registry.activate():
++                        register_top_k_top_p_warmups()
+ 
+             sampler_kwargs: dict[str, Any] = {
+                 "vllm_config": self.vllm_config,
+@@ -537,7 +580,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 "custom_logits_processors": custom_logits_processors,
+             }
+             if self.vllm_config.watermark_config is None:
+-                self.sampler = Sampler(**sampler_kwargs)
++                if self._use_spark_tilelang:
++                    from spark_ds41.sampling.sampler import Sampler as SparkSampler
++                    self.sampler = SparkSampler(**sampler_kwargs)
++                else:
++                    self.sampler = Sampler(**sampler_kwargs)
+             else:
+                 wm_config = self.vllm_config.watermark_config
+                 watermarker = create_watermarker(wm_config)
+@@ -568,7 +615,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         self.vllm_config.watermark_config
+                     ),
+                 )
+-            self.prompt_logprobs_worker = PromptLogprobsWorker(
++            _PromptLogprobsCls = PromptLogprobsWorker
++            if self._use_spark_tilelang:
++                from spark_ds41.sampling.prompt_logprob import (
++                    PromptLogprobsWorker as _PromptLogprobsCls,
++                )
++            self.prompt_logprobs_worker = _PromptLogprobsCls(
+                 self.max_num_reqs,
+                 self.device,
+                 logprobs_mode=self.model_config.logprobs_mode,
+@@ -760,21 +812,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
+         # The speculator clears the flag at load time when the checkpoint has
+         # no confidence head, so it holds the effective value.
+-        self.adaptive_verification = maybe_create_adaptive_verification_manager(
+-            enable_adaptive_verification=getattr(
++        if self._use_spark_tilelang and getattr(
++            self.speculator, "enable_adaptive_verification", False
++        ):
++            from spark_ds41.spec_decode.adaptive_verification import (
++                maybe_create_adaptive_verification_manager as _spark_av_factory,
++            )
++            sc = self.speculative_config
++            _av_kw: dict[str, Any] = {
++                "enable_adaptive_verification": True,
++                "attn_groups": self.attn_groups,
++                "attn_cg_support": attn_cg_support,
++                "req_states": self.req_states,
++                "query_start_loc": self.input_buffers.query_start_loc,
++                "num_bonus_tokens": self.model_state.num_new_sampled_tokens_per_step,
++                "max_total_logits": get_max_chunk_logits(self.vocab_size),
++                "vllm_config": self.vllm_config,
++                "target_layer_names": target_attn_layer_names,
++                "additional_attn_cg_support": additional_attn_cg_support,
++                "planned_confidences": self.copy_drafter is not None,
++                "tp_invariant_confidence": True,
++                "calibrated_confidence": lambda: bool(
++                    self.speculator is not None
++                    and getattr(self.speculator, "acceptance_estimator", None) is not None
++                    and getattr(self.speculator.acceptance_estimator, "is_calibrated", False)
++                ),
++            }
++            if sc is not None:
++                for _k in (
++                    "adaptive_verification_row_cost",
++                    "adaptive_verification_single_req_row_cost_scale",
++                    "adaptive_verification_high_row_cost_scale",
++                    "adaptive_verification_wide_row_cost_knee",
++                    "adaptive_verification_wide_row_cost_scale",
++                ):
++                    _v = getattr(sc, _k, None)
++                    if _v is not None:
++                        _av_kw[_k] = _v
++            self.adaptive_verification = _spark_av_factory(**_av_kw)
++        else:
++                self.adaptive_verification = maybe_create_adaptive_verification_manager(
++                enable_adaptive_verification=getattr(
+                 self.speculator, "enable_adaptive_verification", False
+-            ),
+-            attn_groups=self.attn_groups,
+-            req_states=self.req_states,
+-            query_start_loc=self.input_buffers.query_start_loc,
+-            num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
+-            max_total_logits=get_max_chunk_logits(self.vocab_size),
+-            vllm_config=self.vllm_config,
+-            target_layer_names=target_attn_layer_names,
+-            additional_attn_cg_support=additional_attn_cg_support,
+-            copy_admitted_drafts_to_host=self.batch_sharder is not None,
+-        )
++                ),
++                attn_groups=self.attn_groups,
++                req_states=self.req_states,
++                query_start_loc=self.input_buffers.query_start_loc,
++                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
++                max_total_logits=get_max_chunk_logits(self.vocab_size),
++                vllm_config=self.vllm_config,
++                target_layer_names=target_attn_layer_names,
++                additional_attn_cg_support=additional_attn_cg_support,
++                copy_admitted_drafts_to_host=self.batch_sharder is not None,
++            )
+ 
++        from vllm.v1.kv_cache_interface import CircularBufferSpec
+         self.block_tables = BlockTables(
+             block_sizes=[g.block_size for g in kv_cache_groups],
+             max_num_reqs=self.max_num_reqs,
+@@ -782,6 +874,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             max_num_blocks_per_group=max_num_blocks_per_group,
+             device=self.device,
+             slot_mapping_enabled=[g.uses_slot_mapping for g in kv_cache_groups],
++            slot_mapping_circular=[any(isinstance(sp, CircularBufferSpec) for sp in g.kv_cache_specs.values()) for g in kv_cache_groups],
+             dcp_sharded=[g.dcp_sharded for g in kv_cache_groups],
+             sliding_window_reach=[g.sliding_window_reach for g in kv_cache_groups],
+             cp_size=self.dcp_size,
+@@ -1253,6 +1346,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+     @torch.inference_mode()
+     def profile_adaptive_verification(self) -> None:
++        if self.adaptive_verification is None or not hasattr(
++            self.adaptive_verification, "batches_to_profile"
++        ):
++            return
+         """Seed adaptive verification's cost curves from timed dummy runs, which
+         read KV context from the committed blocks."""
+         assert self.adaptive_verification is not None
+@@ -1333,6 +1430,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             req_index = self.req_states.req_id_to_index[req_id]
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.add_request(req_index)
++            if self.copy_drafter is not None:
++                self.copy_drafter.add_request(req_index)
+             if self.speculator is not None:
+                 self.speculator.add_request(req_index, new_req_data)
+ 
+@@ -1370,6 +1469,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if scheduler_output.scheduled_new_reqs:
+             self.req_states.apply_staged_writes()
+             self.model_state.apply_staged_writes()
++            if self.adaptive_verification is not None and hasattr(
++                self.adaptive_verification, "apply_staged_writes"
++            ):
++                self.adaptive_verification.apply_staged_writes()
++            if self.copy_drafter is not None:
++                self.copy_drafter.apply_staged_writes()
+             if self.sampler is not None:
+                 self.sampler.apply_staged_writes()
+ 
+@@ -1574,15 +1679,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         query_start_loc_np[num_reqs + 1 :] = num_tokens
+         query_start_loc = self.input_buffers.query_start_loc
+         async_tensor_h2d(query_start_loc_np, out=query_start_loc)
++        _fused_expand = False
+         if adaptive_verification is not None:
+-            (
+-                cu_num_logits,
+-                query_start_loc,
+-                total_num_draft_tokens,
+-                num_admitted_draft_tokens,
+-            ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
++            _realloc = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
++            if len(_realloc) == 5:
++                (
++                    cu_num_logits,
++                    query_start_loc,
++                    total_num_draft_tokens,
++                    expanded_idx_mapping,
++                    expanded_local_pos,
++                ) = _realloc
++                num_admitted_draft_tokens = (
++                    adaptive_verification._batch_draft_capacity[:num_reqs]
++                )
++                _fused_expand = True
++            else:
++                (
++                    cu_num_logits,
++                    query_start_loc,
++                    total_num_draft_tokens,
++                    num_admitted_draft_tokens,
++                ) = _realloc
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+-        if num_draft_tokens_per_req is not None:
++        if num_draft_tokens_per_req is not None and not _fused_expand:
+             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
+             )
+@@ -1742,6 +1862,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         input_batch: InputBatch,
+         grammar_output: GrammarOutput | None,
+     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
++        spark_result = self._spark_try_sample(hidden_states, input_batch, grammar_output)
++        if spark_result is not None:
++            return spark_result
+         shard_metadata = None
+         global_input_batch = input_batch
+         if self.batch_sharder is not None:
+@@ -2194,6 +2317,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 and dp_sync_state.num_tokens_across_dp,
+                 batch_descriptor=batch_descriptor,
+                 ubatch_slices=ubatch_slices,
++                moe_prefill_metadata=self._build_moe_prefill_metadata(input_batch),
+                 slot_mapping=slot_mappings_by_layer,
+                 skip_compiled=skip_compiled,
+                 is_padding=input_batch.is_padding,
+@@ -2272,6 +2396,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             return self.pp_handler.send_positions(
+                 output_intermediate_tensors, model_inputs["positions"]
+             )[: input_batch.num_tokens]
++        if (
++            not dummy_run
++            and batch_desc.cg_mode == CUDAGraphMode.FULL
++            and getattr(self, "_pending_post_prefill_cache_flush", False)
++        ):
++            self._pending_post_prefill_cache_flush = False
++            from spark_ds41.worker.mem_utils import reclaim_uma_memory
++            reclaim_uma_memory(getattr(self, "device", None), synchronize=False)
++        elif not dummy_run and batch_desc.cg_mode != CUDAGraphMode.FULL:
++            self._pending_post_prefill_cache_flush = True
++        if self.layer_progress is not None and not dummy_run:
++            return self.layer_progress.reply()
+         return None
+ 
+     @torch.inference_mode()
+@@ -2427,7 +2563,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             assert self.sampler is not None
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 self.speculator.prepare_propose(
+-                    input_batch, num_sampled, num_rejected, self.sampler
++                    input_batch,
++                    num_sampled,
++                    num_rejected,
++                    self.sampler,
++                    dead_row_cut=getattr(self, "_dead_row_cut", None),
++                    copy_int_state=(
++                        self.copy_drafter.int_state
++                        if self.copy_drafter is not None
++                        else None
++                    ),
++                )
++            if self.copy_drafter is not None and num_spec_tokens > 0:
++                _, verified = self._get_num_drafted_and_verified(input_batch)
++                self.copy_drafter.prepare_alloc(
++                    input_batch.idx_mapping,
++                    num_sampled,
++                    verified,
++                    getattr(self, "_dead_row_cut", None) if verified is not None else None,
++                )
++                self.copy_drafter.attach_async_output(
++                    async_output,
++                    input_batch.num_reqs,
++                    self.output_copy_stream,
++                    self.main_stream,
+                 )
+             spec_hidden_states = get_drafter_hidden_states(
+                 self.model, draft_hidden_states
+@@ -2445,7 +2604,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.req_states.next_prefill_tokens,
+                     self.sampler.sampling_states.temperature.gpu,
+                     self.sampler.sampling_states.seeds.gpu,
+-                    num_speculative_tokens=num_spec_tokens,
++                    num_speculative_tokens=min(num_spec_tokens, self.num_draft_steps),
+                     dp_sync_state=dp_sync_state,
+                     mm_inputs=mm_inputs,
+                 )
+@@ -2453,13 +2612,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.pcp_manager.sync_drafts(
+                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
+                 )
+-            if num_spec_tokens < self.num_speculative_steps:
++            confidences = self.speculator.draft_token_confidence_probs
++            planned_confidences = None
++            if self.copy_drafter is not None and num_spec_tokens > 0:
++                draft_tokens, confidences, planned_confidences = (
++                    self.copy_drafter.propose(
++                        input_batch.idx_mapping, draft_tokens, confidences
++                    )
++                )
++            num_draft_cols = draft_tokens.shape[1]
++            if num_spec_tokens < num_draft_cols:
+                 draft_tokens[:, num_spec_tokens:] = -1
+-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if num_draft_cols > 0:
++                self.req_states.draft_tokens[
++                    input_batch.idx_mapping, :num_draft_cols
++                ] = draft_tokens
+             if self.adaptive_verification is not None:
+-                self.adaptive_verification.record_confidences(
+-                    self.speculator.draft_token_confidence_probs, input_batch
+-                )
++                if planned_confidences is not None:
++                    self.adaptive_verification.record_confidences(
++                        confidences, input_batch, planned=planned_confidences
++                    )
++                else:
++                    self.adaptive_verification.record_confidences(
++                        confidences, input_batch
++                    )
+ 
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+diff --git a/vllm/v1/worker/gpu/states.py b/vllm/v1/worker/gpu/states.py
+index c29c26a..7674a07 100644
+--- a/vllm/v1/worker/gpu/states.py
++++ b/vllm/v1/worker/gpu/states.py
+@@ -3,6 +3,7 @@
+ import numpy as np
+ import torch
+ 
++from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+ 
+ 
+@@ -80,10 +81,26 @@ class RequestState:
+             device=device,
+         )
+ 
++        self._new_draft_rows: list[int] = []
++
+         self.next_prefill_tokens = torch.zeros(
+             num_prefill_lookahead, self.max_num_reqs, dtype=torch.int32, device=device
+         )
+ 
++    def register_warmups(self) -> None:
++        """Register staged writes and new-request draft row resets."""
++        for tensor in (self.all_token_ids, self.total_len, self.num_computed_tokens):
++            if hasattr(tensor, "register_warmup"):
++                tensor.register_warmup()
++        if self.num_speculative_steps:
++            from spark_ds41.sampling import tilelang_inputs
++
++            tilelang_inputs.declare(
++                lambda: tilelang_inputs.fill_rows_calls(
++                    torch.int64, self.draft_tokens.dtype
++                )
++            )
++
+     @property
+     def num_reqs(self) -> int:
+         return len(self.req_id_to_index)
+@@ -115,9 +132,17 @@ class RequestState:
+         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
+ 
+         if self.num_speculative_steps > 0:
+-            self.draft_tokens[req_idx].zero_()
++            self._new_draft_rows.append(req_idx)
+ 
+     def apply_staged_writes(self) -> None:
++        if self._new_draft_rows:
++            from spark_ds41.sampling import tilelang_inputs
++
++            rows = async_tensor_h2d(
++                self._new_draft_rows, dtype=torch.int64, device=self.device
++            )
++            tilelang_inputs.fill_rows(rows, self.draft_tokens, 0)
++            self._new_draft_rows.clear()
+         self.prompt_len.copy_to_uva()
+         self.prefill_len.copy_to_uva()
+         self.total_len.apply_write()
+diff --git a/vllm/v1/worker/gpu/structured_outputs.py b/vllm/v1/worker/gpu/structured_outputs.py
+index dc5d23d..1d3d39f 100644
+--- a/vllm/v1/worker/gpu/structured_outputs.py
++++ b/vllm/v1/worker/gpu/structured_outputs.py
+@@ -30,6 +30,29 @@ class StructuredOutputsWorker:
+         self.copy_stream = torch.cuda.Stream()
+         self.mask_stride = mask_stride
+ 
++    def register_warmups(
++        self,
++        *,
++        logits,
++        vocab_size: int,
++        invalid_spec_tokens: bool,
++    ) -> None:
++        from spark_ds41.sampling import tilelang_structured
++        from spark_ds41.sampling.tilelang_sampling import _call, declare
++
++        declare(
++            lambda: [
++                _call(
++                    tilelang_structured.grammar_bitmask_kernel,
++                    *tilelang_structured.grammar_bitmask_key(
++                        dtype, self.mask_stride, has_invalid
++                    ),
++                )
++                for dtype in dict.fromkeys(dt for dt, _ in logits)
++                for has_invalid in ((False, True) if invalid_spec_tokens else (False,))
++            ]
++        )
++
+     def apply_grammar_bitmask(
+         self,
+         logits: torch.Tensor,
+@@ -69,22 +92,34 @@ class StructuredOutputsWorker:
+         current_stream = torch.cuda.current_stream()
+         current_stream.wait_stream(self.copy_stream)
+ 
+-        num_masks = bitmask.shape[0]
+-        assert num_masks == len(mapping)
+-        vocab_size = logits.shape[-1]
+-        BLOCK_SIZE = GRAMMAR_BITMASK_BLOCK_SIZE
+-        grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
+-        _apply_grammar_bitmask_kernel[grid](
+-            logits,
+-            logits.stride(0),
+-            logits_indices,
+-            input_batch.cu_num_logits,
+-            bitmask,
+-            bitmask.stride(0),
+-            vocab_size,
+-            MASK_STRIDE=self.mask_stride,
+-            BLOCK_SIZE=BLOCK_SIZE,
+-        )
++        assert bitmask.shape[0] == len(mapping)
++        if logits.is_cuda:
++            from spark_ds41.sampling import tilelang_structured
++            tilelang_structured.apply_grammar_bitmask(
++                logits,
++                logits_indices,
++                input_batch.cu_num_logits,
++                None,
++                None,
++                bitmask,
++                self.mask_stride,
++            )
++        else:
++            num_masks = bitmask.shape[0]
++            vocab_size = logits.shape[-1]
++            BLOCK_SIZE = GRAMMAR_BITMASK_BLOCK_SIZE
++            grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
++            _apply_grammar_bitmask_kernel[grid](
++                logits,
++                logits.stride(0),
++                logits_indices,
++                input_batch.cu_num_logits,
++                bitmask,
++                bitmask.stride(0),
++                vocab_size,
++                MASK_STRIDE=self.mask_stride,
++                BLOCK_SIZE=BLOCK_SIZE,
++            )
+ 
+         # Ensure the copy stream waits for the device tensors to finish being used
+         # before it re-uses or deallocates them

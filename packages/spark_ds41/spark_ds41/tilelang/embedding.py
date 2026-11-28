@@ -551,7 +551,7 @@ class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
 
         data = weight.data
         in_features = int(data.shape[1])
-        from vllm.v1.worker import display_carveout
+        from spark_ds41.worker import display_carveout
 
         packed = pack_bf16_weight(data, in_place=True)
         del data

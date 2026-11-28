@@ -67,7 +67,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from vllm.v1.worker import display_carveout
+        from spark_ds41.worker import display_carveout
 
         n = sum(output_partition_sizes)
         k = input_size_per_partition
@@ -112,7 +112,7 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
                 from spark_ds41.tilelang.vocab import pack_bf16_weight
 
                 packed = pack_bf16_weight(weight, in_place=True)
-        from vllm.v1.worker import display_carveout
+        from spark_ds41.worker import display_carveout
 
         del weight
         values = packed.values

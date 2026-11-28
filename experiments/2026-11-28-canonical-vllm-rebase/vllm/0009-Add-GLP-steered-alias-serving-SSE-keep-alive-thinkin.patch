@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 9/9] Add GLP steered alias serving, SSE keep-alive, thinking
+ switch, and tokenizer config reuse
+
+---
+ vllm/entrypoints/anthropic/api_router.py      | 10 ++++-
+ .../entrypoints/launchers/api_server/entry.py |  6 +++
+ .../openai/chat_completion/api_router.py      | 10 +++--
+ .../openai/chat_completion/protocol.py        | 11 +++++-
+ .../openai/chat_completion/serving.py         |  1 +
+ .../openai/completion/api_router.py           | 10 +++--
+ vllm/entrypoints/openai/completion/serving.py |  1 +
+ .../openai/responses/api_router.py            | 16 +++++++-
+ vllm/entrypoints/openai/responses/serving.py  |  1 +
+ vllm/entrypoints/serve/engine/serving.py      | 12 ++++++
+ vllm/entrypoints/serve/tokenize/serving.py    |  1 +
+ .../entrypoints/serve/utils/sse_keep_alive.py | 39 ++++++++++++++++++-
+ vllm/tokenizers/registry.py                   | 10 ++++-
+ 13 files changed, 114 insertions(+), 14 deletions(-)
+
+diff --git a/vllm/entrypoints/anthropic/api_router.py b/vllm/entrypoints/anthropic/api_router.py
+index 5d00ab3..87aa1d8 100644
+--- a/vllm/entrypoints/anthropic/api_router.py
++++ b/vllm/entrypoints/anthropic/api_router.py
+@@ -17,6 +17,10 @@ from vllm.entrypoints.anthropic.protocol import (
+     translate_error_type,
+ )
+ from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
++from vllm.entrypoints.serve.utils.sse_keep_alive import (
++    get_sse_keep_alive_interval,
++    with_sse_keep_alive,
++)
+ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+ from vllm.entrypoints.serve.exception_handling.error_response import (
+     create_error_response,
+@@ -84,7 +88,11 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques
+         logger.debug("Anthropic Messages Response: %s", resp)
+         return JSONResponse(content=resp)
+ 
+-    return StreamingResponse(content=generator, media_type="text/event-stream")
++    keep_alive_interval = get_sse_keep_alive_interval(raw_request)
++    return StreamingResponse(
++        content=with_sse_keep_alive(generator, keep_alive_interval),
++        media_type="text/event-stream",
++    )
+ 
+ 
+ @router.post(
+diff --git a/vllm/entrypoints/launchers/api_server/entry.py b/vllm/entrypoints/launchers/api_server/entry.py
+index d84937f..522758c 100644
+--- a/vllm/entrypoints/launchers/api_server/entry.py
++++ b/vllm/entrypoints/launchers/api_server/entry.py
+@@ -179,6 +179,12 @@ async def run_server(args, **uvicorn_kwargs) -> None:
+ async def run_server_worker(
+     listen_address, sock, args, client_config=None, **uvicorn_kwargs
+ ) -> None:
++    try:
++        from spark_ds41.worker.cpu_affinity import apply_role_cpu_affinity
++
++        apply_role_cpu_affinity("api_server")
++    except Exception:
++        pass
+     """Run a single API server worker."""
+     init_parser_plugin(args)
+ 
+diff --git a/vllm/entrypoints/openai/chat_completion/api_router.py b/vllm/entrypoints/openai/chat_completion/api_router.py
+index 0997e8d..3037c91 100644
+--- a/vllm/entrypoints/openai/chat_completion/api_router.py
++++ b/vllm/entrypoints/openai/chat_completion/api_router.py
+@@ -23,7 +23,10 @@ from vllm.entrypoints.serve.utils.api_utils import (
+     with_cancellation,
+ )
+ from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
+-from vllm.entrypoints.serve.utils.sse_keep_alive import with_sse_keep_alive
++from vllm.entrypoints.serve.utils.sse_keep_alive import (
++    get_sse_keep_alive_interval,
++    with_sse_keep_alive,
++)
+ from vllm.logger import init_logger
+ 
+ logger = init_logger(__name__)
+@@ -77,10 +80,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
+             headers=metrics_header(metrics_header_format),
+         )
+ 
+-    args = getattr(raw_request.app.state, "args", None)
+-    keep_alive_interval = getattr(args, "sse_keep_alive_interval", 0)
++    keep_alive_interval = get_sse_keep_alive_interval(raw_request)
+     return StreamingResponse(
+-        content=with_sse_keep_alive(generator, float(keep_alive_interval)),
++        content=with_sse_keep_alive(generator, keep_alive_interval),
+         media_type="text/event-stream",
+     )
+ 
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 3c48595..78eed0e 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -239,6 +239,12 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
+     type: Literal["function"] = "function"
+ 
+ 
++class ChatCompletionThinkingParam(OpenAIBaseModel):
++    """DeepSeek API top-level thinking switch."""
++
++    type: Literal["enabled", "disabled"]
++
++
+ class ChatCompletionRequest(OpenAIBaseModel):
+     # Ordered by official OpenAI API documentation
+     # https://platform.openai.com/docs/api-reference/chat/create
+@@ -283,6 +289,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         ),
+     )
+     thinking_token_budget: ThinkingTokenBudget = None
++    thinking: ChatCompletionThinkingParam | None = None
+     include_reasoning: bool = True
+     parallel_tool_calls: bool | None = True
+ 
+@@ -672,7 +679,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         # enable_thinking to false). For templates that don't declare the
+         # variable, resolve_chat_template_kwargs filters it out harmlessly.
+         user_kwargs = self.chat_template_kwargs or {}
+-        if reasoning_effort is not None and "enable_thinking" not in user_kwargs:
++        if self.thinking is not None and "enable_thinking" not in user_kwargs:
++            extra_kwargs["enable_thinking"] = self.thinking.type == "enabled"
++        elif reasoning_effort is not None and "enable_thinking" not in user_kwargs:
+             extra_kwargs["enable_thinking"] = reasoning_effort != "none"
+ 
+         return ChatParams(
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index ddf60d4..521f784 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -125,6 +125,7 @@ def _make_completion_tokens_details(
+ 
+ 
+ class OpenAIServingChat(GenerateBaseServing):
++    serves_steered_model = True
+     def __init__(
+         self,
+         engine_client: EngineClient,
+diff --git a/vllm/entrypoints/openai/completion/api_router.py b/vllm/entrypoints/openai/completion/api_router.py
+index 6b100f1..6ad674e 100644
+--- a/vllm/entrypoints/openai/completion/api_router.py
++++ b/vllm/entrypoints/openai/completion/api_router.py
+@@ -21,7 +21,10 @@ from vllm.entrypoints.serve.utils.api_utils import (
+     with_cancellation,
+ )
+ from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
+-from vllm.entrypoints.serve.utils.sse_keep_alive import with_sse_keep_alive
++from vllm.entrypoints.serve.utils.sse_keep_alive import (
++    get_sse_keep_alive_interval,
++    with_sse_keep_alive,
++)
+ from vllm.logger import init_logger
+ 
+ logger = init_logger(__name__)
+@@ -69,10 +72,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
+             headers=metrics_header(metrics_header_format),
+         )
+ 
+-    args = getattr(raw_request.app.state, "args", None)
+-    keep_alive_interval = getattr(args, "sse_keep_alive_interval", 0)
++    keep_alive_interval = get_sse_keep_alive_interval(raw_request)
+     return StreamingResponse(
+-        content=with_sse_keep_alive(generator, float(keep_alive_interval)),
++        content=with_sse_keep_alive(generator, keep_alive_interval),
+         media_type="text/event-stream",
+     )
+ 
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index cd17756..b1d25ea 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -133,6 +133,7 @@ def _delta_frame_template(
+ 
+ 
+ class OpenAIServingCompletion(GenerateBaseServing):
++    serves_steered_model = True
+     def __init__(
+         self,
+         engine_client: EngineClient,
+diff --git a/vllm/entrypoints/openai/responses/api_router.py b/vllm/entrypoints/openai/responses/api_router.py
+index ee352dd..0a389e3 100644
+--- a/vllm/entrypoints/openai/responses/api_router.py
++++ b/vllm/entrypoints/openai/responses/api_router.py
+@@ -15,6 +15,10 @@ from vllm.entrypoints.openai.responses.protocol import (
+ )
+ from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
+ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
++from vllm.entrypoints.serve.utils.sse_keep_alive import (
++    get_sse_keep_alive_interval,
++    with_sse_keep_alive,
++)
+ from vllm.entrypoints.serve.utils.api_utils import (
+     load_aware_call,
+     validate_json_request,
+@@ -72,8 +76,12 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
+     elif isinstance(generator, ResponsesResponse):
+         return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
+ 
++    keep_alive_interval = get_sse_keep_alive_interval(raw_request)
+     return StreamingResponse(
+-        content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"
++        content=with_sse_keep_alive(
++            _convert_stream_to_sse_events(generator), keep_alive_interval
++        ),
++        media_type="text/event-stream",
+     )
+ 
+ 
+@@ -102,8 +110,12 @@ async def retrieve_responses(
+         )
+     elif isinstance(response, ResponsesResponse):
+         return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
++    keep_alive_interval = get_sse_keep_alive_interval(raw_request)
+     return StreamingResponse(
+-        content=_convert_stream_to_sse_events(response), media_type="text/event-stream"
++        content=with_sse_keep_alive(
++            _convert_stream_to_sse_events(response), keep_alive_interval
++        ),
++        media_type="text/event-stream",
+     )
+ 
+ 
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index 678498c..6a16dfe 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -103,6 +103,7 @@ logger = init_logger(__name__)
+ 
+ 
+ class OpenAIServingResponses(GenerateBaseServing):
++    serves_steered_model = True
+     def __init__(
+         self,
+         engine_client: EngineClient,
+diff --git a/vllm/entrypoints/serve/engine/serving.py b/vllm/entrypoints/serve/engine/serving.py
+index a74bf67..dc1fcaf 100644
+--- a/vllm/entrypoints/serve/engine/serving.py
++++ b/vllm/entrypoints/serve/engine/serving.py
+@@ -2,6 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Mapping
+ from http import HTTPStatus
++from typing import ClassVar
++
++from spark_ds41.direct_io import weightless
+ 
+ from fastapi import Request
+ 
+@@ -29,6 +32,7 @@ from vllm.utils import random_uuid
+ 
+ 
+ class BaseServing:
++    serves_steered_model: ClassVar[bool] = False
+     def __init__(
+         self,
+         models: OpenAIServingModels | OpenAIModelRegistry,
+@@ -54,6 +58,14 @@ class BaseServing:
+             self.request_logger.log_request_body(request)
+ 
+         error_response = None
++        if weightless.is_steered_model(request.model) and (
++            not self.serves_steered_model or getattr(request, "use_beam_search", False)
++        ):
++            return self.create_error_response(
++                message=f"The model `{request.model}` is served by chat completions, "
++                "completions, responses and messages, without beam search.",
++                param="model",
++            )
+ 
+         if self._is_model_supported(request.model):
+             return None
+diff --git a/vllm/entrypoints/serve/tokenize/serving.py b/vllm/entrypoints/serve/tokenize/serving.py
+index 7eb9d07..3e6dd79 100644
+--- a/vllm/entrypoints/serve/tokenize/serving.py
++++ b/vllm/entrypoints/serve/tokenize/serving.py
+@@ -32,6 +32,7 @@ logger = init_logger(__name__)
+ 
+ 
+ class ServingTokenization(BaseServing):
++    serves_steered_model = True
+     def __init__(
+         self,
+         models: OpenAIServingModels | OpenAIModelRegistry,
+diff --git a/vllm/entrypoints/serve/utils/sse_keep_alive.py b/vllm/entrypoints/serve/utils/sse_keep_alive.py
+index 9904b76..85e6297 100644
+--- a/vllm/entrypoints/serve/utils/sse_keep_alive.py
++++ b/vllm/entrypoints/serve/utils/sse_keep_alive.py
+@@ -13,14 +13,51 @@ count as bytes for proxy read-timeout logic.
+ 
+ import asyncio
+ import contextlib
++import math
++import os
+ from collections.abc import AsyncGenerator
++from typing import Any
+ 
+ SSE_KEEP_ALIVE_COMMENT = ": keep-alive\n\n"
++DEFAULT_SSE_KEEP_ALIVE_INTERVAL_S = 15.0
++
++
++def get_sse_keep_alive_interval(
++    raw_request: Any = None,
++    default: float = DEFAULT_SSE_KEEP_ALIVE_INTERVAL_S,
++) -> float:
++    for env_name in ("VLLM_SSE_KEEPALIVE_INTERVAL_S", "VLLM_SSE_KEEPALIVE_INTERVAL"):
++        env_val = os.environ.get(env_name)
++        if env_val is not None and env_val.strip() != "":
++            try:
++                val = float(env_val)
++            except ValueError:
++                return 0.0
++            return val if 0.0 < val < float("inf") else 0.0
++
++    app = getattr(raw_request, "app", None)
++    state = getattr(app, "state", None)
++    args = getattr(state, "args", None)
++    if args is not None:
++        if getattr(args, "sse_keep_alive_disabled", False):
++            return 0.0
++        arg_val = getattr(args, "sse_keep_alive_interval", None)
++        if arg_val is not None:
++            try:
++                val = float(arg_val)
++            except (TypeError, ValueError):
++                val = 0.0
++            if 0.0 < val < float("inf"):
++                return val
++            if val < 0.0:
++                return 0.0
++
++    return default if 0.0 < default < float("inf") and math.isfinite(default) else 0.0
+ 
+ 
+ def with_sse_keep_alive(
+     generator: AsyncGenerator[str, None],
+-    interval: float,
++    interval: float = DEFAULT_SSE_KEEP_ALIVE_INTERVAL_S,
+ ) -> AsyncGenerator[str, None]:
+     """Emit an SSE keep-alive comment when `generator` is idle.
+ 
+diff --git a/vllm/tokenizers/registry.py b/vllm/tokenizers/registry.py
+index 84a922b..d85ef4d 100644
+--- a/vllm/tokenizers/registry.py
++++ b/vllm/tokenizers/registry.py
+@@ -272,7 +272,15 @@ def get_tokenizer(
+         )
+         tokenizer_cls_ = TokenizersBackend
+ 
+-    if config is not None and tokenizer_cls_ is CachedHfTokenizer:
++    from transformers.tokenization_utils_tokenizers import TokenizersBackend
++
++    if config is not None and (
++        tokenizer_cls_ is CachedHfTokenizer
++        or (
++            isinstance(tokenizer_cls_, type)
++            and issubclass(tokenizer_cls_, TokenizersBackend)
++        )
++    ):
+         if not envs.VLLM_USE_MODELSCOPE and str(tokenizer_name) != requested_name:
+             # AutoTokenizer selects some tokenizer classes by Hub ID
+             config = copy(config)

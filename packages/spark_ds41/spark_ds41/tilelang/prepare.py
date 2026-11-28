@@ -167,6 +167,13 @@ def declare_modules(*models: Any) -> None:
             declare_layer = getattr(method, "declare_layer_kernels", None)
             if declare_layer is not None:
                 declare_layer(module)
+            moe_kernel = getattr(method, "moe_kernel", None)
+            if moe_kernel is not None:
+                impl = getattr(moe_kernel, "impl", moe_kernel)
+                fused_experts = getattr(impl, "fused_experts", None)
+                declare_fe = getattr(fused_experts, "declare_kernels", None)
+                if callable(declare_fe):
+                    declare_fe()
     for module in modules:
         declare_own = getattr(module, "declare_kernels", None)
         if declare_own is not None:

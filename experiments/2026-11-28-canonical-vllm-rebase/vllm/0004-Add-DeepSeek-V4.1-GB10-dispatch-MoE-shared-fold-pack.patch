@@ -1,0 +1,696 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 4/9] Add DeepSeek V4.1 GB10 dispatch, MoE shared-fold, packed
+ LM head, and GLP CLI shim
+
+---
+ vllm/forward_context.py                       |  12 ++
+ .../layers/fused_moe/modular_kernel.py        |   6 +-
+ .../layers/fused_moe/oracle/mxfp4.py          |  15 +-
+ .../layers/fused_moe/runner/moe_runner.py     | 196 +++++++++++++++---
+ .../layers/fused_moe/runner/shared_experts.py |  15 ++
+ .../model_executor/layers/logits_processor.py |  60 +++++-
+ .../layers/vocab_parallel_embedding.py        |   8 +
+ vllm/model_executor/models/config.py          |   6 +
+ vllm/models/deepseek_v41/__init__.py          |  16 ++
+ vllm/models/deepseek_v4_1/__init__.py         |   1 +
+ vllm/models/deepseek_v4_1/glp.py              |   5 +
+ vllm/v1/attention/backend.py                  |   6 +-
+ vllm/v1/attention/backends/registry.py        |   1 +
+ 13 files changed, 315 insertions(+), 32 deletions(-)
+ create mode 100644 vllm/models/deepseek_v4_1/__init__.py
+ create mode 100644 vllm/models/deepseek_v4_1/glp.py
+
+diff --git a/vllm/forward_context.py b/vllm/forward_context.py
+index eb25b32..255e41e 100644
+--- a/vllm/forward_context.py
++++ b/vllm/forward_context.py
+@@ -133,6 +133,14 @@ class DPMetadata:
+         return torch.cumsum(num_tokens_across_sp_cpu, dim=0)
+ 
+ 
++@dataclass(frozen=True)
++class MoEPrefillMetadata:
++    """Semantic prefill ranges in a target forward's padded token ordering."""
++
++    num_tokens: int
++    prefill_ranges: tuple[tuple[int, int], ...]
++
++
+ @dataclass
+ class ForwardContext:
+     # copy from vllm_config.compilation_config.static_forward_context
+@@ -148,6 +156,7 @@ class ForwardContext:
+     """
+     # set dynamically for each forward pass
+     dp_metadata: DPMetadata | None = None
++    moe_prefill_metadata: MoEPrefillMetadata | None = None
+     # determine the cudagraph style at runtime to be FULL, PIECEWISE, or NONE.
+     # by default NONE, no cudagraph is used.
+     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
+@@ -234,6 +243,7 @@ def create_forward_context(
+     additional_kwargs: dict[str, Any] | None = None,
+     skip_compiled: bool = False,
+     is_padding: torch.Tensor | None = None,
++    moe_prefill_metadata: MoEPrefillMetadata | None = None,
+ ):
+     if vllm_config.compilation_config.fast_moe_cold_start:
+         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
+@@ -282,6 +292,7 @@ def set_forward_context(
+     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+     skip_compiled: bool = False,
+     is_padding: torch.Tensor | None = None,
++    moe_prefill_metadata: MoEPrefillMetadata | None = None,
+ ):
+     """A context manager that stores the current forward context,
+     can be attention metadata, etc.
+@@ -349,6 +360,7 @@ def set_forward_context(
+         additional_kwargs,
+         skip_compiled,
+         is_padding=is_padding,
++        moe_prefill_metadata=moe_prefill_metadata,
+     )
+ 
+     try:
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 4a29afe..0eb7348 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -1485,9 +1485,10 @@ class FusedMoEKernelModularImpl:
+             out_dim = self.fused_experts.output_hidden_dim(a1q.size(-1))
+             return a1q.new_empty((*a1q.shape[:-1], out_dim), dtype=in_dtype)
+ 
++        out_dtype = getattr(self.fused_experts, "output_dtype", in_dtype)
+         workspace13, workspace2, fused_out, fused_out_is_specialized = (
+             self._allocate_buffers(
+-                in_dtype,
++                out_dtype,
+                 a1q.device,
+                 M_full,
+                 M_full,
+@@ -1674,7 +1675,8 @@ class FusedMoEKernelModularImpl:
+             (
+                 *hidden_states.shape[:-1],
+                 self.fused_experts.output_hidden_dim(hidden_states.size(-1)),
+-            )
++            ),
++            dtype=getattr(self.fused_experts, "output_dtype", hidden_states.dtype),
+         )
+ 
+         local_num_experts = w1.shape[0]
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+index dd369b9..61d77cb 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -154,6 +154,7 @@ class Mxfp4MoeBackend(Enum):
+     # b12x backends
+     B12X_MXFP4_MXFP8 = "B12X_MXFP4_MXFP8"
+     B12X_MXFP4_BF16 = "B12X_MXFP4_BF16"
++    TILELANG_MXFP4_MXFP8 = "TILELANG_MXFP4_MXFP8"
+     # DeepGEMM FP8xFP4 backend (SM100+)
+     DEEPGEMM_MXFP4 = "DEEPGEMM_MXFP4"
+     # FlashInfer TRTLLM backends
+@@ -228,6 +229,11 @@ def backend_to_kernel_cls(
+ 
+         return [B12xExperts]
+ 
++    elif backend == Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8:
++        from spark_ds41.tilelang.moe_experts import TileLangExperts
++
++        return [TileLangExperts]
++
+     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+         from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+             DeepGemmFP4Experts,
+@@ -383,6 +389,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
+     """
+     mapping: dict[str, list[Mxfp4MoeBackend]] = {
+         "b12x": list(B12X_BACKENDS),
++        "tilelang": [Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8],
+         "deep_gemm": [Mxfp4MoeBackend.DEEPGEMM_MXFP4],
+         "flashinfer_trtllm": [
+             Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+@@ -496,7 +503,7 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
+     """Map backend to its activation key (FP8, MXFP8, or None for BF16)."""
+     if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+         return kFp8Dynamic128Sym
+-    if backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
++    if backend in (Mxfp4MoeBackend.B12X_MXFP4_MXFP8, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
+         return kMxfp8Dynamic
+     if backend in (
+         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+@@ -874,7 +881,7 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
+     if backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
+         # The megakernel takes the model's dimensions and validates them itself.
+         return hidden_size, intermediate_size
+-    if backend in B12X_BACKENDS:
++    if backend in (*B12X_BACKENDS, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
+         # b12x plans for the exact model dimensions. B12xExperts validates the
+         # required MXFP4 block alignment before selecting the backend.
+         return hidden_size, intermediate_size
+@@ -1619,7 +1626,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
+ 
+         is_gfx1250 = on_gfx1250()
+ 
+-    if mxfp4_backend in B12X_BACKENDS:
++    if mxfp4_backend in (*B12X_BACKENDS, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
+         return (
+             w13_weight.data,
+             w2_weight.data,
+@@ -2138,7 +2145,7 @@ def make_mxfp4_moe_quant_config(
+     if mxfp4_backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
+         # The megakernel quantizes activations itself and owns its scales.
+         return FusedMoEQuantConfig.make("nvfp4", weight_dtype="mxfp4")
+-    if mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
++    if mxfp4_backend in (Mxfp4MoeBackend.B12X_MXFP4_MXFP8, Mxfp4MoeBackend.TILELANG_MXFP4_MXFP8):
+         return mxfp4_mxfp8_moe_quant_config(
+             w1_bias=w1_bias,
+             w2_bias=w2_bias,
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 24f0e8a..a9774de 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -647,6 +647,31 @@ class MoERunner(MoERunnerInterface):
+         self._maybe_apply_shared_experts(
+             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+         )
++        _fold_experts = self._spark_fused_experts()
++        _launch_shared = None
++        if getattr(_fold_experts, "fold_shared", False):
++            assert self._shared_experts is not None
++            assert shared_experts_input is not None
++            _order = self._shared_experts._determine_shared_experts_order(
++                shared_experts_input
++            )
++            if _order == SharedExpertsOrder.NO_OVERLAP:
++                _fold_experts.combine_addend = self._shared_experts.peek_output()
++            else:
++                if not shared_experts_overlapping:
++                    _se = self._shared_experts
++
++                    def _launch() -> None:
++                        nonlocal _launch_shared, shared_experts_overlapping
++                        if _launch_shared is None:
++                            return
++                        _launch_shared = None
++                        shared_experts_overlapping = _se.maybe_forward_async(
++                            shared_experts_input
++                        )
++
++                    _launch_shared = _launch
++                _fold_experts.combine_addend = self._shared_experts.wait_output
+ 
+         if (
+             self.routed_experts.quant_method.is_monolithic
+@@ -681,20 +706,32 @@ class MoERunner(MoERunnerInterface):
+         else:
+             assert hidden_states_scale is None
+             # Modular kernels: select experts first, then call routed_experts
+-            topk_weights, topk_ids = self.router.select_experts(
+-                hidden_states=hidden_states,
+-                router_logits=router_logits,
+-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
+-                input_ids=input_ids,
+-            )
+-
+-            fused_out = self.routed_experts.forward_modular(
++            if _launch_shared is not None:
++                self.router._post_gate_hook = _launch_shared
++            try:
++                topk_weights, topk_ids = self.router.select_experts(
++                    hidden_states=hidden_states,
++                    router_logits=router_logits,
++                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
++                    input_ids=input_ids,
++                )
++            finally:
++                if hasattr(self.router, "_post_gate_hook"):
++                    self.router._post_gate_hook = None
++            if _launch_shared is not None:
++                _launch_shared()
++
++            try:
++                fused_out = self.routed_experts.forward_modular(
+                 x=hidden_states,
+                 topk_weights=topk_weights,
+                 topk_ids=topk_ids,
+-                shared_experts=self._shared_experts,
+-                shared_experts_input=shared_experts_input,
+-            )
++                    shared_experts=self._shared_experts,
++                    shared_experts_input=shared_experts_input,
++                )
++            finally:
++                if _fold_experts is not None and hasattr(_fold_experts, "combine_addend"):
++                    _fold_experts.combine_addend = None
+ 
+         if shared_experts_overlapping:
+             assert self._shared_experts is not None
+@@ -740,12 +777,89 @@ class MoERunner(MoERunnerInterface):
+             result = result + zero_expert_output
+         return result
+ 
++    def _spark_fused_experts(self):
++        moe_kernel = getattr(self._quant_method, "moe_kernel", None)
++        if moe_kernel is None:
++            return None
++        impl = getattr(moe_kernel, "impl", moe_kernel)
++        return getattr(impl, "fused_experts", None)
++
++    def _shared_output_fold(
++        self, shared_experts_input: torch.Tensor | None
++    ):
++        if (
++            self._shared_experts is None
++            or shared_experts_input is None
++            or self._fused_output_is_reduced
++            or getattr(self.routed_output_transform, "accumulates_residual", False)
++            or self.routed_output_transform is not None
++        ):
++            return None
++        experts = self._spark_fused_experts()
++        if experts is None or not getattr(experts, "folds_shared_output", False):
++            return None
++        order = self._shared_experts._determine_shared_experts_order(
++            shared_experts_input
++        )
++        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
++            supported = getattr(experts, "folds_deferred_shared_output", False)
++        else:
++            supported = order == SharedExpertsOrder.NO_OVERLAP
++        return experts if supported else None
++
++    def _reduce_scatter_final_output(
++        self,
++        shared_output: torch.Tensor | None,
++        fused_output: torch.Tensor,
++        padded_rows: int,
++        trunc_size: int | None,
++        output_is_reduced: bool,
++        combine=None,
++    ) -> torch.Tensor:
++        if (
++            output_is_reduced
++            or self.moe_config.is_sequence_parallel
++            or self.moe_config.skip_final_all_reduce
++            or isinstance(self.router, ZeroExpertRouter)
++        ):
++            raise NotImplementedError("MoE reduce-scatter needs an unreduced output")
++        rows = fused_output.shape[0]
++        if combine is not None and self.moe_config.tp_size > 1:
++            from vllm.distributed.communication_op import tensor_model_parallel_reduce_scatter
++            tp = self.moe_config.tp_size
++            shard = padded_rows // tp
++            states = torch.zeros(
++                (padded_rows, fused_output.shape[-1]),
++                dtype=self.moe_config.in_dtype,
++                device=fused_output.device,
++            )
++            combine(0, rows, states[:rows])
++            if trunc_size is not None:
++                states = states[..., :trunc_size]
++            return tensor_model_parallel_reduce_scatter(states, dim=0)
++        states = torch.zeros(
++            (padded_rows, fused_output.shape[-1]),
++            dtype=self.moe_config.in_dtype,
++            device=fused_output.device,
++        )
++        if shared_output is None:
++            states[:rows].copy_(fused_output)
++        else:
++            torch.add(shared_output, fused_output, out=states[:rows])
++        if trunc_size is not None:
++            states = states[..., :trunc_size]
++        if self.moe_config.tp_size == 1:
++            return states
++        from vllm.distributed.communication_op import tensor_model_parallel_reduce_scatter
++        return tensor_model_parallel_reduce_scatter(states, dim=0)
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+         shared_experts_input: torch.Tensor | None = None,
++        reduce_scatter_rows: int | None = None,
+     ) -> torch.Tensor:
+         """Invoke the fused moe layer.
+ 
+@@ -789,16 +903,35 @@ class MoERunner(MoERunnerInterface):
+             )
+         )
+ 
+-        result = self._forward_entry(
+-            hidden_states,
+-            router_logits,
+-            shared_experts_input,
+-            input_ids,
+-            self._encode_layer_name(),
+-            self.moe_config.hidden_dim_unpadded
+-            if self._quant_method.has_unpadded_output
+-            else 0,
++        fold = self._shared_output_fold(shared_experts_input)
++        defer = (
++            fold is not None
++            and reduce_scatter_rows is not None
++            and getattr(fold, "defers_folded_combine", False)
+         )
++        deferred_combine = None
++        if fold is not None:
++            fold.fold_shared = True
++            fold.defer_combine = defer
++            fold.deferred_combine = None
++        try:
++            result = self._forward_entry(
++                hidden_states,
++                router_logits,
++                shared_experts_input,
++                input_ids,
++                self._encode_layer_name(),
++                self.moe_config.hidden_dim_unpadded
++                if self._quant_method.has_unpadded_output
++                else 0,
++            )
++            if defer and fold is not None:
++                deferred_combine = fold.deferred_combine
++        finally:
++            if fold is not None:
++                fold.fold_shared = False
++                fold.defer_combine = False
++                fold.deferred_combine = None
+ 
+         #
+         # Note: there are two all-reduce points below. They are mutually
+@@ -812,6 +945,8 @@ class MoERunner(MoERunnerInterface):
+         # Extract outputs from result
+         shared_output, fused_output = _unpack(result)
+         fused_output = cast(torch.Tensor, fused_output)
++        if fold is not None:
++            shared_output = None
+ 
+         if og_hidden_dim_pre_xform is not None:
+             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+@@ -852,9 +987,19 @@ class MoERunner(MoERunnerInterface):
+                 fused_output if shared_output is None else shared_output + fused_output
+             )
+ 
+-        result = self._maybe_reduce_final_output(
+-            result, og_hidden_dim_post_xform, fused_output_is_reduced
+-        )
++        if reduce_scatter_rows is not None:
++            result = self._reduce_scatter_final_output(
++                None,
++                result,
++                reduce_scatter_rows,
++                og_hidden_dim_post_xform,
++                fused_output_is_reduced,
++                combine=deferred_combine,
++            )
++        else:
++            result = self._maybe_reduce_final_output(
++                result, og_hidden_dim_post_xform, fused_output_is_reduced
++            )
+ 
+         return self._maybe_add_zero_expert_output(result)
+ 
+@@ -990,7 +1135,10 @@ class MoERunner(MoERunnerInterface):
+         # If using multi-stream overlap for shared experts, we must launch it
+         # before routed expert dispatch.
+         shared_experts_overlapping = False
+-        if self._shared_experts is not None:
++        _fold_experts = self._spark_fused_experts()
++        if self._shared_experts is not None and not getattr(
++            _fold_experts, "fold_shared", False
++        ):
+             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                 shared_experts_input
+             )
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index e9d80b7..8c61ac5 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -153,6 +153,7 @@ class SharedExperts(torch.nn.Module):
+         assert self._stream is not None
+         idx = self._output_idx
+         assert self._output[idx] is None
++        shared_experts_input.record_stream(self._stream)
+         self._input_ready_event[idx].record(current_stream())
+         with torch.cuda.stream(self._stream):
+             self._input_ready_event[idx].wait(self._stream)
+@@ -164,6 +165,20 @@ class SharedExperts(torch.nn.Module):
+         """Block the main stream until `maybe_forward_async` output is ready."""
+         assert self._stream is not None
+         self._output_ready_event[self._output_idx].wait(current_stream())
++        output = self._output[self._output_idx]
++        if output is not None:
++            output.record_stream(current_stream())
++
++    def peek_output(self) -> torch.Tensor | None:
++        """The finished output, left in place for `output` to take."""
++        return self._output[self._output_idx]
++
++    def wait_output(self) -> torch.Tensor:
++        """`wait`, then the finished output, left in place for `output`."""
++        self.wait()
++        output = self.peek_output()
++        assert output is not None
++        return output
+ 
+     @property
+     def _output_idx(self) -> int:
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 4be952a..faac926 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -73,6 +73,8 @@ class LogitsProcessor(PluggableLayer):
+         scale: float = 1.0,
+         logits_as_input: bool = False,
+         soft_cap: float | None = None,
++        *,
++        lm_head: torch.nn.Module | None = None,
+     ) -> None:
+         """Args:
+         scale: A scaling factor to apply to the logits.
+@@ -92,8 +94,34 @@ class LogitsProcessor(PluggableLayer):
+         # Dtype of the lm_head projection. Defaults to the model dtype; an
+         # fp32 head (via `--hf-overrides '{"head_dtype": "float32"}'`) is
+         # required for RL training-inference consistency.
+-        model_config = get_current_vllm_config().model_config
++        vllm_config = get_current_vllm_config()
++        model_config = vllm_config.model_config
+         self.head_dtype = model_config.head_dtype if model_config is not None else None
++        kernel_config = getattr(vllm_config, "kernel_config", None)
++        self.use_tilelang_vocab_projection = (
++            getattr(kernel_config, "linear_backend", None) == "tilelang"
++        )
++        self._tilelang_vocab_heads: list[VocabParallelEmbedding] = []
++        if lm_head is not None:
++            self.prepare_vocab_projection(lm_head)
++
++    def prepare_vocab_projection(self, lm_head: torch.nn.Module) -> None:
++        if self.use_tilelang_vocab_projection:
++            if (
++                not _is_packed_head(lm_head)
++                and not hasattr(lm_head, "tilelang_vocab_dtype")
++                and _is_plain_bf16_head(lm_head)
++            ):
++                lm_head.tilelang_vocab_dtype = self.head_dtype or lm_head.weight.dtype
++                self._tilelang_vocab_heads.append(lm_head)
++
++    def declare_kernels(self) -> None:
++        if not self._tilelang_vocab_heads:
++            return
++        from spark_ds41.tilelang.vocab import prepare_bf16_head
++
++        for head in self._tilelang_vocab_heads:
++            prepare_bf16_head(head, head.tilelang_vocab_dtype)
+ 
+     def forward(
+         self,
+@@ -144,6 +172,16 @@ class LogitsProcessor(PluggableLayer):
+         embedding_bias: torch.Tensor | None,
+     ) -> torch.Tensor:
+         """Project hidden states through the lm_head, honoring head_dtype."""
++        if (
++            self.use_tilelang_vocab_projection
++            and embedding_bias is None
++            and hasattr(lm_head, "tilelang_vocab")
++        ):
++            from spark_ds41.tilelang.vocab import project_head
++
++            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
++            logits = project_head(lm_head, flat)
++            return logits.reshape(*hidden_states.shape[:-1], -1)
+         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+             return lm_head.quant_method.apply(
+                 lm_head, hidden_states, bias=embedding_bias
+@@ -336,3 +374,23 @@ class LogitsProcessor(PluggableLayer):
+         s += f", org_vocab_size={self.org_vocab_size}"
+         s += f", scale={self.scale}, logits_as_input={self.logits_as_input}"
+         return s
++
++
++def _is_packed_head(head: torch.nn.Module) -> bool:
++    from spark_ds41.worker.packed_bf16 import PackedBf16LmHeadMethod
++
++    return isinstance(getattr(head, "quant_method", None), PackedBf16LmHeadMethod)
++
++
++def _is_plain_bf16_head(head: torch.nn.Module) -> bool:
++    """A loaded, unquantized, contiguous BF16 vocabulary head on the GPU."""
++    return (
++        isinstance(head, VocabParallelEmbedding)
++        and isinstance(
++            head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
++        )
++        and head.weight.ndim == 2
++        and head.weight.dtype == torch.bfloat16
++        and head.weight.is_cuda
++        and head.weight.is_contiguous()
++    )
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 3cdd289..2da63a5 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -268,6 +268,7 @@ class VocabParallelEmbedding(PluggableLayer):
+         reduce_results: bool = True,
+         quant_method: QuantizeMethodBase | None = None,
+         parallel_group: GroupCoordinator | None = None,
++        lm_head_quantization: str | None = None,
+     ):
+         super().__init__()
+ 
+@@ -329,6 +330,11 @@ class VocabParallelEmbedding(PluggableLayer):
+         # method must implement the embedding operation. If we are another
+         # layer type like ParallelLMHead, this is not important.
+         is_embedding_layer = not isinstance(self, ParallelLMHead)
++        self.runtime_lm_head_quantization: str | None = None
++        if not is_embedding_layer and lm_head_quantization == "packed_bf16":
++            from spark_ds41.worker.packed_bf16 import PackedBf16LmHeadMethod
++            quant_method = PackedBf16LmHeadMethod()
++            self.runtime_lm_head_quantization = "packed_bf16"
+         quant_method_implements_embedding = method_has_implemented_embedding(
+             type(quant_method)
+         )
+@@ -613,6 +619,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+         *,
+         disable_tp: bool = False,
+         quant_method: QuantizeMethodBase | None = None,
++        lm_head_quantization: str | None = None,
+     ):
+         self.has_bias = bias
+         super().__init__(
+@@ -625,6 +632,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+             prefix,
+             disable_tp=disable_tp,
+             quant_method=quant_method,
++            lm_head_quantization=lm_head_quantization,
+         )
+         self.quant_config = quant_config
+         if bias:
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index f33779d..ac314c8 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -971,6 +971,9 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
+                 vllm_config
+             )
+         _set_deepseek_indexer_logits_dtype(vllm_config)
++        from spark_ds41.model.config import update_deepseek_v41_vllm_config
++
++        update_deepseek_v41_vllm_config(vllm_config)
+ 
+     @staticmethod
+     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+@@ -994,6 +997,9 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
+                 model_config.hf_text_config.quantization_config["quant_method"] = (
+                     "deepseek_v4_fp8"
+                 )
++        from spark_ds41.model.config import update_deepseek_v41_model_config
++
++        update_deepseek_v41_model_config(model_config)
+ 
+ 
+ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
+diff --git a/vllm/models/deepseek_v41/__init__.py b/vllm/models/deepseek_v41/__init__.py
+index b69e1c6..1ebfbd3 100644
+--- a/vllm/models/deepseek_v41/__init__.py
++++ b/vllm/models/deepseek_v41/__init__.py
+@@ -2,13 +2,29 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepSeek V4.1 hardware-isolated model entry point."""
+ 
++import importlib.util
++
++import torch
++
+ from vllm.platforms import current_platform
+ 
+ from .quant_config import DeepseekV4FP8Config
+ 
++
++def _use_spark_tilelang() -> bool:
++    if not current_platform.is_cuda():
++        return False
++    if importlib.util.find_spec("spark_ds41") is None:
++        return False
++    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 1)
++
++
+ if current_platform.is_rocm():
+     from .amd.dspark import DSparkDeepseekV4ForCausalLM
+     from .amd.vl_model import DeepseekV41ForCausalLM
++elif _use_spark_tilelang():
++    from spark_ds41.model.dspark import DSparkDeepseekV4ForCausalLM
++    from spark_ds41.model.vl_model import DeepseekV41ForCausalLM
+ else:
+     from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
+     from .nvidia.vl_model import DeepseekV41ForCausalLM
+diff --git a/vllm/models/deepseek_v4_1/__init__.py b/vllm/models/deepseek_v4_1/__init__.py
+new file mode 100644
+index 0000000..206a7d8
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/__init__.py
+@@ -0,0 +1 @@
++# Compatibility shim package for spark_ds41.
+diff --git a/vllm/models/deepseek_v4_1/glp.py b/vllm/models/deepseek_v4_1/glp.py
+new file mode 100644
+index 0000000..2374027
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/glp.py
+@@ -0,0 +1,5 @@
++from spark_ds41.model.glp import *  # noqa: F401,F403
++from spark_ds41.model.glp import main
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 9a18576..536f506 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -595,7 +595,11 @@ def max_decode_query_len(vllm_config: "VllmConfig") -> int:
+     # query.
+     return (
+         1
+-        + speculative_config.num_speculative_tokens
++        + getattr(
++            vllm_config,
++            "num_verification_tokens",
++            speculative_config.num_speculative_tokens,
++        )
+         + speculative_config.max_num_new_slots_for_drafting
+     )
+ 
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 6d44621..70749e2 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -128,6 +128,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+         "vllm.models.deepseek_v41.sparse_mla.FlashMLAMegaAttnBackend"
+     )
+     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
++    TILELANG = "spark_ds41.tilelang.attention.DeepseekV41TileLangBackend"
+     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
+     FLASH_ATTN_MLA_SPARSE = (
+         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"

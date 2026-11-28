@@ -328,7 +328,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
         # below the mid tiles: DSpark's draft layers, which read each active
         # expert's slab at most once a step) move into it. Off the carve-out the
         # preparation is unchanged and asks nothing more of the plan.
-        from vllm.v1.worker import display_carveout
+        from spark_ds41.worker import display_carveout
 
         decode_only = display_carveout.required() and (
             self._plan.max_rows is not None and not self._plan._has_mid_tiles()

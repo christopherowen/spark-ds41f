@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 15:14:14 +0100
+Subject: [PATCH 8/9] Add scheduler prefill-yield, late admission, weightless
+ prefix hash, and role affinity hooks
+
+---
+ vllm/v1/core/kv_cache_utils.py  |  12 ++-
+ vllm/v1/core/sched/interface.py |   4 +
+ vllm/v1/core/sched/scheduler.py | 125 +++++++++++++++++++++++++++++++-
+ vllm/v1/engine/core.py          |  31 ++++++++
+ 4 files changed, 167 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 9dc9865..b952c0e 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -20,6 +20,7 @@ from typing import (
+     overload,
+ )
+ 
++from spark_ds41.direct_io import weightless
+ from vllm import envs
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
+@@ -705,8 +706,17 @@ def generate_block_hash_extra_keys(
+         request, start_token_idx, end_token_idx
+     )
+ 
++    steering_keys: list[Any] = (
++        [weightless.BLOCK_HASH_KEY]
++        if start_token_idx == 0 and weightless.is_marked(request.sampling_params)
++        else []
++    )
+     extra_keys: list[Any] = (
+-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
++        lora_extra_keys
++        + mm_extra_keys
++        + cache_salt_keys
++        + prompt_embeds_keys
++        + steering_keys
+     )
+ 
+     if not extra_keys:
+diff --git a/vllm/v1/core/sched/interface.py b/vllm/v1/core/sched/interface.py
+index 80d25d3..bc5319b 100644
+--- a/vllm/v1/core/sched/interface.py
++++ b/vllm/v1/core/sched/interface.py
+@@ -271,6 +271,10 @@ class SchedulerInterface(ABC):
+         """Shutdown the scheduler."""
+         raise NotImplementedError
+ 
++    def continues_prefill(self, scheduler_output: "SchedulerOutput") -> bool:
++        """Whether a scheduled step carries a non-final prompt chunk."""
++        return False
++
+     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":
+         return None
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 32f93ff..916d12e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -99,7 +99,10 @@ from vllm.v1.utils import record_function_or_nullcontext
+ logger = init_logger(__name__)
+ 
+ 
+-class Scheduler(SchedulerInterface):
++from spark_ds41.scheduler.mixin import SparkSchedulerMixin
++
++
++class Scheduler(SparkSchedulerMixin, SchedulerInterface):
+     _encoder_cache_epoch: int = 0
+ 
+     def __init__(
+@@ -342,6 +345,18 @@ class Scheduler(SchedulerInterface):
+             )
+         speculative_config = vllm_config.speculative_config
+         self.num_spec_tokens = vllm_config.num_scheduled_spec_tokens
++        self.num_verification_tokens = getattr(
++            vllm_config, "num_verification_tokens", self.num_spec_tokens
++        )
++        self.copy_drafts = (
++            speculative_config is not None
++            and getattr(speculative_config, "copy_drafts", None) is not None
++        )
++        self.max_decode_rows = getattr(
++            vllm_config,
++            "max_decode_rows",
++            self.max_num_running_reqs * (1 + self.num_spec_tokens),
++        )
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+         # DSV41 SWA bounded replay: groups that declare a replay window are rebuilt
+         # after a prefix hit by recomputing its trailing tokens. One window
+@@ -511,6 +526,7 @@ class Scheduler(SchedulerInterface):
+         # Parked async KV loads can number thousands, so theirs are cached until
+         # they are scheduled; prefill chunks are few and summed on demand.
+         self._inflight_prefills: set[Request] = set()
++        self._spark_init_scheduler()
+         self._parked_reservations: dict[Request, int] = {}
+         self._parked_reserved_blocks = 0
+ 
+@@ -801,7 +817,15 @@ class Scheduler(SchedulerInterface):
+             long_prefill_token_threshold = max(
+                 long_prefill_token_threshold, input_budget // num_eligible_reqs
+             )
+-
++        (
++            _spark_yield_now,
++            _spark_interleave_decode_due,
++            _spark_short_waiting,
++            _spark_yield_long,
++            _spark_runnable_decodes,
++        ) = self._spark_begin_step_yield(long_prefill_token_threshold, token_budget)
++
++        copy_rows_left = self._spark_compute_copy_rows_left()
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+@@ -828,19 +852,54 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            if (
++                _spark_yield_long
++                and request.is_prefill_chunk
++                and (
++                    _spark_interleave_decode_due
++                    or not self._spark_prefill_yield_expired(
++                        request.request_id, _spark_yield_now
++                    )
++                )
++            ):
++                if not _spark_interleave_decode_due:
++                    self._prefill_yield_since.setdefault(
++                        request.request_id, _spark_yield_now
++                    )
++                req_index += 1
++                continue
++
+             if self._ec_transfer_pending(
+                 request, request.num_computed_tokens - request.num_output_placeholders
+             ):
+                 req_index += 1
+                 continue
+ 
++            if self.copy_drafts and copy_rows_left > 0:
++                copy_rows_left -= self._spark_widen_copy_placeholders(
++                    request, copy_rows_left
++                )
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+                 - request.num_computed_tokens
+             )
+-            if 0 < long_prefill_token_threshold < num_new_tokens:
+-                num_new_tokens = long_prefill_token_threshold
++            _eff_thr = self._spark_context_aware_chunk_threshold(
++                request, long_prefill_token_threshold, _spark_runnable_decodes
++            )
++            if 0 < _eff_thr < num_new_tokens:
++                num_new_tokens = _eff_thr
++            if (
++                self.scheduler_config.align_prefill_chunks
++                and long_prefill_token_threshold > 0
++                and request.num_computed_tokens + num_new_tokens < request.num_prompt_tokens
++            ):
++                next_boundary = (
++                    (request.num_computed_tokens // long_prefill_token_threshold) + 1
++                ) * long_prefill_token_threshold
++                aligned_cap = next_boundary - request.num_computed_tokens
++                if num_new_tokens > aligned_cap:
++                    num_new_tokens = aligned_cap
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
+@@ -1134,6 +1193,40 @@ class Scheduler(SchedulerInterface):
+                     skip_request(request_queue)
+                     continue
+ 
++                if not loads_only and (
++                    _spark_interleave_decode_due
++                    or self.max_parallel_prefills > 0
++                    or _spark_yield_long
++                ):
++                    _is_short_wait = self._spark_prefill_finishes_in_chunk(
++                        request,
++                        request.num_computed_tokens,
++                        long_prefill_token_threshold,
++                        min(token_budget, input_budget - draft_slots),
++                    )
++                    if _spark_interleave_decode_due and not _is_short_wait:
++                        skip_request(request_queue)
++                        continue
++                    if (
++                        self.max_parallel_prefills > 0
++                        and not _is_short_wait
++                        and len(self._inflight_prefills) >= self.max_parallel_prefills
++                    ):
++                        skip_request(request_queue)
++                        continue
++                    if (
++                        _spark_yield_long
++                        and not _is_short_wait
++                        and not self._spark_prefill_yield_expired(
++                            request_id, _spark_yield_now
++                        )
++                    ):
++                        self._prefill_yield_since.setdefault(
++                            request_id, _spark_yield_now
++                        )
++                        skip_request(request_queue)
++                        continue
++
+                 # Check that adding the request still respects the max_loras constraint.
+                 if (
+                     self.lora_config
+@@ -1397,6 +1490,17 @@ class Scheduler(SchedulerInterface):
+ 
+                     if 0 < long_prefill_token_threshold < num_new_tokens:
+                         num_new_tokens = long_prefill_token_threshold
++                    if (
++                        self.scheduler_config.align_prefill_chunks
++                        and long_prefill_token_threshold > 0
++                        and request.num_computed_tokens + num_new_tokens < request.num_prompt_tokens
++                    ):
++                        next_boundary = (
++                            (request.num_computed_tokens // long_prefill_token_threshold) + 1
++                        ) * long_prefill_token_threshold
++                        aligned_cap = next_boundary - request.num_computed_tokens
++                        if num_new_tokens > aligned_cap:
++                            num_new_tokens = aligned_cap
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+                     # pooling requests to be chunked
+@@ -1890,6 +1994,7 @@ class Scheduler(SchedulerInterface):
+         request.num_computed_tokens = 0
+         if request.spec_token_ids:
+             request.spec_token_ids = []
++        request.copy_draft_alloc = 0
+         # Async scheduling: mark all in-flight output as stale. Its tokens are
+         # still delivered on return (dropping them would perturb spec-decode
+         # acceptance) but must not mutate the reset counters; each step drains
+@@ -1948,6 +2053,7 @@ class Scheduler(SchedulerInterface):
+         # Clear the finished and preempted request IDs.
+         # NOTE: We shouldn't just clear() here because it will also affect
+         # the scheduler output.
++        self._spark_after_schedule(scheduler_output)
+         self.finished_req_ids = set()
+         self.reset_preempted_req_ids = set()
+ 
+@@ -2389,6 +2495,7 @@ class Scheduler(SchedulerInterface):
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        self._spark_on_output(scheduler_output)
+         # A step with tokens can make schedule() produce work again.
+         if (
+             scheduler_output.total_num_scheduled_tokens
+@@ -2489,6 +2596,15 @@ class Scheduler(SchedulerInterface):
+             generated_token_ids = (
+                 sampled_token_ids[req_index] if sampled_token_ids else []
+             )
++            if (
++                model_runner_output.copy_draft_alloc is not None
++                and not output_is_stale
++            ):
++                request.copy_draft_alloc = (
++                    0
++                    if getattr(request, "force_thinking_end", False)
++                    else model_runner_output.copy_draft_alloc[req_index]
++                )
+ 
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+@@ -3307,6 +3423,7 @@ class Scheduler(SchedulerInterface):
+         if self.aux_output_connector is not None:
+             self.aux_output_connector.request_finished(request)
+         self._inflight_prefills.discard(request)
++        self._spark_forget_request(request.request_id)
+         self._unreserve_parked(request)
+         self._set_kv_fetch_stage(request, None)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 5ccab0c..f317b9f 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -129,7 +129,20 @@ HANDSHAKE_TIMEOUT_MINS = 5
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
+ 
++def late_admission_enabled(vllm_config: VllmConfig, *, batch_queue: bool) -> bool:
++    if envs.VLLM_LATE_ADMISSION_LAYER < 0:
++        return False
++    if not batch_queue or vllm_config.parallel_config.pipeline_parallel_size > 1:
++        raise ValueError(
++            "VLLM_LATE_ADMISSION_LAYER needs async scheduling without pipeline "
++            "parallelism, where one step queues behind the one in flight"
++        )
++    return True
++
++
+ class EngineCore:
++    late_admission: bool = False
++
+     """Inner loop of vLLM's Engine."""
+ 
+     def __init__(
+@@ -237,6 +250,9 @@ class EngineCore:
+         if self.batch_queue_size > 1:
+             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
+             self.batch_queue = deque(maxlen=self.batch_queue_size)
++        self.late_admission = late_admission_enabled(
++            vllm_config, batch_queue=self.batch_queue is not None
++        )
+         # Step awaiting prior outputs before sampling (see step_with_batch_queue).
+         self.deferred_step: tuple[SchedulerOutput, Future[Any]] | None = None
+         # Not with DP, whose busy loop runs a dummy batch on idle steps.
+@@ -796,6 +812,15 @@ class EngineCore:
+         model_executed = False
+         # Workers need a deferred step's sample_tokens() before the next step.
+         if self.deferred_step is None and self.scheduler.should_schedule():
++            if (
++                self.late_admission
++                and batch_queue
++                and not (
++                    hasattr(self.scheduler, "continues_prefill")
++                    and self.scheduler.continues_prefill(batch_queue[0][1])
++                )
++            ):
++                batch_queue[0][2].result()
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+@@ -1688,6 +1713,12 @@ class EngineCoreProc(EngineCore):
+         engine_core: EngineCoreProc | None = None
+         signal_callback: SignalCallback | None = None
+         clean_shutdown = False
++        try:
++            from spark_ds41.worker.cpu_affinity import apply_role_cpu_affinity
++
++            apply_role_cpu_affinity("engine_core")
++        except Exception:
++            pass
+         try:
+             parallel_config: ParallelConfig = vllm_config.parallel_config
+             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0

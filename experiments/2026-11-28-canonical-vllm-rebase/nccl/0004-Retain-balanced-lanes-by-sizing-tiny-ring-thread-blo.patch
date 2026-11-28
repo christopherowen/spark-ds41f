@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 08:34:17 +0100
+Subject: [PATCH 4/4] Retain balanced lanes by sizing tiny ring thread blocks
+ first
+
+Upstream base: NVIDIA/nccl v2.32.3-1 (12df1a11afad322be5a204a2db890161cbf8131d)
+Rationale: Rebased from v2.30.7-1 (topoGetAlgoInfo moved to src/tuning/tuning_general.cc).
+Quality impact: same as v2.30.7-1 patch 0004.
+Upstream status: local switchless-ring patch.
+---
+ src/tuning/tuning_general.cc | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/tuning/tuning_general.cc b/src/tuning/tuning_general.cc
+index 3f5ac05..2b74b02 100644
+--- a/src/tuning/tuning_general.cc
++++ b/src/tuning/tuning_general.cc
+@@ -138,6 +138,16 @@ ncclResult_t ncclTuningSetThreadThresholds(struct ncclComm* comm) {
+   return ncclSuccess;
+ }
+ 
++
++int64_t ncclParamSwitchlessBidirectional();
++
++// Preserve the four direction/root lanes by shrinking a tiny Ring's blocks
++// before shrinking its channel count. Larger messages keep upstream threads.
++static void balanceSwitchlessThreads(int64_t mode, size_t nBytes, int nc, int threshold, int* nt) {
++  if (mode != 2 || nc < 4) return;
++  while (*nt > 128 && nBytes < (size_t)nc * (size_t)*nt * (size_t)threshold) *nt /= 2;
++}
++
+ ncclResult_t ncclTuningGetChannels(struct ncclTuningInput_t* const input, struct ncclTuningResult_t* const result) {
+   int nc = input->comm->nChannels;
+   int nt = input->comm->tuningContext.maxThreads[result->algo][result->proto];
+@@ -166,6 +176,8 @@ ncclResult_t ncclTuningGetChannels(struct ncclTuningInput_t* const input, struct
+     nc = input->comm->nvlsChannels;
+   } else {
+     // Ring/Tree/one-RPN PAT channel tuning
++    if (result->algo == NCCL_ALGO_RING)
++      balanceSwitchlessThreads(ncclParamSwitchlessBidirectional(), input->nBytes, nc, threadThreshold, &nt);
+     while (input->nBytes < nc * nt * threadThreshold) {
+       if (nc >= 2) nc--;
+       else break;

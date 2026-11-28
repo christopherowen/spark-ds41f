@@ -40,7 +40,7 @@ warmups. After the kernel cache is frozen, a call that was not declared raises
 # No `from __future__ import annotations`: TileLang reads the prim_func
 # annotations eagerly, and the symbolic shapes must resolve.
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import NamedTuple, Any
 
 import torch
 
@@ -679,8 +679,16 @@ def logits_rows_key(index_dtype: torch.dtype) -> tuple:
 
 
 def logits_rows(
-    input_ids: torch.Tensor, positions: torch.Tensor, logits_indices: torch.Tensor
+    input_ids: Any,
+    positions: torch.Tensor | None = None,
+    logits_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if positions is None and logits_indices is None:
+        return logits_rows(
+            input_ids.input_ids,
+            input_ids.positions,
+            input_ids.logits_indices,
+        )
     """The input ids and positions at the logits rows, as new tensors."""
     num_logits = logits_indices.shape[0]
     ids = torch.empty(num_logits, dtype=input_ids.dtype, device=input_ids.device)
@@ -3159,9 +3167,10 @@ def dflash_calls(
     sample_from_anchor: bool, cp_layouts: Sequence[tuple[int, int]]
 ) -> list:
     """The DFlash input preparation for each draft group's ``(cp_size,
-    cp_interleave)`` (or the fused multi-group kernel when multiple groups
-    share one layout)."""
-    multi_group = len(cp_layouts) > 1 and len(dict.fromkeys(cp_layouts)) == 1
+    cp_interleave)`` (both single- and multi-group variants when groups share a
+    layout)."""
+    unique = list(dict.fromkeys(cp_layouts)) or [(1, 1)]
+    modes = (False, True) if len(unique) == 1 else (False,)
     return [
         _call(
             prepare_dflash_inputs_kernel,
@@ -3173,5 +3182,14 @@ def dflash_calls(
                 multi_group=multi_group,
             ),
         )
-        for cp_size, cp_interleave in dict.fromkeys(cp_layouts)
+        for cp_size, cp_interleave in unique
+        for multi_group in modes
     ]
+
+
+class DeadRows(NamedTuple):
+    """Verification rows to leave out of routed MoE, decided on device."""
+    confidence: torch.Tensor
+    is_padding: torch.Tensor
+    cut: torch.Tensor
+    log_tau: float
