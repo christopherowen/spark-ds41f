@@ -612,13 +612,18 @@ def smoke_script(upstreams: dict) -> str:
             'print("device", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))\n'
             f'assert importlib.metadata.version("spark-ds41") == {spark_ver!r}\n'
             "import spark_ds41\n"
+            "from vllm.models.deepseek_v41 import (\n"
+            "    DSparkDeepseekV4ForCausalLM,\n"
+            "    DeepseekV41ForCausalLM,\n"
+            ")\n"
             "import spark_ds41.model.dspark  # noqa: F401\n"
             "import spark_ds41.model.model  # noqa: F401\n"
             "import spark_ds41.model.vl_model  # noqa: F401\n"
-            "import spark_ds41.tilelang  # noqa: F401\n"
-            "from vllm.models.deepseek_v41 import DeepseekV41ForCausalLM\n\n"
+            "import spark_ds41.tilelang  # noqa: F401\n\n"
             'print("DS4.1 SM12x class:", DeepseekV41ForCausalLM.__module__)\n'
+            'print("DSpark SM12x class:", DSparkDeepseekV4ForCausalLM.__module__)\n'
             'assert DeepseekV41ForCausalLM.__module__.startswith("spark_ds41.")\n'
+            'assert DSparkDeepseekV4ForCausalLM.__module__.startswith("spark_ds41.")\n'
             'print("GPU import smoke passed")\n'
             "import tilelang\n"
             "import tile_kernels  # noqa: F401\n\n"
