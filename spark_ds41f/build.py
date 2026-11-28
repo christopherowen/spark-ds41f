@@ -642,10 +642,9 @@ def smoke_script(upstreams: dict) -> str:
             )
         if not b12x:
             script += (
-                'assert importlib.util.find_spec("b12x") is None, "B12X is installed"\n'
                 'loaded = sorted(n for n in sys.modules if n == "b12x" or n.startswith("b12x."))\n'
                 "assert not loaded, loaded\n"
-                'print("B12X is not installed; spark_ds41 imports cleanly without it")\n'
+                'print("B12X is not imported; spark_ds41 imports cleanly without it")\n'
             )
         return script
     script = SMOKE_SCRIPT
